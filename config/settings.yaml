@@ -1,0 +1,61 @@
+# ============================================================
+# POLYBOT — RUNTIME SETTINGS (SECURITY CRITICAL)
+# ============================================================
+
+# --- Mode ---
+mode: manifold           # manifold (paper) | kalshi | polymarket | all
+live_migration_approved: false   # Requires manual flip for real-money platforms
+
+# --- Active Platforms ---
+platforms:
+  kalshi:
+    enabled: false        # Enable when API key is ready
+  polymarket:
+    enabled: false        # Enable when wallet is funded
+  manifold:
+    enabled: true         # Paper trading — always on for testing
+
+# --- Circuit Breakers ---
+circuit_breakers:
+  max_daily_loss: -10             # Halt at -$10 (20% of $50 bankroll)
+  max_per_market_pct: 0.15        # 15% of bankroll per market
+  max_category_pct: 0.40          # 40% in any single category
+  max_open_positions: 10          # Max concurrent positions
+  max_quantity_per_order: 50      # Max contracts per single order
+  cooldown_after_loss_minutes: 30 # Cooldown after losing trade
+  min_market_volume: 1000         # Min 24h volume in dollars
+  max_resolution_date_pct: 0.25   # Max 25% of bankroll resolving same date
+
+# --- Monitoring ---
+monitoring:
+  check_interval_seconds: 120    # 2 minutes (prediction markets move fast)
+  missed_check_alert: 3
+  missed_check_kill: 10
+
+# --- Hermes Optimization ---
+hermes:
+  enabled: true
+  lookback_days: 14
+  min_trades_to_optimize: 5      # Need 5+ resolved trades before tuning
+
+# --- Rate Limiting ---
+rate_limits:
+  kalshi_calls_per_minute: 60
+  polymarket_calls_per_minute: 120
+  manifold_calls_per_minute: 120
+  anthropic_calls_per_minute: 30
+  backoff_base_seconds: 2
+  backoff_max_seconds: 60
+
+# --- Notifications ---
+notifications:
+  telegram_enabled: false         # Enable when bot token is set
+  alert_on:
+    - order_filled
+    - order_rejected
+    - circuit_breaker_triggered
+    - market_resolved
+    - kill_switch_activated
+    - daily_summary
+    - missed_monitoring_check
+    - calibration_report

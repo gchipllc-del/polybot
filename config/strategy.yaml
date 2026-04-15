@@ -1,0 +1,118 @@
+# ============================================================
+# POLYBOT — FORECASTING & STRATEGY CONFIGURATION
+# All parameters marked [HERMES] are auto-tuned within bounds
+# ============================================================
+
+# --- Forecasting Engine ---
+forecasting:
+  # Source weights — how much to trust each signal [HERMES]
+  llm_weight: 0.30              # Claude superforecaster analysis (bounds: 0.10 - 0.50)
+  base_rate_weight: 0.25        # Historical base rates (bounds: 0.10 - 0.50)
+  metaculus_weight: 0.20        # Community forecasts (bounds: 0.05 - 0.40)
+  news_weight: 0.15             # News sentiment signal (bounds: 0.05 - 0.30)
+  market_consensus_weight: 0.10 # The market price itself (bounds: 0.05 - 0.20)
+
+  # LLM settings
+  llm_model: claude-sonnet-4-6  # Model for market analysis
+  llm_cache_ttl_minutes: 60     # Cache LLM results for unchanged markets
+  max_tokens_per_analysis: 2000
+
+# --- Scoring Thresholds ---
+scoring:
+  min_composite_score: 6        # Out of 9 (evidence + calibration + edge) [HERMES: 4-8]
+  min_edge: 0.08                # Only trade with 8%+ edge over market [HERMES: 0.05 - 0.20]
+  min_confidence: 0.50          # Minimum confidence in our estimate
+
+# --- Kelly Criterion Position Sizing ---
+kelly_multiplier: 0.25          # Quarter Kelly — conservative start [HERMES: 0.10 - 0.75]
+max_per_market_pct: 0.15        # Max 15% of bankroll per market [HERMES: 0.05 - 0.20]
+
+# --- Market Preferences ---
+markets:
+  # Resolution date window — prefer markets resolving in this range
+  min_resolution_days: 1         # Don't trade markets resolving today (too volatile)
+  max_resolution_days: 90        # Don't tie up capital for months
+  preferred_resolution_days: 7   # Sweet spot for compounding speed
+
+  # Category preferences (can be weighted by Hermes)
+  categories:
+    - politics
+    - economics
+    - weather
+    - crypto
+    - sports
+    - entertainment
+    - ai_tech
+    - geopolitical
+    - science
+
+  # Categories to avoid (updated by Hermes if consistently losing)
+  avoid_categories: []
+
+# --- Mechanical Strategies (from practitioner research) ---
+# These bypass the forecasting engine — they're mathematically guaranteed or near-guaranteed.
+# Priority order: NegRisk arb > Near-resolution harvest > Conviction bets.
+mechanical:
+  # NegRisk Arbitrage — guaranteed profit on multi-outcome markets
+  # Practitioners: 36.2% ROI, 100% win rate. $29M extracted in one year.
+  negrisk:
+    enabled: true
+    min_profit_pct: 0.025         # Min 2.5% profit after fees
+    min_outcomes: 3               # Need 3+ outcomes
+    min_liquidity: 500            # Min $500 volume across all outcomes
+    max_exposure_per_event: 0.20  # Max 20% of bankroll per NegRisk event
+
+  # Near-Resolution Harvesting — markets about to resolve with near-certain outcome
+  # Practitioners: 5.8% ROI, 100% win rate
+  near_resolution:
+    enabled: true
+    max_hours_to_resolution: 24   # Within 24 hours
+    min_price: 0.92               # Market must be 92%+ certain
+    min_profit_after_fees: 0.005  # At least 0.5% profit after fees
+
+  # Smart Money Signals — track high-performing wallets as trade signals
+  smart_money:
+    enabled: false                # Enable when wallet tracking is built
+    min_win_rate: 0.60            # 60%+ win rate required
+    min_trades: 100               # 100+ trade history
+    min_account_age_days: 120     # 4+ months
+
+# --- Market Selection Filters (from AI ensemble practitioners) ---
+market_filters:
+  min_liquidity: 10000            # $10k pool depth
+  min_volume_24h: 500             # $500 daily volume
+  min_hours_to_resolution: 48     # At least 48h remaining
+  price_bounds: [0.10, 0.90]      # Avoid extreme odds
+  max_spread_pct: 0.04            # Bid-ask spread <= 4%
+  max_markets_per_cycle: 20       # Control inference costs
+  min_edge_for_conviction: 0.10   # 10%+ edge for conviction bets
+
+# --- Exit Strategy ---
+exits:
+  stop_loss_pct: 0.25            # Sell if position drops 25% from entry
+  take_profit_price: 0.95         # Sell if price hits 95c
+  early_exit_threshold: 0.15     # Take profit if position gained 15% [HERMES: 0.05 - 0.25]
+  edge_gone_buffer: 0.03          # Sell if market moved past our estimate +/- 3%
+  price_drift_alert: 0.10        # Alert if market moved 10% against us
+  stale_position_hours: 24       # Flag positions with no market activity in 24h
+  cooldown_cycles_after_close: 2  # Block re-entry for 2 scan cycles after exiting
+
+# --- Growth Mode ($50 → $25k) ---
+growth:
+  phase: 1                      # 1: Survival ($50-$200), 2: Acceleration ($200-$2k),
+                                # 3: Scaling ($2k-$10k), 4: Preservation ($10k-$25k)
+  max_concurrent_positions: 3   # Phase 1: concentrated, high-conviction
+  compound_all_profits: true    # Never withdraw during growth
+  prefer_fast_resolution: true  # Bias toward markets resolving in 1-14 days
+
+# --- Hermes Bounds (safety limits for auto-tuning) ---
+hermes_bounds:
+  min_edge:              [0.05, 0.20]
+  kelly_multiplier:      [0.10, 0.75]
+  min_composite_score:   [4, 8]
+  llm_weight:            [0.10, 0.50]
+  base_rate_weight:      [0.10, 0.50]
+  metaculus_weight:       [0.05, 0.40]
+  news_weight:           [0.05, 0.30]
+  early_exit_threshold:  [0.05, 0.25]
+  max_per_market_pct:    [0.05, 0.20]

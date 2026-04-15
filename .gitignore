@@ -1,0 +1,30 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+venv/
+.venv/
+
+# Data (local state)
+data/positions.json
+data/trade_history.json
+data/calibration_log.json
+data/palace/chroma/
+data/palace/knowledge_graph.db
+data/palace/diaries/*.jsonl
+data/hermes_log.jsonl
+
+# Logs
+logs/*.jsonl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

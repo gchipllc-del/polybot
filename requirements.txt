@@ -1,0 +1,26 @@
+# ============================================================
+# POLYBOT Dependencies
+# ============================================================
+
+# --- Prediction Market APIs ---
+kalshi-python>=0.3.0
+py-clob-client>=0.17.0
+requests>=2.31.0
+
+# --- AI / Forecasting ---
+anthropic>=0.40.0
+chromadb>=0.5.0
+
+# --- Dashboard ---
+flask>=3.0.0
+rich>=13.7.0
+
+# --- Config & Utilities ---
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# --- News ---
+newsapi-python>=0.2.7
+
+# --- Testing ---
+pytest>=8.0.0
