@@ -1,0 +1,393 @@
+"""
+Bayesian Forecasting Engine — the core differentiator.
+
+Takes a market, gathers evidence from multiple sources, applies Bayesian
+updating to produce a probability estimate. This estimate is what we bet on.
+
+Pipeline:
+    1. Start with base rate prior (category-level historical frequency)
+    2. Bayesian update with LLM superforecaster analysis
+    3. Bayesian update with Metaculus community forecasts (when available)
+    4. Blend in news sentiment signal
+    5. Light anchor toward market consensus (the market is usually ~right)
+    6. Score the result: evidence quality (0-3), calibration (0-3), edge (0-3)
+
+The output ForecastResult drives everything downstream:
+    - Kelly fraction for position sizing
+    - Composite score for order gate validation
+    - Calibration tracking for Hermes tuning
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+from lib.audit import log_event
+from lib.calibration import brier_score, source_accuracy
+from lib.kelly import expected_value, fractional_kelly, min_edge_for_trade
+from lib.market_client import MarketInfo
+
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "strategy.yaml"
+
+
+def _load_strategy() -> dict:
+    with open(CONFIG_PATH, "r") as f:
+        return yaml.safe_load(f)
+
+
+# ── Base Rate Priors ──────────────────────────────────────────────
+# Historical resolution rates by category (rough empirical priors).
+# Hermes can update these as we accumulate calibration data.
+BASE_RATE_PRIORS: dict[str, float] = {
+    "politics": 0.50,       # Elections, legislation — roughly 50/50 a priori
+    "economics": 0.50,      # GDP, rate decisions
+    "weather": 0.50,        # Temperature records, storms
+    "crypto": 0.50,         # Price targets, ETF approvals
+    "sports": 0.50,         # Game outcomes (no structural prior)
+    "entertainment": 0.50,  # Awards, viewership
+    "ai_tech": 0.50,        # Launches, benchmarks
+    "geopolitical": 0.40,   # Dramatic events slightly less likely
+    "science": 0.45,        # Breakthrough claims often overstated
+    "other": 0.50,
+}
+
+
+@dataclass
+class ForecastResult:
+    """Output of the forecasting engine for a single market."""
+    market_id: str
+    platform: str
+    probability: float              # Our final estimate (0.0 - 1.0)
+    confidence: float               # How confident we are in the estimate (0.0 - 1.0)
+    market_probability: float       # What the market says
+    edge: float                     # probability - market_probability (for YES side)
+    sources: dict[str, float] = field(default_factory=dict)
+    weights: dict[str, float] = field(default_factory=dict)
+    evidence_score: int = 0         # 0-3
+    calibration_score: int = 0      # 0-3
+    edge_score: int = 0             # 0-3
+    composite_score: int = 0        # 0-9
+    kelly_fraction: float = 0.0
+    expected_value: float = 0.0
+    best_side: str = "YES"          # Which side to trade
+    evidence_summary: str = ""
+    bayesian_chain: list[dict] = field(default_factory=list)
+
+
+# ── Bayesian Math ─────────────────────────────────────────────────
+
+def bayesian_update(prior: float, likelihood: float, base_rate: float = 0.5) -> float:
+    """
+    Apply Bayes' theorem to update a probability given new evidence.
+
+    P(H|E) = P(E|H) * P(H) / P(E)
+
+    Where P(E) = P(E|H)*P(H) + P(E|~H)*P(~H)
+
+    We interpret `likelihood` as: "if the hypothesis is true, how likely
+    is this evidence?" And we assume the complementary likelihood is
+    (1 - likelihood) scaled by the base rate.
+
+    Args:
+        prior: Current probability estimate (0.0 - 1.0)
+        likelihood: How likely the evidence if hypothesis is true (0.0 - 1.0)
+        base_rate: How common the evidence is in general (0.0 - 1.0)
+
+    Returns:
+        Updated probability (0.0 - 1.0), clamped to [0.01, 0.99].
+    """
+    if prior <= 0 or prior >= 1:
+        prior = max(0.01, min(prior, 0.99))
+
+    p_e_given_h = max(likelihood, 0.01)
+    p_e_given_not_h = max(1.0 - likelihood, 0.01) * base_rate / max(1.0 - base_rate, 0.01)
+    p_e_given_not_h = max(p_e_given_not_h, 0.01)
+
+    numerator = p_e_given_h * prior
+    denominator = numerator + p_e_given_not_h * (1.0 - prior)
+
+    if denominator <= 0:
+        return prior
+
+    posterior = numerator / denominator
+    return max(0.01, min(posterior, 0.99))
+
+
+def weighted_blend(estimates: dict[str, float], weights: dict[str, float]) -> float:
+    """
+    Weighted average of probability estimates from multiple sources.
+
+    Normalizes weights so they sum to 1.0 (handles missing sources gracefully).
+
+    Args:
+        estimates: {"llm": 0.65, "base_rate": 0.50, ...}
+        weights: {"llm": 0.30, "base_rate": 0.25, ...}
+
+    Returns:
+        Blended probability (0.01 - 0.99).
+    """
+    active = {k: v for k, v in estimates.items() if k in weights}
+    if not active:
+        return 0.50
+
+    total_weight = sum(weights[k] for k in active)
+    if total_weight <= 0:
+        return 0.50
+
+    blended = sum(estimates[k] * weights[k] / total_weight for k in active)
+    return max(0.01, min(blended, 0.99))
+
+
+# ── Scoring ───────────────────────────────────────────────────────
+
+def score_evidence(sources: dict[str, float]) -> int:
+    """
+    Score evidence quality 0-3 based on how many independent sources we have
+    and whether they agree.
+
+    0 = No sources (just base rate)
+    1 = One source only (e.g., just market price)
+    2 = Two+ sources that agree within 15%
+    3 = Three+ sources that strongly agree within 10%
+    """
+    n = len(sources)
+    if n == 0:
+        return 0
+    if n == 1:
+        return 1
+
+    probs = list(sources.values())
+    spread = max(probs) - min(probs)
+
+    if n >= 3 and spread <= 0.10:
+        return 3
+    if n >= 2 and spread <= 0.15:
+        return 2
+    return 1
+
+
+def score_calibration() -> int:
+    """
+    Score our historical calibration quality 0-3.
+
+    0 = No resolved forecasts yet (or Brier > 0.25 = worse than random)
+    1 = Brier 0.20-0.25 (fair)
+    2 = Brier 0.15-0.20 (good)
+    3 = Brier < 0.15 (excellent)
+    """
+    bs = brier_score()
+    if bs < 0:
+        # No resolved forecasts — give benefit of doubt (1)
+        return 1
+    if bs < 0.15:
+        return 3
+    if bs < 0.20:
+        return 2
+    if bs < 0.25:
+        return 1
+    return 0
+
+
+def score_edge(edge: float, market_prob: float, fee_rate: float) -> int:
+    """
+    Score edge quality 0-3.
+
+    0 = Edge below minimum for trade (doesn't beat fees + uncertainty)
+    1 = Edge meets minimum threshold
+    2 = Edge is 2x minimum threshold
+    3 = Edge is 3x+ minimum threshold (strong conviction)
+    """
+    min_e = min_edge_for_trade(market_prob, fee_rate)
+
+    if edge < min_e:
+        return 0
+    if edge < min_e * 2:
+        return 1
+    if edge < min_e * 3:
+        return 2
+    return 3
+
+
+# ── Main Entry Point ──────────────────────────────────────────────
+
+def estimate_probability(
+    market: MarketInfo,
+    llm_estimate: float | None = None,
+    metaculus_estimate: float | None = None,
+    news_sentiment: float | None = None,
+    kronos_estimate: float | None = None,
+    fee_rate: float = 0.07,
+) -> ForecastResult:
+    """
+    Produce a probability estimate for a market by aggregating all sources.
+
+    This is the central function of the bot. Everything flows from this estimate:
+    - Whether we trade (edge > min_edge)
+    - How much we bet (Kelly fraction)
+    - What score we assign (composite 0-9)
+    - How we track accuracy (calibration)
+
+    Args:
+        market: MarketInfo from any platform client
+        llm_estimate: Claude superforecaster probability (from llm_analyst.py)
+        metaculus_estimate: Metaculus community forecast if available
+        news_sentiment: News-based probability signal
+        kronos_estimate: Kronos zero-shot price model probability (for price-based markets)
+        fee_rate: Platform fee rate for edge scoring
+
+    Returns:
+        ForecastResult with probability, scores, kelly, and evidence chain.
+    """
+    strategy = _load_strategy()
+    fc = strategy.get("forecasting", {})
+
+    # Gather configured weights
+    weights = {
+        "llm": fc.get("llm_weight", 0.25),
+        "base_rate": fc.get("base_rate_weight", 0.20),
+        "metaculus": fc.get("metaculus_weight", 0.15),
+        "news": fc.get("news_weight", 0.10),
+        "kronos": fc.get("kronos_weight", 0.20),
+        "market_consensus": fc.get("market_consensus_weight", 0.10),
+    }
+
+    # ── Step 1: Base Rate Prior ───────────────────────────────────
+    category = market.category.lower() if market.category else "other"
+    base_rate = BASE_RATE_PRIORS.get(category, 0.50)
+
+    sources: dict[str, float] = {"base_rate": base_rate}
+    chain: list[dict] = [{"step": "base_rate", "value": base_rate, "source": f"category:{category}"}]
+    current = base_rate
+
+    # ── Step 2: LLM Superforecaster Update ────────────────────────
+    if llm_estimate is not None:
+        sources["llm"] = llm_estimate
+        current = bayesian_update(current, llm_estimate, base_rate)
+        chain.append({"step": "llm_update", "value": current, "llm_raw": llm_estimate})
+
+    # ── Step 3: Metaculus Community Forecast ───────────────────────
+    if metaculus_estimate is not None:
+        sources["metaculus"] = metaculus_estimate
+        current = bayesian_update(current, metaculus_estimate, base_rate)
+        chain.append({"step": "metaculus_update", "value": current, "metaculus_raw": metaculus_estimate})
+
+    # ── Step 4: News Sentiment Signal ─────────────────────────────
+    if news_sentiment is not None:
+        sources["news"] = news_sentiment
+        current = bayesian_update(current, news_sentiment, base_rate)
+        chain.append({"step": "news_update", "value": current, "news_raw": news_sentiment})
+
+    # ── Step 5: Kronos Zero-Shot Price Model ───────────────────���──
+    if kronos_estimate is not None:
+        sources["kronos"] = kronos_estimate
+        current = bayesian_update(current, kronos_estimate, base_rate)
+        chain.append({"step": "kronos_update", "value": current, "kronos_raw": kronos_estimate})
+
+    # ── Step 6: Market Consensus Anchor ───────────────────────────
+    # The market is usually approximately right. Light anchor toward it.
+    market_prob = market.yes_price
+    sources["market_consensus"] = market_prob
+
+    # Final blend: combine Bayesian posterior with weighted source average
+    # This prevents the sequential Bayesian updates from over-counting
+    # correlated evidence (e.g., LLM reading the same news as news_sentiment)
+    source_blend = weighted_blend(sources, weights)
+
+    # 70% Bayesian chain, 30% linear blend — balances responsiveness with stability
+    probability = 0.70 * current + 0.30 * source_blend
+    probability = max(0.01, min(probability, 0.99))
+
+    chain.append({
+        "step": "final_blend",
+        "bayesian_posterior": round(current, 4),
+        "source_blend": round(source_blend, 4),
+        "final": round(probability, 4),
+    })
+
+    # ── Confidence ────────────────────────────────────────────────
+    # Confidence = how much our sources agree + how many we have
+    source_values = [v for k, v in sources.items() if k != "market_consensus"]
+    if len(source_values) >= 2:
+        spread = max(source_values) - min(source_values)
+        agreement = max(0, 1.0 - spread * 3)  # 0.33 spread -> 0 agreement
+        coverage = min(len(source_values) / 4.0, 1.0)  # 4 sources = full coverage
+        confidence = 0.6 * agreement + 0.4 * coverage
+    else:
+        confidence = 0.25  # Single source = low confidence
+
+    # ── Edge Calculation ──────────────────────────────────────────
+    # Decide best side based on where our edge is
+    yes_edge = probability - market_prob
+    no_edge = (1.0 - probability) - (1.0 - market_prob)  # = market_prob - probability
+
+    if yes_edge >= no_edge:
+        best_side = "YES"
+        edge = yes_edge
+        trade_prob = probability
+        trade_market_prob = market_prob
+    else:
+        best_side = "NO"
+        edge = no_edge
+        trade_prob = 1.0 - probability
+        trade_market_prob = 1.0 - market_prob
+
+    # ── Scoring ───────────────────────────────────────────────────
+    ev_score = score_evidence(sources)
+    cal_score = score_calibration()
+    edg_score = score_edge(abs(edge), trade_market_prob, fee_rate)
+    composite = ev_score + cal_score + edg_score
+
+    # ── Kelly Sizing ──────────────────────────────────────────────
+    if edge > 0:
+        kf = fractional_kelly(trade_prob, trade_market_prob)
+        ev = expected_value(trade_prob, trade_market_prob, fee_rate)
+    else:
+        kf = 0.0
+        ev = 0.0
+
+    # ── Build Evidence Summary ────────────────────────────────────
+    parts = [f"Base rate ({category}): {base_rate:.0%}"]
+    if llm_estimate is not None:
+        parts.append(f"LLM: {llm_estimate:.0%}")
+    if metaculus_estimate is not None:
+        parts.append(f"Metaculus: {metaculus_estimate:.0%}")
+    if news_sentiment is not None:
+        parts.append(f"News: {news_sentiment:.0%}")
+    if kronos_estimate is not None:
+        parts.append(f"Kronos: {kronos_estimate:.0%}")
+    parts.append(f"Market: {market_prob:.0%}")
+    parts.append(f"→ Final: {probability:.0%} ({best_side} edge: {edge:+.1%})")
+    summary = " | ".join(parts)
+
+    result = ForecastResult(
+        market_id=market.market_id,
+        platform=market.platform,
+        probability=round(probability, 4),
+        confidence=round(confidence, 4),
+        market_probability=market_prob,
+        edge=round(edge, 4),
+        sources=sources,
+        weights=weights,
+        evidence_score=ev_score,
+        calibration_score=cal_score,
+        edge_score=edg_score,
+        composite_score=composite,
+        kelly_fraction=round(kf, 4),
+        expected_value=round(ev, 4),
+        best_side=best_side,
+        evidence_summary=summary,
+        bayesian_chain=chain,
+    )
+
+    log_event("forecaster", "estimate_complete", {
+        "market_id": market.market_id,
+        "platform": market.platform,
+        "probability": result.probability,
+        "edge": result.edge,
+        "side": result.best_side,
+        "composite_score": result.composite_score,
+        "sources": {k: round(v, 3) for k, v in sources.items()},
+    }, result="success")
+
+    return result

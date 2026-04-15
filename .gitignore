@@ -16,6 +16,12 @@ data/palace/knowledge_graph.db
 data/palace/diaries/*.jsonl
 data/hermes_log.jsonl
 
+# Caches
+data/llm_cache/
+data/news_cache/
+data/kronos_cache/
+data/backtests/
+
 # Logs
 logs/*.jsonl
 

@@ -12,6 +12,11 @@ Usage:
     python main.py calibrate         # Print calibration report
     python main.py hermes            # Run self-optimization
     python main.py hermes --dry-run  # Analysis only, no changes
+    python main.py backtest          # Replay historical trades
+    python main.py backtest --mc     # Monte Carlo simulation (1000 paths)
+    python main.py news <question>   # Test news sentiment for a query
+    python main.py kronos <ticker>   # Kronos zero-shot price forecast
+    python main.py kronos-prob <ticker> <target> [above|below]  # Price probability
     python main.py dashboard         # Launch web dashboard
     python main.py chaos             # Run chaos tests
 """
@@ -54,8 +59,11 @@ def _save_positions(positions: list[dict]):
 
 def cmd_scan():
     """Scan markets across all active platforms, score candidates, propose trades."""
+    import os
+
     from lib.audit import log_event
     from lib.market_client import get_active_clients
+    from lib.market_scanner import get_top_candidates, print_scan_report, scan_all_markets
 
     log_event("startup", "scan_started", {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -71,44 +79,115 @@ def cmd_scan():
 
     print(f"Scanning {len(clients)} platform(s): {[c.platform_name for c in clients]}")
 
-    total_markets = 0
-    for client in clients:
-        try:
-            markets = client.get_markets(status="open", limit=50)
-            total_markets += len(markets)
-            print(f"  [{client.platform_name}] {len(markets)} open markets found")
+    # LLM requires ANTHROPIC_API_KEY — run without it if missing
+    llm_enabled = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if not llm_enabled:
+        print("  (LLM analysis disabled — set ANTHROPIC_API_KEY to enable)")
 
-            for market in markets[:5]:  # Show top 5 for now
-                print(f"    {market.yes_price:.0%} YES | {market.question[:60]}")
-        except Exception as e:
-            print(f"  [{client.platform_name}] Error: {e}")
+    # TODO: pull real bankroll from platform balances once live
+    bankroll = 50.0
 
-    print(f"\nTotal markets scanned: {total_markets}")
-    print("(Forecasting engine not yet active — Phase 2 will score and trade)")
+    candidates = scan_all_markets(
+        clients=clients,
+        llm_enabled=llm_enabled,
+        bankroll=bankroll,
+    )
+
+    print_scan_report(candidates)
+
+    # Show top tradeable opportunities
+    top = get_top_candidates(candidates)
+    if top:
+        print(f"\nRecommended trades ({len(top)}):")
+        for c in top:
+            f = c.forecast
+            print(f"  {f.best_side} {c.market.question[:50]}")
+            print(f"    Edge: {f.edge:+.1%} | Score: {f.composite_score}/9 "
+                  f"| Kelly: ${c.kelly_bet_usd:.2f} | EV: ${f.expected_value:.3f}")
+    else:
+        print("\nNo trades meet criteria this cycle.")
 
 
 def cmd_monitor():
     """Start continuous position monitoring loop."""
-    from lib.audit import log_event
-
-    log_event("startup", "monitor_started", {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-
-    settings = _load_settings()
-    interval = settings["monitoring"]["check_interval_seconds"]
-
-    print(f"Starting monitoring loop (every {interval}s)")
-    print("(Full monitoring engine coming in Phase 4)")
+    from lib.monitor import start_monitoring_loop
 
     positions = _load_positions()
-    print(f"Tracking {len(positions)} open positions")
+    open_count = len([p for p in positions if p.get("status") == "open"])
+    print(f"Tracking {open_count} open positions")
+
+    try:
+        start_monitoring_loop()
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped.")
 
 
 def cmd_forecast(market_id: str):
     """Run forecasting engine on a specific market."""
+    import os
+
+    from lib.forecaster import estimate_probability
+    from lib.market_client import get_active_clients
+
     print(f"Forecasting market: {market_id}")
-    print("(Forecasting engine coming in Phase 2)")
+
+    clients = get_active_clients()
+    market = None
+    for client in clients:
+        try:
+            market = client.get_market(market_id)
+            break
+        except Exception:
+            continue
+
+    if not market:
+        print(f"Market {market_id} not found on any active platform.")
+        return
+
+    # LLM analysis if API key available
+    llm_estimate = None
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            from lib.llm_analyst import analyze_market
+            analysis = analyze_market(
+                market_id=market.market_id,
+                question=market.question,
+                description=market.description,
+                market_price=market.yes_price,
+                category=market.category,
+                resolution_date=market.resolution_date,
+            )
+            llm_estimate = analysis.probability
+            print(f"\nLLM Analysis:")
+            print(f"  Probability: {analysis.probability:.0%}")
+            print(f"  Confidence:  {analysis.confidence:.0%}")
+            print(f"  Reference:   {analysis.reference_class}")
+            for factor in analysis.key_factors:
+                print(f"  Factor:      {factor}")
+        except RuntimeError as e:
+            print(f"  LLM unavailable: {e}")
+
+    fee_rates = {"kalshi": 0.07, "polymarket": 0.02, "manifold": 0.0}
+    fee_rate = fee_rates.get(market.platform, 0.07)
+
+    result = estimate_probability(
+        market=market,
+        llm_estimate=llm_estimate,
+        fee_rate=fee_rate,
+    )
+
+    print(f"\nForecast Result:")
+    print(f"  Our Probability: {result.probability:.0%}")
+    print(f"  Market Price:    {result.market_probability:.0%}")
+    print(f"  Edge:            {result.edge:+.1%} ({result.best_side})")
+    print(f"  Confidence:      {result.confidence:.0%}")
+    print(f"  Composite Score: {result.composite_score}/9 "
+          f"(evidence={result.evidence_score} calibration={result.calibration_score} edge={result.edge_score})")
+    print(f"  Kelly Fraction:  {result.kelly_fraction:.2%}")
+    print(f"  Expected Value:  ${result.expected_value:.4f}/dollar")
+    print(f"\n  Bayesian Chain:")
+    for step in result.bayesian_chain:
+        print(f"    {step}")
 
 
 def cmd_arb():
@@ -169,52 +248,10 @@ def cmd_kill(reason: str = "manual_cli"):
         print("Clean shutdown complete.")
 
 
-def cmd_status():
-    """Print current portfolio status."""
-    from lib.market_client import get_active_clients
-
-    settings = _load_settings()
-    strategy = _load_strategy()
-
-    print("=" * 60)
-    print("  POLYBOT — Prediction Market Trading Bot")
-    print("=" * 60)
-    print(f"  Mode:           {settings['mode']}")
-    print(f"  Growth Phase:   {strategy['growth']['phase']}")
-    print(f"  Kelly:          {strategy['kelly_multiplier']}x")
-    print(f"  Min Edge:       {strategy['scoring']['min_edge']:.0%}")
-    print(f"  Min Score:      {strategy['scoring']['min_composite_score']}/9")
-    print()
-
-    # Show balances from each platform
-    clients = get_active_clients()
-    total_balance = 0.0
-    for client in clients:
-        try:
-            balance = client.get_balance()
-            total_balance += balance
-            print(f"  [{client.platform_name}] Balance: ${balance:.2f}")
-        except Exception as e:
-            print(f"  [{client.platform_name}] Balance: unavailable ({e})")
-
-    print(f"\n  Total Bankroll: ${total_balance:.2f}")
-
-    # Show positions
-    positions = _load_positions()
-    if positions:
-        print(f"\n  Open Positions: {len(positions)}")
-        for pos in positions:
-            side = pos.get("side", "?")
-            question = pos.get("question", "")[:40]
-            entry = pos.get("entry_price", 0)
-            current = pos.get("current_price", 0)
-            pnl = (current - entry) * pos.get("quantity", 0)
-            print(f"    {side} @ {entry:.2f} -> {current:.2f} ({pnl:+.2f}) | {question}")
-    else:
-        print("\n  No open positions")
-
-    print()
-    print("=" * 60)
+def cmd_status(full: bool = False):
+    """Print current portfolio status using Rich terminal dashboard."""
+    from lib.dashboard_terminal import render_terminal_dashboard
+    render_terminal_dashboard(include_calibration=full)
 
 
 def cmd_calibrate():
@@ -225,15 +262,111 @@ def cmd_calibrate():
 
 def cmd_hermes(dry_run: bool = False):
     """Run Hermes self-optimization."""
-    mode = "DRY RUN" if dry_run else "LIVE"
-    print(f"Hermes Optimizer [{mode}]")
-    print("(Hermes optimizer coming in Phase 5)")
+    from agents.hermes_optimizer import print_optimization_report, run_optimization
+
+    settings = _load_settings()
+    lookback = settings.get("hermes", {}).get("lookback_days", 14)
+
+    result = run_optimization(lookback_days=lookback, dry_run=dry_run)
+    print_optimization_report(result)
 
 
-def cmd_dashboard():
+def cmd_backtest(monte_carlo_mode: bool = False, paths: int = 1000, trades: int = 500):
+    """Run historical replay or Monte Carlo simulation."""
+    from lib.backtest import (
+        monte_carlo,
+        print_backtest_report,
+        replay_historical,
+        save_backtest,
+    )
+
+    if monte_carlo_mode:
+        print(f"Running Monte Carlo simulation ({paths:,} paths, {trades} trades each)...")
+        result = monte_carlo(
+            starting_bankroll=50.0,
+            target_bankroll=25000.0,
+            num_paths=paths,
+            trades_per_path=trades,
+        )
+    else:
+        print("Replaying historical trades...")
+        result = replay_historical(starting_bankroll=50.0)
+
+    print_backtest_report(result)
+
+    # Save results
+    path = save_backtest(result)
+    print(f"\nResults saved: {path.name}")
+
+
+def cmd_news(question: str):
+    """Test news sentiment for a given question."""
+    from lib.news_feed import get_news_sentiment
+
+    print(f"Fetching news sentiment for: {question[:80]}")
+    result = get_news_sentiment(
+        market_id="CLI_TEST",
+        question=question,
+        category="other",
+    )
+
+    print(f"\n  Query:       {result.query}")
+    print(f"  Sentiment:   {result.sentiment:.2f} ({'YES-leaning' if result.sentiment > 0.55 else 'NO-leaning' if result.sentiment < 0.45 else 'Neutral'})")
+    print(f"  Confidence:  {result.confidence:.2f}")
+    print(f"  Articles:    {result.article_count} from {result.sources_queried}")
+    print(f"  Cached:      {result.cached}")
+
+    if result.articles:
+        print(f"\n  Top Articles:")
+        for a in result.articles[:5]:
+            print(f"    [{a.source}] {a.title[:70]}")
+            print(f"      relevance={a.relevance:.2f}")
+
+
+def cmd_kronos(ticker: str, pred_bars: int = 30, interval: str = "1d"):
+    """Run Kronos zero-shot price forecast for a ticker."""
+    from lib.kronos_forecaster import predict_price, print_forecast_report
+
+    strategy = _load_strategy()
+    kronos_cfg = strategy.get("kronos", {})
+
+    print(f"Loading Kronos model and fetching {ticker} data...")
+    forecast = predict_price(
+        ticker=ticker,
+        pred_bars=pred_bars,
+        interval=interval,
+        lookback=kronos_cfg.get("default_lookback", 400),
+        sample_count=kronos_cfg.get("sample_count", 10),
+        temperature=kronos_cfg.get("temperature", 0.8),
+        model_name=kronos_cfg.get("model_name", "NeoQuasar/Kronos-base"),
+    )
+    print_forecast_report(forecast)
+
+
+def cmd_kronos_prob(ticker: str, target: float, direction: str = "above", horizon: int = 30):
+    """Estimate probability that price crosses a target."""
+    from lib.kronos_forecaster import price_to_probability, print_probability_report
+
+    strategy = _load_strategy()
+    kronos_cfg = strategy.get("kronos", {})
+
+    print(f"Running Kronos MC probability: Will {ticker} be {direction} ${target:,.2f}?")
+    result = price_to_probability(
+        ticker=ticker,
+        target_price=target,
+        direction=direction,
+        horizon_bars=horizon,
+        interval="1d",
+        sample_count=kronos_cfg.get("sample_count", 10),
+        model_name=kronos_cfg.get("model_name", "NeoQuasar/Kronos-base"),
+    )
+    print_probability_report(result)
+
+
+def cmd_dashboard(port: int = 5050):
     """Launch web dashboard."""
-    print("Starting Polybot Dashboard on http://localhost:5050")
-    print("(Dashboard coming in Phase 4)")
+    from lib.dashboard_web import run_dashboard
+    run_dashboard(port=port)
 
 
 def cmd_chaos():
@@ -368,14 +501,60 @@ def main():
         reason = sys.argv[2] if len(sys.argv) > 2 else "manual_cli"
         cmd_kill(reason)
     elif command == "status":
-        cmd_status()
+        full = "--full" in sys.argv
+        cmd_status(full=full)
     elif command == "calibrate":
         cmd_calibrate()
     elif command == "hermes":
         dry_run = "--dry-run" in sys.argv
         cmd_hermes(dry_run)
+    elif command == "backtest":
+        mc_mode = "--mc" in sys.argv
+        paths = 1000
+        trades = 500
+        for arg in sys.argv[2:]:
+            if arg.startswith("--paths="):
+                paths = int(arg.split("=")[1])
+            elif arg.startswith("--trades="):
+                trades = int(arg.split("=")[1])
+        cmd_backtest(monte_carlo_mode=mc_mode, paths=paths, trades=trades)
+    elif command == "news":
+        if len(sys.argv) < 3:
+            print("Usage: python main.py news <question>")
+            return
+        question = " ".join(sys.argv[2:])
+        cmd_news(question)
+    elif command == "kronos":
+        if len(sys.argv) < 3:
+            print("Usage: python main.py kronos <ticker> [--bars=30] [--interval=1d]")
+            return
+        ticker = sys.argv[2]
+        bars = 30
+        interval = "1d"
+        for arg in sys.argv[3:]:
+            if arg.startswith("--bars="):
+                bars = int(arg.split("=")[1])
+            elif arg.startswith("--interval="):
+                interval = arg.split("=")[1]
+        cmd_kronos(ticker, pred_bars=bars, interval=interval)
+    elif command == "kronos-prob":
+        if len(sys.argv) < 4:
+            print("Usage: python main.py kronos-prob <ticker> <target_price> [above|below] [--horizon=30]")
+            return
+        ticker = sys.argv[2]
+        target = float(sys.argv[3])
+        direction = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] in ("above", "below") else "above"
+        horizon = 30
+        for arg in sys.argv[4:]:
+            if arg.startswith("--horizon="):
+                horizon = int(arg.split("=")[1])
+        cmd_kronos_prob(ticker, target, direction, horizon)
     elif command == "dashboard":
-        cmd_dashboard()
+        port = 5050
+        for arg in sys.argv[2:]:
+            if arg.startswith("--port"):
+                port = int(sys.argv[sys.argv.index(arg) + 1]) if "=" not in arg else int(arg.split("=")[1])
+        cmd_dashboard(port=port)
     elif command == "chaos":
         cmd_chaos()
     else:
