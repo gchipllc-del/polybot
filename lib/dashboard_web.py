@@ -77,6 +77,31 @@ def api_breakers():
 
 
 def run_dashboard(port: int = 5050):
-    """Start the dashboard web server. Binds to localhost only."""
-    print(f"Polybot Dashboard: http://127.0.0.1:{port}")
+    """Start the dashboard web server. Binds to localhost only.
+
+    Fails fast with a helpful message if the port is already bound, so two
+    dashboards on the same port can't silently conflict. See also the sibling
+    traderbot project, which defaults to 5051 to avoid collision with polybot.
+    """
+    import errno
+    import socket
+
+    # Pre-flight check: confirm the port is free before Flask starts, so we
+    # can emit an actionable error instead of a Werkzeug stack trace.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            print(f"ERROR: Port {port} is already in use on 127.0.0.1.")
+            print(f"       Another dashboard may already be running.")
+            print(f"       Check with:  lsof -i :{port}")
+            print(f"       Or pick a different port:  python main.py dashboard --port <N>")
+            raise SystemExit(2)
+        raise
+    finally:
+        probe.close()
+
+    print(f"Polybot Dashboard: http://localhost:{port}")
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

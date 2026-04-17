@@ -620,8 +620,14 @@ def cmd_kronos_prob(ticker: str, target: float, direction: str = "above", horizo
 
 
 def cmd_dashboard(port: int = 5050):
-    """Launch web dashboard."""
+    """Launch web dashboard.
+
+    Default port 5050. Sibling traderbot project uses 5051 to avoid collision.
+    """
     from lib.dashboard_web import run_dashboard
+    print(f"  Polybot Dashboard: http://localhost:{port}")
+    print("  (Polybot uses 5050; traderbot uses 5051 to avoid conflict.)")
+    print("  Press Ctrl+C to stop.\n")
     run_dashboard(port=port)
 
 
