@@ -11,6 +11,7 @@ Security:
 """
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +26,11 @@ POSITIONS_PATH = DATA_DIR / "positions.json"
 TRADE_HISTORY_PATH = DATA_DIR / "trade_history.json"
 CONFIG_PATH = Path(__file__).parent.parent / "config"
 
+# Live-price cache: {(platform, market_id): (fetched_at_epoch, yes_price, no_price)}
+# 30-second TTL keeps the dashboard responsive without hammering platform APIs.
+_PRICE_CACHE: dict[tuple[str, str], tuple[float, float, float]] = {}
+_PRICE_CACHE_TTL_SEC = 30.0
+
 
 def _load_json(path: Path, default):
     if not path.exists():
@@ -34,6 +40,68 @@ def _load_json(path: Path, default):
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return default
+
+
+def _fetch_live_price(platform: str, market_id: str) -> tuple[float, float] | None:
+    """Fetch current (yes_price, no_price) with TTL caching. Returns None on failure."""
+    if not platform or not market_id:
+        return None
+
+    key = (platform, market_id)
+    now = time.time()
+
+    cached = _PRICE_CACHE.get(key)
+    if cached and (now - cached[0]) < _PRICE_CACHE_TTL_SEC:
+        return (cached[1], cached[2])
+
+    try:
+        from lib.market_client import get_client
+        client = get_client(platform)
+        market = client.get_market(market_id)
+        yes_p = float(getattr(market, "yes_price", 0) or 0)
+        no_p = float(getattr(market, "no_price", 0) or 0)
+        if 0 <= yes_p <= 1 and 0 <= no_p <= 1:
+            _PRICE_CACHE[key] = (now, yes_p, no_p)
+            return (yes_p, no_p)
+    except Exception:
+        # Never crash the dashboard on platform errors — fall back to stored price.
+        pass
+
+    return None
+
+
+def _load_positions_with_live_prices() -> list[dict]:
+    """Load positions and refresh current_price for open positions from the platform.
+
+    Returns a list of position dicts with `current_price` replaced by the live
+    market price when available; falls back to the stored value otherwise.
+    Settled positions are returned unchanged (their exit price is final).
+    """
+    positions = _load_json(POSITIONS_PATH, [])
+    refreshed = []
+    for p in positions:
+        if p.get("status") != "open":
+            refreshed.append(p)
+            continue
+
+        live = _fetch_live_price(p.get("platform", ""), p.get("market_id", ""))
+        if live is None:
+            refreshed.append(p)
+            continue
+
+        yes_p, no_p = live
+        side = (p.get("side") or "").upper()
+        live_price = yes_p if side == "YES" else no_p if side == "NO" else None
+        if live_price is None or live_price <= 0:
+            refreshed.append(p)
+            continue
+
+        # Return a shallow copy so we never mutate the on-disk record
+        updated = dict(p)
+        updated["current_price"] = live_price
+        refreshed.append(updated)
+
+    return refreshed
 
 
 def get_portfolio_summary() -> dict:
@@ -69,8 +137,8 @@ def get_portfolio_summary() -> dict:
         except Exception:
             pass
 
-        # Positions value
-        positions = _load_json(POSITIONS_PATH, [])
+        # Positions value — refresh prices so the dashboard reflects reality
+        positions = _load_positions_with_live_prices()
         open_positions = [p for p in positions if p.get("status") == "open"]
         position_value = sum(
             p.get("current_price", 0) * p.get("quantity", 0) for p in open_positions
@@ -156,7 +224,7 @@ def _resolution_countdown(resolution_date: str) -> dict:
 
 def get_positions_table() -> list[dict]:
     """All positions with current P/L, bet count, invested amount, and resolution countdown."""
-    positions = _load_json(POSITIONS_PATH, [])
+    positions = _load_positions_with_live_prices()
     result = []
 
     for p in positions:
@@ -265,7 +333,7 @@ def get_circuit_breaker_status() -> dict:
             settings = yaml.safe_load(f)
 
         cb = settings.get("circuit_breakers", {})
-        positions = _load_json(POSITIONS_PATH, [])
+        positions = _load_positions_with_live_prices()
         open_positions = [p for p in positions if p.get("status") == "open"]
 
         # Daily P/L
