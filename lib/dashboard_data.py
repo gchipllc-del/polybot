@@ -108,8 +108,54 @@ def get_portfolio_summary() -> dict:
         return {"error": str(e)[:200], "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
+def _count_bets_for_market(market_id: str) -> int:
+    """Count how many times we've placed a bet on this market across all history."""
+    history = _load_json(TRADE_HISTORY_PATH, [])
+    return sum(1 for t in history if t.get("market_id") == market_id)
+
+
+def _resolution_countdown(resolution_date: str) -> dict:
+    """Compute human-readable time-to-resolution from an ISO 8601 date string."""
+    if not resolution_date:
+        return {"days": None, "label": "—", "iso": ""}
+    try:
+        if isinstance(resolution_date, str):
+            res_dt = datetime.fromisoformat(resolution_date.replace("Z", "+00:00"))
+        elif isinstance(resolution_date, (int, float)):
+            res_dt = datetime.fromtimestamp(resolution_date / 1000, tz=timezone.utc)
+        else:
+            return {"days": None, "label": "—", "iso": ""}
+
+        now = datetime.now(timezone.utc)
+        delta = res_dt - now
+
+        total_hours = delta.total_seconds() / 3600
+        days = int(delta.days)
+        hours = int(total_hours % 24)
+
+        if total_hours <= 0:
+            label = "RESOLVING"
+        elif days == 0:
+            label = f"{hours}h"
+        elif days < 7:
+            label = f"{days}d {hours}h"
+        elif days < 30:
+            label = f"{days}d"
+        else:
+            label = f"{days}d ({res_dt.strftime('%b %-d')})"
+
+        return {
+            "days": round(delta.total_seconds() / 86400, 1),
+            "label": label,
+            "iso": res_dt.isoformat(),
+            "date_short": res_dt.strftime("%b %-d"),
+        }
+    except (ValueError, TypeError, OSError):
+        return {"days": None, "label": "—", "iso": ""}
+
+
 def get_positions_table() -> list[dict]:
-    """All positions with current P/L."""
+    """All positions with current P/L, bet count, invested amount, and resolution countdown."""
     positions = _load_json(POSITIONS_PATH, [])
     result = []
 
@@ -123,8 +169,13 @@ def get_positions_table() -> list[dict]:
         pnl = (current - entry) * qty
         pnl_pct = (current - entry) / entry if entry > 0 else 0
 
+        market_id = p.get("market_id", "")
+        total_invested = entry * qty
+        bet_count = _count_bets_for_market(market_id)
+        resolution = _resolution_countdown(p.get("resolution_date", ""))
+
         result.append({
-            "market_id": p.get("market_id", ""),
+            "market_id": market_id,
             "platform": p.get("platform", ""),
             "question": p.get("question", "")[:60],
             "category": p.get("category", ""),
@@ -132,13 +183,17 @@ def get_positions_table() -> list[dict]:
             "quantity": qty,
             "entry_price": entry,
             "current_price": current,
+            "total_invested": round(total_invested, 2),
+            "bet_count": bet_count,
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 4),
             "composite_score": p.get("composite_score", 0),
+            "edge_at_entry": p.get("edge_at_entry", 0),
             "our_probability": p.get("our_probability", 0),
             "status": p.get("status", "open"),
             "opened_at": p.get("opened_at", ""),
             "resolution_date": p.get("resolution_date", ""),
+            "resolution_countdown": resolution,
         })
 
     return result
@@ -219,11 +274,27 @@ def get_circuit_breaker_status() -> dict:
             for p in open_positions
         )
 
-        # Largest position pct
-        # Approximate bankroll from config
+        # Largest single-position pct vs actual bankroll.
+        # max_per_market_pct is a per-market limit, so we compare the single
+        # largest position's cost basis (matching check_position_size enforcement)
+        # against real bankroll (cash + position market value).
+        cash_balance = 0.0
+        try:
+            from lib.market_client import get_active_clients
+            for client in get_active_clients():
+                try:
+                    cash_balance += client.get_balance()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        position_market_value = sum(
+            p.get("current_price", 0) * p.get("quantity", 0) for p in open_positions
+        )
+        bankroll = cash_balance + position_market_value
+
         max_pos_pct = 0
-        total_invested = sum(p.get("entry_price", 0) * p.get("quantity", 0) for p in open_positions)
-        bankroll = total_invested + 50  # rough estimate
         for p in open_positions:
             pos_val = p.get("entry_price", 0) * p.get("quantity", 0)
             pct = pos_val / bankroll if bankroll > 0 else 0

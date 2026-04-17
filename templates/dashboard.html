@@ -56,9 +56,9 @@
             <h2>Open Positions</h2>
             <table id="positions-table">
                 <thead>
-                    <tr><th>Side</th><th>Question</th><th>Platform</th><th>Entry</th><th>Current</th><th>P/L</th><th>Score</th></tr>
+                    <tr><th>Side</th><th>Question</th><th>Platform</th><th>Invested</th><th>Bets</th><th>Entry</th><th>Current</th><th>P/L</th><th>Edge</th><th>Score</th><th>Resolves</th></tr>
                 </thead>
-                <tbody id="positions-body"><tr><td colspan="7">Loading...</td></tr></tbody>
+                <tbody id="positions-body"><tr><td colspan="11">Loading...</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -149,20 +149,34 @@ function renderPortfolio(p) {
 
 function renderPositions(positions) {
     const tbody = document.getElementById('positions-body');
-    if (!positions || positions.length === 0) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No open positions</td></tr>'; return; }
+    if (!positions || positions.length === 0) { tbody.innerHTML = '<tr><td colspan="11" style="color:#8b949e">No open positions</td></tr>'; return; }
     const open = positions.filter(p => p.status === 'open');
-    if (open.length === 0) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No open positions</td></tr>'; return; }
-    tbody.innerHTML = open.map(p => `
+    if (open.length === 0) { tbody.innerHTML = '<tr><td colspan="11" style="color:#8b949e">No open positions</td></tr>'; return; }
+    tbody.innerHTML = open.map(p => {
+        const res = p.resolution_countdown || {};
+        const resLabel = res.label || '—';
+        let resStyle = 'color:#8b949e';
+        if (resLabel === 'RESOLVING') resStyle = 'color:#d29922;font-weight:bold';
+        else if (res.days != null && res.days < 3) resStyle = 'color:#d29922;font-weight:bold';
+        else if (res.days != null && res.days < 14) resStyle = 'color:#58a6ff';
+        const resTitle = res.iso ? `title="Resolves ${res.iso}"` : '';
+        const edge = p.edge_at_entry != null ? (p.edge_at_entry*100).toFixed(0) + '%' : '—';
+        const edgeStyle = p.edge_at_entry > 0 ? 'color:#3fb950' : '';
+        return `
         <tr>
             <td style="font-weight:bold">${p.side}</td>
             <td>${p.question}</td>
             <td style="color:#8b949e">${p.platform}</td>
+            <td>$${fmt(p.total_invested, 0)}</td>
+            <td style="text-align:center">${p.bet_count || 1}</td>
             <td>$${fmt(p.entry_price)}</td>
             <td>$${fmt(p.current_price)}</td>
-            <td class="${pnlClass(p.pnl)}">${pnlSign(p.pnl)}</td>
+            <td class="${pnlClass(p.pnl)}">${pnlSign(p.pnl)} <span style="color:#8b949e;font-size:11px">(${(p.pnl_pct*100).toFixed(1)}%)</span></td>
+            <td style="${edgeStyle}">${p.edge_at_entry > 0 ? '+' : ''}${edge}</td>
             <td>${p.composite_score}/9</td>
+            <td style="${resStyle}" ${resTitle}>${resLabel}</td>
         </tr>
-    `).join('');
+    `;}).join('');
 }
 
 function renderBreakers(cb) {

@@ -73,32 +73,49 @@ def render_terminal_dashboard(include_calibration: bool = False):
     open_pos = [p for p in positions if p.get("status") == "open"]
 
     if open_pos:
-        table = Table(title="Open Positions", box=box.ROUNDED, border_style="blue")
-        table.add_column("Side", style="bold")
-        table.add_column("Question")
-        table.add_column("Platform", style="dim")
-        table.add_column("Entry", justify="right")
-        table.add_column("Current", justify="right")
-        table.add_column("P/L $", justify="right")
-        table.add_column("P/L %", justify="right")
-        table.add_column("Score", justify="center")
-
+        console.print()
+        console.print(f"[bold blue]─── Open Positions ({len(open_pos)}) ───[/]")
         for p in open_pos:
             pnl = p.get("pnl", 0)
             pnl_pct = p.get("pnl_pct", 0)
             pnl_color = "green" if pnl >= 0 else "red"
+            edge = p.get("edge_at_entry", 0)
+            resolution = p.get("resolution_countdown", {})
+            res_label = resolution.get("label", "—")
+            res_days = resolution.get("days")
+            bets = p.get("bet_count", 1)
+            invested = p.get("total_invested", 0)
+            side = p.get("side", "?")
+            side_color = "green" if side == "YES" else "red"
 
-            table.add_row(
-                p.get("side", "?"),
-                p.get("question", "?"),
-                p.get("platform", ""),
-                f"${p.get('entry_price', 0):.2f}",
-                f"${p.get('current_price', 0):.2f}" if p.get("current_price") else "-",
-                f"[{pnl_color}]${pnl:+.2f}[/]",
-                f"[{pnl_color}]{pnl_pct:+.1%}[/]",
-                f"{p.get('composite_score', 0)}/9",
+            # Color the resolution countdown
+            if res_label == "RESOLVING" or (res_days is not None and res_days < 3):
+                res_styled = f"[bold yellow]{res_label}[/]"
+            elif res_days is not None and res_days < 14:
+                res_styled = f"[cyan]{res_label}[/]"
+            else:
+                res_styled = f"[dim]{res_label}[/]"
+
+            # Question on its own line; stats below it
+            console.print(
+                f"  [{side_color} bold]{side}[/] "
+                f"[bold white]{p.get('question', '?')}[/] "
+                f"[dim]({p.get('platform', '')})[/]"
             )
-        console.print(table)
+            console.print(
+                f"       "
+                f"Invested: [bold]${invested:,.0f}[/] "
+                f"([dim]{bets} bet{'s' if bets != 1 else ''}[/])    "
+                f"Entry: ${p.get('entry_price', 0):.2f} → Now: ${p.get('current_price', 0):.2f}    "
+                f"P/L: [{pnl_color}]${pnl:+,.2f}[/] [dim]({pnl_pct:+.1%})[/]"
+            )
+            console.print(
+                f"       "
+                f"Edge: [green]{edge:+.0%}[/]    "
+                f"Score: [bold]{p.get('composite_score', 0)}/9[/]    "
+                f"Resolves: {res_styled}"
+            )
+            console.print()
     else:
         console.print("[dim]No open positions[/]")
 
@@ -199,7 +216,12 @@ def _render_plain():
     print(f"\n  Open Positions: {len(open_pos)}")
     for p in open_pos:
         pnl = p.get("pnl", 0)
+        res = p.get("resolution_countdown", {}).get("label", "—")
+        invested = p.get("total_invested", 0)
+        bets = p.get("bet_count", 1)
         print(f"    {p.get('side', '?')} @ {p.get('entry_price', 0):.2f} -> "
-              f"{p.get('current_price', 0):.2f} ({pnl:+.2f}) | {p.get('question', '?')}")
+              f"{p.get('current_price', 0):.2f} ({pnl:+.2f}) "
+              f"| ${invested:,.0f} invested ({bets} bet{'s' if bets != 1 else ''}) "
+              f"| resolves {res} | {p.get('question', '?')}")
 
     print("=" * 60)
