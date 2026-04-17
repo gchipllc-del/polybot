@@ -3,7 +3,9 @@ Polybot — Prediction Market Trading Bot
 CLI entry point. Every command routes through here.
 
 Usage:
-    python main.py scan              # Scan markets, score candidates, propose trades
+    python main.py trade             # FULL PIPELINE: scan → consensus → execute
+    python main.py trade --dry-run   # Same pipeline, but don't place orders
+    python main.py scan              # Scan markets, score candidates (no execution)
     python main.py monitor           # Start continuous position monitoring
     python main.py forecast <id>     # Run forecaster on a specific market
     python main.py arb               # Cross-platform arbitrage scan
@@ -27,6 +29,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
+
+# Load .env before anything touches os.environ
+load_dotenv(Path(__file__).parent / ".env")
 
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
@@ -84,8 +90,7 @@ def cmd_scan():
     if not llm_enabled:
         print("  (LLM analysis disabled — set ANTHROPIC_API_KEY to enable)")
 
-    # TODO: pull real bankroll from platform balances once live
-    bankroll = 50.0
+    bankroll = _get_bankroll(clients)
 
     candidates = scan_all_markets(
         clients=clients,
@@ -106,6 +111,257 @@ def cmd_scan():
                   f"| Kelly: ${c.kelly_bet_usd:.2f} | EV: ${f.expected_value:.3f}")
     else:
         print("\nNo trades meet criteria this cycle.")
+
+
+def _get_bankroll(clients) -> float:
+    """Pull real bankroll from all active platform clients."""
+    bankroll = 0.0
+    for client in clients:
+        try:
+            bal = client.get_balance()
+            if bal > 0:
+                bankroll += bal
+        except Exception:
+            pass
+    return bankroll if bankroll > 0 else 50.0
+
+
+def cmd_trade(dry_run: bool = False):
+    """
+    Full trade pipeline: scan → consensus → order gate → execute.
+
+    This is the ONLY path to placing orders. Every trade must pass:
+        1. Market scanner scoring (evidence + calibration + edge)
+        2. 3-agent consensus (strategy → risk → compliance)
+        3. Order gate 3-step pipeline (propose → validate → execute)
+
+    Args:
+        dry_run: If True, run everything except actual order execution.
+    """
+    import os
+
+    from agents.consensus import print_consensus_result, seek_consensus
+    from lib.audit import log_event
+    from lib.market_client import get_active_clients
+    from lib.market_scanner import get_top_candidates, print_scan_report, scan_all_markets
+    from lib.order_gate import OrderIntent, step1_propose, step2_validate, step3_execute
+
+    log_event("trade", "trade_cycle_started", {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dry_run": dry_run,
+    })
+
+    settings = _load_settings()
+    strategy = _load_strategy()
+    clients = get_active_clients()
+
+    if not clients:
+        print("No active platform clients. Check config/settings.yaml")
+        return
+
+    # ── Pull real bankroll ────────────────────────────────────────
+    bankroll = _get_bankroll(clients)
+    client_map = {c.platform_name: c for c in clients}
+
+    print(f"{'[DRY RUN] ' if dry_run else ''}Starting trade cycle")
+    print(f"  Bankroll: ${bankroll:,.2f} across {len(clients)} platform(s)")
+    print()
+
+    # ── Step 1: Scan ──────────────────────────────────────────────
+    llm_enabled = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if not llm_enabled:
+        print("  (LLM analysis disabled — set ANTHROPIC_API_KEY to enable)")
+
+    candidates = scan_all_markets(
+        clients=clients,
+        llm_enabled=llm_enabled,
+        bankroll=bankroll,
+    )
+    print_scan_report(candidates)
+
+    top = get_top_candidates(candidates)
+    if not top:
+        print("\nNo trades meet criteria this cycle. Standing by.")
+        log_event("trade", "no_opportunities", {}, result="skipped")
+        return
+
+    # ── Step 2: Consensus + Execute for each candidate ────────────
+    print(f"\n{'='*60}")
+    print(f"  AGENT CONSENSUS + EXECUTION")
+    print(f"{'='*60}")
+
+    # Load current positions for context
+    positions = _load_positions()
+    open_positions = [p for p in positions if p.get("status") == "open"]
+    daily_pnl = sum(p.get("unrealized_pnl", 0) for p in open_positions)
+
+    executed = 0
+    vetoed = 0
+
+    for candidate in top:
+        market = candidate.market
+        forecast = candidate.forecast
+        print(f"\n  ── {market.question[:55]} ──")
+        print(f"     {forecast.best_side} | edge={forecast.edge:+.1%} | "
+              f"score={forecast.composite_score}/9 | kelly=${candidate.kelly_bet_usd:.2f}")
+
+        # ── 2a: Agent consensus ───────────────────────────────────
+        consensus = seek_consensus(candidate, bankroll)
+        print_consensus_result(consensus)
+
+        if not consensus["approved"]:
+            vetoed += 1
+            continue
+
+        # ── 2b: Build OrderIntent ─────────────────────────────────
+        proposal = consensus["proposal"]
+        side = proposal["side"]
+        price = market.yes_price if side == "YES" else (1 - market.yes_price)
+
+        # Calculate quantity from Kelly bet size
+        # quantity = kelly_bet_usd / price (number of contracts at this price)
+        quantity = max(1, int(candidate.kelly_bet_usd / price)) if price > 0 else 1
+
+        intent = OrderIntent(
+            market_id=market.market_id,
+            platform=market.platform,
+            question=market.question,
+            side=side,
+            order_type="market",  # AMM markets use market orders
+            quantity=quantity,
+            limit_price=price,
+            our_probability=forecast.probability,
+            market_probability=forecast.market_probability,
+            edge=forecast.edge,
+            kelly_fraction=forecast.kelly_fraction,
+            evidence_score=forecast.evidence_score,
+            calibration_score=forecast.calibration_score,
+            edge_score=forecast.edge_score,
+            composite_score=forecast.composite_score,
+            category=market.category,
+            resolution_date=market.resolution_date,
+            reason=proposal.get("evidence_summary", "")[:200],
+        )
+
+        # ── 2c: Order gate — propose ─────────────────────────────
+        try:
+            step1_propose(intent)
+        except ValueError as e:
+            print(f"     BLOCKED (duplicate): {e}")
+            continue
+
+        # ── 2d: Order gate — validate ─────────────────────────────
+        try:
+            step2_validate(
+                intent=intent,
+                bankroll=bankroll,
+                current_daily_pnl=daily_pnl,
+                current_open_positions=len(open_positions) + executed,
+                market_volume_24h=market.volume_24h,
+            )
+        except Exception as e:
+            print(f"     BLOCKED (validation): {e}")
+            continue
+
+        # ── 2e: Order gate — execute ──────────────────────────────
+        if dry_run:
+            print(f"     DRY RUN — would place: {side} {quantity} @ ${price:.3f} = ${price * quantity:.2f}")
+            executed += 1
+            continue
+
+        platform_client = client_map.get(market.platform)
+        if not platform_client:
+            print(f"     ERROR: No client for platform '{market.platform}'")
+            continue
+
+        try:
+            result = step3_execute(intent, platform_client)
+            print(f"     EXECUTED: order_id={result.get('order_id', '?')[:20]} "
+                  f"status={result.get('status', '?')} "
+                  f"filled={result.get('filled_quantity', 0)} @ ${result.get('filled_price', 0):.3f}")
+
+            # ── 2f: Record position ───────────────────────────────
+            position = {
+                "position_id": f"{market.platform}-{market.market_id}-{side}",
+                "market_id": market.market_id,
+                "platform": market.platform,
+                "question": market.question,
+                "category": market.category,
+                "side": side,
+                "quantity": result.get("filled_quantity", quantity),
+                "entry_price": result.get("filled_price", price),
+                "current_price": price,
+                "our_probability": forecast.probability,
+                "market_probability": forecast.market_probability,
+                "edge_at_entry": forecast.edge,
+                "composite_score": forecast.composite_score,
+                "kelly_bet_usd": candidate.kelly_bet_usd,
+                "correlation_group": candidate.correlation_group,
+                "resolution_date": market.resolution_date,
+                "order_id": result.get("order_id", ""),
+                "status": "open",
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "unrealized_pnl": 0.0,
+            }
+            positions.append(position)
+            _save_positions(positions)
+
+            # Also append to trade history
+            _append_trade_history({
+                **position,
+                "action": "open",
+                "consensus_decision": consensus["decision"],
+            })
+
+            executed += 1
+            log_event("trade", "position_opened", {
+                "market_id": market.market_id,
+                "platform": market.platform,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "kelly_usd": candidate.kelly_bet_usd,
+            }, result="success")
+
+        except Exception as e:
+            print(f"     EXECUTION FAILED: {e}")
+            log_event("trade", "execution_failed", {
+                "market_id": market.market_id,
+                "error": str(e)[:200],
+            }, result="failed")
+
+    # ── Summary ───────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    prefix = "[DRY RUN] " if dry_run else ""
+    print(f"  {prefix}Cycle complete: {executed} executed, {vetoed} vetoed, "
+          f"{len(top) - executed - vetoed} blocked")
+    if executed > 0 and not dry_run:
+        print(f"  Positions now: {len(open_positions) + executed} open")
+    print(f"{'='*60}")
+
+    log_event("trade", "trade_cycle_complete", {
+        "executed": executed,
+        "vetoed": vetoed,
+        "dry_run": dry_run,
+    }, result="success")
+
+
+def _append_trade_history(trade: dict):
+    """Append a trade record to the trade history file."""
+    history_file = DATA_DIR / "trade_history.json"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    history = []
+    if history_file.exists():
+        try:
+            with open(history_file, "r") as f:
+                history = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    history.append(trade)
+    with open(history_file, "w") as f:
+        json.dump(history, f, indent=2, default=str)
 
 
 def cmd_monitor():
@@ -486,7 +742,10 @@ def main():
 
     command = sys.argv[1].lower()
 
-    if command == "scan":
+    if command == "trade":
+        dry_run = "--dry-run" in sys.argv
+        cmd_trade(dry_run=dry_run)
+    elif command == "scan":
         cmd_scan()
     elif command == "monitor":
         cmd_monitor()

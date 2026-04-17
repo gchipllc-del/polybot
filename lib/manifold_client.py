@@ -9,6 +9,7 @@ API docs: https://docs.manifold.markets/api
 
 import os
 import time
+from datetime import datetime, timezone
 from typing import Literal
 
 import requests
@@ -56,6 +57,22 @@ class ManifoldClient(MarketClient):
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def _normalize_resolution_date(close_time) -> str:
+        """Convert Manifold closeTime (epoch ms int or str) to ISO 8601 string."""
+        if not close_time:
+            return ""
+        try:
+            if isinstance(close_time, (int, float)):
+                return datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).isoformat()
+            if isinstance(close_time, str):
+                # Already ISO? Return as-is.
+                datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                return close_time
+        except (ValueError, TypeError, OSError):
+            pass
+        return ""
+
     def _infer_category(self, groups: list[str], question: str) -> str:
         text = " ".join(groups + [question]).lower()
         if any(w in text for w in ["election", "president", "congress", "vote", "political", "politics"]):
@@ -86,15 +103,15 @@ class ManifoldClient(MarketClient):
         status: str = "open",
         limit: int = 100,
     ) -> list[MarketInfo]:
-        """Fetch markets from Manifold."""
+        """Fetch markets from Manifold using search endpoint for best results."""
         try:
-            params = {"limit": limit, "sort": "liquidity"}
+            params = {"term": "", "limit": min(limit, 100), "sort": "liquidity"}
             if status == "open":
                 params["filter"] = "open"
             elif status == "resolved":
                 params["filter"] = "resolved"
 
-            data = self._get("/markets", params)
+            data = self._get("/search-markets", params)
             markets = []
 
             for m in data:
@@ -122,7 +139,7 @@ class ManifoldClient(MarketClient):
                     no_price=1.0 - yes_price,
                     volume_24h=float(m.get("volume24Hours", 0) or 0),
                     total_volume=float(m.get("volume", 0) or 0),
-                    resolution_date=m.get("closeTime", ""),
+                    resolution_date=self._normalize_resolution_date(m.get("closeTime")),
                     resolution_source="Manifold community",
                     outcome=m.get("resolution") if m.get("isResolved") else None,
                     url=m.get("url", ""),
@@ -155,7 +172,7 @@ class ManifoldClient(MarketClient):
             no_price=1.0 - yes_price,
             volume_24h=float(m.get("volume24Hours", 0) or 0),
             total_volume=float(m.get("volume", 0) or 0),
-            resolution_date=m.get("closeTime", ""),
+            resolution_date=self._normalize_resolution_date(m.get("closeTime")),
             resolution_source="Manifold community",
             outcome=m.get("resolution") if m.get("isResolved") else None,
             url=m.get("url", ""),

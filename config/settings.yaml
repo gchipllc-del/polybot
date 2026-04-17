@@ -21,9 +21,9 @@ circuit_breakers:
   max_per_market_pct: 0.15        # 15% of bankroll per market
   max_category_pct: 0.40          # 40% in any single category
   max_open_positions: 10          # Max concurrent positions
-  max_quantity_per_order: 50      # Max contracts per single order
+  max_quantity_per_order: 5000    # Max contracts per order (Manifold uses mana, not contracts)
   cooldown_after_loss_minutes: 30 # Cooldown after losing trade
-  min_market_volume: 1000         # Min 24h volume in dollars
+  min_market_volume: 10           # Min 24h volume (Manifold play money; raise for real platforms)
   max_resolution_date_pct: 0.25   # Max 25% of bankroll resolving same date
 
 # --- Monitoring ---

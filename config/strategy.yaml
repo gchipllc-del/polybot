@@ -20,8 +20,8 @@ forecasting:
 
 # --- Scoring Thresholds ---
 scoring:
-  min_composite_score: 6        # Out of 9 (evidence + calibration + edge) [HERMES: 4-8]
-  min_edge: 0.08                # Only trade with 8%+ edge over market [HERMES: 0.05 - 0.20]
+  min_composite_score: 4        # Lower for paper trading — Hermes will tune up [HERMES: 4-8]
+  min_edge: 0.05                # 5% edge for paper learning phase [HERMES: 0.05 - 0.20]
   min_confidence: 0.50          # Minimum confidence in our estimate
 
 # --- Kelly Criterion Position Sizing ---
@@ -80,11 +80,11 @@ mechanical:
 
 # --- Market Selection Filters (from AI ensemble practitioners) ---
 market_filters:
-  min_liquidity: 10000            # $10k pool depth
-  min_volume_24h: 500             # $500 daily volume
+  min_liquidity: 100              # M$100 for Manifold paper trading (raise for real money)
+  min_volume_24h: 10              # M$10 daily volume (Manifold uses play money)
   min_hours_to_resolution: 48     # At least 48h remaining
   price_bounds: [0.10, 0.90]      # Avoid extreme odds
-  max_spread_pct: 0.04            # Bid-ask spread <= 4%
+  max_spread_pct: 0.10            # Manifold spreads wider than Kalshi/Poly
   max_markets_per_cycle: 20       # Control inference costs
   min_edge_for_conviction: 0.10   # 10%+ edge for conviction bets
 
