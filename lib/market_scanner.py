@@ -467,6 +467,17 @@ def scan_all_markets(
                 except Exception:
                     pass  # Kronos is optional — degrade gracefully
 
+            # Smart-money signal (tracked whale wallets) — Polymarket only.
+            # Feature-flag gated in strategy.yaml; returns None when disabled
+            # or when no qualifying wallets hold a position.
+            smart_money_estimate = None
+            if market.platform.lower() == "polymarket":
+                try:
+                    from lib.smart_money import get_smart_money_estimate
+                    smart_money_estimate = get_smart_money_estimate(market.market_id)
+                except Exception:
+                    pass  # Smart money is optional — degrade gracefully
+
             # Determine fee rate by platform
             fee_rate = _get_fee_rate(market.platform)
 
@@ -477,6 +488,7 @@ def scan_all_markets(
                 metaculus_estimate=metaculus_estimate,
                 news_sentiment=news_sentiment,
                 kronos_estimate=kronos_estimate,
+                smart_money_estimate=smart_money_estimate,
                 fee_rate=fee_rate,
             )
 

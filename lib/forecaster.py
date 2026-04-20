@@ -256,6 +256,7 @@ def estimate_probability(
     metaculus_estimate: float | None = None,
     news_sentiment: float | None = None,
     kronos_estimate: float | None = None,
+    smart_money_estimate: float | None = None,
     fee_rate: float = 0.07,
 ) -> ForecastResult:
     """
@@ -273,6 +274,7 @@ def estimate_probability(
         metaculus_estimate: Metaculus community forecast if available
         news_sentiment: News-based probability signal
         kronos_estimate: Kronos zero-shot price model probability (for price-based markets)
+        smart_money_estimate: Aggregate position flow from tracked profitable wallets
         fee_rate: Platform fee rate for edge scoring
 
     Returns:
@@ -288,6 +290,7 @@ def estimate_probability(
         "metaculus": fc.get("metaculus_weight", 0.15),
         "news": fc.get("news_weight", 0.10),
         "kronos": fc.get("kronos_weight", 0.20),
+        "smart_money": fc.get("smart_money_weight", 0.10),
         "market_consensus": fc.get("market_consensus_weight", 0.10),
     }
 
@@ -325,7 +328,20 @@ def estimate_probability(
         current = bayesian_update(current, kronos_estimate, base_rate)
         chain.append({"step": "kronos_update", "value": current, "kronos_raw": kronos_estimate})
 
-    # ── Step 6: Market Consensus Anchor ───────────────────────────
+    # ── Step 6: Smart Money (tracked whale wallets) ────────────────
+    # Gently pulled toward, not anchored to — smart money is a signal of
+    # *what informed actors think*, which is different from a calibrated
+    # forecast. Low trust weight prevents single-source over-update.
+    if smart_money_estimate is not None:
+        sources["smart_money"] = smart_money_estimate
+        current = bayesian_update(current, smart_money_estimate, base_rate)
+        chain.append({
+            "step": "smart_money_update",
+            "value": current,
+            "smart_money_raw": smart_money_estimate,
+        })
+
+    # ── Step 7: Market Consensus Anchor ───────────────────────────
     # The market is usually approximately right. Light anchor toward it.
     market_prob = market.yes_price
     sources["market_consensus"] = market_prob
@@ -362,6 +378,7 @@ def estimate_probability(
         "metaculus":        0.95,
         "kronos":           0.70,   # Strong only on price-series markets
         "news":             0.50,   # Sentiment is a weak signal
+        "smart_money":      0.75,   # Real capital at stake — strong but correlated with market
         "base_rate":        0.60,
         "market_consensus": 0.40,   # Included for reference, not primary
     }
@@ -429,6 +446,8 @@ def estimate_probability(
         parts.append(f"News: {news_sentiment:.0%}")
     if kronos_estimate is not None:
         parts.append(f"Kronos: {kronos_estimate:.0%}")
+    if smart_money_estimate is not None:
+        parts.append(f"SmartMoney: {smart_money_estimate:.0%}")
     parts.append(f"Market: {market_prob:.0%}")
     parts.append(f"→ Final: {probability:.0%} ({best_side} edge: {edge:+.1%})")
     summary = " | ".join(parts)
