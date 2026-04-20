@@ -14,9 +14,14 @@ forecasting:
   market_consensus_weight: 0.10 # The market price itself (bounds: 0.05 - 0.20)
 
   # LLM settings
-  llm_model: claude-sonnet-4-6  # Model for market analysis
-  llm_cache_ttl_minutes: 60     # Cache LLM results for unchanged markets
+  llm_model: claude-sonnet-4-6       # Model for market analysis
+  llm_cache_ttl_minutes: 60          # Cache LLM results for unchanged markets
   max_tokens_per_analysis: 2000
+  # Ensemble — sample N independent reasoning paths, aggregate with
+  # geomean-log-odds. Reduces variance. Trade-off: Nx API cost.
+  # 1 = fast/cheap (dev), 3 = balanced (default), 5 = maximum quality.
+  llm_ensemble_samples: 3
+  llm_temperature: 0.7               # Higher = more diverse samples
 
 # --- Scoring Thresholds ---
 # Phase 1 (Survival) wants fewer, higher-quality trades. The old 4/9 + 5% edge

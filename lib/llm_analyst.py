@@ -144,43 +144,57 @@ def _cache_put(key: str, analysis: LLMAnalysis):
 
 # ── Prompt Construction ───────────────────────────────────────────
 
-SUPERFORECASTER_PROMPT = """You are a world-class Superforecaster tasked with estimating the probability that the following prediction market question resolves YES.
+SUPERFORECASTER_PROMPT = """You are a world-class Superforecaster estimating the probability that the following prediction market question resolves YES by its resolution date. Your output will be aggregated with independent samples — optimize for calibration, not for agreeing with yourself.
 
 MARKET QUESTION: {question}
 
 MARKET DESCRIPTION: {description}
 
-CURRENT MARKET PRICE: {market_price:.0%} (this is the crowd's implied probability)
+CURRENT MARKET PRICE: {market_price:.0%} (crowd-implied probability — you may agree or disagree)
 
 CATEGORY: {category}
 
 RESOLUTION DATE: {resolution_date}
 
-Use the following 5-step framework. Be rigorous and quantitative.
+Follow this 7-step protocol. Be rigorous, quantitative, and willing to disagree with the crowd when evidence warrants. Show your work.
 
-## Step 1: Reference Class
-What category of event is this? What is the historical base rate for similar events? Name specific reference classes and their frequencies.
+## Step 1: Decompose the question
+Restate the question in your own words. List 2-3 sub-questions whose answers determine the outcome. Clarify ambiguities (what exactly counts as YES? what counts as NO?).
 
-## Step 2: Inside View
-What specific evidence applies to THIS particular market that might deviate from the base rate? Consider recent developments, unique circumstances, and domain-specific factors.
+## Step 2: Reference class forecasting (outside view)
+Name 2-3 specific reference classes with historical base rates. For each, cite the relevant frequency — e.g., "incumbent Senators up for re-election win ~84% of the time (Ballotpedia, 2012–2024)". Take the weighted average as your OUTSIDE view probability.
 
-## Step 3: Key Drivers (list exactly 3-5)
-What are the most important factors that will determine the outcome? For each, state whether it pushes toward YES or NO and by how much.
+## Step 3: Inside view — drivers (4-6)
+List the most important factors for THIS specific market. For each:
+   - Direction: pushes toward YES or NO
+   - Magnitude: how strongly (weak/moderate/strong)
+   - Evidence: what do we actually know?
 
-## Step 4: Probability Estimate
-Synthesize the above into a single probability. Show your reasoning for the final number. Be precise — don't round to multiples of 5 or 10 unless truly warranted.
+## Step 4: Steelman the other side
+Argue the strongest case for the OPPOSITE of your leaning so far. What's the best evidence against your current direction? If the steelman is strong, widen your uncertainty.
 
-## Step 5: Confidence & Reversal
-How confident are you in this estimate? What specific new information would cause you to revise significantly? What's the reasonable range?
+## Step 5: Check for common biases
+Audit for:
+   - Anchoring on market price (you disagree with the crowd too little? too much?)
+   - Availability bias (recent news over-weighted?)
+   - Status-quo bias (under-weighting change?)
+   - Scope insensitivity (treating "by Dec 31" same as "by Mar 1"?)
+Adjust if any bias is distorting.
 
-## OUTPUT FORMAT (required)
-End your response with EXACTLY this block:
+## Step 6: Probability estimate
+Combine outside view, inside view, and bias adjustments into a single probability. Be precise — do not round to multiples of 5 or 10 unless genuinely uncertain. Show the math: "Outside view 40%, inside view pushes +8%, steelman pulls -3% → final 45%".
+
+## Step 7: Meta-uncertainty
+How wide is your plausible range (e.g., 10-percentile to 90-percentile)? What single piece of new information would most change your estimate? If you'd revise >15% on one new data point, widen uncertainty now.
+
+## OUTPUT FORMAT (REQUIRED — the aggregator parses this exactly)
+End your response with this block:
 
 PROBABILITY: [number between 0.01 and 0.99]
 CONFIDENCE: [number between 0.0 and 1.0]
-REFERENCE_CLASS: [one-line summary]
+REFERENCE_CLASS: [one-line summary of primary reference class + base rate]
 KEY_FACTORS: [factor1 | factor2 | factor3]
-REVERSAL_TRIGGERS: [trigger1 | trigger2]"""
+REVERSAL_TRIGGERS: [what info would move the estimate >15% | another trigger]"""
 
 
 def _build_prompt(question: str, description: str, market_price: float,
@@ -322,81 +336,140 @@ def analyze_market(
     # Build prompt
     prompt = _build_prompt(question, description, market_price, category, resolution_date)
 
-    # Rate limit
-    _get_limiter().wait()
+    # Ensemble settings — sample N independent reasoning paths and aggregate
+    # with geomean-log-odds (ForecastBench default). 3 samples balances cost
+    # with variance reduction; 1 disables ensemble for fast/cheap scans.
+    n_samples = fc.get("llm_ensemble_samples", 3)
+    temperature = fc.get("llm_temperature", 0.7)
+    n_samples = max(1, min(int(n_samples), 5))
 
-    # Call Claude API with retries
     import anthropic
+    from lib.forecaster import geomean_log_odds
 
     client = anthropic.Anthropic(api_key=api_key)
-    last_error = None
 
-    for attempt in range(3):
-        try:
-            log_event("llm_analyst", "api_call_start", {
-                "market_id": market_id,
-                "model": model,
-                "attempt": attempt + 1,
-            }, result="pending")
-
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            raw_text = response.content[0].text if response.content else ""
-
-            if not raw_text:
-                raise ValueError("Empty response from API")
-
-            break
-
-        except anthropic.RateLimitError:
-            # Back off exponentially
-            wait = min(2 ** (attempt + 1), 30)
-            log_event("llm_analyst", "rate_limited", {
-                "market_id": market_id,
-                "wait_seconds": wait,
-                "attempt": attempt + 1,
-            }, result="retrying")
-            time.sleep(wait)
-            last_error = "Rate limited by Anthropic API"
-            continue
-
-        except anthropic.APIError as e:
-            last_error = f"API error: {type(e).__name__}"
-            log_event("llm_analyst", "api_error", {
-                "market_id": market_id,
-                "error_type": type(e).__name__,
-                "attempt": attempt + 1,
-            }, result="failed")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-                continue
-            raise RuntimeError(f"Claude API failed after 3 attempts: {last_error}")
-
-    else:
+    def _call_claude_once() -> str:
+        """One API call with retries. Returns raw text or raises RuntimeError."""
+        _get_limiter().wait()
+        last_error = None
+        for attempt in range(3):
+            try:
+                log_event("llm_analyst", "api_call_start", {
+                    "market_id": market_id,
+                    "model": model,
+                    "attempt": attempt + 1,
+                }, result="pending")
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw_text = response.content[0].text if response.content else ""
+                if not raw_text:
+                    raise ValueError("Empty response from API")
+                return raw_text
+            except anthropic.RateLimitError:
+                wait = min(2 ** (attempt + 1), 30)
+                log_event("llm_analyst", "rate_limited", {
+                    "market_id": market_id, "wait_seconds": wait,
+                    "attempt": attempt + 1,
+                }, result="retrying")
+                time.sleep(wait)
+                last_error = "Rate limited by Anthropic API"
+            except anthropic.APIError as e:
+                last_error = f"API error: {type(e).__name__}"
+                log_event("llm_analyst", "api_error", {
+                    "market_id": market_id,
+                    "error_type": type(e).__name__,
+                    "attempt": attempt + 1,
+                }, result="failed")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"Claude API failed after 3 attempts: {last_error}")
         raise RuntimeError(f"Claude API failed after 3 attempts: {last_error}")
 
-    # Parse response (treat as untrusted)
-    parsed = _parse_response(raw_text)
+    # Collect N independent samples
+    samples: list[dict] = []
+    raw_texts: list[str] = []
+    for i in range(n_samples):
+        try:
+            raw = _call_claude_once()
+            raw_texts.append(raw)
+            parsed = _parse_response(raw)
+            samples.append(parsed)
+        except RuntimeError as e:
+            # If at least one sample succeeded, continue with what we have
+            if samples:
+                log_event("llm_analyst", "sample_failed_partial", {
+                    "market_id": market_id, "samples_completed": len(samples),
+                    "error": str(e)[:200],
+                }, result="degraded")
+                break
+            raise
+
+    # Aggregate probabilities via geomean-log-odds (well-behaved at extremes,
+    # symmetric under YES/NO flip, matches ForecastBench best practice)
+    probs = [s["probability"] for s in samples]
+    if len(samples) == 1:
+        final_prob = probs[0]
+        sample_confidence = samples[0]["confidence"]
+    else:
+        ensemble_estimates = {f"sample_{i}": p for i, p in enumerate(probs)}
+        ensemble_weights = {f"sample_{i}": 1.0 for i in range(len(probs))}
+        final_prob = geomean_log_odds(ensemble_estimates, ensemble_weights)
+        # Confidence = avg self-reported conf × (1 - spread across samples)
+        spread = max(probs) - min(probs)
+        avg_conf = sum(s["confidence"] for s in samples) / len(samples)
+        agreement_bonus = max(0.0, 1.0 - spread * 2.5)  # 0.4 spread -> 0 agreement
+        sample_confidence = 0.6 * avg_conf + 0.4 * agreement_bonus
+
+    # Pick reasoning from the sample closest to the aggregate probability
+    # (median-ish — avoids outlier reasoning dominating the cached output)
+    best_idx = min(range(len(samples)), key=lambda i: abs(samples[i]["probability"] - final_prob))
+    best_sample = samples[best_idx]
+    best_raw = raw_texts[best_idx]
 
     # Extract reasoning (everything before the structured output block)
-    reasoning = raw_text
-    output_start = raw_text.find("PROBABILITY:")
+    reasoning = best_raw
+    output_start = best_raw.find("PROBABILITY:")
     if output_start > 0:
-        reasoning = raw_text[:output_start].strip()
+        reasoning = best_raw[:output_start].strip()
+
+    # Merge reference class + key factors from all samples (dedup, cap)
+    all_factors: list[str] = []
+    for s in samples:
+        for f in s.get("key_factors", []):
+            if f not in all_factors:
+                all_factors.append(f)
+    all_factors = all_factors[:6]
+
+    all_triggers: list[str] = []
+    for s in samples:
+        for t in s.get("reversal_triggers", []):
+            if t not in all_triggers:
+                all_triggers.append(t)
+    all_triggers = all_triggers[:4]
 
     analysis = LLMAnalysis(
-        probability=parsed["probability"],
-        confidence=parsed["confidence"],
-        reference_class=parsed["reference_class"],
-        key_factors=parsed["key_factors"],
-        reasoning=reasoning[:5000],  # Cap reasoning length
-        reversal_triggers=parsed["reversal_triggers"],
-        raw_response=raw_text[:8000],  # Cap raw response for audit
+        probability=round(final_prob, 4),
+        confidence=round(sample_confidence, 4),
+        reference_class=best_sample.get("reference_class", ""),
+        key_factors=all_factors,
+        reasoning=reasoning[:5000],
+        reversal_triggers=all_triggers,
+        raw_response=f"[ensemble n={len(samples)}]\n" + best_raw[:8000],
     )
+
+    # Log ensemble statistics for calibration analysis
+    log_event("llm_analyst", "ensemble_complete", {
+        "market_id": market_id,
+        "n_samples": len(samples),
+        "probs": [round(p, 3) for p in probs],
+        "final_probability": analysis.probability,
+        "sample_spread": round(max(probs) - min(probs), 4) if len(probs) > 1 else 0,
+    }, result="success")
 
     # Cache the result
     key = _cache_key(market_id, question)

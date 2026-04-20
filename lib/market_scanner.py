@@ -430,6 +430,17 @@ def scan_all_markets(
             except Exception:
                 pass  # News is optional — degrade gracefully
 
+            # Get Metaculus community forecast (calibrated crowd signal)
+            metaculus_estimate = None
+            try:
+                from lib.metaculus_client import get_metaculus_estimate
+                metaculus_estimate = get_metaculus_estimate(
+                    question=market.question,
+                    resolution_date=market.resolution_date,
+                )
+            except Exception:
+                pass  # Metaculus is optional
+
             # Get Kronos zero-shot price estimate — price-series markets only.
             # Kronos is a financial candle model; it should not contribute to
             # categorical outcomes (elections, court decisions, sports, etc.).
@@ -454,6 +465,7 @@ def scan_all_markets(
             forecast = estimate_probability(
                 market=market,
                 llm_estimate=llm_estimate,
+                metaculus_estimate=metaculus_estimate,
                 news_sentiment=news_sentiment,
                 kronos_estimate=kronos_estimate,
                 fee_rate=fee_rate,
