@@ -26,7 +26,12 @@ from pathlib import Path
 import yaml
 
 from lib.audit import log_event
-from lib.kelly import expected_value, fractional_kelly, kelly_bet_size
+from lib.kelly import (
+    expected_value,
+    fractional_kelly,
+    kelly_bet_size,
+    kelly_bet_size_slippage_aware,
+)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 CONFIG_DIR = Path(__file__).parent.parent / "config"
@@ -66,6 +71,10 @@ class SimulatedTrade:
     fee_paid: float
     edge: float
     composite_score: int = 0
+    # Slippage-aware fields (populated when simulate_slippage=True)
+    effective_price: float = 0.0
+    slippage_pct: float = 0.0
+    naive_bet: float = 0.0
 
 
 @dataclass
@@ -148,6 +157,7 @@ def replay_historical(
     max_per_market_pct: float | None = None,
     min_composite_score: int | None = None,
     min_edge: float | None = None,
+    simulate_slippage: bool = True,
 ) -> BacktestResult:
     """
     Replay all resolved forecasts through the strategy, simulating
@@ -162,6 +172,10 @@ def replay_historical(
         max_per_market_pct: Override max per-market bet size
         min_composite_score: Override minimum composite score filter
         min_edge: Override minimum edge filter
+        simulate_slippage: If True, use slippage-aware Kelly + fill at
+            the effective post-slippage price (realistic). If False, use
+            naive Kelly with top-of-book fills (optimistic — useful to
+            measure how much the slippage model costs you).
 
     Returns:
         BacktestResult with full trade log and bankroll curve.
@@ -223,15 +237,37 @@ def replay_historical(
         if abs(edge) < min_edge:
             continue
 
-        # Kelly sizing
-        if side == "YES":
-            bet = kelly_bet_size(bankroll, our_prob, market_prob,
-                                 fraction=kelly_multiplier,
-                                 max_per_market_pct=max_per_market_pct)
+        # Kelly sizing — honor the flag. Slippage-aware matches prod;
+        # naive is useful as an upper-bound "best case" reference.
+        trade_prob = our_prob if side == "YES" else (1.0 - our_prob)
+        trade_market_prob = market_prob if side == "YES" else (1.0 - market_prob)
+        volume_24h = float(f.get("volume_24h", 1000.0) or 1000.0)
+        market_type = "CPMM" if platform == "manifold" else "CLOB"
+        effective_price = trade_market_prob
+        slippage_pct = 0.0
+        naive_bet = 0.0
+
+        if simulate_slippage:
+            slip = kelly_bet_size_slippage_aware(
+                bankroll=bankroll,
+                our_prob=trade_prob,
+                market_prob=trade_market_prob,
+                volume_24h=volume_24h,
+                market_type=market_type,
+                fraction=kelly_multiplier,
+                max_per_market_pct=max_per_market_pct,
+            )
+            bet = slip["bet_usd"]
+            naive_bet = slip["naive_kelly_usd"]
+            effective_price = slip["effective_price"]
+            slippage_pct = slip["slippage_pct"]
         else:
-            bet = kelly_bet_size(bankroll, 1.0 - our_prob, 1.0 - market_prob,
-                                 fraction=kelly_multiplier,
-                                 max_per_market_pct=max_per_market_pct)
+            bet = kelly_bet_size(
+                bankroll, trade_prob, trade_market_prob,
+                fraction=kelly_multiplier,
+                max_per_market_pct=max_per_market_pct,
+            )
+            naive_bet = bet
 
         if bet <= 0:
             continue
@@ -243,9 +279,16 @@ def replay_historical(
         if bankroll < 1.0:
             break  # Ruin
 
-        # Execute trade
+        # Execute trade at the *effective* price (slippage-aware) or the
+        # top-of-book price (naive). For P/L calculation, the relevant
+        # market_prob is the price we actually paid.
+        fill_market_prob = market_prob if not simulate_slippage else (
+            effective_price if side == "YES" else (1.0 - effective_price)
+        )
         fee_rate = PLATFORM_FEES.get(platform, 0.07)
-        pnl, fee_paid = _calculate_trade_pnl(side, our_prob, market_prob, bet, outcome, fee_rate)
+        pnl, fee_paid = _calculate_trade_pnl(
+            side, our_prob, fill_market_prob, bet, outcome, fee_rate,
+        )
 
         bankroll += pnl
         bankroll = max(bankroll, 0.0)
@@ -270,6 +313,9 @@ def replay_historical(
             bankroll_after=round(bankroll, 2),
             fee_paid=fee_paid,
             edge=round(edge, 4),
+            effective_price=round(effective_price, 4),
+            slippage_pct=round(slippage_pct, 4),
+            naive_bet=round(naive_bet, 2),
         )
         trades.append(trade)
         curve.append(round(bankroll, 2))
@@ -626,3 +672,189 @@ def save_backtest(result: BacktestResult) -> Path:
     tmp.rename(path)
 
     return path
+
+
+# ── Pipeline Regression ────────────────────────────────────────────
+
+def pipeline_smoke_test(verbose: bool = True) -> dict:
+    """
+    End-to-end smoke test: run a synthetic market through the full signal
+    stack to verify everything wires together without import errors,
+    NaNs, or degenerate outputs.
+
+    This exercises:
+        - forecaster.estimate_probability() with all 6 signal sources
+        - base_rates.get_base_rate() lookup
+        - bayesian_update + geomean_log_odds blend
+        - confidence calculation (coverage/agreement/calibration)
+        - edge calc + Kelly sizing + slippage-aware Kelly
+        - scoring (evidence/calibration/edge)
+
+    Does NOT hit any external APIs (no Claude, no Metaculus, no
+    Polymarket) — all signals are passed in directly. Use `polybot scan`
+    for a real end-to-end smoke.
+
+    Returns:
+        {
+          "passed": bool,
+          "checks":  list of per-check pass/fail dicts,
+          "forecast": ForecastResult (serialized),
+          "kelly": dict with bet + slippage data,
+        }
+    """
+    from lib.forecaster import estimate_probability
+    from lib.kelly import kelly_bet_size_slippage_aware
+    from lib.market_client import MarketInfo
+
+    checks: list[dict] = []
+
+    def _check(name: str, ok: bool, detail: str = "") -> bool:
+        checks.append({"name": name, "passed": ok, "detail": detail})
+        if verbose:
+            mark = "OK" if ok else "FAIL"
+            print(f"  [{mark}] {name}" + (f" — {detail}" if detail else ""))
+        return ok
+
+    if verbose:
+        print("=" * 60)
+        print("  PIPELINE SMOKE TEST")
+        print("=" * 60)
+
+    # Build a synthetic market matching the shape the scanner uses.
+    market = MarketInfo(
+        market_id="smoke-test-market",
+        platform="polymarket",
+        question="Will the Federal Reserve cut rates at the June 2026 meeting?",
+        description="Resolves YES if the Fed funds target rate is lower after the June meeting.",
+        category="economics",
+        status="open",
+        yes_price=0.42,
+        no_price=0.58,
+        volume_24h=10_000.0,
+        total_volume=500_000.0,
+        resolution_date="2026-06-18T23:59:00Z",
+        resolution_source="Federal Reserve press release",
+    )
+
+    # Run with every signal source populated (happy path)
+    try:
+        fc = estimate_probability(
+            market=market,
+            llm_estimate=0.55,
+            metaculus_estimate=0.58,
+            news_sentiment=0.60,
+            kronos_estimate=0.52,
+            smart_money_estimate=0.65,
+            fee_rate=0.02,
+        )
+        _check("forecaster runs with all signals", True)
+    except Exception as e:
+        _check("forecaster runs with all signals", False, str(e)[:100])
+        return {"passed": False, "checks": checks}
+
+    # Output sanity checks — guard against the common failure modes:
+    # NaN, probability out of bounds, zero confidence, etc.
+    _check(
+        "probability in (0, 1)",
+        0.0 < fc.probability < 1.0,
+        f"probability={fc.probability:.4f}",
+    )
+    _check(
+        "probability is a real float",
+        isinstance(fc.probability, float) and fc.probability == fc.probability,  # NaN check
+        f"{type(fc.probability).__name__}:{fc.probability}",
+    )
+    _check(
+        "confidence in [0, 1]",
+        0.0 <= fc.confidence <= 1.0,
+        f"confidence={fc.confidence:.3f}",
+    )
+    _check(
+        "composite score in [0, 9]",
+        0 <= fc.composite_score <= 9,
+        f"composite={fc.composite_score}",
+    )
+    _check(
+        "all 6 sources weighed in",
+        {"llm", "metaculus", "news", "kronos", "smart_money", "base_rate"}.issubset(set(fc.sources.keys())),
+        f"sources={sorted(fc.sources.keys())}",
+    )
+    _check(
+        "bayesian_chain includes final_blend",
+        any(step.get("step") == "final_blend" for step in fc.bayesian_chain),
+    )
+    _check(
+        "edge has a valid sign",
+        fc.best_side in ("YES", "NO"),
+        f"best_side={fc.best_side} edge={fc.edge:+.4f}",
+    )
+
+    # Slippage-aware Kelly should give a sane number
+    trade_prob = fc.probability if fc.best_side == "YES" else (1.0 - fc.probability)
+    trade_market_prob = market.yes_price if fc.best_side == "YES" else market.no_price
+    slip = kelly_bet_size_slippage_aware(
+        bankroll=50.0,
+        our_prob=trade_prob,
+        market_prob=trade_market_prob,
+        volume_24h=market.volume_24h,
+        market_type="CLOB",
+    )
+    _check(
+        "kelly bet non-negative",
+        slip["bet_usd"] >= 0,
+        f"bet_usd={slip['bet_usd']:.2f}",
+    )
+    _check(
+        "kelly bet ≤ bankroll",
+        slip["bet_usd"] <= 50.0,
+        f"bet_usd={slip['bet_usd']:.2f}",
+    )
+    _check(
+        "slippage-aware converged",
+        slip["converged"] is True,
+        f"iterations={slip['iterations']}",
+    )
+    _check(
+        "effective price ≥ market price",
+        slip["effective_price"] >= trade_market_prob - 0.0001,
+        f"eff={slip['effective_price']:.4f} vs mkt={trade_market_prob:.4f}",
+    )
+
+    # Graceful degradation: run with NO optional signals (only base rate)
+    try:
+        fc2 = estimate_probability(market=market, fee_rate=0.02)
+        _check(
+            "forecaster works with no signals",
+            0 < fc2.probability < 1,
+            f"probability={fc2.probability:.4f}",
+        )
+    except Exception as e:
+        _check("forecaster works with no signals", False, str(e)[:100])
+
+    # Missing signals should not cause silent key errors
+    try:
+        fc3 = estimate_probability(market=market, llm_estimate=0.5, fee_rate=0.02)
+        _check("forecaster works with one signal", True)
+    except Exception as e:
+        _check("forecaster works with one signal", False, str(e)[:100])
+
+    passed = all(c["passed"] for c in checks)
+    if verbose:
+        print("=" * 60)
+        tally = f"{sum(1 for c in checks if c['passed'])}/{len(checks)}"
+        print(f"  RESULT: {'PASS' if passed else 'FAIL'} ({tally} checks)")
+        print("=" * 60)
+
+    return {
+        "passed": passed,
+        "checks": checks,
+        "forecast": {
+            "probability": fc.probability,
+            "confidence": fc.confidence,
+            "edge": fc.edge,
+            "composite_score": fc.composite_score,
+            "best_side": fc.best_side,
+            "sources": dict(fc.sources),
+        },
+        "kelly": slip,
+    }
