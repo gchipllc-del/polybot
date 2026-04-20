@@ -21,6 +21,7 @@ data/llm_cache/
 data/news_cache/
 data/kronos_cache/
 data/backtests/
+data/forecastbench/
 
 # Logs
 logs/*.jsonl

@@ -22,6 +22,7 @@ Usage:
     python main.py dashboard         # Launch web dashboard
     python main.py chaos             # Run chaos tests
     python main.py smoke             # Pipeline regression (no external APIs)
+    python main.py brier [--n=50]    # Cold-start calibration: replay ForecastBench dataset
 """
 
 import json
@@ -644,6 +645,35 @@ def cmd_smoke():
     sys.exit(0 if result["passed"] else 1)
 
 
+def cmd_brier(n: int = 50, use_llm: bool = False, sources: list[str] | None = None):
+    """Cold-start calibration check — replay ForecastBench resolved questions.
+
+    Measures our Brier score on an out-of-sample public dataset and
+    compares to the crowd's implied probability as a baseline. Use
+    before deploying real money to verify the forecaster isn't
+    miscalibrated, overconfident, or systematically biased.
+
+    Verdict:
+        Δ Brier < 0  → we beat the crowd (evidence of edge)
+        Δ Brier = 0  → noise, inconclusive
+        Δ Brier > 0  → the crowd beats us → recalibrate before deploying
+    """
+    from lib.backtest import replay_forecastbench
+    result = replay_forecastbench(
+        limit=n,
+        sources=sources,
+        use_llm=use_llm,
+        verbose=True,
+    )
+    # Exit 0 if we beat the crowd OR tied (Brier ≤ crowd).
+    # Exit 1 if we're meaningfully worse (Δ > 0.02).
+    if result["n"] == 0:
+        print("No resolved questions available — cannot score.")
+        sys.exit(1)
+    passed = result["brier_improvement"] <= 0.02
+    sys.exit(0 if passed else 1)
+
+
 def cmd_chaos():
     """Run chaos tests to verify safety systems."""
     from lib.audit import log_event
@@ -837,6 +867,21 @@ def main():
         cmd_chaos()
     elif command == "smoke":
         cmd_smoke()
+    elif command == "brier":
+        n = 50
+        use_llm = False
+        sources: list[str] | None = None
+        for arg in sys.argv[2:]:
+            if arg.startswith("--n="):
+                try:
+                    n = max(1, int(arg.split("=", 1)[1]))
+                except ValueError:
+                    pass
+            elif arg == "--llm":
+                use_llm = True
+            elif arg.startswith("--sources="):
+                sources = [s.strip() for s in arg.split("=", 1)[1].split(",") if s.strip()]
+        cmd_brier(n=n, use_llm=use_llm, sources=sources)
     else:
         print(f"Unknown command: {command}")
         print(__doc__)

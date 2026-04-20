@@ -674,6 +674,237 @@ def save_backtest(result: BacktestResult) -> Path:
     return path
 
 
+# ── ForecastBench Public-Dataset Replay ────────────────────────────
+
+def replay_forecastbench(
+    limit: int | None = 50,
+    dates: list[str] | None = None,
+    sources: list[str] | None = None,
+    use_llm: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """
+    Replay resolved questions from the ForecastBench public dataset
+    through our forecaster and score them with Brier + log-loss.
+
+    This is our cold-start calibration check: before we have a live
+    track record, we need an out-of-sample way to know whether the
+    forecaster is miscalibrated, overconfident, or biased. ForecastBench
+    gives us ~3,000 resolved binary questions with crowd-implied prices
+    at forecast-time (= our "market_price" analogue) and known outcomes.
+
+    We compute Brier for two things:
+        1. Our forecaster's probability (the bot's output)
+        2. The crowd-implied probability (baseline / market consensus)
+
+    If our Brier ≥ crowd Brier → we have no alpha, stop and recalibrate.
+    If our Brier < crowd Brier → we have evidence of edge, proceed.
+
+    Args:
+        limit: Max questions to replay. Keep small (<100) for quick
+            checks unless you're willing to pay LLM cost.
+        dates: Forecast-due dates to pull from (see KNOWN_DATES in
+            lib/forecastbench_loader.py). Defaults to 5 most recent.
+        sources: Restrict to question sources (e.g. ["polymarket",
+            "manifold", "metaculus"]). None = all sources.
+        use_llm: If True, call Claude for each question. Expensive —
+            typically leave False for regression runs.
+        verbose: Print per-question progress.
+
+    Returns:
+        {
+          "n": int,                              # questions scored
+          "our_brier": float,                    # lower is better (0 = perfect)
+          "crowd_brier": float,                  # baseline comparison
+          "brier_improvement": float,            # our_brier - crowd_brier (neg = better)
+          "our_log_loss": float,
+          "crowd_log_loss": float,
+          "by_source": dict[source, stats],      # per-source breakdown
+          "samples": list[dict],                 # first few per-question details
+        }
+    """
+    from lib.calibration import brier_score, log_loss
+    from lib.forecastbench_loader import load_resolved_questions
+    from lib.forecaster import estimate_probability
+    from lib.market_client import MarketInfo
+
+    log_event("forecastbench", "replay_start", {
+        "limit": limit, "dates": dates, "sources": sources, "use_llm": use_llm,
+    }, result="pending")
+
+    # Load questions — the loader handles caching and date validation.
+    questions = load_resolved_questions(dates=dates, limit=limit, sources=sources)
+    if not questions:
+        log_event("forecastbench", "replay_no_questions", {}, result="failed")
+        return {
+            "n": 0,
+            "our_brier": -1.0,
+            "crowd_brier": -1.0,
+            "brier_improvement": 0.0,
+            "our_log_loss": -1.0,
+            "crowd_log_loss": -1.0,
+            "by_source": {},
+            "samples": [],
+        }
+
+    if verbose:
+        print("=" * 60)
+        print(f"  FORECASTBENCH REPLAY ({len(questions)} questions)")
+        print("=" * 60)
+
+    # Build forecast records compatible with calibration.brier_score().
+    # We record TWO parallel streams: one with our probability, one with
+    # the crowd's — so we can score both on the same set of questions.
+    our_forecasts: list[dict] = []
+    crowd_forecasts: list[dict] = []
+    samples: list[dict] = []
+    by_source: dict[str, dict] = {}
+
+    for i, q in enumerate(questions):
+        # Synthesize a MarketInfo from the ForecastBench question.
+        # volume_24h is set to a typical mid-range value so the
+        # forecaster's market_consensus_prior weight behaves sensibly.
+        # The exact number doesn't matter for Brier scoring — we're
+        # comparing probabilities, not bet sizes.
+        market = MarketInfo(
+            market_id=f"fb:{q.question_id}",
+            platform=q.source,
+            question=q.question_text,
+            description=q.background or q.resolution_criteria or "",
+            category=q.category,
+            status="resolved",
+            yes_price=q.market_price,
+            no_price=1.0 - q.market_price,
+            volume_24h=10_000.0,  # synthetic (sufficient for forecaster)
+            total_volume=100_000.0,
+            resolution_date=q.resolution_date,
+            resolution_source=q.source,
+            outcome="YES" if q.resolved_to == 1.0 else "NO",
+        )
+
+        # Optional LLM call — typically off to save $$.
+        llm_est = None
+        if use_llm:
+            try:
+                from lib.llm_analyst import analyze_market
+                analysis = analyze_market(
+                    market_id=market.market_id,
+                    question=market.question,
+                    description=market.description,
+                    market_price=market.yes_price,
+                    category=market.category,
+                    resolution_date=market.resolution_date,
+                    retrieve_news=False,   # news is stale for historic questions
+                )
+                llm_est = analysis.probability
+            except Exception as e:
+                # Degrade gracefully — skip LLM for this question.
+                log_event("forecastbench", "llm_failed", {
+                    "question_id": q.question_id, "error": str(e)[:150],
+                }, result="degraded")
+                llm_est = None
+
+        # Run the forecaster. No news/metaculus/kronos/smart_money
+        # since we don't have offline snapshots — the base-rate +
+        # market-consensus blend + optional LLM is what we're testing.
+        try:
+            fc = estimate_probability(
+                market=market,
+                llm_estimate=llm_est,
+                fee_rate=0.02,
+            )
+            our_prob = fc.probability
+        except Exception as e:
+            log_event("forecastbench", "forecaster_failed", {
+                "question_id": q.question_id, "error": str(e)[:150],
+            }, result="failed")
+            continue
+
+        outcome_bool = bool(q.resolved_to == 1.0)
+
+        our_forecasts.append({
+            "market_id": market.market_id,
+            "our_probability": our_prob,
+            "outcome": outcome_bool,
+        })
+        crowd_forecasts.append({
+            "market_id": market.market_id,
+            "our_probability": q.market_price,
+            "outcome": outcome_bool,
+        })
+
+        # Per-source breakdown
+        src = q.source
+        if src not in by_source:
+            by_source[src] = {"n": 0, "our_sse": 0.0, "crowd_sse": 0.0}
+        by_source[src]["n"] += 1
+        o = 1.0 if outcome_bool else 0.0
+        by_source[src]["our_sse"] += (our_prob - o) ** 2
+        by_source[src]["crowd_sse"] += (q.market_price - o) ** 2
+
+        # Keep a handful of samples for the report
+        if len(samples) < 5:
+            samples.append({
+                "question": q.question_text[:100],
+                "source": q.source,
+                "crowd_prob": round(q.market_price, 3),
+                "our_prob": round(our_prob, 3),
+                "outcome": "YES" if outcome_bool else "NO",
+            })
+
+        if verbose and (i + 1) % 10 == 0:
+            print(f"  ... {i + 1}/{len(questions)}")
+
+    # Score both streams.
+    our_brier = brier_score(our_forecasts)
+    crowd_brier = brier_score(crowd_forecasts)
+    our_ll = log_loss(our_forecasts)
+    crowd_ll = log_loss(crowd_forecasts)
+
+    # Finalize per-source Brier
+    for src, stats in by_source.items():
+        if stats["n"] > 0:
+            stats["our_brier"] = round(stats["our_sse"] / stats["n"], 4)
+            stats["crowd_brier"] = round(stats["crowd_sse"] / stats["n"], 4)
+            del stats["our_sse"]
+            del stats["crowd_sse"]
+
+    result = {
+        "n": len(our_forecasts),
+        "our_brier": round(our_brier, 4),
+        "crowd_brier": round(crowd_brier, 4),
+        "brier_improvement": round(our_brier - crowd_brier, 4),
+        "our_log_loss": round(our_ll, 4),
+        "crowd_log_loss": round(crowd_ll, 4),
+        "by_source": by_source,
+        "samples": samples,
+    }
+
+    if verbose:
+        print()
+        print(f"  OUR Brier:    {result['our_brier']:.4f}")
+        print(f"  CROWD Brier:  {result['crowd_brier']:.4f}")
+        verdict = "BETTER" if result["brier_improvement"] < 0 else "WORSE"
+        print(f"  Δ Brier:      {result['brier_improvement']:+.4f}  ({verdict} than crowd)")
+        print(f"  OUR LogLoss:  {result['our_log_loss']:.4f}")
+        print(f"  CROWD LogLoss:{result['crowd_log_loss']:.4f}")
+        print()
+        print(f"  Per-source Brier (our vs crowd):")
+        for src, stats in sorted(by_source.items(), key=lambda kv: kv[1]["n"], reverse=True):
+            print(f"    {src:12s} n={stats['n']:3d}  "
+                  f"ours={stats['our_brier']:.3f}  crowd={stats['crowd_brier']:.3f}")
+        print("=" * 60)
+
+    log_event("forecastbench", "replay_complete", {
+        "n": result["n"],
+        "our_brier": result["our_brier"],
+        "crowd_brier": result["crowd_brier"],
+        "brier_improvement": result["brier_improvement"],
+    }, result="success")
+
+    return result
+
+
 # ── Pipeline Regression ────────────────────────────────────────────
 
 def pipeline_smoke_test(verbose: bool = True) -> dict:
