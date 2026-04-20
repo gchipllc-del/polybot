@@ -407,25 +407,11 @@ def scan_all_markets(
 
     for market in to_forecast:
         try:
-            # Get LLM estimate if enabled
-            llm_estimate = None
-            if llm_enabled:
-                try:
-                    from lib.llm_analyst import analyze_market
-                    analysis = analyze_market(
-                        market_id=market.market_id,
-                        question=market.question,
-                        description=market.description,
-                        market_price=market.yes_price,
-                        category=market.category,
-                        resolution_date=market.resolution_date,
-                    )
-                    llm_estimate = analysis.probability
-                except RuntimeError:
-                    # API key missing or API down — forecast without LLM
-                    pass
-
-            # Get news sentiment signal
+            # Fetch news FIRST — it feeds both the news_sentiment signal
+            # AND the LLM's retrieval-augmented context. Doing it once
+            # avoids a duplicate fetch (news_feed has its own cache so
+            # this is idempotent, but we still pay latency twice).
+            news_result = None
             news_sentiment = None
             try:
                 from lib.news_feed import get_news_sentiment
@@ -438,6 +424,25 @@ def scan_all_markets(
                     news_sentiment = news_result.sentiment
             except Exception:
                 pass  # News is optional — degrade gracefully
+
+            # Get LLM estimate if enabled, with news context injected
+            llm_estimate = None
+            if llm_enabled:
+                try:
+                    from lib.llm_analyst import analyze_market
+                    analysis = analyze_market(
+                        market_id=market.market_id,
+                        question=market.question,
+                        description=market.description,
+                        market_price=market.yes_price,
+                        category=market.category,
+                        resolution_date=market.resolution_date,
+                        news_result=news_result,    # retrieval-augmented
+                    )
+                    llm_estimate = analysis.probability
+                except RuntimeError:
+                    # API key missing or API down — forecast without LLM
+                    pass
 
             # Get Metaculus community forecast (calibrated crowd signal)
             metaculus_estimate = None
