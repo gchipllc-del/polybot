@@ -21,6 +21,7 @@ Usage:
     python main.py kronos-prob <ticker> <target> [above|below]  # Price probability
     python main.py dashboard         # Launch web dashboard
     python main.py chaos             # Run chaos tests
+    python main.py smoke             # Pipeline regression (no external APIs)
 """
 
 import json
@@ -631,6 +632,18 @@ def cmd_dashboard(port: int = 5050):
     run_dashboard(port=port)
 
 
+def cmd_smoke():
+    """Pipeline smoke test — validate the full forecasting stack end-to-end.
+
+    Runs a synthetic market through every signal source + scoring + Kelly
+    sizing, checks for NaN, bounds, graceful degradation. No external API
+    calls. Use before deploying config changes.
+    """
+    from lib.backtest import pipeline_smoke_test
+    result = pipeline_smoke_test(verbose=True)
+    sys.exit(0 if result["passed"] else 1)
+
+
 def cmd_chaos():
     """Run chaos tests to verify safety systems."""
     from lib.audit import log_event
@@ -822,6 +835,8 @@ def main():
         cmd_dashboard(port=port)
     elif command == "chaos":
         cmd_chaos()
+    elif command == "smoke":
+        cmd_smoke()
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
