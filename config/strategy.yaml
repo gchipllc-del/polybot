@@ -19,9 +19,12 @@ forecasting:
   max_tokens_per_analysis: 2000
 
 # --- Scoring Thresholds ---
+# Phase 1 (Survival) wants fewer, higher-quality trades. The old 4/9 + 5% edge
+# let marginal candidates through (Starmer NO squeaked in at 5/9 with +8% edge).
+# Survival phase raises bar; Hermes tunes back down once Brier is measured.
 scoring:
-  min_composite_score: 4        # Lower for paper trading — Hermes will tune up [HERMES: 4-8]
-  min_edge: 0.05                # 5% edge for paper learning phase [HERMES: 0.05 - 0.20]
+  min_composite_score: 6        # Require 2+ sources agreeing + decent edge [HERMES: 4-8]
+  min_edge: 0.08                # 8% edge survives spread + slippage [HERMES: 0.05 - 0.20]
   min_confidence: 0.50          # Minimum confidence in our estimate
 
 # --- Kelly Criterion Position Sizing ---
@@ -84,7 +87,7 @@ market_filters:
   min_volume_24h: 10              # M$10 daily volume (Manifold uses play money)
   min_hours_to_resolution: 48     # At least 48h remaining
   price_bounds: [0.10, 0.90]      # Avoid extreme odds
-  max_spread_pct: 0.10            # Manifold spreads wider than Kalshi/Poly
+  max_spread_pct: 0.05            # Tight: wide spreads eat the edge on entry
   max_markets_per_cycle: 20       # Control inference costs
   min_edge_for_conviction: 0.10   # 10%+ edge for conviction bets
 

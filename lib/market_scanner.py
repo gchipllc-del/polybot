@@ -130,14 +130,53 @@ def _estimate_spread(market: MarketInfo) -> float:
     return 0.0
 
 
+def _days_to_resolution(resolution_date) -> float | None:
+    """
+    Compute days from now to resolution, accepting either ISO 8601 string
+    or epoch-ms (int/float). Returns None if unparseable.
+    """
+    if not resolution_date:
+        return None
+    try:
+        if isinstance(resolution_date, str):
+            res_dt = datetime.fromisoformat(resolution_date.replace("Z", "+00:00"))
+        elif isinstance(resolution_date, (int, float)):
+            res_dt = datetime.fromtimestamp(resolution_date / 1000, tz=timezone.utc)
+        else:
+            return None
+        delta = res_dt - datetime.now(timezone.utc)
+        return delta.total_seconds() / 86400.0
+    except (ValueError, TypeError, OSError):
+        return None
+
+
 # ── Correlation Detection ─────────────────────────────────────────
 
+_STOPWORDS = frozenset({
+    "a", "an", "the", "will", "is", "are", "be", "been", "was", "were",
+    "in", "on", "at", "to", "for", "of", "and", "or", "by", "with",
+    "this", "that", "these", "those", "it", "its", "than", "more", "less",
+    "who", "what", "when", "where", "why", "how", "which",
+    "there", "any", "if", "but", "before", "after", "during",
+    "would", "could", "should", "may", "might", "can",
+})
+
+
 def _normalize_text(text: str) -> str:
-    """Normalize text for comparison. Lowercase, strip punctuation."""
+    """Normalize text for comparison: lowercase, strip punctuation and
+    single-digit tokens (which make unrelated markets look similar)."""
     text = text.lower()
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Return content words (stopwords removed) from a question string."""
+    return {
+        w for w in _normalize_text(text).split()
+        if w not in _STOPWORDS and len(w) > 2
+    }
 
 
 def detect_correlated_markets(candidates: list[MarketCandidate]) -> list[MarketCandidate]:
@@ -178,13 +217,24 @@ def detect_correlated_markets(candidates: list[MarketCandidate]) -> list[MarketC
     # Text similarity for remaining ungrouped candidates
     ungrouped = [i for i, c in enumerate(candidates) if not c.correlation_group]
 
+    # Precompute content-token sets (stopwords filtered) to make similarity
+    # robust to filler words. Also gather rare-proper-noun sets (tokens that
+    # appear in ≤ 2 questions) — shared rare tokens are a strong correlation
+    # signal even when overall overlap is low.
+    token_sets = [
+        _content_tokens(candidates[idx].market.question) for idx in ungrouped
+    ]
+    token_freq: dict[str, int] = {}
+    for ts in token_sets:
+        for t in ts:
+            token_freq[t] = token_freq.get(t, 0) + 1
+    rare_tokens = {t for t, n in token_freq.items() if n <= 2}
+
     for i in range(len(ungrouped)):
         if candidates[ungrouped[i]].correlation_group:
-            continue  # Already grouped in this pass
+            continue
 
-        text_i = _normalize_text(candidates[ungrouped[i]].market.question)
-        words_i = set(text_i.split())
-
+        words_i = token_sets[i]
         if not words_i:
             continue
 
@@ -192,18 +242,32 @@ def detect_correlated_markets(candidates: list[MarketCandidate]) -> list[MarketC
             if candidates[ungrouped[j]].correlation_group:
                 continue
 
-            text_j = _normalize_text(candidates[ungrouped[j]].market.question)
-            words_j = set(text_j.split())
-
+            words_j = token_sets[j]
             if not words_j:
                 continue
 
-            # Jaccard similarity
-            intersection = len(words_i & words_j)
-            union = len(words_i | words_j)
-            similarity = intersection / union if union > 0 else 0
+            intersection = words_i & words_j
+            if not intersection:
+                continue
 
-            if similarity > 0.60:
+            # Jaccard similarity
+            union = words_i | words_j
+            jaccard = len(intersection) / len(union)
+
+            # Szymkiewicz–Simpson overlap: catches subset relations
+            # ("Will Fed cut rates in June" ⊂ "Will Fed cut rates in June meeting?")
+            overlap = len(intersection) / min(len(words_i), len(words_j))
+
+            # Shared rare tokens (proper nouns, specific entities)
+            shared_rare = intersection & rare_tokens
+
+            correlated = (
+                jaccard > 0.55
+                or overlap > 0.80
+                or len(shared_rare) >= 2  # Two distinctive entities in common
+            )
+
+            if correlated:
                 group_id += 1
                 tag = f"text_{group_id}"
                 candidates[ungrouped[i]].correlation_group = tag
@@ -366,16 +430,22 @@ def scan_all_markets(
             except Exception:
                 pass  # News is optional — degrade gracefully
 
-            # Get Kronos zero-shot price estimate (for price-based markets)
+            # Get Kronos zero-shot price estimate — price-series markets only.
+            # Kronos is a financial candle model; it should not contribute to
+            # categorical outcomes (elections, court decisions, sports, etc.).
+            # Gate at category + question-parse level as defense in depth.
             kronos_estimate = None
-            try:
-                from lib.kronos_forecaster import get_kronos_estimate
-                kronos_estimate = get_kronos_estimate(
-                    market_question=market.question,
-                    horizon_days=30,
-                )
-            except Exception:
-                pass  # Kronos is optional — degrade gracefully
+            PRICE_SERIES_CATEGORIES = {"crypto", "economics", "stocks", "markets", "finance"}
+            category_ok = (market.category or "").lower() in PRICE_SERIES_CATEGORIES
+            if category_ok:
+                try:
+                    from lib.kronos_forecaster import get_kronos_estimate
+                    kronos_estimate = get_kronos_estimate(
+                        market_question=market.question,
+                        horizon_days=30,
+                    )
+                except Exception:
+                    pass  # Kronos is optional — degrade gracefully
 
             # Determine fee rate by platform
             fee_rate = _get_fee_rate(market.platform)
@@ -423,12 +493,29 @@ def scan_all_markets(
         tradeable = detect_correlated_markets(tradeable)
         tradeable = _deduplicate_correlated(tradeable)
 
-    # ── Step 5: Rank by expected value * confidence ───────────────
+    # ── Step 5: Rank by capital efficiency ───────────────────────────
+    # The old ranking was EV × confidence, which equal-weighted a 5-day
+    # bet and a 74-day bet. A $64 position held 74 days is $0.86/day of
+    # capital use; a $157 position held 5 days is $31.40/day. To compound
+    # $50 → $25k we must rank by EV per day of capital locked up.
+    #
+    # capital_efficiency = (EV × confidence) / max(1, days_to_resolution)
+    # Markets with unknown resolution dates default to 30 days (neutral).
+    def _capital_efficiency(c: MarketCandidate) -> float:
+        days = _days_to_resolution(c.market.resolution_date) or 30.0
+        days = max(1.0, days)
+        return (c.forecast.expected_value * c.forecast.confidence) / days
+
     tradeable_clean = [c for c in tradeable if not c.skip_reason]
-    tradeable_clean.sort(
-        key=lambda c: c.forecast.expected_value * c.forecast.confidence,
-        reverse=True,
-    )
+    # Stash the metric on the candidate for transparency in the UI/audit
+    for c in tradeable_clean:
+        c.forecast.bayesian_chain.append({
+            "step": "capital_efficiency",
+            "days_to_resolution": _days_to_resolution(c.market.resolution_date),
+            "ev_per_day": round(_capital_efficiency(c), 6),
+        })
+
+    tradeable_clean.sort(key=_capital_efficiency, reverse=True)
 
     for i, c in enumerate(tradeable_clean):
         c.rank = i + 1

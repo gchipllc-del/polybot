@@ -77,41 +77,96 @@ class ForecastResult:
 
 # ── Bayesian Math ─────────────────────────────────────────────────
 
-def bayesian_update(prior: float, likelihood: float, base_rate: float = 0.5) -> float:
+import math
+
+
+def bayesian_update(prior: float, source_estimate: float, base_rate: float = 0.5) -> float:
     """
-    Apply Bayes' theorem to update a probability given new evidence.
+    Update a prior probability given an independent source's estimate, using
+    the odds-ratio form of Bayes' theorem.
 
-    P(H|E) = P(E|H) * P(H) / P(E)
+        posterior_odds = prior_odds × likelihood_ratio
 
-    Where P(E) = P(E|H)*P(H) + P(E|~H)*P(~H)
+    where `likelihood_ratio = odds(source_estimate) / odds(base_rate)`.
 
-    We interpret `likelihood` as: "if the hypothesis is true, how likely
-    is this evidence?" And we assume the complementary likelihood is
-    (1 - likelihood) scaled by the base rate.
+    Intuition:
+        - If the source agrees with the base rate, no update (LR=1).
+        - If the source says 80% when base is 50%, LR = (4/1) / (1/1) = 4:
+          prior odds multiply by 4.
+        - Symmetric: if a second source agrees with the first, the effect
+          compounds multiplicatively — correct for independent evidence.
+
+    This replaces an earlier pseudo-Bayesian form that treated the source
+    estimate directly as P(E|H), which systematically under-updated.
 
     Args:
         prior: Current probability estimate (0.0 - 1.0)
-        likelihood: How likely the evidence if hypothesis is true (0.0 - 1.0)
-        base_rate: How common the evidence is in general (0.0 - 1.0)
+        source_estimate: Independent source's estimate of P(H) (0.0 - 1.0)
+        base_rate: Unconditional prior for the hypothesis (0.0 - 1.0)
 
     Returns:
         Updated probability (0.0 - 1.0), clamped to [0.01, 0.99].
     """
-    if prior <= 0 or prior >= 1:
-        prior = max(0.01, min(prior, 0.99))
+    prior = max(0.01, min(prior, 0.99))
+    source_estimate = max(0.01, min(source_estimate, 0.99))
+    base_rate = max(0.01, min(base_rate, 0.99))
 
-    p_e_given_h = max(likelihood, 0.01)
-    p_e_given_not_h = max(1.0 - likelihood, 0.01) * base_rate / max(1.0 - base_rate, 0.01)
-    p_e_given_not_h = max(p_e_given_not_h, 0.01)
+    prior_odds = prior / (1.0 - prior)
+    source_odds = source_estimate / (1.0 - source_estimate)
+    base_odds = base_rate / (1.0 - base_rate)
 
-    numerator = p_e_given_h * prior
-    denominator = numerator + p_e_given_not_h * (1.0 - prior)
+    likelihood_ratio = source_odds / base_odds
+    # Dampen extreme likelihood ratios so a single 99%→base-50% source can't
+    # overwhelm multiple moderate signals. Caps effective update at ~20:1.
+    likelihood_ratio = max(0.05, min(likelihood_ratio, 20.0))
 
-    if denominator <= 0:
-        return prior
+    posterior_odds = prior_odds * likelihood_ratio
+    posterior = posterior_odds / (1.0 + posterior_odds)
 
-    posterior = numerator / denominator
     return max(0.01, min(posterior, 0.99))
+
+
+def logit(p: float) -> float:
+    """Log-odds of a probability. Useful for geomean-of-log-odds aggregation."""
+    p = max(1e-6, min(p, 1 - 1e-6))
+    return math.log(p / (1.0 - p))
+
+
+def inv_logit(x: float) -> float:
+    """Inverse log-odds (sigmoid), converting back to probability."""
+    if x > 500:  # avoid overflow
+        return 1.0 - 1e-6
+    if x < -500:
+        return 1e-6
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def geomean_log_odds(estimates: dict[str, float], weights: dict[str, float]) -> float:
+    """
+    Aggregate probability estimates using the geometric mean of log-odds.
+
+    This is the aggregator used in ForecastBench (Halawi 2024, NeurIPS) —
+    well-behaved at extremes (unlike arithmetic mean, which is pulled toward
+    0.5), invariant under YES/NO flip, and mathematically equivalent to the
+    log-odds-average. The weighted form weights evidence by trust.
+
+    Args:
+        estimates: {"llm": 0.65, "metaculus": 0.58, ...}
+        weights:   {"llm": 0.30, "metaculus": 0.25, ...}
+
+    Returns:
+        Aggregated probability (0.01 - 0.99).
+    """
+    active = {k: v for k, v in estimates.items() if k in weights and weights[k] > 0}
+    if not active:
+        return 0.50
+
+    total_w = sum(weights[k] for k in active)
+    if total_w <= 0:
+        return 0.50
+
+    log_odds_sum = sum(logit(estimates[k]) * (weights[k] / total_w) for k in active)
+    return max(0.01, min(inv_logit(log_odds_sum), 0.99))
 
 
 def weighted_blend(estimates: dict[str, float], weights: dict[str, float]) -> float:
@@ -289,32 +344,64 @@ def estimate_probability(
     market_prob = market.yes_price
     sources["market_consensus"] = market_prob
 
-    # Final blend: combine Bayesian posterior with weighted source average
-    # This prevents the sequential Bayesian updates from over-counting
-    # correlated evidence (e.g., LLM reading the same news as news_sentiment)
-    source_blend = weighted_blend(sources, weights)
-
-    # 70% Bayesian chain, 30% linear blend — balances responsiveness with stability
-    probability = 0.70 * current + 0.30 * source_blend
+    # Final blend: use geomean-of-log-odds (Halawi 2024 / ForecastBench standard).
+    # This is symmetric under YES/NO flip, well-behaved at extremes, and the
+    # weighted form combines sources by trust without arithmetic-mean bias
+    # toward 0.5. We blend it 50/50 with the sequential Bayesian posterior:
+    # the Bayesian chain captures independent-evidence compounding; the
+    # geomean tempers it when the chain over-shoots on correlated sources.
+    log_odds_blend = geomean_log_odds(sources, weights)
+    probability = inv_logit(0.5 * logit(current) + 0.5 * logit(log_odds_blend))
     probability = max(0.01, min(probability, 0.99))
 
     chain.append({
         "step": "final_blend",
         "bayesian_posterior": round(current, 4),
-        "source_blend": round(source_blend, 4),
+        "log_odds_blend": round(log_odds_blend, 4),
         "final": round(probability, 4),
     })
 
     # ── Confidence ────────────────────────────────────────────────
-    # Confidence = how much our sources agree + how many we have
-    source_values = [v for k, v in sources.items() if k != "market_consensus"]
-    if len(source_values) >= 2:
-        spread = max(source_values) - min(source_values)
-        agreement = max(0, 1.0 - spread * 3)  # 0.33 spread -> 0 agreement
-        coverage = min(len(source_values) / 4.0, 1.0)  # 4 sources = full coverage
-        confidence = 0.6 * agreement + 0.4 * coverage
+    # Confidence blends three signals, each with its own trustworthiness:
+    #   1. Coverage: how many *quality* sources weighed in (not a flat count)
+    #   2. Agreement: how tight the distribution of estimates is
+    #   3. Historical calibration: past Brier score against ground truth
+    #
+    # Each source has a trust weight reflecting how noisy it is. News
+    # sentiment is noisier than Metaculus community forecasts; a raw LLM
+    # estimate is noisier than one backed by retrieval. These weights are
+    # used for coverage so adding a noisy source can't fake high confidence.
+    SOURCE_TRUST = {
+        "llm":              0.85,
+        "metaculus":        0.95,
+        "kronos":           0.70,   # Strong only on price-series markets
+        "news":             0.50,   # Sentiment is a weak signal
+        "base_rate":        0.60,
+        "market_consensus": 0.40,   # Included for reference, not primary
+    }
+
+    quality_sources = {k: v for k, v in sources.items() if k != "market_consensus"}
+    weighted_coverage = sum(SOURCE_TRUST.get(k, 0.3) for k in quality_sources)
+    # Normalize: full coverage = ~3 quality sources at avg trust 0.7
+    coverage = min(weighted_coverage / 2.1, 1.0)
+
+    if len(quality_sources) >= 2:
+        values = list(quality_sources.values())
+        spread = max(values) - min(values)
+        agreement = max(0.0, 1.0 - spread * 3)  # 0.33 spread -> 0 agreement
     else:
-        confidence = 0.25  # Single source = low confidence
+        agreement = 0.5  # Neutral — can't measure agreement with one source
+
+    # Historical calibration — did our past forecasts match reality?
+    # Brier 0 = perfect, 0.25 = random for 50/50 markets.
+    try:
+        bs = brier_score()
+        cal_quality = max(0.0, 1.0 - (bs / 0.25)) if bs >= 0 else 0.5
+    except Exception:
+        cal_quality = 0.5
+
+    confidence = 0.40 * agreement + 0.40 * coverage + 0.20 * cal_quality
+    confidence = max(0.0, min(confidence, 1.0))
 
     # ── Edge Calculation ──────────────────────────────────────────
     # Decide best side based on where our edge is
