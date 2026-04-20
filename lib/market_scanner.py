@@ -30,7 +30,12 @@ import yaml
 
 from lib.audit import log_event
 from lib.forecaster import ForecastResult, estimate_probability
-from lib.kelly import expected_value, kelly_bet_size, min_edge_for_trade
+from lib.kelly import (
+    expected_value,
+    kelly_bet_size,
+    kelly_bet_size_slippage_aware,
+    min_edge_for_trade,
+)
 from lib.market_client import MarketClient, MarketInfo
 
 CONFIG_PATH = Path(__file__).parent.parent / "config"
@@ -52,7 +57,11 @@ class MarketCandidate:
     market: MarketInfo
     forecast: ForecastResult
     rank: int = 0                   # Position in ranked list (1 = best)
-    kelly_bet_usd: float = 0.0     # Dollar amount to bet
+    kelly_bet_usd: float = 0.0     # Dollar amount to bet (slippage-aware)
+    naive_kelly_usd: float = 0.0   # What naive Kelly would have said (pre-slippage)
+    effective_price: float = 0.0   # Price we'd actually fill at
+    slippage_pct: float = 0.0      # (effective - market) / market
+    edge_post_slip: float = 0.0    # Edge after accounting for slippage
     correlation_group: str = ""    # Markets in same group are correlated
     skip_reason: str = ""          # If filtered out, why
 
@@ -471,25 +480,72 @@ def scan_all_markets(
                 fee_rate=fee_rate,
             )
 
-            # Calculate Kelly bet size
+            # Calculate slippage-aware Kelly bet size.
+            # Naive Kelly assumes you fill at top-of-book; thin books punish
+            # that assumption hard (a narrow edge can be eaten entirely by
+            # slippage). Fixed-point iteration re-sizes the bet so it's
+            # priced against the price *after* its own impact.
+            bet_usd = 0.0
+            naive_bet = 0.0
+            effective_price = market.yes_price
+            slippage_pct = 0.0
+            edge_post_slip = forecast.edge
+
             if forecast.edge > 0 and forecast.best_side:
                 trade_prob = forecast.probability if forecast.best_side == "YES" else (1.0 - forecast.probability)
                 trade_market = market.yes_price if forecast.best_side == "YES" else (1.0 - market.yes_price)
-                bet_usd = kelly_bet_size(bankroll, trade_prob, trade_market)
-            else:
-                bet_usd = 0.0
+                market_type = "CPMM" if market.platform.lower() == "manifold" else "CLOB"
+
+                slip_result = kelly_bet_size_slippage_aware(
+                    bankroll=bankroll,
+                    our_prob=trade_prob,
+                    market_prob=trade_market,
+                    volume_24h=market.volume_24h,
+                    market_type=market_type,
+                )
+                bet_usd = slip_result["bet_usd"]
+                naive_bet = slip_result["naive_kelly_usd"]
+                effective_price = slip_result["effective_price"]
+                slippage_pct = slip_result["slippage_pct"]
+                edge_post_slip = slip_result["edge_post_slip"]
+
+                # Audit trail — every slippage calc is inspectable
+                forecast.bayesian_chain.append({
+                    "step": "slippage_sizing",
+                    "market_type": market_type,
+                    "volume_24h": market.volume_24h,
+                    "naive_kelly_usd": naive_bet,
+                    "sized_kelly_usd": bet_usd,
+                    "effective_price": effective_price,
+                    "slippage_pct": slippage_pct,
+                    "edge_post_slip": edge_post_slip,
+                    "converged": slip_result["converged"],
+                    "iterations": slip_result["iterations"],
+                })
 
             candidate = MarketCandidate(
                 market=market,
                 forecast=forecast,
                 kelly_bet_usd=round(bet_usd, 2),
+                naive_kelly_usd=round(naive_bet, 2),
+                effective_price=round(effective_price, 4),
+                slippage_pct=round(slippage_pct, 4),
+                edge_post_slip=round(edge_post_slip, 4),
             )
 
-            # Apply score and edge thresholds
+            # Apply score, edge, and slippage-adjusted edge thresholds.
+            # edge_post_slip check ensures we're not taking trades where
+            # slippage eats the entire margin of safety — a 9% edge in a
+            # thin book that slips 8% is a losing trade after fees.
             if forecast.composite_score < min_score:
                 candidate.skip_reason = f"low_score:{forecast.composite_score}/{min_score}"
             elif abs(forecast.edge) < min_edge:
                 candidate.skip_reason = f"low_edge:{forecast.edge:.2%}<{min_edge:.0%}"
+            elif bet_usd > 0 and edge_post_slip < min_edge:
+                candidate.skip_reason = (
+                    f"slippage_eats_edge:{edge_post_slip:.2%}<{min_edge:.0%}"
+                    f"(slip={slippage_pct:.1%})"
+                )
 
             candidates.append(candidate)
 

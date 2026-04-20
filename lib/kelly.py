@@ -186,3 +186,160 @@ def expected_value(our_prob: float, market_prob: float, fee_rate: float = 0.07) 
     ev = our_prob * net_profit - (1.0 - our_prob) * market_prob
 
     return ev
+
+
+# ── Slippage-Aware Sizing ─────────────────────────────────────────
+# A naive Kelly bet in a thin orderbook pays the last traded price only
+# on the first contract; the rest are filled at progressively worse
+# prices. This can eat 50%+ of a narrow edge instantly. The functions
+# below model price impact and solve for bet size that *accounts for
+# its own impact* — so the "effective price" after filling is still
+# profitable.
+
+
+def estimate_slippage(
+    bet_usd: float,
+    market_prob: float,
+    volume_24h: float,
+    market_type: str = "CPMM",
+) -> float:
+    """
+    Estimate the effective fill price for a bet of size `bet_usd`.
+
+    Two simple impact models:
+      - CPMM (Manifold):     sqrt(bet / pool_proxy) — convex impact
+      - CLOB (Kalshi/Poly):  linear in depth — top-of-book walk
+
+    Both clamped so a tiny bet in a thin market still executes, and a
+    huge bet can't produce a >15% impact (we'd refuse to trade it well
+    before then via circuit breakers).
+
+    Args:
+        bet_usd: Dollar size of the proposed bet
+        market_prob: Current mid-price (0.0-1.0)
+        volume_24h: Recent daily volume in USD (proxy for book depth)
+        market_type: "CPMM" or "CLOB"
+
+    Returns:
+        Effective fill price (0.0-1.0). Equal to market_prob for zero-size bet.
+    """
+    if bet_usd <= 0:
+        return market_prob
+    if market_prob <= 0 or market_prob >= 1:
+        return market_prob
+
+    # Volume as proxy for liquidity — floor at $50 to avoid divide-by-near-zero
+    depth = max(volume_24h, 50.0)
+
+    if market_type.upper() == "CPMM":
+        # CPMM pool depth estimated as ~5× daily volume (Manifold rough proxy)
+        pool = depth * 5.0
+        # Price impact ≈ bet / (bet + 2*pool)
+        impact = bet_usd / (bet_usd + 2.0 * pool)
+    else:
+        # CLOB: assume top-of-book holds 10% of daily volume; then linear decay
+        top_book = depth * 0.10
+        if bet_usd <= top_book:
+            impact = 0.5 * (bet_usd / top_book) * 0.01  # Up to 0.5% impact for top-of-book fills
+        else:
+            remainder = bet_usd - top_book
+            # Each additional $1 of volume in excess walks price 0.5% per top-book
+            impact = 0.005 + (remainder / top_book) * 0.01
+
+    # Cap impact — anything above 15% means we're clearly too big; break circuit
+    impact = max(0.0, min(impact, 0.15))
+
+    # For YES side, effective price = market + impact (pay more)
+    # For NO side, effective price of the NO contract = (1 - market) + impact (same direction)
+    # We model market_prob as the side being bought, so always additive.
+    return min(0.99, market_prob + impact)
+
+
+def kelly_bet_size_slippage_aware(
+    bankroll: float,
+    our_prob: float,
+    market_prob: float,
+    volume_24h: float = 1000.0,
+    market_type: str = "CPMM",
+    fraction: float | None = None,
+    max_per_market_pct: float | None = None,
+    max_iterations: int = 6,
+    tolerance_usd: float = 0.25,
+) -> dict:
+    """
+    Solve for a Kelly bet size that accounts for its own price impact.
+
+    Iterates: propose bet → compute effective price → recompute edge →
+    re-size Kelly. Converges when bet size changes < `tolerance_usd`.
+
+    The returned dict exposes the convergence so the scanner/UI can show
+    slippage-adjusted numbers rather than the naive top-of-book figures.
+
+    Args:
+        bankroll: Dollars available
+        our_prob: Our probability estimate (for the side we're buying)
+        market_prob: Top-of-book market price (for the side we're buying)
+        volume_24h: Recent daily volume (depth proxy)
+        market_type: "CPMM" (Manifold) or "CLOB" (Kalshi/Polymarket)
+        fraction, max_per_market_pct: as in kelly_bet_size()
+        max_iterations: Fixed-point iteration cap
+        tolerance_usd: Convergence threshold
+
+    Returns:
+        {
+          "bet_usd":          final dollar bet size,
+          "effective_price":  price we'd actually fill at,
+          "slippage_pct":     (effective - market) / market,
+          "naive_kelly_usd":  what naive Kelly would have said,
+          "edge_post_slip":   edge after accounting for slippage,
+          "converged":        bool,
+          "iterations":       int,
+        }
+    """
+    if bankroll <= 0 or market_prob <= 0 or market_prob >= 1:
+        return {"bet_usd": 0.0, "effective_price": market_prob, "slippage_pct": 0.0,
+                "naive_kelly_usd": 0.0, "edge_post_slip": 0.0,
+                "converged": True, "iterations": 0}
+
+    naive_bet = kelly_bet_size(bankroll, our_prob, market_prob,
+                                fraction=fraction, max_per_market_pct=max_per_market_pct)
+    if naive_bet <= 0:
+        return {"bet_usd": 0.0, "effective_price": market_prob, "slippage_pct": 0.0,
+                "naive_kelly_usd": 0.0, "edge_post_slip": our_prob - market_prob,
+                "converged": True, "iterations": 0}
+
+    bet = naive_bet
+    converged = False
+    effective_price = market_prob
+
+    for i in range(max_iterations):
+        effective_price = estimate_slippage(bet, market_prob, volume_24h, market_type)
+        new_bet = kelly_bet_size(bankroll, our_prob, effective_price,
+                                  fraction=fraction, max_per_market_pct=max_per_market_pct)
+        if new_bet <= 0:
+            bet = 0.0
+            effective_price = market_prob
+            converged = True
+            break
+        if abs(new_bet - bet) < tolerance_usd:
+            bet = new_bet
+            converged = True
+            break
+        bet = new_bet
+    else:
+        # No convergence — be conservative, scale down 20%
+        bet = bet * 0.80
+
+    effective_price = estimate_slippage(bet, market_prob, volume_24h, market_type)
+    slippage_pct = (effective_price - market_prob) / market_prob if market_prob > 0 else 0.0
+    edge_post_slip = our_prob - effective_price
+
+    return {
+        "bet_usd": round(bet, 2),
+        "effective_price": round(effective_price, 4),
+        "slippage_pct": round(slippage_pct, 4),
+        "naive_kelly_usd": round(naive_bet, 2),
+        "edge_post_slip": round(edge_post_slip, 4),
+        "converged": converged,
+        "iterations": i + 1 if converged else max_iterations,
+    }
