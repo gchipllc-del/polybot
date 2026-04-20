@@ -1,0 +1,25 @@
+{
+  "generated_at": "2026-04-20T15:09:22.203352+00:00",
+  "samples_by_category": {
+    "crypto": 263,
+    "other": 1245,
+    "sports": 90,
+    "ai_tech": 83,
+    "geopolitical": 104,
+    "entertainment": 43,
+    "politics": 133,
+    "weather": 23,
+    "economics": 15,
+    "science": 1
+  },
+  "rates_by_category": {
+    "crypto": 0.3992,
+    "other": 0.4763,
+    "sports": 0.3222,
+    "ai_tech": 0.506,
+    "geopolitical": 0.4904,
+    "entertainment": 0.4186,
+    "politics": 0.3985
+  },
+  "total_samples": 2000
+}

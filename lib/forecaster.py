@@ -24,6 +24,7 @@ from pathlib import Path
 import yaml
 
 from lib.audit import log_event
+from lib.base_rates import get_base_rate
 from lib.calibration import brier_score, source_accuracy
 from lib.kelly import expected_value, fractional_kelly, min_edge_for_trade
 from lib.market_client import MarketInfo
@@ -34,23 +35,6 @@ CONFIG_PATH = Path(__file__).parent.parent / "config" / "strategy.yaml"
 def _load_strategy() -> dict:
     with open(CONFIG_PATH, "r") as f:
         return yaml.safe_load(f)
-
-
-# ── Base Rate Priors ──────────────────────────────────────────────
-# Historical resolution rates by category (rough empirical priors).
-# Hermes can update these as we accumulate calibration data.
-BASE_RATE_PRIORS: dict[str, float] = {
-    "politics": 0.50,       # Elections, legislation — roughly 50/50 a priori
-    "economics": 0.50,      # GDP, rate decisions
-    "weather": 0.50,        # Temperature records, storms
-    "crypto": 0.50,         # Price targets, ETF approvals
-    "sports": 0.50,         # Game outcomes (no structural prior)
-    "entertainment": 0.50,  # Awards, viewership
-    "ai_tech": 0.50,        # Launches, benchmarks
-    "geopolitical": 0.40,   # Dramatic events slightly less likely
-    "science": 0.45,        # Breakthrough claims often overstated
-    "other": 0.50,
-}
 
 
 @dataclass
@@ -308,8 +292,10 @@ def estimate_probability(
     }
 
     # ── Step 1: Base Rate Prior ───────────────────────────────────
+    # Empirical rate from lib/base_rates.py (Manifold historical), falling
+    # back to curated static priors when empirical sample is insufficient.
     category = market.category.lower() if market.category else "other"
-    base_rate = BASE_RATE_PRIORS.get(category, 0.50)
+    base_rate = get_base_rate(category)
 
     sources: dict[str, float] = {"base_rate": base_rate}
     chain: list[dict] = [{"step": "base_rate", "value": base_rate, "source": f"category:{category}"}]
