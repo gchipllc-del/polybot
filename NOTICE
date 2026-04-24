@@ -1,0 +1,63 @@
+Polybot - Third-party attributions
+==================================
+
+This project incorporates curated data or design patterns from the following
+third-party works. Code in this repository is original unless otherwise noted;
+these attributions are retained for provenance.
+
+--------------------------------------------------------------------------------
+1. koala73/worldmonitor
+   https://github.com/koala73/worldmonitor
+   (c) 2024-2026 Elie Habib
+   Licensed under GNU AGPL-3.0
+
+   USED FOR:
+       - Curated RSS/Atom feed URL list in lib/news_feeds.py
+       - Source-tiering concept (market-moving wire services ranked first)
+
+   WHAT WE DID NOT COPY:
+       - No worldmonitor source code, parsing logic, UI, or proxy helpers
+       - Feed URLs are factual data (URLs to public third-party feeds) and
+         are not themselves copyrightable
+
+   AGPL-3.0 caveat: because AGPL SS13 imposes network-copyleft on any code
+   linked or served over a network, worldmonitor's *code* cannot be imported
+   into this project without open-sourcing the entire bot. We chose to
+   re-implement any feed-handling logic from scratch rather than vendor
+   their code. Before any COMMERCIAL or HOSTED deployment of polybot,
+   review whether the curated feed list should be replaced with
+   independently sourced URLs, or worldmonitor should be commercially
+   licensed.
+
+--------------------------------------------------------------------------------
+2. Fincept-Corporation/FinceptTerminal
+   https://github.com/Fincept-Corporation/FinceptTerminal
+   Licensed under GNU AGPL-3.0
+
+   USED FOR:
+       - Reference only. Their published roster of free data sources (FRED,
+         IMF, World Bank, AkShare, Polygon, Kraken, etc.) informed
+         polybot's future data-connector shortlist.
+       - No code, no persona prompts, no agent definitions copied.
+
+--------------------------------------------------------------------------------
+3. zilliztech/claude-context
+   https://github.com/zilliztech/claude-context
+   Licensed under Apache-2.0
+
+   USED FOR:
+       - Installed as Claude Code MCP server for semantic code search
+         during development (not vendored -- run as external process).
+       - Concept inspired runtime semantic search for lib/memory_palace.py
+         drawers (we implemented this independently with sqlite-vec +
+         sentence-transformers; no claude-context code).
+
+--------------------------------------------------------------------------------
+4. jxnl/instructor
+   https://github.com/jxnl/instructor
+   Licensed under MIT
+
+   USED FOR:
+       - Structured LLM output (Pydantic validation + auto-retry) in
+         lib/llm_analyst.py, replacing hand-rolled regex parsing of
+         superforecaster responses.

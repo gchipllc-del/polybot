@@ -14,35 +14,106 @@ forecasting:
   smart_money_weight: 0.10      # Tracked whale wallet flow (bounds: 0.05 - 0.25)
   market_consensus_weight: 0.10 # The market price itself (bounds: 0.05 - 0.20)
 
-  # LLM settings
-  llm_model: claude-sonnet-4-6       # Model for market analysis
+  # --- LLM Ensemble (multi-provider) ---
+  # Every provider runs in parallel. Their probability estimates are
+  # aggregated with weighted geomean-log-odds. Cross-model diversity
+  # reduces systematic bias vs. N samples of a single model.
+  #
+  # Each provider is skipped silently if its API key env var is missing,
+  # so you can run with any subset. Set ANTHROPIC_API_KEY, DEEPSEEK_API_KEY,
+  # and/or MOONSHOT_API_KEY to enable.
+  #
+  # Weights are RELATIVE — normalized at aggregation time.
+  # Claude is the best-calibrated out of the box; DeepSeek-R1 adds strong
+  # explicit reasoning at ~1/20th the cost; Kimi K2 covers news-heavy
+  # markets well and serves as a tiebreaker.
+  llm_providers:
+    - name: claude
+      model: claude-sonnet-4-6       # Anthropic — requires ANTHROPIC_API_KEY
+      weight: 0.50
+      samples: 2                     # Two independent Claude samples
+      max_tokens: 2000
+      temperature: 0.7
+      enabled: true
+    - name: deepseek
+      model: deepseek-chat           # or "deepseek-reasoner" for R1 (slower, deeper CoT)
+      weight: 0.30                   # Requires DEEPSEEK_API_KEY
+      samples: 1
+      max_tokens: 2500               # R1 needs headroom for reasoning traces
+      temperature: 0.7
+      enabled: true
+    - name: kimi
+      model: kimi-k2-0905-preview    # Moonshot — requires MOONSHOT_API_KEY
+      weight: 0.20
+      samples: 1
+      max_tokens: 2000
+      temperature: 0.7
+      enabled: true
+
   llm_cache_ttl_minutes: 60          # Cache LLM results for unchanged markets
+
+  # Route LLM analysis through the `instructor` library for pydantic-validated
+  # structured output (auto-retries on bad JSON). Falls back to the legacy
+  # regex parse of raw text if instructor isn't installed OR the structured
+  # call itself fails. Default on; set false to pin to the legacy path.
+  use_instructor: true
+
+  # --- Ensemble-Disagreement Kelly Dampener ---
+  # When the LLM providers (Claude / DeepSeek / Kimi) disagree on a
+  # market, size the Kelly bet down. The ensemble spread (max - min
+  # probability across providers) is a revealed "I don't know" signal
+  # across independent calibrations — it beats any single model's
+  # self-reported confidence number.
+  #
+  # Linear ramp from full Kelly (1.0) at mild_threshold down to `kelly_floor`
+  # at strong_threshold. With defaults:
+  #   spread 0.05  → 1.00  (providers within 5 pts — full Kelly)
+  #   spread 0.10  → 1.00  (at mild threshold)
+  #   spread 0.15  → 0.75  (cut 25%)
+  #   spread 0.20  → 0.50  (at strong threshold — half Kelly)
+  #   spread 0.30+ → 0.50  (clamped at floor)
+  #
+  # The floor prevents dampening from vetoing a bet entirely — that's
+  # the order gate's job. This block is sizing-only.
+  disagreement:
+    enabled: true
+    mild_threshold: 0.10      # Below this, no dampening
+    strong_threshold: 0.20    # At/above this, dampener clamped at floor
+    kelly_floor: 0.5          # Minimum multiplier (half Kelly, floor)
+
+  # --- Legacy single-Claude config (used as fallback if llm_providers is removed) ---
+  llm_model: claude-sonnet-4-6
   max_tokens_per_analysis: 2000
-  # Ensemble — sample N independent reasoning paths, aggregate with
-  # geomean-log-odds. Reduces variance. Trade-off: Nx API cost.
-  # 1 = fast/cheap (dev), 3 = balanced (default), 5 = maximum quality.
   llm_ensemble_samples: 3
-  llm_temperature: 0.7               # Higher = more diverse samples
+  llm_temperature: 0.7
 
 # --- Scoring Thresholds ---
-# Phase 1 (Survival) wants fewer, higher-quality trades. The old 4/9 + 5% edge
-# let marginal candidates through (Starmer NO squeaked in at 5/9 with +8% edge).
-# Survival phase raises bar; Hermes tunes back down once Brier is measured.
+# Phase 1 (Survival) wants fewer, higher-quality trades. Previous 6/9 + 8% edge
+# was still letting medium-conviction + long-dated markets slip through.
+# Survival phase raises the bar further; Hermes tunes back down once Brier
+# is measured over 20+ resolved trades.
 scoring:
-  min_composite_score: 6        # Require 2+ sources agreeing + decent edge [HERMES: 4-8]
-  min_edge: 0.08                # 8% edge survives spread + slippage [HERMES: 0.05 - 0.20]
-  min_confidence: 0.50          # Minimum confidence in our estimate
+  min_composite_score: 7        # Raised 6→7: only high-conviction setups [HERMES: 4-8]
+  min_edge: 0.10                # Raised 0.08→0.10: survives 2% fees + 2% slippage with real margin [HERMES: 0.05 - 0.20]
+  min_confidence: 0.60          # Raised 0.50→0.60: reject "unsure" forecasts
 
 # --- Kelly Criterion Position Sizing ---
-kelly_multiplier: 0.25          # Quarter Kelly — conservative start [HERMES: 0.10 - 0.75]
-max_per_market_pct: 0.15        # Max 15% of bankroll per market [HERMES: 0.05 - 0.20]
+# Sizing tightened for Phase 1 ($50 bankroll). With max_per_market=0.08 we can
+# carry ~12 concurrent $4 positions — a proper portfolio instead of 2 big bets.
+# Hermes can ramp both up once we have 10+ resolved trades with Brier < 0.20.
+kelly_multiplier: 0.20          # Fifth Kelly until calibration proven [HERMES: 0.10 - 0.75]
+max_per_market_pct: 0.08        # Max 8% of bankroll per market [HERMES: 0.05 - 0.20]
 
 # --- Market Preferences ---
 markets:
-  # Resolution date window — prefer markets resolving in this range
+  # Resolution date window — cut long-dated markets hard.
+  # 60+ day bets are dead money: capital locked, little movement, high news
+  # risk. The bot now strongly prefers 7-14 day resolutions and caps hard at 30.
   min_resolution_days: 1         # Don't trade markets resolving today (too volatile)
-  max_resolution_days: 90        # Don't tie up capital for months
-  preferred_resolution_days: 7   # Sweet spot for compounding speed
+  max_resolution_days: 15        # HARD CAP: reject anything beyond 15 days (was 30)
+  preferred_resolution_days: 7   # Score peak — Gaussian penalty outside this (tightened with cap)
+  decay_resolution_days: 7       # Width of the Gaussian — 14d gets ~13% penalty, 15d ~20%
+  resolution_score_weight: 0.15  # How much window-bias shifts composite score (0.0=off, 0.3=heavy)
 
   # Category preferences (can be weighted by Hermes)
   categories:
@@ -74,11 +145,24 @@ mechanical:
 
   # Near-Resolution Harvesting — markets about to resolve with near-certain outcome
   # Practitioners: 5.8% ROI, 100% win rate
+  #
+  # The harvester bypasses the forecasting engine + agent consensus because
+  # the math is transparent — a 95c contract resolving in 4h has ~5% certain
+  # upside. It STILL goes through the order gate (propose → validate →
+  # execute) so circuit breakers + dedup + audit trail apply normally.
+  #
+  # Sizing is fixed-fraction (not Kelly) with two caps:
+  #   max_position_pct      — per harvester position (of bankroll)
+  #   max_total_exposure_pct — across all open harvester positions
+  # These stay UNDER circuit_breakers.max_per_market_pct in settings.yaml
+  # so the breaker never trips on our own sizing — that's the intent.
   near_resolution:
     enabled: true
     max_hours_to_resolution: 24   # Within 24 hours
     min_price: 0.92               # Market must be 92%+ certain
     min_profit_after_fees: 0.005  # At least 0.5% profit after fees
+    max_position_pct: 0.05        # Max 5% of bankroll per harvester position
+    max_total_exposure_pct: 0.20  # Max 20% of bankroll across all harvester positions
 
   # Smart Money Signals — track high-performing wallets as trade signals
   smart_money:
@@ -96,6 +180,10 @@ market_filters:
   max_spread_pct: 0.05            # Tight: wide spreads eat the edge on entry
   max_markets_per_cycle: 20       # Control inference costs
   min_edge_for_conviction: 0.10   # 10%+ edge for conviction bets
+  # --- New defensive filters ---
+  max_positions_same_category: 2  # Prevents 4 simultaneous "election" bets correlating into one loss
+  adverse_selection_edge: 0.40    # Edge > 40% triggers second-pass review (the market is usually right)
+  min_book_depth_usd: 500         # Don't bet into a 3-trader market — slippage eats alpha on exit
 
 # --- Exit Strategy ---
 exits:
@@ -106,6 +194,48 @@ exits:
   price_drift_alert: 0.10        # Alert if market moved 10% against us
   stale_position_hours: 24       # Flag positions with no market activity in 24h
   cooldown_cycles_after_close: 2  # Block re-entry for 2 scan cycles after exiting
+
+  # --- Reforecast-based Exit (Phase B) ---
+  # The static `edge_gone_buffer` compares market drift against the
+  # probability we estimated AT ENTRY. That misses the case where new
+  # information (news, a correlated market moving, base-rate shift) has
+  # invalidated our original forecast even if the market price hasn't
+  # caught up yet. This block re-runs the full forecast pipeline on open
+  # positions and exits when our *current* best estimate says the edge
+  # is gone or flipped against us.
+  #
+  # Cost control: each reforecast burns an LLM+news+Metaculus call, so
+  # the gates below throttle hard. Even with 10 open positions, at a
+  # 30-minute reforecast cadence that's ~20 ensemble calls per hour.
+  reforecast:
+    enabled: true
+    min_age_minutes: 30            # Don't reforecast a position opened <30min ago
+    min_interval_minutes: 30       # Min time between reforecasts on same position
+    min_price_drift: 0.03          # Skip reforecast unless market moved >=3% since entry
+    flipped_threshold: -0.03       # Exit (advisory) if reforecast edge < -3% after fees
+    strong_against_threshold: -0.10 # Exit (immediate) if reforecast edge < -10%
+    llm_enabled: true              # Set false for news+Metaculus-only (cheap) reforecasts
+
+  # --- Auto-Exit Execution ---
+  # Default is SIGNAL-ONLY: the monitor detects, logs, and prints exit signals
+  # but never trades. Operator closes manually. Finance-grade default — keep
+  # human in the loop until the bot has a calibrated track record.
+  #
+  # When enabled, the monitor dispatches on signal.reason (immediate-urgency only):
+  #   resolved                   → resolution_tracker.settle_position (mark + P/L)
+  #   stop_loss                  → client.close_position() at market
+  #   take_profit                → client.close_position() at market
+  #   reforecast_strong_against  → client.close_position() at market
+  # Advisory signals (early_exit, edge_gone, reforecast_edge_gone, price_drift,
+  # stale, market_not_found) are NEVER auto-executed — they're opinions.
+  #
+  # max_per_cycle caps cascading exits — a bad cycle shouldn't dump the book.
+  # min_seconds_between_attempts throttles retries when close_position fails
+  # repeatedly on the same market (don't spam the exchange).
+  auto_exit:
+    enabled: false                 # Off by default — keep human in the loop
+    max_per_cycle: 3               # Max positions closed per monitor cycle
+    min_seconds_between_attempts: 300  # Cool-off per position after a failed close
 
 # --- Growth Mode ($50 → $25k) ---
 growth:

@@ -154,6 +154,18 @@ def add_drawer(drawer: Drawer) -> str:
         with open(fallback_file, "a") as f:
             f.write(json.dumps(asdict(drawer)) + "\n")
 
+    # Mirror into sqlite-vec semantic index if available. No-op when the
+    # deps aren't installed (lib.memory_vec short-circuits). This gives us
+    # a ChromaDB-independent semantic search path alongside the existing one.
+    try:
+        from lib import memory_vec
+        memory_vec.index_drawer(
+            drawer.drawer_id, drawer.content,
+            wing=drawer.wing, hall=drawer.hall, room=drawer.room,
+        )
+    except Exception:
+        pass  # never block writes on vector indexing
+
     return drawer.drawer_id
 
 
@@ -164,41 +176,63 @@ def search_memory(
     room: str | None = None,
     n_results: int = 5,
 ) -> list[dict]:
-    """Semantic search across the palace. Filters by wing/hall/room if provided."""
-    if not HAS_CHROMA:
-        return _search_fallback(query, wing, n_results)
+    """
+    Semantic search across the palace. Filters by wing/hall/room if provided.
 
-    init_palace()
-    client = chromadb.PersistentClient(path=str(PALACE_DIR / "chroma"))
-    collection = client.get_or_create_collection("prediction_drawers")
+    Preference order:
+      1. ChromaDB (if installed and has data)
+      2. sqlite-vec + sentence-transformers (if deps installed)
+      3. JSONL keyword fallback
+    """
+    if HAS_CHROMA:
+        init_palace()
+        client = chromadb.PersistentClient(path=str(PALACE_DIR / "chroma"))
+        collection = client.get_or_create_collection("prediction_drawers")
 
-    where_filter = {}
-    if wing:
-        where_filter["wing"] = wing
-    if hall:
-        where_filter["hall"] = hall
-    if room:
-        where_filter["room"] = room
+        where_filter = {}
+        if wing:
+            where_filter["wing"] = wing
+        if hall:
+            where_filter["hall"] = hall
+        if room:
+            where_filter["room"] = room
 
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results,
-        where=where_filter if where_filter else None,
-    )
+        results = collection.query(
+            query_texts=[query],
+            n_results=n_results,
+            where=where_filter if where_filter else None,
+        )
 
-    memories = []
-    if results and results["documents"]:
-        for i, doc in enumerate(results["documents"][0]):
-            meta = results["metadatas"][0][i] if results["metadatas"] else {}
-            dist = results["distances"][0][i] if results["distances"] else 0
-            memories.append({
-                "content": doc,
-                "metadata": meta,
-                "relevance": round(1 - dist, 4),
-                "drawer_id": results["ids"][0][i] if results["ids"] else "",
-            })
+        memories = []
+        if results and results["documents"]:
+            for i, doc in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i] if results["metadatas"] else {}
+                dist = results["distances"][0][i] if results["distances"] else 0
+                memories.append({
+                    "content": doc,
+                    "metadata": meta,
+                    "relevance": round(1 - dist, 4),
+                    "drawer_id": results["ids"][0][i] if results["ids"] else "",
+                })
+        if memories:
+            return memories
 
-    return memories
+    # Second preference: sqlite-vec semantic search (lighter than ChromaDB).
+    try:
+        from lib import memory_vec
+        if memory_vec.semantic_search_available():
+            hits = memory_vec.search(query, k=n_results, wing=wing)
+            if hits:
+                return [{
+                    "content": h["text"],
+                    "metadata": {"wing": h["wing"], "hall": h["hall"], "room": h["room"]},
+                    "relevance": h["similarity"],
+                    "drawer_id": h["drawer_id"],
+                } for h in hits]
+    except Exception:
+        pass
+
+    return _search_fallback(query, wing, n_results)
 
 
 def _search_fallback(query: str, wing: str | None, n: int) -> list[dict]:
