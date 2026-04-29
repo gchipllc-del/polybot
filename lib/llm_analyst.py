@@ -146,8 +146,19 @@ _RATE_LIMIT_KEYS = {
     "deepseek": "deepseek_calls_per_minute",
     "kimi":     "moonshot_calls_per_minute",
     "moonshot": "moonshot_calls_per_minute",
+    # Free-tier providers (added 2026-04-25)
+    "gemini":   "gemini_calls_per_minute",
+    "groq":     "groq_calls_per_minute",
+    "cerebras": "cerebras_calls_per_minute",
+    "ollama":   "ollama_calls_per_minute",
 }
-_DEFAULT_RPM = {"claude": 30, "deepseek": 30, "kimi": 30, "moonshot": 30}
+# Conservative defaults that respect documented free-tier ceilings.
+# Gemini Pro free tier is the tightest (5 RPM); Flash gets 15. Pick 5
+# to be safe across model variants. Override in settings.yaml rate_limits.
+_DEFAULT_RPM = {
+    "claude": 30, "deepseek": 30, "kimi": 30, "moonshot": 30,
+    "gemini": 5, "groq": 30, "cerebras": 30, "ollama": 60,
+}
 
 
 def _get_limiter(provider_name: str) -> _RateLimiter:
@@ -375,8 +386,13 @@ class _OpenAICompatibleClient(_ProviderClient):
         raise RuntimeError(f"{self.name} API failed: {last_error}")
 
 
-# Provider registry — what endpoint + env var each provider uses
+# Provider registry — what endpoint + env var each provider uses.
+#
+# Paid providers (claude/deepseek/kimi) require funded accounts. The free
+# providers below (gemini/groq/cerebras) are real production-grade APIs with
+# generous free tiers — use them when paid accounts are out of credits.
 _PROVIDER_REGISTRY = {
+    # ─── Paid providers (require funded accounts) ────────────────────────
     "claude": {
         "kind": "anthropic",
         "env": "ANTHROPIC_API_KEY",
@@ -387,7 +403,7 @@ _PROVIDER_REGISTRY = {
         "kind": "openai",
         "env": "DEEPSEEK_API_KEY",
         "base_url": "https://api.deepseek.com/v1",
-        "default_model": "deepseek-chat",
+        "default_model": "deepseek-v4-flash",
     },
     "kimi": {
         "kind": "openai",
@@ -400,6 +416,41 @@ _PROVIDER_REGISTRY = {
         "env": "MOONSHOT_API_KEY",
         "base_url": "https://api.moonshot.ai/v1",
         "default_model": "kimi-k2-0905-preview",
+    },
+    # ─── Free-tier providers (added 2026-04-25) ──────────────────────────
+    # Google AI Studio — best free reasoning model. Get key at
+    # https://aistudio.google.com/app/apikey . Free tier is ~5 RPM Pro,
+    # ~15 RPM Flash, and a few hundred requests/day.
+    "gemini": {
+        "kind": "openai",
+        "env": "GOOGLE_API_KEY",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "default_model": "gemini-2.5-pro",
+    },
+    # Groq — hosted DeepSeek-R1-distill-llama-70b and Llama 3.3 70B at
+    # ~500 tok/s. Free tier 30 RPM. Get key at https://console.groq.com/keys
+    "groq": {
+        "kind": "openai",
+        "env": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "deepseek-r1-distill-llama-70b",
+    },
+    # Cerebras — Llama 3.3 70B and Qwen3-32B at ~2000 tok/s. Free tier 30
+    # RPM. Get key at https://cloud.cerebras.ai/
+    "cerebras": {
+        "kind": "openai",
+        "env": "CEREBRAS_API_KEY",
+        "base_url": "https://api.cerebras.ai/v1",
+        "default_model": "llama-3.3-70b",
+    },
+    # Ollama — local inference, no real key needed. Run `ollama serve` then
+    # `ollama pull deepseek-r1:32b`. Set OLLAMA_API_KEY=ollama (any string)
+    # to enable in the ensemble — the OpenAI SDK rejects an empty key.
+    "ollama": {
+        "kind": "openai",
+        "env": "OLLAMA_API_KEY",
+        "base_url": "http://localhost:11434/v1",
+        "default_model": "deepseek-r1:32b",
     },
 }
 
@@ -553,10 +604,66 @@ def _sanitize(s: str, max_len: int) -> str:
     return s[:max_len]
 
 
+# ─── Persona Swarm (T1.2, 2026-04-26) ───────────────────────────────
+# Adapted from PolySwarm's 50-persona swarm (Barot & Borkhatariya 2026).
+# Each persona reframes the same superforecaster protocol through a
+# different reasoning lens. The samples loop rotates through these so
+# the ensemble gets cross-cognitive-style diversity at zero extra
+# API cost — different prompts → different reasoning paths even from
+# the same model.
+PERSONAS = {
+    "analyst": (
+        "You are a careful, methodical financial analyst. Weight base rates "
+        "heavily; demand specific evidence to deviate from outside-view priors. "
+        "Penalize over-confidence."
+    ),
+    "economist": (
+        "You are a macro/political economist. Frame this question through "
+        "incentive structures, institutional behavior, and equilibrium "
+        "reasoning. Ask: who benefits from each outcome?"
+    ),
+    "contrarian": (
+        "You are a contrarian. Begin by assuming the crowd-implied "
+        "probability is wrong, then steelman the opposite view aggressively. "
+        "Only converge on the consensus if the steelman fails."
+    ),
+    "quant": (
+        "You are a rigorous quantitative analyst. Translate every qualitative "
+        "claim into a base rate or expected value. Prefer ranges over point "
+        "estimates; discount narratives that lack numerical support."
+    ),
+    "historian": (
+        "You are a historian of similar events. Anchor your forecast on "
+        "structurally analogous past episodes. Identify what makes THIS "
+        "case more or less typical of the reference class."
+    ),
+}
+_PERSONA_ORDER = list(PERSONAS.keys())
+
+
+def _persona_prefix(persona_name: str) -> str:
+    """Return a persona instruction block prepended to the standard prompt."""
+    if persona_name not in PERSONAS:
+        return ""
+    return (
+        f"## PERSONA — {persona_name.upper()}\n"
+        f"{PERSONAS[persona_name]}\n\n"
+        "(After applying this perspective, follow the 7-step Superforecaster "
+        "protocol below. The persona shapes your reasoning, not the output "
+        "format.)\n\n"
+    )
+
+
 def _build_prompt(question: str, description: str, market_price: float,
                   category: str, resolution_date: str,
-                  news_context: str = "") -> str:
-    """Build the superforecaster prompt with sanitized interpolations."""
+                  news_context: str = "",
+                  persona: str | None = None) -> str:
+    """Build the superforecaster prompt with sanitized interpolations.
+
+    If `persona` is provided, prepend the persona instruction block so
+    the same model produces a meaningfully different reasoning path on
+    the next call. Defaults to no prefix (legacy behaviour).
+    """
     if news_context:
         news_block = (
             "\n## RECENT NEWS CONTEXT (external, may be incomplete — reason with "
@@ -567,7 +674,7 @@ def _build_prompt(question: str, description: str, market_price: float,
     else:
         news_block = ""
 
-    return SUPERFORECASTER_PROMPT.format(
+    body = SUPERFORECASTER_PROMPT.format(
         question=_sanitize(question, 500),
         description=_sanitize(description, 2000),
         market_price=max(0.01, min(market_price, 0.99)),
@@ -575,6 +682,7 @@ def _build_prompt(question: str, description: str, market_price: float,
         resolution_date=_sanitize(resolution_date, 50),
         news_context=news_block,
     )
+    return _persona_prefix(persona) + body if persona else body
 
 
 def _summarize_news_for_context(news_result) -> str:
@@ -830,6 +938,20 @@ def analyze_market(
     if news_result is not None:
         news_context_str = _summarize_news_for_context(news_result)
 
+    # Persona swarm: pre-build one prompt per persona so the sample loop
+    # can rotate through them without rebuilding interpolations each call.
+    persona_swarm_enabled = fc.get("persona_swarm_enabled", True)
+    if persona_swarm_enabled:
+        persona_prompts = {
+            persona: _build_prompt(
+                question, description, market_price, category, resolution_date,
+                news_context=news_context_str, persona=persona,
+            )
+            for persona in _PERSONA_ORDER
+        }
+    else:
+        persona_prompts = {}
+    # Default prompt (no persona) for legacy / disabled-swarm paths
     prompt = _build_prompt(
         question, description, market_price, category, resolution_date,
         news_context=news_context_str,
@@ -854,10 +976,22 @@ def analyze_market(
 
     use_inst = _use_instructor(fc)
 
+    # Global persona index — rotates across the entire (provider × sample)
+    # space so we get even coverage of all 5 personas across the ensemble
+    persona_idx = 0
+
     for spec, client in providers:
         per_sample_weight = spec.weight / max(spec.samples, 1)
         provider_samples = 0
         for i in range(spec.samples):
+            # Pick this call's persona + prompt
+            current_persona = None
+            current_prompt = prompt
+            if persona_swarm_enabled and persona_prompts:
+                current_persona = _PERSONA_ORDER[persona_idx % len(_PERSONA_ORDER)]
+                current_prompt = persona_prompts[current_persona]
+                persona_idx += 1
+
             try:
                 _get_limiter(spec.name).wait()
                 log_event("llm_analyst", "api_call_start", {
@@ -865,6 +999,7 @@ def analyze_market(
                     "provider": spec.name,
                     "model": spec.model,
                     "sample_index": i,
+                    "persona": current_persona,
                     "instructor": use_inst,
                 }, result="pending")
 
@@ -875,7 +1010,7 @@ def analyze_market(
                     # to the legacy raw-text + regex parse so we never regress.
                     try:
                         obj = client.complete_structured(
-                            prompt, spec.model, spec.max_tokens,
+                            current_prompt, spec.model, spec.max_tokens,
                             spec.temperature, _SuperforecastSchema,
                         )
                         parsed = {
@@ -901,11 +1036,15 @@ def analyze_market(
 
                 if parsed is None:
                     raw = client.complete(
-                        prompt, spec.model, spec.max_tokens, spec.temperature
+                        current_prompt, spec.model, spec.max_tokens, spec.temperature
                     )
                     parsed = _parse_response(raw)
 
                 raw_texts.append(raw)
+                # Tag the sample with its persona so calibration analysis can
+                # later separate which personas produce better-calibrated forecasts
+                if isinstance(parsed, dict):
+                    parsed.setdefault("persona", current_persona)
                 samples.append(parsed)
                 sample_weights.append(per_sample_weight)
                 sample_sources.append(spec.name)

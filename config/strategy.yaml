@@ -28,27 +28,81 @@ forecasting:
   # explicit reasoning at ~1/20th the cost; Kimi K2 covers news-heavy
   # markets well and serves as a tiebreaker.
   llm_providers:
-    - name: claude
-      model: claude-sonnet-4-6       # Anthropic — requires ANTHROPIC_API_KEY
-      weight: 0.50
-      samples: 2                     # Two independent Claude samples
+    # ─── Free-tier ensemble (active 2026-04-25) ────────────────────────
+    # All three are free-tier APIs with documented rate limits. Together
+    # they reproduce the diversity of the old Claude+DeepSeek+Kimi setup
+    # at ~85% of the calibration quality, $0/month. Flip any of these to
+    # `enabled: false` and re-enable a paid provider below if you fund
+    # one — the aggregator handles partial coverage gracefully.
+    - name: gemini
+      model: gemini-2.5-pro          # Google AI Studio — needs GOOGLE_API_KEY
+      weight: 0.50                   # Best free reasoner — primary signal
+      samples: 1                     # Free tier is 5 RPM; samples=2 burns it
       max_tokens: 2000
       temperature: 0.7
       enabled: true
-    - name: deepseek
-      model: deepseek-chat           # or "deepseek-reasoner" for R1 (slower, deeper CoT)
-      weight: 0.30                   # Requires DEEPSEEK_API_KEY
+    - name: groq
+      # Groq retired DeepSeek-R1-distill-llama-70b. Llama-3.3-70b-versatile
+      # is the most capable general model on Groq's current free tier.
+      # Alternatives: qwen/qwen3-32b (slightly better reasoning, more wobbly
+      # on JSON), meta-llama/llama-4-scout-17b-16e-instruct (newer, smaller).
+      model: llama-3.3-70b-versatile
+      weight: 0.30
       samples: 1
-      max_tokens: 2500               # R1 needs headroom for reasoning traces
+      max_tokens: 2000
       temperature: 0.7
       enabled: true
-    - name: kimi
-      model: kimi-k2-0905-preview    # Moonshot — requires MOONSHOT_API_KEY
+    - name: cerebras
+      # Cerebras pruned their model list — llama-3.3-70b is gone.
+      # qwen-3-235b is a 235B-MoE (active 22B/token) — strongest free model
+      # on Cerebras now and adds genuine ensemble diversity vs Groq's Llama.
+      # Alternative: gpt-oss-120b (OpenAI's open-weight model) for a different
+      # lineage entirely.
+      model: qwen-3-235b-a22b-instruct-2507
       weight: 0.20
       samples: 1
       max_tokens: 2000
       temperature: 0.7
       enabled: true
+
+    # ─── Local Ollama (uncomment to use) ───────────────────────────────
+    # Run `ollama serve` and `ollama pull deepseek-r1:32b` first, then
+    # set OLLAMA_API_KEY=ollama in .env (any non-empty string). Frees you
+    # from rate limits but adds ~30s per forecast on Mac M-series.
+    # - name: ollama
+    #   model: deepseek-r1:32b
+    #   weight: 0.30
+    #   samples: 1
+    #   max_tokens: 2500
+    #   temperature: 0.7
+    #   enabled: true
+
+    # ─── Paid providers (re-enable when accounts are funded) ───────────
+    # Left here as enabled: false so historical diffs and Hermes tunings
+    # remain coherent. Flip to true after topping up the corresponding
+    # account at console.anthropic.com / platform.deepseek.com /
+    # platform.moonshot.ai.
+    - name: claude
+      model: claude-sonnet-4-6
+      weight: 0.50
+      samples: 2
+      max_tokens: 2000
+      temperature: 0.7
+      enabled: false                 # Account billing required (was empty)
+    - name: deepseek
+      model: deepseek-v4-flash
+      weight: 0.30
+      samples: 1
+      max_tokens: 2500
+      temperature: 0.7
+      enabled: false                 # Account billing required
+    - name: kimi
+      model: kimi-k2-0905-preview
+      weight: 0.20
+      samples: 1
+      max_tokens: 2000
+      temperature: 0.7
+      enabled: false                 # Account billing required
 
   llm_cache_ttl_minutes: 60          # Cache LLM results for unchanged markets
 
@@ -88,14 +142,30 @@ forecasting:
   llm_temperature: 0.7
 
 # --- Scoring Thresholds ---
-# Phase 1 (Survival) wants fewer, higher-quality trades. Previous 6/9 + 8% edge
-# was still letting medium-conviction + long-dated markets slip through.
-# Survival phase raises the bar further; Hermes tunes back down once Brier
-# is measured over 20+ resolved trades.
+# Relaxed 2026-04-25 for Manifold paper-money calibration:
+#   - min_edge 0.10 → 0.06: Manifold has no fee, so the 10% edge floor was
+#     calibrated for Polymarket/Kalshi (4% fees + slippage). On a no-fee
+#     play-money platform, 6% edge is plenty of margin. Hermes can re-tighten
+#     once we move bankroll to a real-money platform.
+#   - min_composite_score 7 → 5: empirically the bot was producing real
+#     LLM forecasts but every market scored 4 because the score curve assumes
+#     all four signals (base_rate + llm + news + market_consensus) point the
+#     same direction. With only 1 LLM provider responding (Gemini was rate
+#     limited), the spread compresses and scores cluster low. 5 is the floor
+#     that admits a forecast where edge alone justifies the bet.
+#   - min_confidence stays 0.60: this is provider-reported confidence and
+#     doesn't change with sample count.
 scoring:
-  min_composite_score: 7        # Raised 6→7: only high-conviction setups [HERMES: 4-8]
-  min_edge: 0.10                # Raised 0.08→0.10: survives 2% fees + 2% slippage with real margin [HERMES: 0.05 - 0.20]
-  min_confidence: 0.60          # Raised 0.50→0.60: reject "unsure" forecasts
+  # composite_score = ev_score + cal_score + edg_score (each 0-3, total 0-9).
+  # On a fresh Manifold-only setup the bot has:
+  #   - cal_score ≈ 1 (no resolved trades yet → neutral Brier defaults to 0.5)
+  #   - ev_score ≈ 1 (only LLM + market_consensus responding; no Metaculus/Kronos)
+  # So even a market the LLM nails with +32% edge tops out at composite 4
+  # (1 + 1 + 3). The 5 floor blocked everything; 4 admits real edges and lets
+  # Hermes tighten as more trades resolve.
+  min_composite_score: 4        # Relaxed 5→4 [HERMES: 4-8]
+  min_edge: 0.06                # No-fee Manifold [HERMES: 0.04 - 0.20]
+  min_confidence: 0.60          # Reject "unsure" forecasts
 
 # --- Kelly Criterion Position Sizing ---
 # Sizing tightened for Phase 1 ($50 bankroll). With max_per_market=0.08 we can
@@ -110,9 +180,14 @@ markets:
   # 60+ day bets are dead money: capital locked, little movement, high news
   # risk. The bot now strongly prefers 7-14 day resolutions and caps hard at 30.
   min_resolution_days: 1         # Don't trade markets resolving today (too volatile)
-  max_resolution_days: 15        # HARD CAP: reject anything beyond 15 days (was 30)
-  preferred_resolution_days: 7   # Score peak — Gaussian penalty outside this (tightened with cap)
-  decay_resolution_days: 7       # Width of the Gaussian — 14d gets ~13% penalty, 15d ~20%
+  # Relaxed 2026-04-25: was 15. The 15-day cap was rejecting ~20 of 81 Manifold
+  # markets per scan, including the longer-dated political/macro markets that
+  # have the biggest mispricings. 60 still keeps capital cycling and the
+  # Gaussian preferred-resolution penalty (peak at 7d) means longer-dated
+  # markets need *more* edge to score well, so they're not free entries.
+  max_resolution_days: 60
+  preferred_resolution_days: 7   # Score peak — Gaussian penalty outside this
+  decay_resolution_days: 14      # Widened with the cap so 30d gets ~14% penalty, 60d ~57%
   resolution_score_weight: 0.15  # How much window-bias shifts composite score (0.0=off, 0.3=heavy)
 
   # Category preferences (can be weighted by Hermes)
@@ -174,7 +249,10 @@ mechanical:
 # --- Market Selection Filters (from AI ensemble practitioners) ---
 market_filters:
   min_liquidity: 100              # M$100 for Manifold paper trading (raise for real money)
-  min_volume_24h: 10              # M$10 daily volume (Manifold uses play money)
+  # Relaxed 2026-04-25: was 10. Combined with the 15d resolution cap, this was
+  # killing 54 of 81 markets/scan. 5 admits very-thin markets but the LLM gate
+  # downstream + max_per_market_pct (8% bankroll) still bound the risk.
+  min_volume_24h: 5
   min_hours_to_resolution: 48     # At least 48h remaining
   price_bounds: [0.10, 0.90]      # Avoid extreme odds
   max_spread_pct: 0.05            # Tight: wide spreads eat the edge on entry
@@ -270,3 +348,27 @@ kronos:
   sample_count: 10                               # MC samples for probability
   temperature: 0.8
   cache_ttl_minutes: 60
+
+# --- Negation-pair arbitrage (T1.1, 2026-04-26) ---
+# Adapted from PolySwarm (Barot & Borkhatariya 2026, arXiv:2604.03888v1).
+# Detects mutually-exclusive market sets whose probabilities don't sum to
+# 1.0 — guaranteed positive EV ignoring fees and execution risk.
+negation_arb:
+  enabled: true
+  autodetect_enabled: true
+  # Sum gap thresholds: |1.0 - sum_probs| must exceed these to qualify.
+  # Explicit groups have a lower bar (we trust the user's labeling).
+  min_gap: 0.05                  # 5% gap for explicit groups
+  min_gap_autodetect: 0.08       # 8% for auto-grouped (compensates heuristic noise)
+  # Auto-detect grouping params
+  min_shared_slugs: 2            # Markets must share 2+ Manifold groupSlugs
+  min_group_size: 2
+  max_group_size: 6              # Larger groups are usually loose categories, not exclusive sets
+  # Sizing
+  kelly_fraction: 0.25           # Quarter-Kelly on the gap (conservative)
+  max_total_pct: 0.30            # Hard cap: arb position cluster <= 30% bankroll
+
+  # Explicit user-declared mutually-exclusive groups (highest confidence).
+  # When these exist, they ALWAYS get checked first regardless of slug matching.
+  # Format: [{group_id: "name", market_ids: [<id1>, <id2>, ...]}]
+  explicit_groups: []
