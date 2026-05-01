@@ -114,13 +114,13 @@ def get_portfolio_summary() -> dict:
 
         mode = settings.get("mode", "manifold")
         growth = strategy.get("growth", {})
-        phase = growth.get("phase", 1)
         phase_labels = {
             1: "Survival ($50-$200)",
             2: "Acceleration ($200-$2k)",
             3: "Scaling ($2k-$10k)",
             4: "Preservation ($10k-$25k)",
         }
+        # Phase computed below once we know live bankroll (auto-graduation).
 
         # Calculate total bankroll from platform balances
         total_balance = 0.0
@@ -165,6 +165,12 @@ def get_portfolio_summary() -> dict:
         # Lifetime ("total dollar gains from inception") = realized + unrealized.
         lifetime_pnl = realized_pnl + unrealized_pnl
 
+        # Phase auto-graduates with bankroll (Wave 2 polybot follow-up).
+        from lib.phase import effective_phase, effective_max_positions
+        live_bankroll = total_balance + position_value
+        phase = effective_phase(live_bankroll, strategy)
+        phase_max_positions = effective_max_positions(live_bankroll, strategy)
+
         return {
             "total_bankroll": round(total_balance + position_value, 2),
             "cash_balance": round(total_balance, 2),
@@ -177,6 +183,7 @@ def get_portfolio_summary() -> dict:
             "lifetime_pnl": round(lifetime_pnl, 2),
             "mode": mode,
             "phase": phase,
+            "phase_max_positions": phase_max_positions,
             "phase_label": phase_labels.get(phase, ""),
             "kelly_multiplier": strategy.get("kelly_multiplier", 0.25),
             "min_edge": strategy.get("scoring", {}).get("min_edge", 0.08),

@@ -119,6 +119,44 @@ class TestResolvedTradeFilter:
         with pytest.raises(CircuitBreakerTripped):
             check_daily_loss(-60.0, bankroll=100.0, settings=settings)
 
+    def test_effective_phase_graduates_with_bankroll(self):
+        from lib.phase import effective_phase, effective_max_positions
+
+        strategy = {
+            "growth": {
+                "phase_thresholds": [
+                    {"phase": 1, "min_bankroll": 0},
+                    {"phase": 2, "min_bankroll": 200},
+                    {"phase": 3, "min_bankroll": 2000},
+                    {"phase": 4, "min_bankroll": 10000},
+                ],
+                "phase_caps": {1: 3, 2: 8, 3: 15, 4: 25},
+            }
+        }
+        # Phase boundaries
+        assert effective_phase(0, strategy) == 1
+        assert effective_phase(199.99, strategy) == 1
+        assert effective_phase(200, strategy) == 2
+        assert effective_phase(739, strategy) == 2          # current bankroll
+        assert effective_phase(2000, strategy) == 3
+        assert effective_phase(10000, strategy) == 4
+        assert effective_phase(50000, strategy) == 4
+
+        # Cap follows phase
+        assert effective_max_positions(150, strategy) == 3
+        assert effective_max_positions(739, strategy) == 8
+        assert effective_max_positions(5000, strategy) == 15
+        assert effective_max_positions(20000, strategy) == 25
+
+    def test_effective_phase_falls_back_to_legacy_setting(self):
+        """If phase_thresholds is missing, the legacy growth.phase int wins."""
+        from lib.phase import effective_phase, effective_max_positions
+
+        strategy = {"growth": {"phase": 3, "max_concurrent_positions": 12}}
+        assert effective_phase(50, strategy) == 3
+        # No phase_caps → falls through to max_concurrent_positions
+        assert effective_max_positions(50, strategy) == 12
+
     def test_won_must_be_bool_not_truthy(self, isolated_history):
         """`won: 1` (int) or `won: "true"` (str) should NOT count — only
         explicit booleans, since settle_position writes Python bool."""

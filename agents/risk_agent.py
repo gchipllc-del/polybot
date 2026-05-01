@@ -23,6 +23,7 @@ from pathlib import Path
 
 from lib.audit import log_event
 from lib.kelly import min_edge_for_trade
+from lib.phase import effective_phase, effective_max_positions
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"
@@ -100,17 +101,22 @@ class RiskAgent:
             )
 
         # ── 2. Position count ─────────────────────────────────────
-        max_positions = growth.get("max_concurrent_positions", 3)
+        # Phase + cap auto-graduate off live bankroll. Falls back to the
+        # legacy growth.max_concurrent_positions / growth.phase if
+        # phase_thresholds is not configured.
+        active_phase = effective_phase(bankroll, strategy)
+        max_positions = effective_max_positions(bankroll, strategy)
         current_count = len(open_positions)
 
         checks["position_count"] = {
             "current": current_count,
             "max": max_positions,
+            "phase": active_phase,
             "pass": current_count < max_positions,
         }
         if not checks["position_count"]["pass"]:
             veto_reasons.append(
-                f"At {current_count} positions (max {max_positions} in phase {growth.get('phase', 1)})"
+                f"At {current_count} positions (max {max_positions} in phase {active_phase})"
             )
 
         # ── 3. Correlation exposure ───────────────────────────────
