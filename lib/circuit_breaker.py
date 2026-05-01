@@ -51,19 +51,47 @@ def check_paper_mode(settings: dict | None = None):
         )
 
 
-def check_daily_loss(current_daily_pnl: float, settings: dict | None = None) -> bool:
-    """Check if daily loss limit has been breached."""
+def check_daily_loss(
+    current_daily_pnl: float,
+    bankroll: float = 0.0,
+    settings: dict | None = None,
+) -> bool:
+    """Check if daily loss limit has been breached.
+
+    Two layers — whichever is more lenient (further from zero) wins:
+      - max_daily_loss      : hard dollar floor (kicks in regardless of bankroll)
+      - max_daily_loss_pct  : bankroll-relative ceiling (auto-scales as
+                              bankroll grows, prevents stale absolute floors
+                              like the 2026-04-30 polybot bite where -$10 was
+                              still configured at a $739 bankroll)
+    The dollar floor is preserved so a small or recovering bankroll still
+    has a hard absolute stop.
+    """
     if settings is None:
         settings = _load_settings()
-    max_loss = settings["circuit_breakers"]["max_daily_loss"]
 
-    if current_daily_pnl <= max_loss:
+    cb = settings["circuit_breakers"]
+    max_loss_dollar = float(cb["max_daily_loss"])
+    max_loss_pct = cb.get("max_daily_loss_pct")
+
+    effective_limit = max_loss_dollar
+    if max_loss_pct is not None and bankroll > 0:
+        pct_limit = float(max_loss_pct) * bankroll
+        # Both are negative; "more lenient" = lower (more negative) value.
+        effective_limit = min(max_loss_dollar, pct_limit)
+
+    if current_daily_pnl <= effective_limit:
         log_event("circuit_breaker", "daily_loss_breached", {
             "current_pnl": current_daily_pnl,
-            "max_loss": max_loss,
+            "max_loss_dollar": max_loss_dollar,
+            "max_loss_pct": max_loss_pct,
+            "bankroll": bankroll,
+            "effective_limit": effective_limit,
         }, result="blocked")
         raise CircuitBreakerTripped(
-            f"HALTED: Daily P/L ${current_daily_pnl:.2f} breached limit ${max_loss}"
+            f"HALTED: Daily P/L ${current_daily_pnl:.2f} breached limit "
+            f"${effective_limit:.2f} (dollar floor ${max_loss_dollar}, "
+            f"pct {max_loss_pct} of bankroll ${bankroll:.2f})"
         )
     return True
 
@@ -252,7 +280,7 @@ def run_all_checks(
 
     # Core safety
     check_paper_mode(settings)
-    check_daily_loss(current_daily_pnl, settings)
+    check_daily_loss(current_daily_pnl, bankroll, settings)
     check_position_size(order_value, bankroll, settings)
     check_open_positions(current_open_positions, settings)
     check_quantity_per_order(quantity, settings)

@@ -317,9 +317,13 @@ exits:
 
 # --- Growth Mode ($50 → $25k) ---
 growth:
-  phase: 1                      # 1: Survival ($50-$200), 2: Acceleration ($200-$2k),
+  # Phase manually graduates as bankroll crosses thresholds. 2026-04-30: bumped
+  # 1 → 2 because bankroll reached $739 (well past the $200 Phase 1 ceiling).
+  # Auto-graduation off bankroll is a Wave 2 audit item (see traderbot's plan).
+  phase: 2                      # 1: Survival ($50-$200), 2: Acceleration ($200-$2k),
                                 # 3: Scaling ($2k-$10k), 4: Preservation ($10k-$25k)
-  max_concurrent_positions: 3   # Phase 1: concentrated, high-conviction
+  max_concurrent_positions: 8   # Phase 2: more concurrent slots so winners aren't blocked
+                                # while existing 7-position book resolves
   compound_all_profits: true    # Never withdraw during growth
   prefer_fast_resolution: true  # Bias toward markets resolving in 1-14 days
 

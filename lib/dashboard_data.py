@@ -150,11 +150,20 @@ def get_portfolio_summary() -> dict:
         if bs >= 0:
             cal_grade = "Excellent" if bs < 0.10 else "Good" if bs < 0.15 else "Fair" if bs < 0.20 else "Poor"
 
-        # Daily P/L from open positions
-        daily_pl = sum(
+        # Unrealized P/L on currently-open positions (mark-to-market vs entry).
+        # Despite the historical "daily_pl" name kept for backwards compat, this
+        # is NOT today's P/L — it's the floating gain/loss on open inventory.
+        unrealized_pnl = sum(
             (p.get("current_price", 0) - p.get("entry_price", 0)) * p.get("quantity", 0)
             for p in open_positions
         )
+
+        # Realized P/L: net_profit summed across every settled trade since inception.
+        trade_history = _load_json(TRADE_HISTORY_PATH, [])
+        realized_pnl = sum(t.get("net_profit", 0) for t in trade_history)
+
+        # Lifetime ("total dollar gains from inception") = realized + unrealized.
+        lifetime_pnl = realized_pnl + unrealized_pnl
 
         return {
             "total_bankroll": round(total_balance + position_value, 2),
@@ -162,7 +171,10 @@ def get_portfolio_summary() -> dict:
             "position_value": round(position_value, 2),
             "platform_balances": platform_balances,
             "open_positions": len(open_positions),
-            "daily_pl": round(daily_pl, 2),
+            "daily_pl": round(unrealized_pnl, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "realized_pnl": round(realized_pnl, 2),
+            "lifetime_pnl": round(lifetime_pnl, 2),
             "mode": mode,
             "phase": phase,
             "phase_label": phase_labels.get(phase, ""),
@@ -283,8 +295,14 @@ def get_calibration_data() -> dict:
 
 
 def get_trade_history() -> dict:
-    """Completed trades with cumulative P/L series for charting."""
-    history = _load_json(TRADE_HISTORY_PATH, [])
+    """Completed trades with cumulative P/L series for charting.
+
+    Filters to entries that have actually resolved (`won` set to a bool by
+    settle_position) — open positions written to history mid-flight would
+    otherwise corrupt win-rate and tank the displayed total_pnl.
+    """
+    history_all = _load_json(TRADE_HISTORY_PATH, [])
+    history = [t for t in history_all if isinstance(t.get("won"), bool)]
     if not history:
         return {"trades": [], "total_pnl": 0, "win_rate": 0, "total_trades": 0, "pl_series": []}
 
@@ -368,12 +386,22 @@ def get_circuit_breaker_status() -> dict:
             pct = pos_val / bankroll if bankroll > 0 else 0
             max_pos_pct = max(max_pos_pct, pct)
 
+        # Daily-loss effective limit: same two-layer logic as check_daily_loss.
+        # Whichever is more lenient (further from zero) wins; keeps the
+        # absolute floor in play if bankroll falls below the pct threshold.
+        max_loss_dollar = float(cb.get("max_daily_loss", -10))
+        max_loss_pct = cb.get("max_daily_loss_pct")
+        if max_loss_pct is not None and bankroll > 0:
+            effective_loss_limit = min(max_loss_dollar, float(max_loss_pct) * bankroll)
+        else:
+            effective_loss_limit = max_loss_dollar
         breakers = {
             "daily_loss": {
-                "limit": cb.get("max_daily_loss", -10),
+                "limit": round(effective_loss_limit, 2),
                 "current": round(daily_pl, 2),
-                "pct_used": round(abs(daily_pl / cb.get("max_daily_loss", -10)), 2) if daily_pl < 0 else 0,
-                "tripped": daily_pl <= cb.get("max_daily_loss", -10),
+                "pct_used": round(abs(daily_pl / effective_loss_limit), 2)
+                            if daily_pl < 0 and effective_loss_limit < 0 else 0,
+                "tripped": daily_pl <= effective_loss_limit,
             },
             "position_size": {
                 "limit": cb.get("max_per_market_pct", 0.15),

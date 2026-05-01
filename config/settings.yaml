@@ -17,10 +17,19 @@ platforms:
 
 # --- Circuit Breakers ---
 circuit_breakers:
-  max_daily_loss: -10             # Halt at -$10 (20% of $50 bankroll)
+  # Two layers — whichever is more lenient wins:
+  #   max_daily_loss      : hard dollar floor (last-resort absolute stop)
+  #   max_daily_loss_pct  : bankroll-relative ceiling (auto-scales)
+  # Original -10 floor was calibrated to a $50 bankroll. Bankroll grew to
+  # ~$739 by 2026-04-30 and the absolute floor was tripping false-positive
+  # daily; pct rule now does the live work (10% of $739 ≈ -$73.90).
+  max_daily_loss: -50             # absolute floor — never let losses exceed this
+  max_daily_loss_pct: -0.10       # bankroll-relative ceiling (10%)
   max_per_market_pct: 0.15        # 15% of bankroll per market
   max_category_pct: 0.40          # 40% in any single category
-  max_open_positions: 10          # Max concurrent positions
+  # NOTE: position-count gate of record is strategy.yaml `growth.max_concurrent_positions`
+  # (phase-scoped). This breaker is a defense-in-depth absolute ceiling.
+  max_open_positions: 10          # Max concurrent positions (defense-in-depth)
   max_quantity_per_order: 5000    # Max contracts per order (Manifold uses mana, not contracts)
   cooldown_after_loss_minutes: 30 # Cooldown after losing trade
   min_market_volume: 10           # Min 24h volume (Manifold play money; raise for real platforms)
@@ -43,7 +52,10 @@ rate_limits:
   kalshi_calls_per_minute: 60
   polymarket_calls_per_minute: 120
   manifold_calls_per_minute: 120
-  anthropic_calls_per_minute: 30
+  # --- LLM providers (one bucket per provider) ---
+  anthropic_calls_per_minute: 30     # Claude
+  deepseek_calls_per_minute: 30      # DeepSeek (usually generous limits)
+  moonshot_calls_per_minute: 30      # Kimi / Moonshot
   backoff_base_seconds: 2
   backoff_max_seconds: 60
 

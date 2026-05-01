@@ -282,6 +282,18 @@ def check_all_resolutions() -> list[dict]:
     return settlements
 
 
+def _is_resolved_trade(t: dict) -> bool:
+    """A trade counts toward win-rate / P&L only if it actually resolved.
+
+    Discriminator: `won` is explicitly set to a bool by settle_position().
+    Open positions that were appended to history mid-flight (or other
+    intermediate records) lack this field and would otherwise corrupt
+    the win-rate denominator (this was the bite at finding #2 of polybot
+    audit on 2026-04-30 — open trades were inflating the loss count).
+    """
+    return isinstance(t.get("won"), bool)
+
+
 def get_performance_summary() -> dict:
     """
     Calculate overall trading performance from trade history.
@@ -289,7 +301,8 @@ def get_performance_summary() -> dict:
     Returns:
         Win rate, total P/L, average profit/loss, best/worst trades, etc.
     """
-    history = _load_trade_history()
+    history_all = _load_trade_history()
+    history = [t for t in history_all if _is_resolved_trade(t)]
     if not history:
         return {
             "total_trades": 0,
