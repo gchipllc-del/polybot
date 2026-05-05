@@ -11,6 +11,25 @@ Wraps the Kronos foundation model (pretrained on 45+ global exchanges) to:
 The model runs zero-shot — no fine-tuning needed. It understands candlestick
 patterns from pretraining on massive cross-market data.
 
+Hyperparameters follow the original Kronos paper recommendations (Shi et al.,
+"Kronos: A Foundation Model for the Language of Financial Markets",
+arXiv:2508.02739, Table 6):
+
+    Task                              T     top-p   N samples
+    -----------------------------------------------------------
+    Price Series Forecasting          0.6   0.90    10
+    Return Forecasting                0.6   0.90    10
+    Realized Volatility Forecasting   0.9   0.90     1
+    Synthetic K-line Generation       1.0   0.95     1
+    Investment Simulation             0.6   0.90    10
+
+Model sizes (Kronos paper Table 1):
+    Kronos-small:  24.7M params  (8 layers,  d_model=512,  8 heads)
+    Kronos-base:  102.3M params (12 layers, d_model=832, 16 heads) [default]
+    Kronos-large: 499.2M params (18 layers, d_model=1664, 32 heads)
+
+Max context: 512 tokens (paper hard limit).
+
 Security:
     - Model weights downloaded from Hugging Face (verified checksums)
     - All yfinance data treated as untrusted (validated on ingest)
@@ -38,7 +57,76 @@ CACHE_DIR = DATA_DIR / "kronos_cache"
 
 # Singleton model — loaded once, reused across calls
 _predictor = None
+_loaded_model_name: str | None = None  # Track which model is loaded
 _model_lock = False  # Simple single-process guard
+
+# ── Paper-Recommended Inference Presets (arXiv:2508.02739 Table 6) ──
+PAPER_PRESETS = {
+    "forecast": {"T": 0.6, "top_p": 0.90, "sample_count": 10},
+    "return":   {"T": 0.6, "top_p": 0.90, "sample_count": 10},
+    "volatility": {"T": 0.9, "top_p": 0.90, "sample_count": 1},
+    "generate": {"T": 1.0, "top_p": 0.95, "sample_count": 1},
+    "simulate": {"T": 0.6, "top_p": 0.90, "sample_count": 10},
+}
+
+# ── Model Size Selector (paper Table 1) ──────────────────────────
+KRONOS_MODELS = {
+    "small": {
+        "model": "NeoQuasar/Kronos-small",
+        "tokenizer": "NeoQuasar/Kronos-Tokenizer-base",
+        "params_m": 24.7,
+    },
+    "base": {
+        "model": "NeoQuasar/Kronos-base",
+        "tokenizer": "NeoQuasar/Kronos-Tokenizer-base",
+        "params_m": 102.3,
+    },
+    "large": {
+        "model": "NeoQuasar/Kronos-large",
+        "tokenizer": "NeoQuasar/Kronos-Tokenizer-base",
+        "params_m": 499.2,
+    },
+}
+
+DEFAULT_MODEL_SIZE = "base"
+MAX_CONTEXT_LEN = 512  # Paper hard limit
+
+# ── Paper-Specified Look-back × Forecast-Horizon (Table 8) ───────
+PAPER_WINDOWS = {
+    "5m":   (480, 96),
+    "10m":  (240, 48),
+    "15m":  (160, 32),
+    "20m":  (120, 24),
+    "40m":  (90,  24),
+    "1h":   (80,  12),
+    "2h":   (60,  12),
+    "4h":   (90,  18),
+    "1d":   (40,  12),
+}
+
+
+def paper_window(interval: str) -> tuple[int, int]:
+    """Look up paper-recommended (lookback, forecast_horizon). Falls back to 1d."""
+    return PAPER_WINDOWS.get(interval, PAPER_WINDOWS["1d"])
+
+
+def _resolve_model(
+    model_size: str | None = None,
+    model_name: str | None = None,
+) -> tuple[str, str]:
+    """
+    Resolve a friendly size name into (model_name, tokenizer_name).
+    Precedence: explicit model_name > model_size > default ("base").
+    """
+    if model_name:
+        return model_name, "NeoQuasar/Kronos-Tokenizer-base"
+    size = (model_size or DEFAULT_MODEL_SIZE).lower()
+    if size not in KRONOS_MODELS:
+        raise ValueError(
+            f"Unknown model_size '{size}'. Valid: {list(KRONOS_MODELS.keys())}"
+        )
+    cfg = KRONOS_MODELS[size]
+    return cfg["model"], cfg["tokenizer"]
 
 
 # ── Data Structures ──────────────────────────────────────────────
@@ -80,17 +168,20 @@ class PriceProbability:
 def _load_predictor(
     model_name: str = "NeoQuasar/Kronos-base",
     tokenizer_name: str = "NeoQuasar/Kronos-Tokenizer-base",
-    max_context: int = 512,
+    max_context: int = MAX_CONTEXT_LEN,
 ):
     """
     Load Kronos model + tokenizer. Downloads from HuggingFace on first call.
 
     Uses singleton pattern — heavy models should only load once per process.
+    If a different model_name is requested than what's currently loaded, the
+    old predictor is released and a new one is loaded (size switching).
     Returns the KronosPredictor instance.
     """
-    global _predictor, _model_lock
+    global _predictor, _loaded_model_name, _model_lock
 
-    if _predictor is not None:
+    # Fast path: same model already loaded
+    if _predictor is not None and _loaded_model_name == model_name:
         return _predictor
 
     if _model_lock:
@@ -102,9 +193,19 @@ def _load_predictor(
 
         from lib.kronos import Kronos, KronosPredictor, KronosTokenizer
 
+        # Release previous model if we're switching sizes
+        if _predictor is not None and _loaded_model_name != model_name:
+            log_event("kronos", "model_switching", {
+                "from": _loaded_model_name,
+                "to": model_name,
+            })
+            _predictor = None
+            _loaded_model_name = None
+
         log_event("kronos", "model_loading", {
             "model": model_name,
             "tokenizer": tokenizer_name,
+            "max_context": max_context,
         })
 
         tokenizer = KronosTokenizer.from_pretrained(tokenizer_name)
@@ -119,22 +220,28 @@ def _load_predictor(
         else:
             device = "cpu"
 
+        # Clamp max_context to paper limit (512)
+        max_context = min(max(16, int(max_context)), MAX_CONTEXT_LEN)
+
         _predictor = KronosPredictor(
             model=model,
             tokenizer=tokenizer,
             device=device,
             max_context=max_context,
         )
+        _loaded_model_name = model_name
 
         log_event("kronos", "model_loaded", {
             "model": model_name,
             "device": device,
+            "max_context": max_context,
         }, result="success")
 
         return _predictor
 
     except Exception as e:
         log_event("kronos", "model_load_failed", {
+            "model": model_name,
             "error": str(e)[:200],
         }, result="failed")
         raise
@@ -217,9 +324,16 @@ def _fetch_ohlcv(
 
 # ── Cache ────────────────────────────────────────────────────────
 
-def _cache_key(ticker: str, interval: str, pred_bars: int) -> str:
+def _cache_key(
+    ticker: str,
+    interval: str,
+    pred_bars: int,
+    model_name: str = "NeoQuasar/Kronos-base",
+) -> str:
+    """Cache key includes model_name so size switches don't hit stale cache."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    raw = f"{ticker}:{interval}:{pred_bars}:{today}"
+    short_model = model_name.rsplit("-", 1)[-1].lower() if "-" in model_name else model_name
+    raw = f"{ticker}:{interval}:{pred_bars}:{today}:{short_model}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -256,9 +370,12 @@ def predict_price(
     pred_bars: int = 30,
     interval: str = "1d",
     lookback: int = 400,
-    sample_count: int = 5,
-    temperature: float = 0.8,
-    model_name: str = "NeoQuasar/Kronos-base",
+    sample_count: int = 10,              # Paper Table 6: N=10 for forecasting
+    temperature: float = 0.6,            # Paper Table 6: T=0.6 for price forecasting
+    top_p: float = 0.90,                 # Paper Table 6: top_p=0.90
+    model_name: str | None = None,
+    model_size: str | None = None,       # "small" | "base" | "large"
+    use_paper_window: bool = False,      # Snap lookback+pred_bars to paper Table 8
 ) -> KronosForecast:
     """
     Predict future prices for a ticker using Kronos.
@@ -266,20 +383,36 @@ def predict_price(
     This is the main function for raw price forecasting. For prediction
     market probability estimates, use `price_to_probability()` instead.
 
+    Hyperparameter defaults follow the Kronos paper (arXiv:2508.02739,
+    Table 6) for "Price Series Forecasting": T=0.6, top_p=0.90, N=10.
+
     Args:
         ticker: Stock/crypto symbol (e.g., "AAPL", "BTC-USD", "ETH-USD")
         pred_bars: Number of future bars to predict
         interval: Bar interval ("1d" for daily, "1h" for hourly)
         lookback: Number of historical bars to feed the model (max 512)
-        sample_count: Number of inference samples to average (more = smoother)
-        temperature: Sampling temperature (lower = more conservative)
-        model_name: HuggingFace model ID
+        sample_count: Number of inference samples (paper default: 10)
+        temperature: Sampling temperature (paper default: 0.6)
+        top_p: Nucleus sampling cutoff (paper default: 0.90)
+        model_name: Explicit HuggingFace model ID (overrides model_size)
+        model_size: "small" (fast, 24.7M), "base" (default, 102.3M), "large" (499.2M)
+        use_paper_window: Snap lookback/pred_bars to paper Table 8 window
 
     Returns:
         KronosForecast with predicted OHLCV and direction.
     """
-    # Check cache
-    key = _cache_key(ticker, interval, pred_bars)
+    # Resolve model + optionally snap to paper window
+    model_name, tokenizer_name = _resolve_model(model_size=model_size, model_name=model_name)
+    if use_paper_window:
+        pw_lookback, pw_horizon = paper_window(interval)
+        lookback = pw_lookback
+        pred_bars = pw_horizon
+        log_event("kronos", "using_paper_window", {
+            "interval": interval, "lookback": lookback, "pred_bars": pred_bars,
+        })
+
+    # Check cache (key includes model_name so sizes don't collide)
+    key = _cache_key(ticker, interval, pred_bars, model_name=model_name)
     cached = _cache_get(key, ttl_minutes=60)
     if cached and "predicted_close" in cached:
         return KronosForecast(
@@ -304,13 +437,14 @@ def predict_price(
     period = period_map.get(interval, "1y")
     data = _fetch_ohlcv(ticker, period=period, interval=interval)
 
-    # Clamp lookback to available data and model max context
-    lookback = min(lookback, len(data), 512)
+    # Clamp lookback to available data and model max context (paper: 512)
+    lookback = min(lookback, len(data), MAX_CONTEXT_LEN)
     data = data.tail(lookback + pred_bars)  # Extra for timestamp generation
 
     # Prepare input
     hist = data.head(lookback)
     x_df = hist[["open", "high", "low", "close", "volume"]].copy()
+    # Paper Section 2: Kronos expects 6-dim OHLCVA. "Amount" = price × volume.
     x_df["amount"] = x_df["volume"] * x_df["close"]
 
     x_timestamp = pd.DatetimeIndex(hist.index)
@@ -327,7 +461,12 @@ def predict_price(
     y_timestamp = pd.date_range(start=last_ts + freq, periods=pred_bars, freq=freq)
 
     # Load model and predict
-    predictor = _load_predictor(model_name=model_name)
+    predictor = _load_predictor(model_name=model_name, tokenizer_name=tokenizer_name)
+
+    # Clamp to safe ranges
+    temperature = max(0.1, min(float(temperature), 2.0))
+    top_p = max(0.1, min(float(top_p), 1.0))
+    sample_count = max(1, min(int(sample_count), 50))
 
     pred_df = predictor.predict(
         df=x_df,
@@ -335,7 +474,7 @@ def predict_price(
         y_timestamp=y_timestamp,
         pred_len=pred_bars,
         T=temperature,
-        top_p=0.9,
+        top_p=top_p,
         sample_count=sample_count,
         verbose=False,
     )
@@ -423,8 +562,12 @@ def price_to_probability(
     direction: str = "above",
     horizon_bars: int = 30,
     interval: str = "1d",
-    sample_count: int = 10,
-    model_name: str = "NeoQuasar/Kronos-base",
+    sample_count: int = 10,              # Paper Table 6: N=10 for forecasting
+    temperature: float = 0.6,            # Paper Table 6: T=0.6 for price forecasting
+    top_p: float = 0.90,                 # Paper Table 6: top_p=0.90
+    model_name: str | None = None,
+    model_size: str | None = None,
+    use_paper_window: bool = False,
 ) -> PriceProbability:
     """
     Estimate the probability that a price will be above/below a target.
@@ -439,14 +582,20 @@ def price_to_probability(
     Uses multi-sample Monte Carlo: runs Kronos multiple times with
     different sampling paths, counts what fraction cross the target.
 
+    Hyperparameter defaults follow Kronos paper Table 6 for price
+    forecasting: T=0.6, top_p=0.90, N=10.
+
     Args:
         ticker: Stock/crypto symbol
         target_price: The price threshold
         direction: "above" or "below"
         horizon_bars: How many bars into the future
         interval: Bar interval
-        sample_count: Number of independent Kronos samples (more = better probability estimate)
-        model_name: HuggingFace model ID
+        sample_count: Number of independent Kronos paths (paper: 10)
+        temperature: Sampling temperature (paper: 0.6)
+        top_p: Nucleus sampling cutoff (paper: 0.90)
+        model_name / model_size: See _resolve_model
+        use_paper_window: Snap to paper Table 8 window
 
     Returns:
         PriceProbability with the estimated probability.
@@ -454,19 +603,33 @@ def price_to_probability(
     if direction not in ("above", "below"):
         raise ValueError(f"direction must be 'above' or 'below', got '{direction}'")
 
+    # Resolve model
+    model_name, tokenizer_name = _resolve_model(model_size=model_size, model_name=model_name)
+    if use_paper_window:
+        pw_lookback, pw_horizon = paper_window(interval)
+        horizon_bars = pw_horizon
+        _requested_lookback = pw_lookback
+    else:
+        _requested_lookback = 400
+
+    # Clamp to safe ranges
+    temperature = max(0.1, min(float(temperature), 2.0))
+    top_p = max(0.1, min(float(top_p), 1.0))
+    sample_count = max(1, min(int(sample_count), 50))
+
     # Run multiple independent forecasts
     # Each with sample_count=1 so we get independent paths
     crosses = 0
     all_finals = []
 
-    predictor = _load_predictor(model_name=model_name)
+    predictor = _load_predictor(model_name=model_name, tokenizer_name=tokenizer_name)
 
     # Fetch data once
     period_map = {"1d": "2y", "1h": "60d", "5m": "7d"}
     period = period_map.get(interval, "1y")
     data = _fetch_ohlcv(ticker, period=period, interval=interval)
 
-    lookback = min(400, len(data), 512)
+    lookback = min(_requested_lookback, len(data), MAX_CONTEXT_LEN)
     hist = data.tail(lookback)
 
     x_df = hist[["open", "high", "low", "close", "volume"]].copy()
@@ -490,9 +653,9 @@ def price_to_probability(
                 x_timestamp=x_timestamp,
                 y_timestamp=y_timestamp,
                 pred_len=horizon_bars,
-                T=0.9,  # Slight temperature for diversity
-                top_p=0.92,
-                sample_count=1,
+                T=temperature,
+                top_p=top_p,
+                sample_count=1,     # 1 per loop = independent MC path
                 verbose=False,
             )
 
@@ -589,6 +752,181 @@ def price_to_probability(
     }, result="success")
 
     return result
+
+
+# ── Volatility Forecasting (Kronos Paper's Strongest Task) ───────
+# The Kronos paper reports realized-volatility MAE of 0.037 vs 0.066 for the
+# best baseline — ~44% reduction. For prediction markets on volatility
+# (VIX >X, BTC IV >Y, etc.), this is a direct alpha source.
+
+@dataclass
+class VolatilityForecast:
+    """Output of a Kronos realized-volatility prediction."""
+    ticker: str
+    interval: str
+    horizon_bars: int
+    current_price: float
+    realized_vol_annualized: float
+    realized_vol_period: float
+    historical_vol_annualized: float
+    vol_regime: str                    # "low", "normal", "elevated", "extreme"
+    confidence: float
+
+
+def predict_volatility(
+    ticker: str,
+    horizon_bars: int = 30,
+    interval: str = "1d",
+    lookback: int = 400,
+    temperature: float = 0.9,            # Paper Table 6: T=0.9 for volatility
+    top_p: float = 0.90,                 # Paper Table 6: top_p=0.90
+    sample_count: int = 1,               # Paper Table 6: N=1 for volatility
+    model_name: str | None = None,
+    model_size: str | None = None,
+    use_paper_window: bool = False,
+) -> VolatilityForecast:
+    """
+    Predict realized volatility over a horizon using Kronos.
+
+    Kronos's strongest task per the paper (arXiv:2508.02739 Fig 1):
+    volatility MAE 0.037 vs 0.066 best baseline (~44% reduction).
+
+    Paper Table 6 hyperparameters: T=0.9, top_p=0.90, N=1.
+    """
+    model_name, tokenizer_name = _resolve_model(model_size=model_size, model_name=model_name)
+
+    if use_paper_window:
+        pw_lookback, pw_horizon = paper_window(interval)
+        lookback = pw_lookback
+        horizon_bars = pw_horizon
+
+    period_map = {"1d": "2y", "1h": "60d", "5m": "7d"}
+    period = period_map.get(interval, "1y")
+    data = _fetch_ohlcv(ticker, period=period, interval=interval)
+
+    lookback = min(lookback, len(data), MAX_CONTEXT_LEN)
+    hist = data.tail(lookback)
+
+    x_df = hist[["open", "high", "low", "close", "volume"]].copy()
+    x_df["amount"] = x_df["volume"] * x_df["close"]
+    x_timestamp = pd.DatetimeIndex(hist.index)
+
+    if interval == "1d":
+        freq = pd.tseries.offsets.BDay(1)
+        bars_per_year = 252
+    elif interval == "1h":
+        freq = pd.tseries.offsets.Hour(1)
+        bars_per_year = 252 * 6.5
+    else:
+        freq = pd.tseries.offsets.Minute(5)
+        bars_per_year = 252 * 78
+
+    last_ts = x_timestamp[-1]
+    y_timestamp = pd.date_range(start=last_ts + freq, periods=horizon_bars, freq=freq)
+
+    temperature = max(0.1, min(float(temperature), 2.0))
+    top_p = max(0.1, min(float(top_p), 1.0))
+    sample_count = max(1, min(int(sample_count), 20))
+
+    predictor = _load_predictor(model_name=model_name, tokenizer_name=tokenizer_name)
+
+    try:
+        pred_df = predictor.predict(
+            df=x_df,
+            x_timestamp=x_timestamp,
+            y_timestamp=y_timestamp,
+            pred_len=horizon_bars,
+            T=temperature,
+            top_p=top_p,
+            sample_count=sample_count,
+            verbose=False,
+        )
+    except Exception as e:
+        log_event("kronos", "volatility_failed", {
+            "ticker": ticker, "error": str(e)[:200],
+        }, result="failed")
+        raise
+
+    pred_close = pred_df["close"].values.astype(float)
+    if len(pred_close) < 2:
+        raise RuntimeError(f"Insufficient prediction bars for {ticker}: {len(pred_close)}")
+    log_returns = np.diff(np.log(np.clip(pred_close, 1e-9, None)))
+    period_std = float(np.std(log_returns, ddof=1)) if len(log_returns) > 1 else 0.0
+    annualized = period_std * (bars_per_year ** 0.5)
+    period_vol = period_std * (len(log_returns) ** 0.5)
+
+    hist_close = hist["close"].values.astype(float)
+    hist_log_returns = np.diff(np.log(np.clip(hist_close, 1e-9, None)))
+    hist_std = float(np.std(hist_log_returns, ddof=1)) if len(hist_log_returns) > 1 else 0.0
+    hist_annualized = hist_std * (bars_per_year ** 0.5)
+
+    if annualized < 0.15:
+        regime = "low"
+    elif annualized < 0.35:
+        regime = "normal"
+    elif annualized < 0.60:
+        regime = "elevated"
+    else:
+        regime = "extreme"
+
+    if hist_annualized > 0.001:
+        divergence = abs(annualized - hist_annualized) / hist_annualized
+        confidence = max(0.2, min(1.0 - divergence * 0.5, 0.95))
+    else:
+        confidence = 0.5
+
+    current_price = float(hist["close"].iloc[-1])
+
+    result = VolatilityForecast(
+        ticker=ticker,
+        interval=interval,
+        horizon_bars=horizon_bars,
+        current_price=round(current_price, 4),
+        realized_vol_annualized=round(annualized, 4),
+        realized_vol_period=round(period_vol, 4),
+        historical_vol_annualized=round(hist_annualized, 4),
+        vol_regime=regime,
+        confidence=round(confidence, 4),
+    )
+
+    log_event("kronos", "volatility_computed", {
+        "ticker": ticker,
+        "horizon_bars": horizon_bars,
+        "ann_vol": result.realized_vol_annualized,
+        "hist_vol": result.historical_vol_annualized,
+        "regime": regime,
+    }, result="success")
+
+    return result
+
+
+def predict_with_preset(
+    ticker: str,
+    task: str,
+    pred_bars: int = 30,
+    interval: str = "1d",
+    lookback: int = 400,
+    model_size: str | None = None,
+    model_name: str | None = None,
+    use_paper_window: bool = True,
+) -> KronosForecast | VolatilityForecast:
+    """Shortcut applying paper Table 6 hyperparameters for a given task."""
+    task = task.lower()
+    if task not in PAPER_PRESETS:
+        raise ValueError(f"Unknown task '{task}'. Valid: {list(PAPER_PRESETS.keys())}")
+    preset = PAPER_PRESETS[task]
+
+    if task == "volatility":
+        return predict_volatility(
+            ticker=ticker, horizon_bars=pred_bars, interval=interval, lookback=lookback,
+            temperature=preset["T"], top_p=preset["top_p"], sample_count=preset["sample_count"],
+            model_name=model_name, model_size=model_size, use_paper_window=use_paper_window,
+        )
+    return predict_price(
+        ticker=ticker, pred_bars=pred_bars, interval=interval, lookback=lookback,
+        sample_count=preset["sample_count"], temperature=preset["T"], top_p=preset["top_p"],
+        model_name=model_name, model_size=model_size, use_paper_window=use_paper_window,
+    )
 
 
 # ── Market Question Parser ───────────────────────────────────────
@@ -783,4 +1121,22 @@ def print_probability_report(result: PriceProbability):
         print(f"  Direction:      {f.direction.upper()}")
         print(f"  Range:          ${f.pred_low_watermark:,.2f} — ${f.pred_high_watermark:,.2f}")
 
+    print("=" * 60)
+
+
+def print_volatility_report(result: VolatilityForecast):
+    """Print a formatted Kronos volatility forecast to terminal."""
+    print("=" * 60)
+    print(f"  KRONOS VOLATILITY — {result.ticker} ({result.interval})")
+    print("=" * 60)
+    print(f"  Current Price:       ${result.current_price:,.2f}")
+    print(f"  Horizon:             {result.horizon_bars} bars")
+    print(f"  Predicted Ann Vol:   {result.realized_vol_annualized:.1%}")
+    print(f"  Predicted Period:    {result.realized_vol_period:.1%}")
+    print(f"  Historical Ann Vol:  {result.historical_vol_annualized:.1%}")
+    delta = result.realized_vol_annualized - result.historical_vol_annualized
+    delta_pct = (delta / result.historical_vol_annualized * 100) if result.historical_vol_annualized > 0 else 0
+    print(f"  Change vs History:   {delta:+.1%} ({delta_pct:+.0f}% relative)")
+    print(f"  Regime:              {result.vol_regime.upper()}")
+    print(f"  Confidence:          {result.confidence:.0%}")
     print("=" * 60)
