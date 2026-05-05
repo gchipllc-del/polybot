@@ -3,12 +3,15 @@ Polybot — Prediction Market Trading Bot
 CLI entry point. Every command routes through here.
 
 Usage:
-    python main.py trade             # FULL PIPELINE: scan → consensus → execute
-    python main.py trade --dry-run   # Same pipeline, but don't place orders
-    python main.py scan              # Scan markets, score candidates (no execution)
-    python main.py monitor           # Start continuous position monitoring
-    python main.py forecast <id>     # Run forecaster on a specific market
-    python main.py arb               # Cross-platform arbitrage scan
+    python main.py trade                    # FULL PIPELINE: harvester → scan → consensus → execute
+    python main.py trade --dry-run          # Same pipeline, but don't place orders
+    python main.py trade --skip-harvester   # Skip the mechanical harvester, conviction only
+    python main.py scan                     # Scan markets, score candidates (no execution)
+    python main.py monitor                  # Start continuous position monitoring
+    python main.py forecast <id>            # Run forecaster on a specific market
+    python main.py arb                      # Cross-platform arbitrage REPORT (read-only)
+    python main.py harvest                  # Mechanical near-resolution harvester only
+    python main.py harvest --dry-run        # Report what harvester would buy
     python main.py kill [reason]     # Emergency kill switch
     python main.py status            # Current positions, bankroll, calibration
     python main.py calibrate         # Print calibration report
@@ -33,8 +36,11 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-# Load .env before anything touches os.environ
-load_dotenv(Path(__file__).parent / ".env")
+# Load .env before anything touches os.environ.
+# override=True is critical because some parent shells (notably Claude Code)
+# pre-set ANTHROPIC_API_KEY to an empty string, which would otherwise beat
+# the real value we put in .env under dotenv's default override=False.
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
@@ -128,22 +134,33 @@ def _get_bankroll(clients) -> float:
     return bankroll if bankroll > 0 else 50.0
 
 
-def cmd_trade(dry_run: bool = False):
+def cmd_trade(dry_run: bool = False, skip_harvester: bool = False):
     """
-    Full trade pipeline: scan → consensus → order gate → execute.
+    Full trade pipeline: harvester → scan → consensus → order gate → execute.
 
-    This is the ONLY path to placing orders. Every trade must pass:
+    Per strategy.yaml priority order:
+        Mechanical harvesters (cheap, near-certain) run BEFORE conviction
+        bets (expensive to forecast, uncertain) so harvester positions
+        claim open-position slots first.
+
+    Every conviction trade must pass:
         1. Market scanner scoring (evidence + calibration + edge)
         2. 3-agent consensus (strategy → risk → compliance)
         3. Order gate 3-step pipeline (propose → validate → execute)
 
+    Harvester trades bypass the forecasting engine + consensus (see
+    `lib.harvester` docstring) but DO go through the order gate.
+
     Args:
         dry_run: If True, run everything except actual order execution.
+        skip_harvester: If True, skip the near-resolution harvester and run
+            only the conviction-bet side of the pipeline.
     """
     import os
 
     from agents.consensus import print_consensus_result, seek_consensus
     from lib.audit import log_event
+    from lib.harvester import harvest_near_resolution, print_harvester_summary
     from lib.market_client import get_active_clients
     from lib.market_scanner import get_top_candidates, print_scan_report, scan_all_markets
     from lib.order_gate import OrderIntent, step1_propose, step2_validate, step3_execute
@@ -151,6 +168,7 @@ def cmd_trade(dry_run: bool = False):
     log_event("trade", "trade_cycle_started", {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "dry_run": dry_run,
+        "skip_harvester": skip_harvester,
     })
 
     settings = _load_settings()
@@ -169,7 +187,37 @@ def cmd_trade(dry_run: bool = False):
     print(f"  Bankroll: ${bankroll:,.2f} across {len(clients)} platform(s)")
     print()
 
-    # ── Step 1: Scan ──────────────────────────────────────────────
+    # ── Phase 0: Near-resolution harvester ────────────────────────
+    # Mechanical trades first. Positions opened here count toward the
+    # conviction scan's open-position budget, as intended.
+    positions = _load_positions()
+    open_positions = [p for p in positions if p.get("status") == "open"]
+    daily_pnl = sum(p.get("unrealized_pnl", 0) for p in open_positions)
+
+    if not skip_harvester:
+        print(f"{'='*60}")
+        print(f"  NEAR-RESOLUTION HARVESTER")
+        print(f"{'='*60}")
+        harvest = harvest_near_resolution(
+            clients=clients,
+            bankroll=bankroll,
+            strategy=strategy,
+            positions=positions,  # mutated in-place on execute
+            client_map=client_map,
+            current_daily_pnl=daily_pnl,
+            dry_run=dry_run,
+        )
+        print_harvester_summary(harvest)
+        # Persist any positions opened by the harvester before the
+        # conviction scan runs, so a mid-cycle crash doesn't lose them.
+        if harvest.get("executed", 0) > 0 and not dry_run:
+            _save_positions(positions)
+            # Refresh derived values for the consensus loop below.
+            open_positions = [p for p in positions if p.get("status") == "open"]
+            daily_pnl = sum(p.get("unrealized_pnl", 0) for p in open_positions)
+
+    # ── Phase 1: Forecasting scan ─────────────────────────────────
+    print()
     llm_enabled = bool(os.environ.get("ANTHROPIC_API_KEY"))
     if not llm_enabled:
         print("  (LLM analysis disabled — set ANTHROPIC_API_KEY to enable)")
@@ -183,19 +231,14 @@ def cmd_trade(dry_run: bool = False):
 
     top = get_top_candidates(candidates)
     if not top:
-        print("\nNo trades meet criteria this cycle. Standing by.")
+        print("\nNo conviction trades meet criteria this cycle. Standing by.")
         log_event("trade", "no_opportunities", {}, result="skipped")
         return
 
-    # ── Step 2: Consensus + Execute for each candidate ────────────
+    # ── Phase 2: Consensus + Execute for each candidate ───────────
     print(f"\n{'='*60}")
     print(f"  AGENT CONSENSUS + EXECUTION")
     print(f"{'='*60}")
-
-    # Load current positions for context
-    positions = _load_positions()
-    open_positions = [p for p in positions if p.get("status") == "open"]
-    daily_pnl = sum(p.get("unrealized_pnl", 0) for p in open_positions)
 
     executed = 0
     vetoed = 0
@@ -486,6 +529,55 @@ def cmd_arb():
 
     print("\n(Cross-platform price arb coming in Phase 5)")
     print("=" * 60)
+
+
+def cmd_harvest(dry_run: bool = False):
+    """
+    Run ONLY the near-resolution harvester (no forecasting, no consensus).
+
+    Lightweight CLI for the mechanical strategy — good for cron or
+    anytime you want to sweep residual discounts without running the
+    full, LLM-heavy conviction pipeline.
+    """
+    from lib.audit import log_event
+    from lib.harvester import harvest_near_resolution, print_harvester_summary
+    from lib.market_client import get_active_clients
+
+    log_event("harvest", "cmd_started", {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dry_run": dry_run,
+    })
+
+    strategy = _load_strategy()
+    clients = get_active_clients()
+    if not clients:
+        print("No active platform clients. Check config/settings.yaml")
+        return
+
+    bankroll = _get_bankroll(clients)
+    client_map = {c.platform_name: c for c in clients}
+    positions = _load_positions()
+    open_positions = [p for p in positions if p.get("status") == "open"]
+    daily_pnl = sum(p.get("unrealized_pnl", 0) for p in open_positions)
+
+    print(f"{'[DRY RUN] ' if dry_run else ''}Near-resolution harvester standalone")
+    print(f"  Bankroll: ${bankroll:,.2f} across {len(clients)} platform(s)")
+    print()
+
+    summary = harvest_near_resolution(
+        clients=clients,
+        bankroll=bankroll,
+        strategy=strategy,
+        positions=positions,
+        client_map=client_map,
+        current_daily_pnl=daily_pnl,
+        dry_run=dry_run,
+    )
+    print_harvester_summary(summary)
+
+    if summary.get("executed", 0) > 0 and not dry_run:
+        _save_positions(positions)
+        print(f"\n  Persisted {summary['executed']} new harvester position(s).")
 
 
 def cmd_kill(reason: str = "manual_cli"):
@@ -793,7 +885,8 @@ def main():
 
     if command == "trade":
         dry_run = "--dry-run" in sys.argv
-        cmd_trade(dry_run=dry_run)
+        skip_harvester = "--skip-harvester" in sys.argv
+        cmd_trade(dry_run=dry_run, skip_harvester=skip_harvester)
     elif command == "scan":
         cmd_scan()
     elif command == "monitor":
@@ -805,6 +898,9 @@ def main():
         cmd_forecast(sys.argv[2])
     elif command == "arb":
         cmd_arb()
+    elif command == "harvest":
+        dry_run = "--dry-run" in sys.argv
+        cmd_harvest(dry_run=dry_run)
     elif command == "kill":
         reason = sys.argv[2] if len(sys.argv) > 2 else "manual_cli"
         cmd_kill(reason)
