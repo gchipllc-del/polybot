@@ -278,3 +278,154 @@ def print_calibration_report():
             print(f"  {source:20s}: Brier={data['brier']:.4f}  (n={data['count']})")
 
     print("=" * 60)
+
+
+# ─── Per-provider / per-persona breakdown + Shapley weights (T1.3, 2026-04-26) ───
+# Adapted from PolySwarm's Shapley decomposition (Barot & Borkhatariya 2026).
+# After enough resolved trades accumulate, we can compute each provider's
+# realized Brier and re-weight the ensemble such that worse-calibrated
+# providers get less influence on aggregated forecasts.
+
+def provider_brier_breakdown(
+    forecasts: list[dict] | None = None,
+    min_samples: int = 5,
+) -> dict[str, dict]:
+    """
+    Brier per individual LLM provider (gemini/groq/cerebras/...).
+
+    Reads forecast entries' `provider_predictions` field — populated by
+    record_forecast() when individual provider samples are available
+    (callers pass them through after llm_analyst.analyze_market). For
+    legacy entries without that field, returns nothing.
+    """
+    if forecasts is None:
+        forecasts = _load_forecasts()
+
+    resolved = [f for f in forecasts
+                if f.get("outcome") is not None
+                and f.get("provider_predictions")]
+    if not resolved:
+        return {}
+
+    by_provider: dict[str, list[float]] = defaultdict(list)
+    for f in resolved:
+        outcome = 1.0 if f["outcome"] else 0.0
+        for prov, pred in f.get("provider_predictions", {}).items():
+            try:
+                p = float(pred.get("probability") if isinstance(pred, dict) else pred)
+                by_provider[prov].append((p - outcome) ** 2)
+            except (TypeError, ValueError):
+                continue
+
+    out = {}
+    for prov, scores in by_provider.items():
+        if len(scores) < min_samples:
+            continue
+        out[prov] = {
+            "brier": round(sum(scores) / len(scores), 4),
+            "count": len(scores),
+        }
+    return dict(sorted(out.items(), key=lambda x: x[1]["brier"]))
+
+
+def persona_brier_breakdown(
+    forecasts: list[dict] | None = None,
+    min_samples: int = 5,
+) -> dict[str, dict]:
+    """Brier per persona (analyst / economist / contrarian / quant / historian).
+
+    Uses each sample's `persona` field (tagged by llm_analyst.analyze_market
+    after T1.2 persona swarm). Filters to >=min_samples per persona to
+    avoid noise from low-volume personas.
+    """
+    if forecasts is None:
+        forecasts = _load_forecasts()
+
+    resolved = [f for f in forecasts
+                if f.get("outcome") is not None
+                and f.get("provider_predictions")]
+    if not resolved:
+        return {}
+
+    by_persona: dict[str, list[float]] = defaultdict(list)
+    for f in resolved:
+        outcome = 1.0 if f["outcome"] else 0.0
+        for prov, pred in f.get("provider_predictions", {}).items():
+            if not isinstance(pred, dict):
+                continue
+            persona = pred.get("persona") or "unknown"
+            try:
+                p = float(pred.get("probability"))
+                by_persona[persona].append((p - outcome) ** 2)
+            except (TypeError, ValueError):
+                continue
+
+    out = {}
+    for persona, scores in by_persona.items():
+        if len(scores) < min_samples:
+            continue
+        out[persona] = {
+            "brier": round(sum(scores) / len(scores), 4),
+            "count": len(scores),
+        }
+    return dict(sorted(out.items(), key=lambda x: x[1]["brier"]))
+
+
+def compute_shapley_weights(
+    forecasts: list[dict] | None = None,
+    min_samples: int = 8,
+    floor: float = 0.05,
+) -> dict[str, float]:
+    """
+    Compute new ensemble weights from realized provider Brier scores.
+
+    Inverse-Brier weighting: providers with lower (better) Brier get
+    higher weight. Capped at `floor` minimum so a temporarily-bad
+    provider doesn't get permanently zeroed out (random small samples
+    can have very high Brier just from variance).
+
+    Returns: {provider_name: weight}, weights summing to 1.0. Empty
+    dict if not enough data yet.
+    """
+    breakdown = provider_brier_breakdown(forecasts, min_samples=min_samples)
+    if not breakdown:
+        return {}
+
+    # Inverse-Brier transform: weight = 1 / (brier + epsilon).
+    # Brier 0.10 -> weight ~10, Brier 0.25 -> weight 4.
+    eps = 0.01
+    inv = {p: 1.0 / (d["brier"] + eps) for p, d in breakdown.items()}
+    total = sum(inv.values())
+    raw = {p: w / total for p, w in inv.items()}
+
+    # Apply floor and renormalize
+    floored = {p: max(w, floor) for p, w in raw.items()}
+    total_f = sum(floored.values())
+    return {p: round(w / total_f, 4) for p, w in floored.items()}
+
+
+def print_advanced_calibration_report():
+    """Extended report with per-provider + per-persona + Shapley weights."""
+    forecasts = _load_forecasts()
+    print_calibration_report()  # the existing summary
+    pb = provider_brier_breakdown(forecasts)
+    if pb:
+        print(f"\n  --- Per-Provider Brier (T1.3) ---")
+        for prov, d in pb.items():
+            print(f"  {prov:20s}: Brier={d['brier']:.4f}  (n={d['count']})")
+    else:
+        print("\n  Per-provider Brier: insufficient data "
+              "(need >=5 resolved samples per provider with provider_predictions)")
+
+    pp = persona_brier_breakdown(forecasts)
+    if pp:
+        print(f"\n  --- Per-Persona Brier (T1.2) ---")
+        for persona, d in pp.items():
+            print(f"  {persona:20s}: Brier={d['brier']:.4f}  (n={d['count']})")
+
+    weights = compute_shapley_weights(forecasts)
+    if weights:
+        print(f"\n  --- Recommended Provider Weights (Shapley) ---")
+        for prov, w in sorted(weights.items(), key=lambda x: -x[1]):
+            print(f"  {prov:20s}: {w*100:5.1f}%")
+        print(f"\n  Apply via: edit forecasting.llm_providers in strategy.yaml")
