@@ -103,56 +103,72 @@ class ManifoldClient(MarketClient):
         status: str = "open",
         limit: int = 100,
     ) -> list[MarketInfo]:
-        """Fetch markets from Manifold using search endpoint for best results."""
-        try:
-            params = {"term": "", "limit": min(limit, 100), "sort": "liquidity"}
-            if status == "open":
-                params["filter"] = "open"
-            elif status == "resolved":
-                params["filter"] = "resolved"
+        """Fetch markets from Manifold.
 
-            data = self._get("/search-markets", params)
-            markets = []
+        Strategy: union two sorts so the candidate set spans both
+        well-bonded markets (sort=liquidity) AND markets where humans are
+        actively trading right now (sort=last-updated). The single-sort
+        approach was missing all the fresh activity — markets get added to
+        bonded liquidity once at creation but only show up in last-updated
+        when they have live betting, which is exactly where mispricings live.
+        """
+        # Manifold caps /search-markets at 100 per call; pull both sorts in
+        # parallel-equivalent order and dedupe by market_id.
+        per_sort = min(limit, 100)
+        markets_by_id: dict[str, MarketInfo] = {}
 
-            for m in data:
-                # Only handle binary markets
-                if m.get("outcomeType") != "BINARY":
-                    continue
+        for sort_mode in ("last-updated", "liquidity"):
+            try:
+                params = {"term": "", "limit": per_sort, "sort": sort_mode}
+                if status == "open":
+                    params["filter"] = "open"
+                elif status == "resolved":
+                    params["filter"] = "resolved"
 
-                question = m.get("question", "")
-                groups = [g.get("name", "") for g in m.get("groups", [])]
-                market_category = self._infer_category(groups, question)
+                data = self._get("/search-markets", params)
 
-                if category and market_category != category:
-                    continue
+                for m in data:
+                    if m.get("outcomeType") != "BINARY":
+                        continue
 
-                yes_price = m.get("probability", 0.5)
+                    question = m.get("question", "")
+                    groups = [g.get("name", "") for g in m.get("groups", [])]
+                    market_category = self._infer_category(groups, question)
 
-                info = MarketInfo(
-                    market_id=m.get("id", ""),
-                    platform="manifold",
-                    question=question,
-                    description=m.get("textDescription", "")[:500],
-                    category=market_category,
-                    status="open" if m.get("isResolved") is False else "resolved",
-                    yes_price=yes_price,
-                    no_price=1.0 - yes_price,
-                    volume_24h=float(m.get("volume24Hours", 0) or 0),
-                    total_volume=float(m.get("volume", 0) or 0),
-                    resolution_date=self._normalize_resolution_date(m.get("closeTime")),
-                    resolution_source="Manifold community",
-                    outcome=m.get("resolution") if m.get("isResolved") else None,
-                    url=m.get("url", ""),
-                )
-                markets.append(info)
+                    if category and market_category != category:
+                        continue
 
-            return markets
+                    market_id = m.get("id", "")
+                    if not market_id or market_id in markets_by_id:
+                        continue  # already pulled in the other sort
 
-        except Exception as e:
-            log_event("market_client", "manifold_get_markets_failed", {
-                "error": str(e),
-            }, result="failed")
-            return []
+                    yes_price = m.get("probability", 0.5)
+                    info = MarketInfo(
+                        market_id=market_id,
+                        platform="manifold",
+                        question=question,
+                        description=m.get("textDescription", "")[:500],
+                        category=market_category,
+                        status="open" if m.get("isResolved") is False else "resolved",
+                        yes_price=yes_price,
+                        no_price=1.0 - yes_price,
+                        volume_24h=float(m.get("volume24Hours", 0) or 0),
+                        total_volume=float(m.get("volume", 0) or 0),
+                        resolution_date=self._normalize_resolution_date(m.get("closeTime")),
+                        resolution_source="Manifold community",
+                        outcome=m.get("resolution") if m.get("isResolved") else None,
+                        url=m.get("url", ""),
+                    )
+                    markets_by_id[market_id] = info
+
+            except Exception as e:
+                log_event("market_client", "manifold_get_markets_failed", {
+                    "error": str(e),
+                    "sort_mode": sort_mode,
+                }, result="failed")
+                # Don't bail — try the other sort
+
+        return list(markets_by_id.values())
 
     def get_market(self, market_id: str) -> MarketInfo:
         m = self._get(f"/market/{market_id}")

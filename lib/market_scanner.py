@@ -21,6 +21,7 @@ Security:
     - Full audit trail on every scan
 """
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -29,8 +30,9 @@ from pathlib import Path
 import yaml
 
 from lib.audit import log_event
-from lib.forecaster import ForecastResult, estimate_probability
+from lib.forecaster import ForecastResult, build_forecast_for_market
 from lib.kelly import (
+    ensemble_dampener,
     expected_value,
     kelly_bet_size,
     kelly_bet_size_slippage_aware,
@@ -57,13 +59,20 @@ class MarketCandidate:
     market: MarketInfo
     forecast: ForecastResult
     rank: int = 0                   # Position in ranked list (1 = best)
-    kelly_bet_usd: float = 0.0     # Dollar amount to bet (slippage-aware)
+    kelly_bet_usd: float = 0.0     # Dollar amount to bet (slippage + dampener applied)
     naive_kelly_usd: float = 0.0   # What naive Kelly would have said (pre-slippage)
     effective_price: float = 0.0   # Price we'd actually fill at
     slippage_pct: float = 0.0      # (effective - market) / market
     edge_post_slip: float = 0.0    # Edge after accounting for slippage
     correlation_group: str = ""    # Markets in same group are correlated
     skip_reason: str = ""          # If filtered out, why
+    time_bonus: float = 1.0        # Gaussian resolution-window multiplier (1.0 = peak)
+    # Ensemble-disagreement dampener. 1.0 = no dampening (providers agree),
+    # 0.5 (default floor) = max dampening applied. The pre-dampener bet is
+    # recorded here so the UI can show "we cut this from $X to $Y because
+    # our models disagreed by Z%."
+    disagreement_dampener: float = 1.0
+    pre_dampener_kelly_usd: float = 0.0
 
 
 # ── Hard Filters ──────────────────────────────────────────────────
@@ -157,6 +166,35 @@ def _days_to_resolution(resolution_date) -> float | None:
         return delta.total_seconds() / 86400.0
     except (ValueError, TypeError, OSError):
         return None
+
+
+def _resolution_bonus(days: float | None, markets_cfg: dict) -> float:
+    """
+    Gaussian score multiplier based on days-to-resolution.
+
+    Biases scoring toward the preferred resolution window so short-dated
+    bets earn full credit while long-dated ones (within the hard cap)
+    take a graded penalty. Prediction-market capital stuck in a 60-day
+    bet is dead money for compounding — this penalty rewards velocity.
+
+    Returns a value in [1 - weight, 1.0]:
+        - 1.0 at the preferred window (no penalty)
+        - decays to `1 - weight` as days move away (Gaussian)
+
+    Example with preferred=10, decay=14, weight=0.15:
+        days=10  -> 1.00   (no penalty — sweet spot)
+        days=24  -> 0.92   (~8% penalty at one sigma)
+        days=30  -> 0.87   (13% penalty near the 30d hard cap)
+        days>50  -> 0.85   (floor = 1 - weight)
+    """
+    if days is None or days <= 0:
+        return 1.0  # Neutral when unknown — don't punish missing metadata
+    preferred = markets_cfg.get("preferred_resolution_days", 10)
+    decay = max(1.0, float(markets_cfg.get("decay_resolution_days", 14)))
+    weight = max(0.0, min(float(markets_cfg.get("resolution_score_weight", 0.15)), 0.5))
+
+    gauss = math.exp(-((float(days) - float(preferred)) / decay) ** 2)
+    return (1.0 - weight) + weight * gauss
 
 
 # ── Correlation Detection ─────────────────────────────────────────
@@ -407,94 +445,14 @@ def scan_all_markets(
 
     for market in to_forecast:
         try:
-            # Fetch news FIRST — it feeds both the news_sentiment signal
-            # AND the LLM's retrieval-augmented context. Doing it once
-            # avoids a duplicate fetch (news_feed has its own cache so
-            # this is idempotent, but we still pay latency twice).
-            news_result = None
-            news_sentiment = None
-            try:
-                from lib.news_feed import get_news_sentiment
-                news_result = get_news_sentiment(
-                    market_id=market.market_id,
-                    question=market.question,
-                    category=market.category or "other",
-                )
-                if news_result.confidence > 0.1:
-                    news_sentiment = news_result.sentiment
-            except Exception:
-                pass  # News is optional — degrade gracefully
-
-            # Get LLM estimate if enabled, with news context injected
-            llm_estimate = None
-            if llm_enabled:
-                try:
-                    from lib.llm_analyst import analyze_market
-                    analysis = analyze_market(
-                        market_id=market.market_id,
-                        question=market.question,
-                        description=market.description,
-                        market_price=market.yes_price,
-                        category=market.category,
-                        resolution_date=market.resolution_date,
-                        news_result=news_result,    # retrieval-augmented
-                    )
-                    llm_estimate = analysis.probability
-                except RuntimeError:
-                    # API key missing or API down — forecast without LLM
-                    pass
-
-            # Get Metaculus community forecast (calibrated crowd signal)
-            metaculus_estimate = None
-            try:
-                from lib.metaculus_client import get_metaculus_estimate
-                metaculus_estimate = get_metaculus_estimate(
-                    question=market.question,
-                    resolution_date=market.resolution_date,
-                )
-            except Exception:
-                pass  # Metaculus is optional
-
-            # Get Kronos zero-shot price estimate — price-series markets only.
-            # Kronos is a financial candle model; it should not contribute to
-            # categorical outcomes (elections, court decisions, sports, etc.).
-            # Gate at category + question-parse level as defense in depth.
-            kronos_estimate = None
-            PRICE_SERIES_CATEGORIES = {"crypto", "economics", "stocks", "markets", "finance"}
-            category_ok = (market.category or "").lower() in PRICE_SERIES_CATEGORIES
-            if category_ok:
-                try:
-                    from lib.kronos_forecaster import get_kronos_estimate
-                    kronos_estimate = get_kronos_estimate(
-                        market_question=market.question,
-                        horizon_days=30,
-                    )
-                except Exception:
-                    pass  # Kronos is optional — degrade gracefully
-
-            # Smart-money signal (tracked whale wallets) — Polymarket only.
-            # Feature-flag gated in strategy.yaml; returns None when disabled
-            # or when no qualifying wallets hold a position.
-            smart_money_estimate = None
-            if market.platform.lower() == "polymarket":
-                try:
-                    from lib.smart_money import get_smart_money_estimate
-                    smart_money_estimate = get_smart_money_estimate(market.market_id)
-                except Exception:
-                    pass  # Smart money is optional — degrade gracefully
-
-            # Determine fee rate by platform
-            fee_rate = _get_fee_rate(market.platform)
-
-            # Run forecaster
-            forecast = estimate_probability(
+            # Run the full forecast pipeline (news → LLM ensemble →
+            # Metaculus → Kronos → smart money → Bayesian aggregation).
+            # The same orchestrator is used by the monitor for reforecasting
+            # open positions, so entry and exit see the same evidence model.
+            forecast = build_forecast_for_market(
                 market=market,
-                llm_estimate=llm_estimate,
-                metaculus_estimate=metaculus_estimate,
-                news_sentiment=news_sentiment,
-                kronos_estimate=kronos_estimate,
-                smart_money_estimate=smart_money_estimate,
-                fee_rate=fee_rate,
+                strategy=strategy,
+                llm_enabled=llm_enabled,
             )
 
             # Calculate slippage-aware Kelly bet size.
@@ -507,6 +465,9 @@ def scan_all_markets(
             effective_price = market.yes_price
             slippage_pct = 0.0
             edge_post_slip = forecast.edge
+
+            dampener = 1.0
+            pre_dampener_bet = 0.0
 
             if forecast.edge > 0 and forecast.best_side:
                 trade_prob = forecast.probability if forecast.best_side == "YES" else (1.0 - forecast.probability)
@@ -540,6 +501,37 @@ def scan_all_markets(
                     "iterations": slip_result["iterations"],
                 })
 
+                # ── Ensemble-Disagreement Dampener ──────────────────
+                # When the LLM providers disagreed on this market (e.g.,
+                # Claude 70%, DeepSeek 40%), the ensemble spread is a
+                # revealed "I don't know" signal across independent
+                # calibrations — stronger than any single model's
+                # self-reported confidence. Size down the Kelly bet
+                # proportionally so we pay less for disagreement.
+                disagreement_cfg = (
+                    strategy.get("forecasting", {}).get("disagreement", {}) or {}
+                )
+                if disagreement_cfg.get("enabled", True) and forecast.llm_spread > 0:
+                    dampener = ensemble_dampener(
+                        spread=forecast.llm_spread,
+                        mild_threshold=disagreement_cfg.get("mild_threshold", 0.10),
+                        strong_threshold=disagreement_cfg.get("strong_threshold", 0.20),
+                        floor=disagreement_cfg.get("kelly_floor", 0.5),
+                    )
+                    pre_dampener_bet = bet_usd
+                    bet_usd = bet_usd * dampener
+
+                    # Audit: always record the decision, even when the
+                    # dampener passes through at 1.0 (for observability
+                    # of why a bet was NOT cut).
+                    forecast.bayesian_chain.append({
+                        "step": "disagreement_dampener",
+                        "llm_spread": round(forecast.llm_spread, 4),
+                        "dampener": round(dampener, 4),
+                        "pre_dampener_usd": round(pre_dampener_bet, 2),
+                        "post_dampener_usd": round(bet_usd, 2),
+                    })
+
             candidate = MarketCandidate(
                 market=market,
                 forecast=forecast,
@@ -548,21 +540,53 @@ def scan_all_markets(
                 effective_price=round(effective_price, 4),
                 slippage_pct=round(slippage_pct, 4),
                 edge_post_slip=round(edge_post_slip, 4),
+                disagreement_dampener=round(dampener, 4),
+                pre_dampener_kelly_usd=round(pre_dampener_bet, 2),
             )
 
-            # Apply score, edge, and slippage-adjusted edge thresholds.
-            # edge_post_slip check ensures we're not taking trades where
-            # slippage eats the entire margin of safety — a 9% edge in a
-            # thin book that slips 8% is a losing trade after fees.
+            # --- Compute time-window bonus for ranking ---
+            # The Gaussian favors markets in the preferred-resolution sweet
+            # spot (gentle — it's a ranking signal, not a gate). The raw
+            # composite_score gate below keeps the integer quality bar
+            # intact; the bonus just nudges closer-to-preferred bets up in
+            # the rankings. See `_resolution_bonus` for the math.
+            markets_cfg = strategy.get("markets", {})
+            days_to_res = _days_to_resolution(market.resolution_date)
+            time_bonus = _resolution_bonus(days_to_res, markets_cfg)
+            # Stash on the candidate so ranking can pick it up later
+            candidate.time_bonus = time_bonus
+
+            # --- Adverse-selection check ---
+            # If the edge is extreme (>40% by default) but conviction is
+            # below 9/9, the market probably knows something we don't.
+            # Prediction markets are usually right about large edges.
+            adverse_edge = filters.get("adverse_selection_edge", 0.40)
+
             if forecast.composite_score < min_score:
-                candidate.skip_reason = f"low_score:{forecast.composite_score}/{min_score}"
+                candidate.skip_reason = (
+                    f"low_score:{forecast.composite_score}/9<{min_score}"
+                )
             elif abs(forecast.edge) < min_edge:
                 candidate.skip_reason = f"low_edge:{forecast.edge:.2%}<{min_edge:.0%}"
+            elif abs(forecast.edge) > adverse_edge and forecast.composite_score < 9:
+                candidate.skip_reason = (
+                    f"adverse_selection_suspect:edge={forecast.edge:.0%}"
+                    f">{adverse_edge:.0%}_requires_9/9_conviction"
+                    f"(got_{forecast.composite_score}/9)"
+                )
             elif bet_usd > 0 and edge_post_slip < min_edge:
                 candidate.skip_reason = (
                     f"slippage_eats_edge:{edge_post_slip:.2%}<{min_edge:.0%}"
                     f"(slip={slippage_pct:.1%})"
                 )
+
+            # Stash the adjustment for transparency in audit/UI
+            forecast.bayesian_chain.append({
+                "step": "time_window_bonus",
+                "days_to_resolution": days_to_res,
+                "raw_composite_score": forecast.composite_score,
+                "time_bonus": round(time_bonus, 4),
+            })
 
             candidates.append(candidate)
 
@@ -578,18 +602,46 @@ def scan_all_markets(
         tradeable = detect_correlated_markets(tradeable)
         tradeable = _deduplicate_correlated(tradeable)
 
+    # ── Step 4b: Per-category concentration cap ───────────────────
+    # Prevent 4 simultaneous "election" bets correlating into one loss.
+    # We keep the highest-EV candidate per category up to the cap and
+    # mark the rest with a transparent skip_reason so they show up in
+    # the scan report as "would-have-been" trades.
+    max_per_cat = filters.get("max_positions_same_category", 2)
+    if tradeable and max_per_cat:
+        # Sort by EV so the best N per category survive the cap
+        tradeable.sort(
+            key=lambda c: c.forecast.expected_value,
+            reverse=True,
+        )
+        by_cat: dict[str, int] = {}
+        for c in tradeable:
+            if c.skip_reason:
+                continue
+            cat = (c.market.category or "other").lower()
+            if by_cat.get(cat, 0) >= max_per_cat:
+                c.skip_reason = (
+                    f"category_cap:{cat}_has_{by_cat[cat]}>={max_per_cat}"
+                )
+                continue
+            by_cat[cat] = by_cat.get(cat, 0) + 1
+
     # ── Step 5: Rank by capital efficiency ───────────────────────────
     # The old ranking was EV × confidence, which equal-weighted a 5-day
     # bet and a 74-day bet. A $64 position held 74 days is $0.86/day of
     # capital use; a $157 position held 5 days is $31.40/day. To compound
     # $50 → $25k we must rank by EV per day of capital locked up.
     #
-    # capital_efficiency = (EV × confidence) / max(1, days_to_resolution)
-    # Markets with unknown resolution dates default to 30 days (neutral).
+    # capital_efficiency = (EV × confidence × time_bonus) / max(1, days)
+    # - time_bonus is the Gaussian peak at preferred-resolution-days, so
+    #   very-imminent (<3d) and near-cap (>25d) bets get a gentle ranking
+    #   penalty on top of the /days divisor
+    # - Markets with unknown resolution dates default to 30 days (neutral)
     def _capital_efficiency(c: MarketCandidate) -> float:
         days = _days_to_resolution(c.market.resolution_date) or 30.0
         days = max(1.0, days)
-        return (c.forecast.expected_value * c.forecast.confidence) / days
+        bonus = getattr(c, "time_bonus", 1.0) or 1.0
+        return (c.forecast.expected_value * c.forecast.confidence * bonus) / days
 
     tradeable_clean = [c for c in tradeable if not c.skip_reason]
     # Stash the metric on the candidate for transparency in the UI/audit
