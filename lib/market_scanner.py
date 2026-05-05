@@ -197,6 +197,47 @@ def _resolution_bonus(days: float | None, markets_cfg: dict) -> float:
     return (1.0 - weight) + weight * gauss
 
 
+def _niche_volume_bonus(volume_24h: float, markets_cfg: dict) -> float:
+    """
+    Wave D: niche-market scoring bonus (polymarket-pipeline pattern).
+
+    Biases candidate ranking toward the inefficient-edge sweet spot — markets
+    with enough liquidity to be tradeable but small enough that sophisticated
+    bots aren't already dominating. polymarket-pipeline's research found
+    sub-$500K-volume markets had measurably more mispricing than the high-
+    volume "whale" markets where edge has been arb'd away.
+
+    Gaussian centered on `niche_preferred_volume` (default $50K), decaying
+    toward `niche_floor_score` for both very-thin and very-fat markets.
+
+    Returns a value in [niche_floor_score, 1.0]:
+      - 1.0 at the sweet spot (full credit)
+      - decays smoothly toward the floor in both directions (log-space, so
+        the curve is symmetric in volume orders-of-magnitude, not dollars)
+
+    Example with preferred=50_000, decay_octaves=1.5, floor=0.85:
+      vol=$1k        -> ~0.86  (too thin, near floor)
+      vol=$10k       -> ~0.95  (climbing — niche territory)
+      vol=$50k       -> 1.00   (sweet spot)
+      vol=$500k      -> ~0.92  (sophisticated bots present)
+      vol=$5M        -> ~0.86  (whale market, near floor)
+
+    Returns 1.0 (neutral) if volume is unknown or non-positive.
+    """
+    if volume_24h is None or volume_24h <= 0:
+        return 1.0
+    preferred = max(1.0, float(markets_cfg.get("niche_preferred_volume", 50_000)))
+    decay_oct = max(0.1, float(markets_cfg.get("niche_decay_octaves", 1.5)))
+    floor = max(0.0, min(float(markets_cfg.get("niche_floor_score", 0.85)), 1.0))
+    weight = 1.0 - floor
+
+    # Octave distance — symmetric in log-space so $5K vs $500K (each ~10x
+    # off the $50K center) gets the same penalty.
+    octaves = math.log2(float(volume_24h) / preferred)
+    gauss = math.exp(-(octaves / decay_oct) ** 2)
+    return floor + weight * gauss
+
+
 # ── Correlation Detection ─────────────────────────────────────────
 
 _STOPWORDS = frozenset({
@@ -436,8 +477,18 @@ def scan_all_markets(
         "filtered_out": len(filtered_out),
     }, result="success")
 
-    # Cap inference costs — only forecast top candidates by volume
-    passed.sort(key=lambda m: m.volume_24h, reverse=True)
+    # Cap inference costs — pick top candidates by NICHE-AWARE priority.
+    # Wave D: pure volume-DESC sorting was selecting whale markets where
+    # sophisticated bots have already arb'd the edge away. Now we rank by
+    # `_niche_volume_bonus(volume_24h)` × log10(volume) so we still prefer
+    # liquid markets but bias the chosen set toward the $50K sweet spot.
+    # polymarket-pipeline research: sub-$500K markets have measurably more
+    # mispricing than the headline-volume tier.
+    def _candidate_priority(m) -> float:
+        vol = max(1.0, float(m.volume_24h or 0))
+        return _niche_volume_bonus(vol, markets_cfg) * math.log10(vol)
+
+    passed.sort(key=_candidate_priority, reverse=True)
     to_forecast = passed[:max_per_cycle]
 
     # ── Step 3: Forecast each candidate ───────────────────────────

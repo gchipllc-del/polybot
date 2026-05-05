@@ -206,6 +206,17 @@ markets:
   decay_resolution_days: 14      # Widened with the cap so 30d gets ~14% penalty, 60d ~57%
   resolution_score_weight: 0.15  # How much window-bias shifts composite score (0.0=off, 0.3=heavy)
 
+  # --- Wave D: niche-market bias (polymarket-pipeline pattern) ---
+  # Bias candidate selection toward the inefficient-edge sweet spot —
+  # markets with enough liquidity to be tradeable but small enough that
+  # sophisticated bots aren't dominating. polymarket-pipeline found
+  # sub-$500K-volume markets had measurably more mispricing than whale
+  # markets where edge is already arb'd away. Gaussian curve in log-volume
+  # space, so it's symmetric in orders of magnitude.
+  niche_preferred_volume: 50000   # USD 24h volume sweet spot
+  niche_decay_octaves: 1.5        # σ of the Gaussian (in log2 octaves)
+  niche_floor_score: 0.85         # Minimum multiplier (whale and dust both penalized to this)
+
   # Category preferences (can be weighted by Hermes)
   categories:
     - politics
