@@ -785,7 +785,7 @@ def _aggregate_ensemble(
     - `spread` is max - min across samples, useful for diagnostics
     - `per_provider_probs` gives visibility into which model said what
     """
-    from lib.forecaster import geomean_log_odds
+    from lib.forecaster import aggregate_samples
 
     probs = [s["probability"] for s in samples]
 
@@ -801,7 +801,14 @@ def _aggregate_ensemble(
     ensemble_weights = {
         f"s{i}": float(w) for i, w in enumerate(sample_weights)
     }
-    final_prob = geomean_log_odds(ensemble_estimates, ensemble_weights)
+    # Wave B: dispatcher routes by sample count.
+    #   N ≥ 5 → trimmed_mean (Halawi 2024 NeurIPS optimal)
+    #   N < 5 → weighted geomean of log-odds (legacy default; trimmed
+    #            mean degenerates with too few samples)
+    # Override via strategy.yaml forecasting.ensemble_aggregation.
+    fc_cfg = _load_strategy().get("forecasting", {})
+    method = str(fc_cfg.get("ensemble_aggregation", "auto"))
+    final_prob = aggregate_samples(ensemble_estimates, ensemble_weights, method=method)
 
     spread = max(probs) - min(probs)
     avg_conf = sum(s["confidence"] for s in samples) / len(samples)

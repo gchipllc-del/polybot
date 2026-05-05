@@ -111,6 +111,17 @@ forecasting:
 
   llm_cache_ttl_minutes: 60          # Cache LLM results for unchanged markets
 
+  # --- Ensemble Aggregation (Wave B) ---
+  # How to combine N probability samples into one final estimate.
+  #   auto             — trimmed_mean if N≥5 else weighted_geomean (default)
+  #   weighted_geomean — legacy: log-odds weighted geomean (good at extremes)
+  #   trimmed_mean     — Halawi 2024 NeurIPS optimal (drops outliers, weighted)
+  #   median           — robust to extremes, weights ignored
+  #   mean             — plain unweighted mean
+  # Auto picks trimmed_mean only when there's enough samples for it to make
+  # sense (≥5; trimming 1 from each tail leaves ≥3 in the middle).
+  ensemble_aggregation: auto
+
   # Route LLM analysis through the `instructor` library for pydantic-validated
   # structured output (auto-retries on bad JSON). Falls back to the legacy
   # regex parse of raw text if instructor isn't installed OR the structured

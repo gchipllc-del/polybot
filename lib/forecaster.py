@@ -158,6 +158,105 @@ def geomean_log_odds(estimates: dict[str, float], weights: dict[str, float]) -> 
     return max(0.01, min(inv_logit(log_odds_sum), 0.99))
 
 
+def trimmed_mean_weighted(
+    estimates: dict[str, float],
+    weights: dict[str, float],
+    trim: int = 1,
+) -> float:
+    """
+    Trim the highest `trim` and lowest `trim` samples by value, then
+    weighted mean of the remaining ones (renormalized weights).
+
+    Wave B aggregation per Halawi et al. 2024 NeurIPS "Approaching
+    Human-Level Forecasting with Language Models", which compared 5
+    aggregators across N≥6 samples and found trimmed mean optimal.
+
+    Falls back to a plain weighted mean when len(samples) ≤ 2×trim
+    (not enough samples to trim safely). Callers should usually use
+    the `aggregate_samples` dispatcher so small ensembles route to
+    weighted geomean instead of degrading here.
+
+    Args:
+        estimates: {"s0": 0.65, "s1": 0.58, ...}
+        weights:   {"s0": 1.0,  "s1": 1.0,  ...} (renormalized inside)
+        trim: Count to drop from each tail. Default 1 = drop top-1 + bot-1.
+
+    Returns:
+        Aggregated probability (0.01 - 0.99).
+    """
+    active = {k: v for k, v in estimates.items() if k in weights}
+    if not active:
+        return 0.50
+
+    n = len(active)
+    if n <= 2 * trim:
+        # Not enough samples to trim — fall back to plain weighted mean.
+        total_w = sum(weights[k] for k in active)
+        if total_w <= 0:
+            return 0.50
+        return max(0.01, min(
+            sum(active[k] * weights[k] / total_w for k in active),
+            0.99,
+        ))
+
+    pairs = sorted(
+        ((active[k], weights[k]) for k in active),
+        key=lambda pw: pw[0],
+    )
+    middle = pairs[trim:-trim]
+    total_w = sum(w for _, w in middle)
+    if total_w <= 0:
+        # All-zero weights in the middle band — degenerate, return median.
+        mid = middle[len(middle) // 2][0]
+        return max(0.01, min(mid, 0.99))
+
+    blended = sum(p * w / total_w for p, w in middle)
+    return max(0.01, min(blended, 0.99))
+
+
+def aggregate_samples(
+    estimates: dict[str, float],
+    weights: dict[str, float],
+    method: str = "auto",
+    trim: int = 1,
+) -> float:
+    """
+    Single dispatch for ensemble aggregation. Use this from anywhere
+    that combines N independent probability samples.
+
+    Methods:
+      "auto"             — trimmed_mean if N ≥ 5, else weighted_geomean
+                           (preserves backward compatibility for the
+                           default 3-provider × 1-sample setup)
+      "weighted_geomean" — log-odds-weighted geomean (legacy default)
+      "trimmed_mean"     — drop top + bottom `trim`, weighted mean of rest
+      "median"           — middle sample by value (weights ignored)
+      "mean"             — plain unweighted mean
+
+    Returns:
+        Aggregated probability (0.01 - 0.99).
+    """
+    n = len(estimates)
+    if n == 0:
+        return 0.50
+
+    if method == "auto":
+        method = "trimmed_mean" if n >= 5 else "weighted_geomean"
+
+    if method == "weighted_geomean":
+        return geomean_log_odds(estimates, weights)
+    if method == "trimmed_mean":
+        return trimmed_mean_weighted(estimates, weights, trim=trim)
+    if method == "median":
+        vals = sorted(estimates.values())
+        mid = vals[len(vals) // 2]
+        return max(0.01, min(mid, 0.99))
+    if method == "mean":
+        return max(0.01, min(sum(estimates.values()) / n, 0.99))
+
+    raise ValueError(f"unknown aggregation method: {method!r}")
+
+
 def weighted_blend(estimates: dict[str, float], weights: dict[str, float]) -> float:
     """
     Weighted average of probability estimates from multiple sources.
