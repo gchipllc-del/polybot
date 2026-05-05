@@ -135,11 +135,13 @@ function renderPortfolio(p) {
     if (!p || p.error) { document.getElementById('portfolio-stats').innerHTML = 'Error: ' + (p?.error || 'unknown'); return; }
     const modeBadge = p.mode === 'manifold' ? '<span class="badge paper">PAPER</span>' : '<span class="badge live">LIVE</span>';
     const calClass = {Excellent:'ok',Good:'ok',Fair:'warn',Poor:'trip'}[p.calibration_grade] || '';
+    const lifetimeTitle = `title="Realized $${fmt(p.realized_pnl)} + Unrealized $${fmt(p.unrealized_pnl)}"`;
     document.getElementById('portfolio-stats').innerHTML = `
         <div class="stat"><div class="label">Bankroll</div><div class="value">$${fmt(p.total_bankroll)}</div></div>
         <div class="stat"><div class="label">Cash</div><div class="value">$${fmt(p.cash_balance)}</div></div>
         <div class="stat"><div class="label">Positions</div><div class="value">$${fmt(p.position_value)}</div></div>
-        <div class="stat"><div class="label">Daily P/L</div><div class="value ${pnlClass(p.daily_pl)}">${pnlSign(p.daily_pl)}</div></div>
+        <div class="stat" ${lifetimeTitle}><div class="label">Lifetime P/L</div><div class="value ${pnlClass(p.lifetime_pnl)}">${pnlSign(p.lifetime_pnl)}</div></div>
+        <div class="stat"><div class="label">Open P/L</div><div class="value ${pnlClass(p.unrealized_pnl)}">${pnlSign(p.unrealized_pnl)}</div></div>
         <div class="stat"><div class="label">Mode</div><div class="value">${modeBadge}</div></div>
         <div class="stat"><div class="label">Phase</div><div class="value">${p.phase}</div></div>
         <div class="stat"><div class="label">Kelly</div><div class="value">${(p.kelly_multiplier*100).toFixed(0)}%</div></div>

@@ -42,8 +42,12 @@ def render_terminal_dashboard(include_calibration: bool = False):
     phase = portfolio.get("phase", 1)
     phase_label = portfolio.get("phase_label", "")
 
-    pl = portfolio.get("daily_pl", 0)
-    pl_color = "green" if pl >= 0 else "red"
+    open_pl = portfolio.get("unrealized_pnl", portfolio.get("daily_pl", 0))
+    open_color = "green" if open_pl >= 0 else "red"
+
+    lifetime_pl = portfolio.get("lifetime_pnl", 0)
+    lifetime_color = "green" if lifetime_pl >= 0 else "red"
+    realized = portfolio.get("realized_pnl", 0)
 
     cal_grade = portfolio.get("calibration_grade", "N/A")
     cal_color = {"Excellent": "green", "Good": "cyan", "Fair": "yellow", "Poor": "red"}.get(cal_grade, "dim")
@@ -55,7 +59,8 @@ def render_terminal_dashboard(include_calibration: bool = False):
         f"  Mode: {mode_badge}  Phase {phase}: {phase_label}  "
         f"Kelly: {portfolio.get('kelly_multiplier', 0.25):.0%}  "
         f"Min Edge: {portfolio.get('min_edge', 0.08):.0%}\n"
-        f"  Daily P/L: [{pl_color}]${pl:+,.2f}[/]  "
+        f"  Lifetime P/L: [{lifetime_color} bold]${lifetime_pl:+,.2f}[/] "
+        f"[dim](realized ${realized:+,.2f} + open ${open_pl:+,.2f})[/]  "
         f"Calibration: [{cal_color}]{cal_grade}[/]"
         + (f" (Brier: {portfolio['brier_score']:.4f})" if portfolio.get("brier_score") else "")
     )
@@ -204,12 +209,14 @@ def _render_plain():
     print("=" * 60)
     print("  POLYBOT — Prediction Market Trader")
     print("=" * 60)
-    print(f"  Bankroll:    ${portfolio.get('total_bankroll', 0):,.2f}")
-    print(f"  Cash:        ${portfolio.get('cash_balance', 0):,.2f}")
-    print(f"  Mode:        {portfolio.get('mode', 'manifold')}")
-    print(f"  Phase:       {portfolio.get('phase', 1)}")
-    print(f"  Daily P/L:   ${portfolio.get('daily_pl', 0):+,.2f}")
-    print(f"  Calibration: {portfolio.get('calibration_grade', 'N/A')}")
+    print(f"  Bankroll:     ${portfolio.get('total_bankroll', 0):,.2f}")
+    print(f"  Cash:         ${portfolio.get('cash_balance', 0):,.2f}")
+    print(f"  Mode:         {portfolio.get('mode', 'manifold')}")
+    print(f"  Phase:        {portfolio.get('phase', 1)}")
+    print(f"  Lifetime P/L: ${portfolio.get('lifetime_pnl', 0):+,.2f}  "
+          f"(realized ${portfolio.get('realized_pnl', 0):+,.2f} + "
+          f"open ${portfolio.get('unrealized_pnl', 0):+,.2f})")
+    print(f"  Calibration:  {portfolio.get('calibration_grade', 'N/A')}")
 
     positions = get_positions_table()
     open_pos = [p for p in positions if p.get("status") == "open"]
