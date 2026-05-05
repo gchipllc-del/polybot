@@ -1,7 +1,7 @@
 """
 LLM Superforecaster — Multi-provider market analysis.
 
-Runs the 7-step Superforecaster protocol across an ensemble of LLMs
+Runs the 8-step Superforecaster protocol across an ensemble of LLMs
 (Claude + DeepSeek + Kimi by default), then aggregates the independent
 probability estimates with a weighted geomean-log-odds. Cross-model
 diversity reduces systematic bias vs. running N samples of a single
@@ -557,24 +557,27 @@ CATEGORY: {category}
 
 RESOLUTION DATE: {resolution_date}
 {news_context}
-Follow this 7-step protocol. Be rigorous, quantitative, and willing to disagree with the crowd when evidence warrants. Show your work.
+Follow this 8-step protocol. Be rigorous, quantitative, and willing to disagree with the crowd when evidence warrants. Show your work.
 
 ## Step 1: Decompose the question
 Restate the question in your own words. List 2-3 sub-questions whose answers determine the outcome. Clarify ambiguities (what exactly counts as YES? what counts as NO?).
 
-## Step 2: Reference class forecasting (outside view)
+## Step 2: Knowledge expansion — what do you know about this topic?
+Before reasoning, briefly enumerate the relevant facts, history, and context you already know about this specific topic (people, institutions, prior events, mechanics, recent developments). 4-8 bullet points. This activates background knowledge before commitment — Halawi et al. 2024 NeurIPS found this stage materially improves calibration over jumping straight to reference-class reasoning. Do NOT make up facts; if you're uncertain, say "I don't know whether X" rather than fabricating.
+
+## Step 3: Reference class forecasting (outside view)
 Name 2-3 specific reference classes with historical base rates. For each, cite the relevant frequency — e.g., "incumbent Senators up for re-election win ~84% of the time (Ballotpedia, 2012–2024)". Take the weighted average as your OUTSIDE view probability.
 
-## Step 3: Inside view — drivers (4-6)
+## Step 4: Inside view — drivers (4-6)
 List the most important factors for THIS specific market. For each:
    - Direction: pushes toward YES or NO
    - Magnitude: how strongly (weak/moderate/strong)
    - Evidence: what do we actually know?
 
-## Step 4: Steelman the other side
+## Step 5: Steelman the other side
 Argue the strongest case for the OPPOSITE of your leaning so far. What's the best evidence against your current direction? If the steelman is strong, widen your uncertainty.
 
-## Step 5: Check for common biases
+## Step 6: Check for common biases
 Audit for:
    - Anchoring on market price (you disagree with the crowd too little? too much?)
    - Availability bias (recent news over-weighted?)
@@ -582,10 +585,10 @@ Audit for:
    - Scope insensitivity (treating "by Dec 31" same as "by Mar 1"?)
 Adjust if any bias is distorting.
 
-## Step 6: Probability estimate
+## Step 7: Probability estimate
 Combine outside view, inside view, and bias adjustments into a single probability. Be precise — do not round to multiples of 5 or 10 unless genuinely uncertain. Show the math: "Outside view 40%, inside view pushes +8%, steelman pulls -3% → final 45%".
 
-## Step 7: Meta-uncertainty
+## Step 8: Meta-uncertainty
 How wide is your plausible range (e.g., 10-percentile to 90-percentile)? What single piece of new information would most change your estimate? If you'd revise >15% on one new data point, widen uncertainty now.
 
 ## OUTPUT FORMAT (REQUIRED — the aggregator parses this exactly)
@@ -648,7 +651,7 @@ def _persona_prefix(persona_name: str) -> str:
     return (
         f"## PERSONA — {persona_name.upper()}\n"
         f"{PERSONAS[persona_name]}\n\n"
-        "(After applying this perspective, follow the 7-step Superforecaster "
+        "(After applying this perspective, follow the 8-step Superforecaster "
         "protocol below. The persona shapes your reasoning, not the output "
         "format.)\n\n"
     )
