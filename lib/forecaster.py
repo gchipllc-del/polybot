@@ -262,6 +262,7 @@ def estimate_probability(
     news_sentiment: float | None = None,
     kronos_estimate: float | None = None,
     smart_money_estimate: float | None = None,
+    news_impact_estimate: float | None = None,
     fee_rate: float = 0.07,
     llm_spread: float = 0.0,
 ) -> ForecastResult:
@@ -298,6 +299,10 @@ def estimate_probability(
         "kronos": fc.get("kronos_weight", 0.20),
         "smart_money": fc.get("smart_money_weight", 0.10),
         "market_consensus": fc.get("market_consensus_weight", 0.10),
+        # Wave A (TauricResearch + polymarket-pipeline integration):
+        # classification-not-probability signal. Weight defaults to the
+        # same as legacy news_sentiment so the two are balanced.
+        "news_impact": fc.get("news_impact_weight", 0.10),
     }
 
     # ── Step 1: Base Rate Prior ───────────────────────────────────
@@ -327,6 +332,21 @@ def estimate_probability(
         sources["news"] = news_sentiment
         current = bayesian_update(current, news_sentiment, base_rate)
         chain.append({"step": "news_update", "value": current, "news_raw": news_sentiment})
+
+    # ── Step 4b: News-Impact Classification (Wave A) ──────────────
+    # Complementary to sentiment: this is the LLM's question-conditioned
+    # MORE_LIKELY_YES / NO / NOT_RELEVANT classification + materiality,
+    # converted to a probability estimate via news_classifier. LLMs are
+    # better at directional classification than calibrated probability,
+    # so this signal tends to be cleaner than raw sentiment.
+    if news_impact_estimate is not None:
+        sources["news_impact"] = news_impact_estimate
+        current = bayesian_update(current, news_impact_estimate, base_rate)
+        chain.append({
+            "step": "news_impact_update",
+            "value": current,
+            "news_impact_raw": news_impact_estimate,
+        })
 
     # ── Step 5: Kronos Zero-Shot Price Model ───────────────────���──
     if kronos_estimate is not None:
@@ -616,6 +636,39 @@ def build_forecast_for_market(
         except Exception:
             pass
 
+    # News-impact classification (Wave A — adapted from polymarket-pipeline).
+    # Skips silently if no news, no LLM provider, or weight set to 0.
+    # The classifier reuses news_result articles when available so we don't
+    # double-spend the news API budget.
+    news_impact_estimate = None
+    fc_cfg = _load_strategy().get("forecasting", {})
+    if fc_cfg.get("news_impact_weight", 0.10) > 0:
+        try:
+            from lib.news_classifier import (
+                classify_news_impact,
+                classification_to_probability,
+            )
+            articles = []
+            if news_result is not None:
+                articles = list(getattr(news_result, "articles", []) or [])
+            if articles:
+                classification = classify_news_impact(
+                    question=market.question,
+                    articles=articles,
+                    current_yes_price=market.yes_price,
+                )
+                if classification is not None:
+                    threshold = float(
+                        fc_cfg.get("news_impact_materiality_threshold", 0.30)
+                    )
+                    news_impact_estimate = classification_to_probability(
+                        classification,
+                        prior=market.yes_price,  # nudge from current market price
+                        materiality_threshold=threshold,
+                    )
+        except Exception:
+            pass  # News-impact is optional; degrade gracefully
+
     fee_rate = _FEE_RATES.get(market.platform.lower(), 0.07)
 
     return estimate_probability(
@@ -625,6 +678,7 @@ def build_forecast_for_market(
         news_sentiment=news_sentiment,
         kronos_estimate=kronos_estimate,
         smart_money_estimate=smart_money_estimate,
+        news_impact_estimate=news_impact_estimate,
         fee_rate=fee_rate,
         llm_spread=llm_spread,
     )
