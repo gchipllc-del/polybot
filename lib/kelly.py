@@ -188,6 +188,63 @@ def expected_value(our_prob: float, market_prob: float, fee_rate: float = 0.07) 
     return ev
 
 
+def ensemble_dampener(
+    spread: float,
+    mild_threshold: float = 0.10,
+    strong_threshold: float = 0.20,
+    floor: float = 0.5,
+) -> float:
+    """
+    Kelly multiplier in [floor, 1.0] based on LLM ensemble disagreement.
+
+    High ensemble spread (Claude says 70%, DeepSeek says 40%) is a much
+    better "I don't know" signal than any single model's self-reported
+    confidence — it's revealed preference across independent calibrations.
+    When spread is high, we size down. When spread is tight, we trust the
+    estimate and size fully.
+
+    Returns a ramp:
+        spread ≤ mild_threshold        → 1.0 (no dampening, full Kelly)
+        mild_threshold < s < strong_t  → linear interpolation down to floor
+        spread ≥ strong_threshold      → floor (heavy dampening)
+
+    With defaults:
+        spread 0.05  → 1.00   (providers within 5 pts — full size)
+        spread 0.10  → 1.00   (at mild threshold — still full)
+        spread 0.15  → 0.75   (halfway — cut 25%)
+        spread 0.20  → 0.50   (at strong threshold — half Kelly)
+        spread 0.30  → 0.50   (clamped at floor)
+
+    The floor prevents the dampener from vetoing a bet entirely — we
+    already reject via the order gate when composite score is too low.
+    This is a sizing knob, not a hard filter.
+
+    Args:
+        spread: Max-minus-min probability across ensemble samples (0.0–1.0).
+            Use the `ensemble_spread` field on LLMAnalysis.
+        mild_threshold: Below this, no dampening applied.
+        strong_threshold: At or above this, dampener clamped at `floor`.
+        floor: Minimum multiplier returned on max disagreement.
+
+    Returns:
+        Multiplier in [floor, 1.0] to scale a Kelly bet by.
+    """
+    # Defensive clamps — bad config or corrupt data shouldn't crash sizing
+    spread = max(0.0, min(float(spread), 1.0))
+    floor = max(0.0, min(float(floor), 1.0))
+    mild = max(0.0, float(mild_threshold))
+    strong = max(mild + 1e-9, float(strong_threshold))  # Ensure strong > mild
+
+    if spread <= mild:
+        return 1.0
+    if spread >= strong:
+        return floor
+
+    # Linear ramp from 1.0 (at mild) down to floor (at strong)
+    t = (spread - mild) / (strong - mild)
+    return 1.0 - t * (1.0 - floor)
+
+
 # ── Slippage-Aware Sizing ─────────────────────────────────────────
 # A naive Kelly bet in a thin orderbook pays the last traded price only
 # on the first contract; the rest are filled at progressively worse

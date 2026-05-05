@@ -57,6 +57,11 @@ class ForecastResult:
     best_side: str = "YES"          # Which side to trade
     evidence_summary: str = ""
     bayesian_chain: list[dict] = field(default_factory=list)
+    # LLM ensemble spread (max-min across providers) — feeds the Kelly
+    # dampener. 0.0 = one provider or perfect agreement, 1.0 = total
+    # disagreement. Defaults to 0.0 so legacy callers that skip the LLM
+    # path don't accidentally trigger any dampening.
+    llm_spread: float = 0.0
 
 
 # ── Bayesian Math ─────────────────────────────────────────────────
@@ -258,6 +263,7 @@ def estimate_probability(
     kronos_estimate: float | None = None,
     smart_money_estimate: float | None = None,
     fee_rate: float = 0.07,
+    llm_spread: float = 0.0,
 ) -> ForecastResult:
     """
     Produce a probability estimate for a market by aggregating all sources.
@@ -470,6 +476,7 @@ def estimate_probability(
         best_side=best_side,
         evidence_summary=summary,
         bayesian_chain=chain,
+        llm_spread=round(max(0.0, min(float(llm_spread), 1.0)), 4),
     )
 
     log_event("forecaster", "estimate_complete", {
@@ -483,3 +490,141 @@ def estimate_probability(
     }, result="success")
 
     return result
+
+
+# ── Pipeline Orchestrator ─────────────────────────────────────────
+
+# Fee rates by platform. Hardcoded as a safety fallback so a config
+# typo can't silently zero-fee a real-money platform.
+_FEE_RATES = {
+    "kalshi": 0.07,
+    "polymarket": 0.02,
+    "manifold": 0.0,
+}
+
+# Categories where Kronos (a financial candle model) has signal.
+# Gated to prevent it from weighing in on elections, court decisions, etc.
+_PRICE_SERIES_CATEGORIES = frozenset({
+    "crypto", "economics", "stocks", "markets", "finance",
+})
+
+
+def build_forecast_for_market(
+    market: MarketInfo,
+    strategy: dict | None = None,
+    llm_enabled: bool = True,
+) -> ForecastResult:
+    """
+    Orchestrate the full forecast pipeline for a single market.
+
+    Fetches news sentiment, LLM ensemble analysis, Metaculus community
+    forecast, Kronos zero-shot estimate (price-series markets only), and
+    smart-money flow, then aggregates via `estimate_probability()`.
+
+    Each source is optional — if fetching fails, it's dropped silently and
+    the forecast uses whatever signals did arrive. This is the same logic
+    the market scanner uses during its Phase 3 pass, extracted here so the
+    monitor can reforecast open positions on the same footing that got them
+    opened in the first place (no shortcuts, no stale cached probability).
+
+    Args:
+        market: Normalized market data from a MarketClient
+        strategy: Strategy config. Unused here (each sub-module reads its
+            own slice) but accepted for future wiring + signature symmetry.
+        llm_enabled: When False, skip the LLM call. Useful for fast unit
+            tests, cheap "news-only" reforecasts, or when the budget is
+            tight late in a session.
+
+    Returns:
+        ForecastResult with probability, confidence, edge, scoring, Kelly.
+        Never raises — any sub-source failures are swallowed internally so
+        a transient network hiccup can't take down a monitoring cycle.
+    """
+    # News first — it feeds both the news_sentiment signal AND the LLM's
+    # retrieval-augmented context. Fetching once keeps the two in sync
+    # (news_feed has its own TTL cache, so this is idempotent, but we
+    # skip the duplicate latency either way).
+    news_result = None
+    news_sentiment = None
+    try:
+        from lib.news_feed import get_news_sentiment
+        news_result = get_news_sentiment(
+            market_id=market.market_id,
+            question=market.question,
+            category=market.category or "other",
+        )
+        # Low-confidence news gets dropped — it's noise without signal.
+        if getattr(news_result, "confidence", 0) > 0.1:
+            news_sentiment = news_result.sentiment
+    except Exception:
+        pass  # News is optional — degrade gracefully
+
+    # LLM superforecaster ensemble (Claude + DeepSeek + Kimi if configured)
+    # Also captures the cross-provider spread for downstream Kelly dampening
+    # — high disagreement is a better "I don't know" signal than any single
+    # model's self-reported confidence.
+    llm_estimate = None
+    llm_spread = 0.0
+    if llm_enabled:
+        try:
+            from lib.llm_analyst import analyze_market
+            analysis = analyze_market(
+                market_id=market.market_id,
+                question=market.question,
+                description=market.description,
+                market_price=market.yes_price,
+                category=market.category,
+                resolution_date=market.resolution_date,
+                news_result=news_result,
+            )
+            llm_estimate = analysis.probability
+            # ensemble_spread is optional on the dataclass; default 0 if absent
+            llm_spread = float(getattr(analysis, "ensemble_spread", 0.0) or 0.0)
+        except RuntimeError:
+            pass  # No API key or provider down — forecast without LLM
+
+    # Metaculus community forecast (calibrated crowd signal)
+    metaculus_estimate = None
+    try:
+        from lib.metaculus_client import get_metaculus_estimate
+        metaculus_estimate = get_metaculus_estimate(
+            question=market.question,
+            resolution_date=market.resolution_date,
+        )
+    except Exception:
+        pass
+
+    # Kronos zero-shot price estimate — only for price-series markets.
+    # A financial candle model has no business scoring an election outcome.
+    kronos_estimate = None
+    if (market.category or "").lower() in _PRICE_SERIES_CATEGORIES:
+        try:
+            from lib.kronos_forecaster import get_kronos_estimate
+            kronos_estimate = get_kronos_estimate(
+                market_question=market.question,
+                horizon_days=30,
+            )
+        except Exception:
+            pass
+
+    # Smart-money signal (tracked whale wallets) — Polymarket only.
+    smart_money_estimate = None
+    if market.platform.lower() == "polymarket":
+        try:
+            from lib.smart_money import get_smart_money_estimate
+            smart_money_estimate = get_smart_money_estimate(market.market_id)
+        except Exception:
+            pass
+
+    fee_rate = _FEE_RATES.get(market.platform.lower(), 0.07)
+
+    return estimate_probability(
+        market=market,
+        llm_estimate=llm_estimate,
+        metaculus_estimate=metaculus_estimate,
+        news_sentiment=news_sentiment,
+        kronos_estimate=kronos_estimate,
+        smart_money_estimate=smart_money_estimate,
+        fee_rate=fee_rate,
+        llm_spread=llm_spread,
+    )
