@@ -417,6 +417,12 @@ def scan_all_markets(
     scoring = strategy.get("scoring", {})
     min_edge = scoring.get("min_edge", 0.08)
     min_score = scoring.get("min_composite_score", 6)
+    # Hoisted: the nested _candidate_priority closure below references
+    # markets_cfg. Python's local-name rule treats any function-scope
+    # assignment as making the name local throughout the function — if
+    # we leave the only assignment lower down, the closure fires at
+    # passed.sort() before markets_cfg is bound and raises NameError.
+    markets_cfg = strategy.get("markets", {})
 
     log_event("scanner", "scan_started", {
         "platforms": [c.platform_name for c in clients],
@@ -601,7 +607,6 @@ def scan_all_markets(
             # composite_score gate below keeps the integer quality bar
             # intact; the bonus just nudges closer-to-preferred bets up in
             # the rankings. See `_resolution_bonus` for the math.
-            markets_cfg = strategy.get("markets", {})
             days_to_res = _days_to_resolution(market.resolution_date)
             time_bonus = _resolution_bonus(days_to_res, markets_cfg)
             # Stash on the candidate so ranking can pick it up later
