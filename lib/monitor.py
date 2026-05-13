@@ -560,13 +560,16 @@ def _execute_pending_exits(
         - min_seconds_between_attempts cool-off per position
     """
     cfg = (strategy.get("exits", {}) or {}).get("auto_exit", {}) or {}
-    if not cfg.get("enabled", False):
-        return {
-            "enabled": False,
-            "executed": [],
-            "failed": [],
-            "skipped": [],
-        }
+    auto_exit_enabled = bool(cfg.get("enabled", False))
+
+    # Settling resolved markets is *pure bookkeeping* — it updates
+    # positions.json + records P/L for calibration. No broker order is
+    # placed. It must therefore run regardless of `auto_exit.enabled`,
+    # which only governs whether the bot is allowed to place actual
+    # CLOSE orders against the exchange. Conflating these two was the
+    # bug that left 9 manifold positions stuck "open" for 9-16 days
+    # after their markets had already resolved, hiding their final
+    # P/L from the dashboard and the calibration log.
 
     max_per_cycle = int(cfg.get("max_per_cycle", 3))
     cool_off_seconds = float(cfg.get("min_seconds_between_attempts", 300))
@@ -582,8 +585,29 @@ def _execute_pending_exits(
     skipped: list[dict] = []
 
     for signal in exit_signals:
-        # Only immediate-urgency signals ever reach the exchange.
+        # Only immediate-urgency signals ever reach this dispatcher.
         if signal.urgency != "immediate":
+            continue
+
+        # Branch on signal kind. Settle-reasons (resolved markets) run
+        # unconditionally — no broker order, no risk to auto_exit gate.
+        if signal.reason in _SETTLE_REASONS:
+            record = _execute_resolved_signal(signal)
+            if record.get("status") == "executed":
+                executed.append(record)
+            else:
+                skipped.append(record)
+            continue
+
+        # Everything below this point is a broker-facing CLOSE — must
+        # respect the auto_exit gate. If disabled, log it as skipped
+        # so the dashboard can show "would have closed" for the operator.
+        if not auto_exit_enabled:
+            skipped.append({
+                "market_id": signal.market_id,
+                "reason": signal.reason,
+                "note": "auto_exit disabled — human-in-the-loop close required",
+            })
             continue
 
         if len(executed) >= max_per_cycle:
@@ -592,15 +616,6 @@ def _execute_pending_exits(
                 "reason": signal.reason,
                 "note": f"max_per_cycle={max_per_cycle} reached",
             })
-            continue
-
-        # Branch on signal kind.
-        if signal.reason in _SETTLE_REASONS:
-            record = _execute_resolved_signal(signal)
-            if record.get("status") == "executed":
-                executed.append(record)
-            else:
-                skipped.append(record)
             continue
 
         if signal.reason not in _CLOSE_REASONS:
@@ -651,7 +666,9 @@ def _execute_pending_exits(
             failed.append(record)
 
     return {
-        "enabled": True,
+        # Reports whether the broker-facing CLOSE path was enabled this
+        # cycle. The bookkeeping settle path runs regardless.
+        "enabled": auto_exit_enabled,
         "dry_run": dry_run,
         "executed": executed,
         "failed": failed,
