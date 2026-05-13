@@ -209,7 +209,13 @@ def settle_position(
         outcome=outcome_bool,
     )
 
-    # Store in memory palace
+    # Store in memory palace. Catch *every* exception (not just ImportError):
+    # chromadb's onnx embedder occasionally segfaults / raises AttributeError
+    # in fresh subprocess Python invocations, which had been preventing the
+    # `position_settled` audit log line below from ever firing. The
+    # settlement itself (status update + trade history + calibration record)
+    # has already succeeded by the time we reach this block — memory palace
+    # is an enhancement, not a requirement.
     try:
         from lib.memory_palace import remember_resolution
         remember_resolution(
@@ -220,8 +226,11 @@ def settle_position(
             profit=pnl["net_profit"],
             our_probability=our_probability,
         )
-    except ImportError:
-        pass
+    except Exception as _mp_exc:
+        log_event("resolution", "memory_palace_skip", {
+            "market_id": market_id,
+            "error": str(_mp_exc)[:200],
+        }, result="degraded")
 
     log_event("resolution", "position_settled", {
         "market_id": market_id,
