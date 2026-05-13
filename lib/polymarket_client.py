@@ -10,6 +10,7 @@ SDK: py-clob-client
 API docs: https://docs.polymarket.com/
 """
 
+import json as _json
 import os
 import time
 from typing import Literal
@@ -21,6 +22,27 @@ from lib.audit import log_event
 from lib.market_client import MarketClient, MarketInfo, OrderResult, PositionInfo
 
 load_dotenv()
+
+
+def _parse_json_list(raw, *, default=None) -> list:
+    """Tolerant parse of a Gamma-API field that's a JSON-encoded list.
+
+    Polymarket's Gamma API serializes ``outcomePrices`` and
+    ``clobTokenIds`` as JSON strings inside the JSON response. They're
+    occasionally malformed (we've seen empty strings, truncated values,
+    and the rare `null`). This helper always returns a list — falls
+    back to ``default`` on any parse failure so callers never crash on
+    a flaky API response. Pattern from predmarket's `_normalize_outcomes`.
+    """
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str) or not raw:
+        return list(default) if default is not None else []
+    try:
+        parsed = _json.loads(raw)
+        return parsed if isinstance(parsed, list) else (list(default) if default is not None else [])
+    except (_json.JSONDecodeError, TypeError, ValueError):
+        return list(default) if default is not None else []
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 CLOB_API_BASE = "https://clob.polymarket.com"
@@ -143,15 +165,9 @@ class PolymarketClient(MarketClient):
             if category and market_category != category:
                 continue
 
-            # Polymarket prices are 0.00 - 1.00
-            outcomes = m.get("outcomePrices", "[]")
-            if isinstance(outcomes, str):
-                import json
-                try:
-                    outcomes = json.loads(outcomes)
-                except (json.JSONDecodeError, TypeError):
-                    outcomes = [0.5, 0.5]
-
+            # Polymarket prices are 0.00 - 1.00. outcomePrices may arrive as
+            # a JSON-encoded string from Gamma — _parse_json_list normalizes.
+            outcomes = _parse_json_list(m.get("outcomePrices"), default=[0.5, 0.5])
             yes_price = float(outcomes[0]) if len(outcomes) > 0 else 0.5
             no_price = float(outcomes[1]) if len(outcomes) > 1 else 1.0 - yes_price
 
@@ -171,7 +187,10 @@ class PolymarketClient(MarketClient):
                 url=f"https://polymarket.com/event/{m.get('slug', '')}",
                 extra={
                     "condition_id": m.get("conditionId", ""),
-                    "token_ids": m.get("clobTokenIds", ""),
+                    # Pre-parsed token_ids so order/orderbook paths don't
+                    # re-fetch + re-parse (was a real bug in place_order
+                    # where the parse had no try/except).
+                    "token_ids": _parse_json_list(m.get("clobTokenIds")),
                     "tags": tags,
                 },
             )
@@ -188,14 +207,7 @@ class PolymarketClient(MarketClient):
         tags = m.get("tags", []) or []
         question = m.get("question", "")
 
-        outcomes = m.get("outcomePrices", "[]")
-        if isinstance(outcomes, str):
-            import json
-            try:
-                outcomes = json.loads(outcomes)
-            except (json.JSONDecodeError, TypeError):
-                outcomes = [0.5, 0.5]
-
+        outcomes = _parse_json_list(m.get("outcomePrices"), default=[0.5, 0.5])
         yes_price = float(outcomes[0]) if len(outcomes) > 0 else 0.5
         no_price = float(outcomes[1]) if len(outcomes) > 1 else 1.0 - yes_price
 
@@ -215,7 +227,7 @@ class PolymarketClient(MarketClient):
             url=f"https://polymarket.com/event/{m.get('slug', '')}",
             extra={
                 "condition_id": m.get("conditionId", ""),
-                "token_ids": m.get("clobTokenIds", ""),
+                "token_ids": _parse_json_list(m.get("clobTokenIds")),
             },
         )
 
@@ -225,16 +237,11 @@ class PolymarketClient(MarketClient):
 
         self._rate_limit()
         try:
-            # Need the token_id for the CLOB
+            # Need the token_id for the CLOB. token_ids is pre-parsed
+            # by get_markets/get_market into a list — but accept a raw
+            # string too (defensive for any caller that bypassed those).
             market = self.get_market(market_id)
-            token_ids = market.extra.get("token_ids", "")
-            if isinstance(token_ids, str):
-                import json
-                try:
-                    token_ids = json.loads(token_ids)
-                except (json.JSONDecodeError, TypeError):
-                    return {"bids": [], "asks": []}
-
+            token_ids = _parse_json_list(market.extra.get("token_ids"))
             if not token_ids:
                 return {"bids": [], "asks": []}
 
@@ -277,10 +284,22 @@ class PolymarketClient(MarketClient):
             from py_clob_client.order_builder.constants import BUY
 
             market = self.get_market(market_id)
-            token_ids = market.extra.get("token_ids", "")
-            if isinstance(token_ids, str):
-                import json
-                token_ids = json.loads(token_ids)
+            # token_ids is normally a list (pre-parsed by get_market); the
+            # tolerant parser is belt-and-braces for any path that stashed
+            # a raw string. This was the real bug — the previous code did
+            # a bare json.loads here with no try/except, so a malformed
+            # API payload crashed place_order.
+            token_ids = _parse_json_list(market.extra.get("token_ids"))
+            if len(token_ids) < 2:
+                log_event("market_client", "polymarket_place_order_failed", {
+                    "reason": "missing_token_ids",
+                    "market_id": market_id,
+                }, result="failed")
+                return OrderResult(
+                    success=False, order_id="", platform="polymarket",
+                    market_id=market_id, side=side, quantity=quantity,
+                    fill_price=0.0, error="missing token_ids for market",
+                )
 
             # YES = token_ids[0], NO = token_ids[1]
             token_id = token_ids[0] if side == "YES" else token_ids[1]
