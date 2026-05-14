@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jesse.polybot.btc_arb</string>
+    <!--
+        BTC arb signal monitor — fires every 120s.
+        Samples Binance.US BTC spot + Polymarket strike-binary markets,
+        persists gaps to data/btc_arb_signal.jsonl, and auto-records
+        Phase 2 paper trades when |gap| ≥ 2%.
+
+        Read-only: never places real orders. Phase 3 (real execution)
+        will be a separate cron once Phase 2 paper P&L proves edge.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/jesse/Desktop/projects/polybot &amp;&amp; set -a &amp;&amp; source .env &amp;&amp; set +a &amp;&amp; /Users/jesse/anaconda3/bin/python main.py btc-arb-monitor 2&gt;&amp;1</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_btc_arb.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_btc_arb_err.log</string>
+</dict>
+</plist>
