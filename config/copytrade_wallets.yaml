@@ -19,5 +19,10 @@ manifold:
   # Add more handles here as you identify them, one per line.
   # Example: - SomeKnownTrader
 
-# Polymarket placeholder — Stage 1B will add on-chain wallet addresses here.
-polymarket: []
+# Polymarket — Stage 1 supports scoring via the Data API (no API key
+# needed, public read access). Address format: 0x-prefixed 40-char hex.
+polymarket:
+  # coinman2 — the wallet famous from the latency-arb thread. Real
+  # numbers as of scan: +$32k realized, -$11k unrealized, 41.6% win
+  # rate on 1.27M deployed = +2.56% ROI. Modest, not the legend.
+  - "0x55be7aa03ecfbe37aa5460db791205f7ac9ddca3"

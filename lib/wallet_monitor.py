@@ -102,20 +102,140 @@ def _fetch_manifold_recent_bets(handle: str, *, limit: int = 50,
         return []
 
 
-# ── Polymarket fetching (stub) ───────────────────────────────────────
+# ── Polymarket fetching ──────────────────────────────────────────────
+
+POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+
+
+def _fetch_polymarket_summary(wallet_address: str) -> dict | None:
+    """Pull a Polymarket wallet's portfolio summary.
+
+    Three Data-API calls:
+      * ``/value?user=<wallet>``      — current portfolio value
+      * ``/positions?user=<wallet>``  — open positions + per-position PnL
+      * ``/trades?user=<wallet>&limit=200`` — recent trade history
+
+    Returns a dict combining all three. None on failure (any sub-fetch
+    that 4xxs takes down the whole result, since the scorer needs all
+    three pieces).
+    """
+    import requests
+
+    addr = wallet_address.strip().lower()
+    if not addr.startswith("0x") or len(addr) != 42:
+        log_event("wallet_monitor", "polymarket_bad_address",
+                  {"address": wallet_address[:80]}, result="degraded")
+        return None
+
+    try:
+        value_resp = requests.get(
+            f"{POLYMARKET_DATA_API}/value", params={"user": addr},
+            timeout=15,
+        )
+        value_resp.raise_for_status()
+        value_data = value_resp.json()
+        current_value = float(value_data[0]["value"]) if value_data else 0.0
+
+        pos_resp = requests.get(
+            f"{POLYMARKET_DATA_API}/positions",
+            params={"user": addr, "limit": 200, "sortBy": "CURRENT", "sortDirection": "DESC"},
+            timeout=15,
+        )
+        pos_resp.raise_for_status()
+        positions = pos_resp.json() or []
+
+        tr_resp = requests.get(
+            f"{POLYMARKET_DATA_API}/trades",
+            params={"user": addr, "limit": 200},
+            timeout=15,
+        )
+        tr_resp.raise_for_status()
+        trades = tr_resp.json() or []
+    except Exception as e:
+        log_event("wallet_monitor", "polymarket_fetch_failed",
+                  {"address": addr[:10] + "...", "error": str(e)[:200]},
+                  result="degraded")
+        return None
+
+    return {
+        "address": addr,
+        "current_value": current_value,
+        "positions": positions,
+        "trades": trades,
+    }
+
+
+def _score_polymarket_summary(summary: dict) -> dict:
+    """Reduce a Polymarket portfolio summary to performance metrics.
+
+    Polymarket's ``/positions`` endpoint is far richer than Manifold's
+    user profile — each position carries ``realizedPnl``, ``totalBought``,
+    ``cashPnl``, ``percentPnl``. We sum across positions.
+
+    Open vs settled:
+      * A position is "settled" when ``redeemable`` is True (the market
+        resolved and the user can redeem winnings) OR ``currentValue==0``
+        (position closed).
+      * Otherwise it's "open".
+
+    Win count uses realized P&L (positive = win).
+    """
+    positions = summary.get("positions", []) or []
+    trades = summary.get("trades", []) or []
+
+    realized = 0.0
+    unrealized = 0.0
+    total_bought = 0.0
+    settled, open_, wins, losses = 0, 0, 0, 0
+
+    for p in positions:
+        rp = float(p.get("realizedPnl", 0) or 0)
+        cp = float(p.get("cashPnl", 0) or 0)
+        tb = float(p.get("totalBought", 0) or 0)
+        cv = float(p.get("currentValue", 0) or 0)
+        is_resolved = bool(p.get("redeemable")) or cv == 0
+        realized += rp
+        total_bought += tb
+        if is_resolved:
+            settled += 1
+            if rp > 0:
+                wins += 1
+            else:
+                losses += 1
+        else:
+            open_ += 1
+            # unrealized = current value - cost basis (≈ cp for open)
+            unrealized += cp - rp
+
+    win_rate = wins / settled if settled > 0 else 0.0
+    roi = realized / total_bought if total_bought > 0 else 0.0
+
+    # Recency from latest trade
+    last_ts = max((int(t.get("timestamp", 0) or 0) for t in trades), default=0)
+    last_iso = (
+        datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()
+        if last_ts else ""
+    )
+
+    sizes = [float(t.get("size", 0) or 0) * float(t.get("price", 0) or 0)
+             for t in trades if t.get("size") and t.get("price")]
+    avg_size = statistics.mean(sizes) if sizes else 0.0
+
+    return {
+        "settled": settled, "open": open_,
+        "wins": wins, "losses": losses, "win_rate": win_rate,
+        "realized_pnl": realized, "unrealized_pnl": unrealized,
+        "cost_basis": total_bought, "roi_pct": roi,
+        "avg_bet_size": avg_size, "last_bet_at": last_iso,
+    }
+
 
 def _fetch_polymarket_trades(wallet_address: str, *, lookback_days: int = 30) -> list[dict]:
-    """Polymarket Data-API fetch — placeholder until Stage 1B.
-
-    Polymarket exposes per-wallet trade history at
-    ``https://data-api.polymarket.com/trades?user=<wallet>&limit=N``. To
-    avoid a half-built fetcher in production, this stub raises until
-    the implementation lands.
-    """
-    raise NotImplementedError(
-        "Polymarket wallet fetching not yet implemented — "
-        "enable POLY_PRIVATE_KEY in .env and revisit"
-    )
+    """Compat shim. Stage 1 Polymarket path goes through
+    ``_fetch_polymarket_summary`` directly; this helper exists so
+    ``score_wallet`` has a consistent fetch-then-score split."""
+    summary = _fetch_polymarket_summary(wallet_address)
+    return (summary or {}).get("trades", [])
 
 
 # ── Scoring ──────────────────────────────────────────────────────────
@@ -241,9 +361,11 @@ def score_wallet(handle: str, *, platform: str = "manifold",
         metrics = _score_manifold_user(user, recent)
         total_bets = len(recent)
     elif platform == "polymarket":
-        trades = _fetch_polymarket_trades(handle, lookback_days=lookback_days)
-        # When Polymarket lands, swap _score_polymarket_trades in here.
-        raise NotImplementedError("Polymarket scorer pending Stage 1B")
+        summary = _fetch_polymarket_summary(handle)
+        if summary is None:
+            raise ValueError(f"Polymarket wallet not found or fetch failed: {handle}")
+        metrics = _score_polymarket_summary(summary)
+        total_bets = len(summary.get("trades", []))
     else:
         raise ValueError(f"Unknown platform: {platform}")
 

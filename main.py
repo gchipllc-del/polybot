@@ -784,8 +784,17 @@ def cmd_wallet_scan(top_n: int = 25, platform: str = "manifold", lookback_days: 
     if platform == "manifold":
         handles = discover_top_manifold(top_n=top_n)
     elif platform == "polymarket":
-        print("  Polymarket discovery pending — add wallets manually for now.")
-        return
+        # No public leaderboard API for Polymarket — use curated config
+        # (the Data API used by score_wallet itself is public read-access,
+        # no key needed for scoring).
+        import yaml
+        cfg_path = Path(__file__).parent / "config" / "copytrade_wallets.yaml"
+        try:
+            with open(cfg_path) as f:
+                data = yaml.safe_load(f) or {}
+            handles = list(data.get("polymarket", []) or [])[:top_n]
+        except Exception:
+            handles = []
     else:
         print(f"  Unknown platform: {platform}")
         return
