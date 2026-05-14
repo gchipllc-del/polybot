@@ -207,10 +207,14 @@ def settle_paper_trades() -> dict:
         mid = r.get("market_id")
         if not mid:
             continue
+        # Gamma's /markets defaults to closed=false, so resolved
+        # markets are invisible without explicitly asking for them.
+        # Without this filter, settlement never fires.
         try:
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={"condition_ids": mid}, timeout=10,
+                params={"condition_ids": mid, "closed": "true"},
+                timeout=10,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -219,8 +223,8 @@ def settle_paper_trades() -> dict:
         if not isinstance(data, list) or not data:
             continue
         m = data[0]
-        # A market is resolved when ``closed=True`` AND ``umaResolutionStatuses``
-        # is "resolved" or outcome prices collapse to (1,0) or (0,1).
+        # Belt-and-suspenders: if Gamma ever stops respecting the filter,
+        # the explicit closed check below still guards us.
         if not m.get("closed"):
             continue
         # Determine the winning outcome from final outcomePrices
