@@ -261,15 +261,34 @@ def persist_signals(signals: list[BtcArbSignal]) -> None:
             f.write(json.dumps(asdict(s)) + "\n")
 
 
-def run_signal_cycle(*, annual_vol: float = DEFAULT_ANNUAL_VOL) -> dict:
+def run_signal_cycle(
+    *,
+    annual_vol: float = DEFAULT_ANNUAL_VOL,
+    record_paper_trades: bool = True,
+) -> dict:
     """One full sample: compute, persist, log. Returns summary dict.
 
     The signal cycle is intentionally cheap (~1-2s with 2 HTTP calls)
     so it can run inside a tight loop or be called from a launchd
     cron at any cadence.
+
+    ``record_paper_trades=True`` (default) auto-records Phase 2 paper
+    entries when any signal's gap exceeds the threshold. Set False
+    for pure read-only measurement.
     """
     signals = compute_signals(annual_vol=annual_vol)
     persist_signals(signals)
+    n_paper = 0
+    if record_paper_trades and signals:
+        try:
+            from lib.btc_arb_paper import record_paper_trades_from_signals
+            new_trades = record_paper_trades_from_signals(
+                [asdict(s) for s in signals]
+            )
+            n_paper = len(new_trades)
+        except Exception as e:
+            log_event("btc_arb", "paper_record_failed",
+                      {"error": str(e)[:200]}, result="degraded")
     if signals:
         top = signals[0]
         log_event("btc_arb", "signal_cycle", {
@@ -278,9 +297,11 @@ def run_signal_cycle(*, annual_vol: float = DEFAULT_ANNUAL_VOL) -> dict:
             "top_market_id": top.market_id[:16],
             "top_strike": top.strike_usd,
             "spot": top.spot_usd,
+            "paper_trades_opened": n_paper,
         })
     return {
         "n_markets": len(signals),
         "max_abs_gap": signals[0].abs_gap if signals else 0.0,
         "signals": [asdict(s) for s in signals],
+        "paper_trades_opened": n_paper,
     }

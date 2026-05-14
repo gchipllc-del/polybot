@@ -903,6 +903,41 @@ def cmd_btc_arb_monitor(once: bool = True):
     print(f"  Persisted to data/btc_arb_signal.jsonl")
 
 
+def cmd_btc_arb_paper_settle():
+    """Phase 2 — settle open BTC arb paper trades against actual
+    market outcomes. Run periodically (manually or cron) so the report
+    stays current.
+    """
+    from lib.btc_arb_paper import settle_paper_trades
+    result = settle_paper_trades()
+    print(f"=== BTC arb paper-settle ===")
+    print(f"  Newly settled:        {result['settled_now']}")
+    print(f"  Paper P&L this cycle: ${result['paper_pnl_this_cycle']:+,.2f}")
+    print(f"  Total open:           {result['total_open']}")
+    print(f"  Total settled:        {result['total_settled']}")
+
+
+def cmd_btc_arb_paper_report():
+    """Phase 2 — aggregate paper P&L stats. The verdict on whether
+    the BTC arb signal would have been profitable.
+    """
+    from lib.btc_arb_paper import summary
+    s = summary()
+    print(f"=== BTC arb paper-trade report ===")
+    print(f"  Total trades:     {s['total_trades']}")
+    print(f"  Open/Won/Lost/Void: {s['open']}/{s['won']}/{s['lost']}/{s['void']}")
+    print(f"  Capital deployed: ${s['capital_deployed']:,.2f}")
+    print(f"  Total paper P&L:  ${s['total_paper_pnl']:+,.2f}")
+    print(f"  Win rate:         {s['win_rate']:.1%}")
+    print(f"  ROI:              {s['roi_pct']:+.2%}")
+    if s["per_day_pnl"]:
+        print(f"\n  Per-day P&L:")
+        for day in sorted(s["per_day_pnl"]):
+            pnl = s["per_day_pnl"][day]
+            flag = " ⚠ daily limit" if pnl <= -20 else ""
+            print(f"    {day}: ${pnl:+,.2f}{flag}")
+
+
 def cmd_paper_copy_settle():
     """Stage 3 — poll markets for resolution, mark open paper copies
     won/lost/void, persist updated P&L. Run periodically (manually or
@@ -1216,6 +1251,10 @@ def main():
         cmd_paper_copy_report()
     elif command == "btc-arb-monitor":
         cmd_btc_arb_monitor()
+    elif command == "btc-arb-paper-settle":
+        cmd_btc_arb_paper_settle()
+    elif command == "btc-arb-paper-report":
+        cmd_btc_arb_paper_report()
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
