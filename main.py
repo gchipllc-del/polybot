@@ -29,6 +29,8 @@ Usage:
     python main.py wallet-scan       # Discover + score top wallets (Stage 1 copy-trade)
     python main.py wallet-score <handle>  # Deep-dive one wallet
     python main.py wallet-watch      # Poll watchlist, alert on new bets (Stage 2)
+    python main.py paper-copy-settle # Settle resolved paper-copy trades (Stage 3)
+    python main.py paper-copy-report # Aggregate paper P&L per source wallet (Stage 3)
 """
 
 import json
@@ -870,6 +872,49 @@ def cmd_wallet_watch(min_score: float = 0.10, max_wallets: int = 20):
         print("  (no new activity on any watched wallet)")
 
 
+def cmd_paper_copy_settle():
+    """Stage 3 — poll markets for resolution, mark open paper copies
+    won/lost/void, persist updated P&L. Run periodically (manually or
+    via cron) so the report stays current.
+    """
+    from lib.wallet_paper_copy import settle_paper_copies
+    result = settle_paper_copies()
+    print(f"=== Paper-copy settlement cycle ===")
+    print(f"  Newly settled:        {result['settled_now']}")
+    print(f"  Paper P&L this cycle: M${result['paper_pnl_this_cycle']:+,.2f}")
+    print(f"  Total open:           {result['total_open']}")
+    print(f"  Total settled:        {result['total_settled']}")
+
+
+def cmd_paper_copy_report():
+    """Stage 3 — aggregate paper P&L per source wallet. The verdict on
+    whether copy-trading each wallet would have been profitable
+    (without yet risking real capital).
+    """
+    from lib.wallet_paper_copy import summary_by_wallet
+    summary = summary_by_wallet()
+    if not summary:
+        print("No paper-copy trades recorded yet — run `wallet-watch` first.")
+        return
+
+    # Sort by ROI descending
+    rows = sorted(summary.items(), key=lambda kv: kv[1].get("roi_pct", 0), reverse=True)
+    print(f"=== Paper-copy report (by source wallet) ===")
+    print(f"  {'handle':<28}{'open':<6}{'won':<5}{'lost':<6}{'void':<6}"
+          f"{'win%':<7}{'cap':<10}{'pnl':<12}{'roi%':<8}")
+    for handle, s in rows:
+        cap = s.get("capital_at_risk", 0)
+        pnl = s.get("total_pnl", 0)
+        wr = s.get("win_rate", 0) * 100
+        roi = s.get("roi_pct", 0) * 100
+        print(f"  {handle[:27]:<28}{s['open']:<6}{s['wins']:<5}{s['losses']:<6}"
+              f"{s['voids']:<6}{wr:<7.0f}M${cap:<8.0f}M${pnl:<+10.2f}{roi:<+8.1f}")
+    settled_total = sum(s['wins'] + s['losses'] + s['voids'] for s in summary.values())
+    total_pnl = sum(s['total_pnl'] for s in summary.values())
+    print(f"\n  Total settled: {settled_total}   Total paper P&L: M${total_pnl:+,.2f}")
+    print(f"  Run `paper-copy-settle` to mark newly-resolved markets.")
+
+
 def cmd_wallet_score(handle: str, platform: str = "manifold", lookback_days: int = 30):
     """Deep-dive one wallet — fetch + score + print full metrics."""
     from lib.wallet_monitor import score_wallet
@@ -1134,6 +1179,10 @@ def main():
             elif arg.startswith("--max="):
                 max_wallets = int(arg.split("=", 1)[1])
         cmd_wallet_watch(min_score=min_score, max_wallets=max_wallets)
+    elif command == "paper-copy-settle":
+        cmd_paper_copy_settle()
+    elif command == "paper-copy-report":
+        cmd_paper_copy_report()
     else:
         print(f"Unknown command: {command}")
         print(__doc__)

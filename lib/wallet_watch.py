@@ -245,6 +245,15 @@ def run_watch_cycle(
         for a in new_alerts:
             _persist_alert(a)
             telegram_ok = _send_telegram(a)
+            # Stage 3: record a paper-copy entry so we can measure
+            # later whether following this wallet would have been
+            # profitable. Best-effort — never blocks the alert flow.
+            try:
+                from lib.wallet_paper_copy import record_paper_copy_from_alert
+                record_paper_copy_from_alert(asdict(a))
+            except Exception as e:
+                log_event("wallet_watch", "paper_copy_record_failed",
+                          {"error": str(e)[:200]}, result="degraded")
             log_event("wallet_watch", "alert", {
                 "handle": a.handle, "platform": a.platform,
                 "side": a.side, "amount": a.amount,
