@@ -186,6 +186,7 @@ def _score_polymarket_summary(summary: dict) -> dict:
     realized = 0.0
     unrealized = 0.0
     total_bought = 0.0
+    total_cash_pnl = 0.0  # realized + mark-to-market unrealized
     settled, open_, wins, losses = 0, 0, 0, 0
 
     for p in positions:
@@ -196,6 +197,7 @@ def _score_polymarket_summary(summary: dict) -> dict:
         is_resolved = bool(p.get("redeemable")) or cv == 0
         realized += rp
         total_bought += tb
+        total_cash_pnl += cp
         if is_resolved:
             settled += 1
             if rp > 0:
@@ -204,11 +206,15 @@ def _score_polymarket_summary(summary: dict) -> dict:
                 losses += 1
         else:
             open_ += 1
-            # unrealized = current value - cost basis (≈ cp for open)
-            unrealized += cp - rp
+            unrealized += cp - rp  # unrealized = total cash PnL minus realized portion
 
     win_rate = wins / settled if settled > 0 else 0.0
-    roi = realized / total_bought if total_bought > 0 else 0.0
+    # ROI uses cashPnl (includes unrealized) so wallets with mostly-open
+    # positions get a meaningful number — Polymarket's positions
+    # endpoint sets cashPnl = current-value - cost-basis for opens, and
+    # realized-pnl for settled. Sum is the right "is this wallet up?"
+    # measure for copy-trade ranking.
+    roi = total_cash_pnl / total_bought if total_bought > 0 else 0.0
 
     # Recency from latest trade
     last_ts = max((int(t.get("timestamp", 0) or 0) for t in trades), default=0)
@@ -236,6 +242,64 @@ def _fetch_polymarket_trades(wallet_address: str, *, lookback_days: int = 30) ->
     ``score_wallet`` has a consistent fetch-then-score split."""
     summary = _fetch_polymarket_summary(wallet_address)
     return (summary or {}).get("trades", [])
+
+
+def discover_top_polymarket(
+    *,
+    top_n: int = 25,
+    period: str = "monthly",
+    min_volume: float = 10_000.0,
+) -> list[str]:
+    """Pull top Polymarket wallets by P&L from the Data API's
+    ``/v1/leaderboard`` endpoint.
+
+    Returns a list of wallet addresses (``proxyWallet``). The composite
+    scorer downstream (``score_wallet``) then filters by realized ROI
+    and recent activity — leaderboard rank alone isn't enough since
+    a wallet can be #1 by sheer volume (high turnover) without being
+    risk-adjusted profitable.
+
+    ``period``: 'allTime' | 'monthly' | 'weekly' (Polymarket's filters).
+    ``min_volume``: filter out tiny accounts even if they appear on the
+    leaderboard — under \$10k turnover, the sample isn't statistically
+    meaningful for copy-trading.
+    """
+    import requests
+    try:
+        resp = requests.get(
+            f"{POLYMARKET_DATA_API}/v1/leaderboard",
+            params={"period": period, "limit": top_n * 2},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        rows = resp.json() or []
+    except Exception as e:
+        log_event("wallet_monitor", "polymarket_leaderboard_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+        return []
+
+    qualified: list[str] = []
+    for row in rows:
+        if len(qualified) >= top_n:
+            break
+        vol = float(row.get("vol", 0) or 0)
+        pnl = float(row.get("pnl", 0) or 0)
+        addr = str(row.get("proxyWallet", "")).lower()
+        if not addr.startswith("0x") or len(addr) != 42:
+            continue
+        if vol < min_volume:
+            continue
+        # Skip wallets with non-positive PnL — they may rank by volume
+        # but they're not profitable, which is what copy-trading needs.
+        if pnl <= 0:
+            continue
+        qualified.append(addr)
+
+    log_event("wallet_monitor", "polymarket_discover_complete", {
+        "rows_fetched": len(rows), "qualified": len(qualified),
+        "period": period, "min_volume": min_volume,
+    })
+    return qualified
 
 
 # ── Scoring ──────────────────────────────────────────────────────────

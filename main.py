@@ -784,17 +784,25 @@ def cmd_wallet_scan(top_n: int = 25, platform: str = "manifold", lookback_days: 
     if platform == "manifold":
         handles = discover_top_manifold(top_n=top_n)
     elif platform == "polymarket":
-        # No public leaderboard API for Polymarket — use curated config
-        # (the Data API used by score_wallet itself is public read-access,
-        # no key needed for scoring).
+        # Three-layer discovery (curated first, then auto from leaderboard).
+        # Polymarket's /v1/leaderboard returns top wallets by PnL —
+        # autodiscovery here mirrors what discover_top_manifold does.
+        from lib.wallet_monitor import discover_top_polymarket
+        handles: list[str] = []
         import yaml
         cfg_path = Path(__file__).parent / "config" / "copytrade_wallets.yaml"
         try:
             with open(cfg_path) as f:
                 data = yaml.safe_load(f) or {}
-            handles = list(data.get("polymarket", []) or [])[:top_n]
+            handles.extend((data.get("polymarket", []) or [])[:top_n])
         except Exception:
-            handles = []
+            pass
+        remaining = top_n - len(handles)
+        if remaining > 0:
+            auto = discover_top_polymarket(top_n=remaining, period="monthly")
+            for h in auto:
+                if h not in handles:
+                    handles.append(h)
     else:
         print(f"  Unknown platform: {platform}")
         return
