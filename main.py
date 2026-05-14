@@ -28,6 +28,7 @@ Usage:
     python main.py brier [--n=50]    # Cold-start calibration: replay ForecastBench dataset
     python main.py wallet-scan       # Discover + score top wallets (Stage 1 copy-trade)
     python main.py wallet-score <handle>  # Deep-dive one wallet
+    python main.py wallet-watch      # Poll watchlist, alert on new bets (Stage 2)
 """
 
 import json
@@ -824,6 +825,34 @@ def cmd_wallet_scan(top_n: int = 25, platform: str = "manifold", lookback_days: 
     print(f"\n  Persisted {len(scored)} scored wallet(s) to data/wallet_scores.json")
 
 
+def cmd_wallet_watch(min_score: float = 0.10, max_wallets: int = 20):
+    """Stage 2 copy-trade — poll watched wallets, alert on new bets.
+
+    Reads the watchlist from ``data/wallet_scores.json`` (filtered by
+    composite score ≥ ``min_score``), fetches each wallet's latest
+    bets, and fires alerts for any newer than the last poll.
+
+    Outputs: ``data/wallet_alerts.jsonl`` (always), Telegram (if
+    configured), and ``audit_log.jsonl``. Read-only — never places
+    orders. Use ``wallet-scan`` to refresh scores before running.
+    """
+    from lib.wallet_watch import run_watch_cycle
+    result = run_watch_cycle(min_score=min_score, max_wallets=max_wallets)
+    print(f"=== Wallet watch cycle ===")
+    print(f"  Wallets polled: {result['wallets_polled']}")
+    print(f"  Alerts fired:   {result['alerts_fired']}")
+    if result["alerts"]:
+        print(f"\n  Recent alerts:")
+        for a in result["alerts"][:10]:
+            print(f"    {a['handle']:20s} {a['side']:3s} "
+                  f"@ {a['prob_after']:.0%}  M${a['amount']:>6.0f}  "
+                  f"{a['market_question'][:50]}")
+    elif result["wallets_polled"] == 0:
+        print("  (no eligible wallets — run `wallet-scan` first)")
+    else:
+        print("  (no new activity on any watched wallet)")
+
+
 def cmd_wallet_score(handle: str, platform: str = "manifold", lookback_days: int = 30):
     """Deep-dive one wallet — fetch + score + print full metrics."""
     from lib.wallet_monitor import score_wallet
@@ -1079,6 +1108,15 @@ def main():
             elif arg.startswith("--lookback="):
                 lookback = max(1, int(arg.split("=", 1)[1]))
         cmd_wallet_score(handle=handle, platform=platform, lookback_days=lookback)
+    elif command == "wallet-watch":
+        min_score = 0.10
+        max_wallets = 20
+        for arg in sys.argv[2:]:
+            if arg.startswith("--min-score="):
+                min_score = float(arg.split("=", 1)[1])
+            elif arg.startswith("--max="):
+                max_wallets = int(arg.split("=", 1)[1])
+        cmd_wallet_watch(min_score=min_score, max_wallets=max_wallets)
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
