@@ -31,6 +31,7 @@ Usage:
     python main.py wallet-watch      # Poll watchlist, alert on new bets (Stage 2)
     python main.py paper-copy-settle # Settle resolved paper-copy trades (Stage 3)
     python main.py paper-copy-report # Aggregate paper P&L per source wallet (Stage 3)
+    python main.py btc-arb-monitor   # Sample Binance spot vs Polymarket BTC gaps (Phase 1)
 """
 
 import json
@@ -872,6 +873,36 @@ def cmd_wallet_watch(min_score: float = 0.10, max_wallets: int = 20):
         print("  (no new activity on any watched wallet)")
 
 
+def cmd_btc_arb_monitor(once: bool = True):
+    """Phase 1 latency-arb — sample Binance spot vs Polymarket BTC
+    daily-strike YES prices, compute the gap, persist to disk.
+
+    Read-only. Phase 2 (paper trade) + Phase 3 (real execution) ride
+    on the signal file this command produces. Run once per invocation
+    (cron-friendly) or wrap in your own loop.
+    """
+    from lib.btc_arb_signal import run_signal_cycle
+    result = run_signal_cycle()
+    print(f"=== BTC arb signal cycle ===")
+    if result["n_markets"] == 0:
+        print("  No qualifying BTC daily-strike markets right now.")
+        return
+    print(f"  Sampled {result['n_markets']} market(s). Top divergences:")
+    print(f"  {'strike':>10}{'yes_pm':>9}{'implied':>10}{'gap':>9}"
+          f"{'hrs_left':>10}{'vol_24h':>12}")
+    for s in result["signals"][:5]:
+        direction = "↑YES_cheap" if s["gap"] > 0 else "↓NO_cheap"
+        print(f"  ${s['strike_usd']:>9,.0f}"
+              f"  {s['yes_price']:>.2f}"
+              f"  {s['implied_yes_prob']:>.2f}"
+              f"  {s['gap']:>+.3f}"
+              f"  {s['hours_to_close']:>7.1f}h"
+              f"  ${s['volume_24h']:>9,.0f}  {direction}")
+    spot = result["signals"][0]["spot_usd"]
+    print(f"\n  Binance.US spot: ${spot:,.2f}")
+    print(f"  Persisted to data/btc_arb_signal.jsonl")
+
+
 def cmd_paper_copy_settle():
     """Stage 3 — poll markets for resolution, mark open paper copies
     won/lost/void, persist updated P&L. Run periodically (manually or
@@ -1183,6 +1214,8 @@ def main():
         cmd_paper_copy_settle()
     elif command == "paper-copy-report":
         cmd_paper_copy_report()
+    elif command == "btc-arb-monitor":
+        cmd_btc_arb_monitor()
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
