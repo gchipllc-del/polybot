@@ -274,36 +274,166 @@ def discover_top_manifold(*, top_n: int = 25, client=None,
                            seed_handles: list[str] | None = None) -> list[str]:
     """Return a candidate handle list to score.
 
-    Manifold has no public leaderboard endpoint — ``/v0/users`` returns
-    new signups, not top traders by profit (verified empirically:
-    profitCached comes back None on the list endpoint). Two real
-    discovery paths:
+    Three layered sources, merged in order:
+      1. ``seed_handles`` (caller-supplied) — highest priority
+      2. Curated config (``config/copytrade_wallets.yaml``)
+      3. Automated discovery via ``discover_via_resolved_markets`` —
+         scans recently-resolved high-volume markets and counts which
+         wallets bet on the winning side most often. Adds the top-N
+         such wallets to the candidate pool.
 
-      1. Curated seed list — known good traders the user has identified
-         (passed via ``seed_handles`` or loaded from
-         ``config/copytrade_wallets.yaml``).
-      2. Recent-resolution scan (planned for Stage 1B) — walk recently
-         resolved high-volume markets and accumulate which wallets
-         consistently land on the winning side.
-
-    For Stage 1 MVP we go with #1. Add wallets to the config file as
-    you find them.
+    Layer 3 is what makes Stage 1B different from Stage 1: we no longer
+    need the user to manually curate. The composite scorer downstream
+    still gates real copy-trading on multi-window performance.
     """
+    handles: list[str] = []
     if seed_handles:
-        return seed_handles[:top_n]
-    # Try to load curated list from config
+        handles.extend(seed_handles)
+    # Curated config
     try:
         import yaml
         cfg_path = Path(__file__).parent.parent / "config" / "copytrade_wallets.yaml"
         if cfg_path.exists():
             with open(cfg_path) as f:
                 data = yaml.safe_load(f) or {}
-            handles = data.get("manifold", []) or []
-            return list(handles)[:top_n]
+            for h in (data.get("manifold", []) or []):
+                if h and h not in handles:
+                    handles.append(h)
     except Exception as e:
         log_event("wallet_monitor", "discover_config_load_failed",
                   {"error": str(e)[:200]}, result="degraded")
-    return []
+
+    # Automated discovery — fill remaining slots with wallets that
+    # demonstrably picked winners in recent resolved markets.
+    remaining = top_n - len(handles)
+    if remaining > 0:
+        try:
+            auto = discover_via_resolved_markets(
+                top_n=remaining, client=client,
+            )
+            for h in auto:
+                if h not in handles:
+                    handles.append(h)
+        except Exception as e:
+            log_event("wallet_monitor", "discover_auto_failed",
+                      {"error": str(e)[:200]}, result="degraded")
+
+    return handles[:top_n]
+
+
+def discover_via_resolved_markets(
+    *,
+    top_n: int = 20,
+    market_scan_size: int = 100,
+    min_market_volume: float = 500.0,
+    min_bets_per_market: int = 4,
+    client=None,
+) -> list[str]:
+    """Walk recently-resolved high-volume Manifold markets and identify
+    wallets that consistently land on the winning side.
+
+    Algorithm:
+      1. Pull ``market_scan_size`` recently-resolved BINARY markets
+         from ``/v0/search-markets?filter=resolved&sort=newest``.
+      2. Skip markets with low volume or fewer than ``min_bets_per_market``
+         bets — too few datapoints to be meaningful.
+      3. For each remaining market: fetch the bets, compare each bet's
+         ``outcome`` against the market's ``resolution``.
+      4. Tally winning-side bets per ``userUsername``.
+      5. Return the top-N usernames by raw winning-bet count.
+
+    This is intentionally crude — it counts hits, not P&L. Stage 1
+    scoring downstream (``score_wallet``) takes the final cut on ROI.
+    Discovery here just produces the candidate pool. Wallets that
+    appear in the top-N here are *worth scoring*; the scorer decides
+    if they're worth following.
+
+    Note: rate-limited by the existing ManifoldClient (~5 req/s).
+    Scanning 100 markets ≈ 100 bet-fetches ≈ 20-30 seconds.
+    """
+    if client is None:
+        from lib.manifold_client import ManifoldClient
+        client = ManifoldClient()
+
+    from collections import Counter
+
+    # 1. Pull recently-resolved markets
+    try:
+        markets = client._get("/search-markets", {
+            "filter": "resolved", "sort": "newest",
+            "limit": market_scan_size, "term": "",
+        }) or []
+    except Exception as e:
+        log_event("wallet_monitor", "discover_search_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+        return []
+
+    # 2. Filter to high-quality BINARY markets
+    candidates = [
+        m for m in markets
+        if m.get("outcomeType") == "BINARY"
+        and float(m.get("volume", 0) or 0) >= min_market_volume
+        and (m.get("uniqueBettorCount") or 0) >= min_bets_per_market
+        and str(m.get("resolution", "")).upper() in ("YES", "NO")
+    ]
+    log_event("wallet_monitor", "discover_market_pool", {
+        "total_scanned": len(markets),
+        "qualifying": len(candidates),
+        "min_volume": min_market_volume,
+    })
+
+    # 3+4. For each market, count winning-side bettors. Bet objects only
+    # carry userId (no username) — accumulate IDs first, resolve to
+    # usernames in bulk at the end to amortize the lookup cost.
+    winners_by_id: Counter[str] = Counter()
+    for m in candidates:
+        mid = m.get("id")
+        resolution = str(m.get("resolution", "")).upper()
+        if not mid or resolution not in ("YES", "NO"):
+            continue
+        try:
+            bets = client._get("/bets", {"contractId": mid, "limit": 200}) or []
+        except Exception:
+            continue
+        seen_users: set[str] = set()
+        for b in bets:
+            if b.get("isCancelled"):
+                continue
+            user_id = b.get("userId")
+            outcome = str(b.get("outcome", "")).upper()
+            # Count each user at most once per market (avoid favoring
+            # wallets that just churn the same market).
+            if not user_id or user_id in seen_users:
+                continue
+            if outcome == resolution:
+                winners_by_id[user_id] += 1
+                seen_users.add(user_id)
+
+    # 5. Resolve top-N userIds to usernames. ``/v0/user/by-id/{id}``
+    # returns the user object; we want ``username`` for the rest of
+    # the pipeline. Best-effort — skip IDs we can't resolve.
+    top_ids = [uid for uid, _count in winners_by_id.most_common(top_n * 2)]
+    usernames: list[str] = []
+    for uid in top_ids:
+        if len(usernames) >= top_n:
+            break
+        try:
+            u = client._get(f"/user/by-id/{uid}")
+            name = u.get("username") if isinstance(u, dict) else None
+            if name:
+                usernames.append(name)
+        except Exception:
+            continue
+    top = usernames
+    log_event("wallet_monitor", "discover_complete", {
+        "candidates_found": len(top),
+        "markets_used": len(candidates),
+        "top_5_with_counts": [
+            {"user_id": uid, "wins": c}
+            for uid, c in winners_by_id.most_common(5)
+        ],
+    })
+    return top
 
 
 def persist_scores(scores: list[WalletPerformance]) -> None:
