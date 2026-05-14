@@ -29,6 +29,8 @@ Usage:
     python main.py wallet-scan       # Discover + score top wallets (Stage 1 copy-trade)
     python main.py wallet-score <handle>  # Deep-dive one wallet
     python main.py wallet-watch      # Poll watchlist, alert on new bets (Stage 2)
+    python main.py wallet-backtest <handle>  # Replay wallet's history as hypothetical copy
+    python main.py wallet-backtest-all       # Backtest every scored + curated wallet, rank by ROI
     python main.py paper-copy-settle # Settle resolved paper-copy trades (Stage 3)
     python main.py paper-copy-report # Aggregate paper P&L per source wallet (Stage 3)
     python main.py btc-arb-monitor   # Sample Binance spot vs Polymarket BTC gaps (Phase 1)
@@ -999,6 +1001,129 @@ def cmd_wallet_score(handle: str, platform: str = "manifold", lookback_days: int
     print(f"  Composite score:   {perf.score:+.4f}")
 
 
+def cmd_wallet_backtest(
+    handle: str,
+    *,
+    platform: str = "manifold",
+    lookback_days: int = 90,
+    copy_size_usd: float = 10.0,
+):
+    """Replay a wallet's historical bets and print hypothetical copy P&L.
+
+    Honest about what it is: an *upper bound* on copy-edge (we assume
+    we'd fill at the same price the source got, which understates real
+    slippage). Use the ranking, not the absolute numbers, to decide
+    which wallets are worth following.
+    """
+    from lib.wallet_backtest import backtest_wallet
+
+    print(f"Backtesting {handle} ({platform}, last {lookback_days}d, "
+          f"${copy_size_usd:.0f}/trade)...")
+    print("  This walks every historical bet + looks up each market's")
+    print("  resolution — can take 30-90s for active wallets.")
+    summary, out_path = backtest_wallet(
+        handle, platform=platform,
+        copy_size_usd=copy_size_usd,
+        lookback_days=lookback_days,
+    )
+
+    print()
+    print(f"=== {summary.handle} ({summary.platform}, {summary.lookback_days}d) ===")
+    print(f"  Bets seen:         {summary.total_bets_seen}")
+    print(f"  Copied (resolved): {summary.bets_copied}")
+    print(f"  Skipped:           {summary.bets_skipped}")
+    if summary.skip_reasons:
+        for reason, n in sorted(summary.skip_reasons.items(),
+                                key=lambda kv: -kv[1]):
+            print(f"      {reason:20s} {n}")
+    if summary.bets_copied == 0:
+        print("  → No copyable bets in window. Try --lookback=180 or check the handle.")
+        return
+    print(f"  Wins / Losses:     {summary.wins} / {summary.losses}  "
+          f"(voids: {summary.voids})")
+    print(f"  Win rate:          {summary.win_rate:.1%}")
+    print(f"  Capital deployed:  ${summary.total_capital_deployed:,.2f}")
+    print(f"  Paper P&L:         ${summary.total_paper_pnl:+,.2f}")
+    print(f"  ROI:               {summary.roi_pct:+.2%}")
+
+    if summary.top_winners:
+        print("\n  Top winners:")
+        for w in summary.top_winners[:3]:
+            print(f"    {w['side']:3s} @ {w['fill']:.2f}  "
+                  f"${w['pnl']:+,.2f}  {w['market'][:70]}")
+    if summary.top_losers:
+        print("\n  Top losers:")
+        for l in summary.top_losers[:3]:
+            print(f"    {l['side']:3s} @ {l['fill']:.2f}  "
+                  f"${l['pnl']:+,.2f}  {l['market'][:70]}")
+
+    if out_path:
+        print(f"\n  Full detail → {out_path}")
+
+
+def cmd_wallet_backtest_all(
+    *,
+    lookback_days: int = 90,
+    copy_size_usd: float = 10.0,
+    min_settled: int = 5,
+):
+    """Backtest every scored + curated wallet, rank by hypothetical ROI.
+
+    Turns the leaderboard into a real-vs-fake-edge filter. Wallets with
+    too few settled copyable bets (< ``min_settled``) sink to the
+    bottom regardless of their ROI — three wins on three bets isn't
+    signal.
+    """
+    from lib.wallet_backtest import backtest_all
+
+    def _progress(i, n, handle, platform):
+        print(f"  [{i}/{n}] {platform}: {handle[:60]}...", flush=True)
+
+    print(f"Backtesting all known wallets (last {lookback_days}d, "
+          f"${copy_size_usd:.0f}/trade, min {min_settled} settled)")
+    print("This walks Manifold + Polymarket — can take several minutes.")
+    print()
+    result = backtest_all(
+        copy_size_usd=copy_size_usd,
+        lookback_days=lookback_days,
+        min_settled=min_settled,
+        progress_callback=_progress,
+    )
+
+    ranked = result["ranked"]
+    failed = result["failed"]
+    if not ranked:
+        print("\nNo wallets backtested. Run `wallet-scan` first or check "
+              "config/copytrade_wallets.yaml.")
+        return
+
+    print()
+    print(f"=== Ranked {len(ranked)} wallets by backtested ROI ===")
+    print(f"{'rank':>4} {'plat':4} {'handle':30} {'copied':>6} {'wr':>6} "
+          f"{'pnl':>10} {'roi':>8} {'flag':>5}")
+    print("-" * 80)
+    for i, r in enumerate(ranked, 1):
+        h = (r.get("handle") or "")[:30]
+        plat = (r.get("platform") or "?")[:4]
+        copied = r.get("bets_copied", 0)
+        settled = r.get("wins", 0) + r.get("losses", 0)
+        wr = r.get("win_rate", 0.0)
+        pnl = r.get("total_paper_pnl", 0.0)
+        roi = r.get("roi_pct", 0.0)
+        flag = "thin" if settled < min_settled else ""
+        print(f"{i:>4} {plat:4} {h:30} {copied:>6} {wr:>6.1%} "
+              f"${pnl:>+8.2f} {roi:>+7.2%} {flag:>5}")
+
+    if failed:
+        print()
+        print(f"Failed: {len(failed)}")
+        for f in failed[:5]:
+            print(f"  {f['platform']}: {f['handle']:30} — {f['error'][:50]}")
+
+    if result.get("output_path"):
+        print(f"\nFull ranking → {result['output_path']}")
+
+
 def cmd_chaos():
     """Run chaos tests to verify safety systems."""
     from lib.audit import log_event
@@ -1245,6 +1370,44 @@ def main():
             elif arg.startswith("--max="):
                 max_wallets = int(arg.split("=", 1)[1])
         cmd_wallet_watch(min_score=min_score, max_wallets=max_wallets)
+    elif command == "wallet-backtest":
+        if len(sys.argv) < 3:
+            print("Usage: python main.py wallet-backtest <handle> "
+                  "[--platform=manifold|polymarket] [--lookback=90] [--size=10]")
+            return
+        handle = sys.argv[2]
+        platform = "manifold"
+        lookback = 90
+        size = 10.0
+        # Auto-detect Polymarket addresses
+        if handle.startswith("0x") and len(handle) == 42:
+            platform = "polymarket"
+        for arg in sys.argv[3:]:
+            if arg.startswith("--platform="):
+                platform = arg.split("=", 1)[1]
+            elif arg.startswith("--lookback="):
+                lookback = max(1, int(arg.split("=", 1)[1]))
+            elif arg.startswith("--size="):
+                size = max(0.01, float(arg.split("=", 1)[1]))
+        cmd_wallet_backtest(
+            handle=handle, platform=platform,
+            lookback_days=lookback, copy_size_usd=size,
+        )
+    elif command == "wallet-backtest-all":
+        lookback = 90
+        size = 10.0
+        min_settled = 5
+        for arg in sys.argv[2:]:
+            if arg.startswith("--lookback="):
+                lookback = max(1, int(arg.split("=", 1)[1]))
+            elif arg.startswith("--size="):
+                size = max(0.01, float(arg.split("=", 1)[1]))
+            elif arg.startswith("--min-settled="):
+                min_settled = max(0, int(arg.split("=", 1)[1]))
+        cmd_wallet_backtest_all(
+            lookback_days=lookback, copy_size_usd=size,
+            min_settled=min_settled,
+        )
     elif command == "paper-copy-settle":
         cmd_paper_copy_settle()
     elif command == "paper-copy-report":
