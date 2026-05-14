@@ -116,6 +116,29 @@ def step2_validate(
     price = intent.limit_price or intent.market_probability
     order_value = price * intent.quantity
 
+    # Reject orders too close to certainty (≥0.95) or near zero (≤0.05).
+    # Manifold returns 400 Bad Request on these — the platform refuses to
+    # take the other side of a "free money" trade. Without this gate,
+    # the trader keeps re-proposing the same impossible bet every cycle
+    # and produces a retry-loop in the audit log (observed 2026-05-14:
+    # ~24 retries on a YES-at-0.991 intent over multiple hours).
+    # ``min_composite_score`` later catches some of these, but this
+    # rejects them earlier and with a clearer reason.
+    EXTREME_PRICE_FLOOR = 0.05
+    EXTREME_PRICE_CEIL = 0.95
+    if price is not None and not (EXTREME_PRICE_FLOOR <= price <= EXTREME_PRICE_CEIL):
+        log_event("order_gate", "step2_extreme_price", {
+            "hash": intent.intent_hash,
+            "price": price,
+            "floor": EXTREME_PRICE_FLOOR,
+            "ceil": EXTREME_PRICE_CEIL,
+        }, result="blocked")
+        raise ValueError(
+            f"Order price {price:.4f} outside tradable band "
+            f"[{EXTREME_PRICE_FLOOR}, {EXTREME_PRICE_CEIL}] — "
+            f"prediction market platforms reject extreme-confidence orders"
+        )
+
     # Run all circuit breaker checks
     try:
         run_all_checks(
