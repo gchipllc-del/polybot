@@ -1,0 +1,23 @@
+# Curated wallet watchlist for the copy-trading roadmap.
+#
+# Stage 1 (wallet-scan) reads from here when no seed_handles are passed
+# explicitly. Add Manifold usernames you've identified as strong traders.
+#
+# Discovery sources to consider:
+#   * Manifold's web leaderboard (no public API): https://manifold.markets/leaderboards
+#   * Reddit / Discord recommendations
+#   * Watching specific markets resolve and noting who bet correctly
+#
+# Anti-pattern: don't blindly add high-balance accounts. Whales got there
+# by SELLING at peaks, not predicting outcomes. Look for high
+# fractionResolvedCorrectly (>0.55) + consistent recent activity.
+
+manifold:
+  # Manifold founder — high activity, baseline-positive
+  - Austin
+
+  # Add more handles here as you identify them, one per line.
+  # Example: - SomeKnownTrader
+
+# Polymarket placeholder — Stage 1B will add on-chain wallet addresses here.
+polymarket: []

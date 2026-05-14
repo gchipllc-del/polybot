@@ -26,6 +26,8 @@ Usage:
     python main.py chaos             # Run chaos tests
     python main.py smoke             # Pipeline regression (no external APIs)
     python main.py brier [--n=50]    # Cold-start calibration: replay ForecastBench dataset
+    python main.py wallet-scan       # Discover + score top wallets (Stage 1 copy-trade)
+    python main.py wallet-score <handle>  # Deep-dive one wallet
 """
 
 import json
@@ -766,6 +768,80 @@ def cmd_brier(n: int = 50, use_llm: bool = False, sources: list[str] | None = No
     sys.exit(0 if passed else 1)
 
 
+def cmd_wallet_scan(top_n: int = 25, platform: str = "manifold", lookback_days: int = 30):
+    """Stage 1 copy-trade — discover top wallets, score each, persist results.
+
+    Read-only. Output goes to ``data/wallet_scores.json`` for Stages 2-4
+    to consume. Top wallets ranked by the composite score from
+    ``lib.wallet_monitor`` (ROI × activity × recency × win-rate floor).
+    """
+    from lib.wallet_monitor import (
+        discover_top_manifold, score_wallet, persist_scores,
+    )
+
+    print(f"=== Wallet scan: platform={platform} lookback={lookback_days}d ===")
+    if platform == "manifold":
+        handles = discover_top_manifold(top_n=top_n)
+    elif platform == "polymarket":
+        print("  Polymarket discovery pending — add wallets manually for now.")
+        return
+    else:
+        print(f"  Unknown platform: {platform}")
+        return
+
+    print(f"  Discovered {len(handles)} candidate handle(s); scoring each...")
+    scored = []
+    for i, h in enumerate(handles, 1):
+        try:
+            perf = score_wallet(h, platform=platform, lookback_days=lookback_days)
+            scored.append(perf)
+            print(f"  [{i:2d}/{len(handles)}] {h:24s} "
+                  f"trades={perf.settled_bets:>5d} "
+                  f"roi={perf.roi_pct:+.1%} score={perf.score:+.3f}")
+        except Exception as e:
+            print(f"  [{i:2d}/{len(handles)}] {h:24s} FAILED: {str(e)[:80]}")
+
+    if not scored:
+        print("\n  No wallets scored — check API connectivity.")
+        return
+
+    scored.sort(key=lambda p: p.score, reverse=True)
+    persist_scores(scored)
+
+    print(f"\n=== Top 10 by composite score ===")
+    print(f"  {'rank':<5}{'handle':<28}{'trades':<7}{'roi%':<10}{'idle_d':<8}{'score':<8}")
+    now_ts = datetime.now(timezone.utc)
+    for i, p in enumerate(scored[:10], 1):
+        days_idle = "?"
+        if p.last_bet_at:
+            try:
+                d = datetime.fromisoformat(p.last_bet_at.replace("Z", "+00:00"))
+                days_idle = str((now_ts - d).days)
+            except (ValueError, TypeError):
+                pass
+        print(f"  {i:<5}{p.handle:<28}{p.settled_bets:<7}"
+              f"{p.roi_pct*100:<+10.1f}{days_idle:<8}{p.score:<+8.3f}")
+    print(f"\n  Persisted {len(scored)} scored wallet(s) to data/wallet_scores.json")
+
+
+def cmd_wallet_score(handle: str, platform: str = "manifold", lookback_days: int = 30):
+    """Deep-dive one wallet — fetch + score + print full metrics."""
+    from lib.wallet_monitor import score_wallet
+    perf = score_wallet(handle, platform=platform, lookback_days=lookback_days)
+    print(f"=== {perf.handle} ({perf.platform}, last {perf.lookback_days}d) ===")
+    print(f"  Total bets:        {perf.total_bets}")
+    print(f"  Settled / Open:    {perf.settled_bets} / {perf.open_bets}")
+    print(f"  Wins / Losses:     {perf.wins} / {perf.losses}")
+    print(f"  Win rate:          {perf.win_rate:.1%}")
+    print(f"  Realized P&L:      ${perf.realized_pnl:+,.2f}")
+    print(f"  Unrealized P&L:    ${perf.unrealized_pnl:+,.2f}")
+    print(f"  Capital at risk:   ${perf.capital_at_risk:,.2f}")
+    print(f"  ROI:               {perf.roi_pct:+.2%}")
+    print(f"  Avg bet size:      ${perf.avg_bet_size:.2f}")
+    print(f"  Last bet:          {perf.last_bet_at[:19]}")
+    print(f"  Composite score:   {perf.score:+.4f}")
+
+
 def cmd_chaos():
     """Run chaos tests to verify safety systems."""
     from lib.audit import log_event
@@ -978,6 +1054,31 @@ def main():
             elif arg.startswith("--sources="):
                 sources = [s.strip() for s in arg.split("=", 1)[1].split(",") if s.strip()]
         cmd_brier(n=n, use_llm=use_llm, sources=sources)
+    elif command == "wallet-scan":
+        top = 25
+        platform = "manifold"
+        lookback = 30
+        for arg in sys.argv[2:]:
+            if arg.startswith("--top="):
+                top = max(1, int(arg.split("=", 1)[1]))
+            elif arg.startswith("--platform="):
+                platform = arg.split("=", 1)[1]
+            elif arg.startswith("--lookback="):
+                lookback = max(1, int(arg.split("=", 1)[1]))
+        cmd_wallet_scan(top_n=top, platform=platform, lookback_days=lookback)
+    elif command == "wallet-score":
+        if len(sys.argv) < 3:
+            print("Usage: python main.py wallet-score <handle> [--platform=manifold] [--lookback=30]")
+            return
+        handle = sys.argv[2]
+        platform = "manifold"
+        lookback = 30
+        for arg in sys.argv[3:]:
+            if arg.startswith("--platform="):
+                platform = arg.split("=", 1)[1]
+            elif arg.startswith("--lookback="):
+                lookback = max(1, int(arg.split("=", 1)[1]))
+        cmd_wallet_score(handle=handle, platform=platform, lookback_days=lookback)
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
