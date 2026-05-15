@@ -38,10 +38,42 @@ EXTREME_PRICE_FLOOR = 0.05
 EXTREME_PRICE_CEIL = 0.95
 
 
+def _asset_from_ticker(ticker: str) -> str:
+    """Fall back: extract asset shortname from a Kalshi ticker if the
+    sample didn't carry an explicit asset field (legacy compatibility).
+
+    KXBTC15M-26MAY150830-30 → "btc"
+    KXETH15M-... → "eth"
+    """
+    if not ticker.startswith("KX"):
+        return ""
+    rest = ticker[2:]
+    # Strip trailing digits/Day/Month suffix — keep the leading alpha run
+    asset_chars: list[str] = []
+    for c in rest:
+        if c.isalpha():
+            asset_chars.append(c)
+        else:
+            break
+    # KXBTC15M → "BTC" (we want just the asset, drop the "15M" part)
+    name = "".join(asset_chars).rstrip("M")
+    # Some series end in a frequency hint like "BTCD" (daily); strip
+    # trailing D if it makes the asset name 4+ chars (BTCD→BTC,
+    # ETHD→ETH, but leave DOGE alone)
+    if len(name) > 3 and name.endswith("D"):
+        name = name[:-1]
+    return name.lower()
+
+
 @dataclass
 class KalshiFifteenMinPaperTrade:
-    """One paper-traded YES/NO position on a Kalshi BTC 15-min market."""
+    """One paper-traded YES/NO position on a Kalshi 15-min crypto market.
+
+    ``asset`` is the registry key (btc/eth/sol/...) so the report can
+    demux by asset without parsing tickers.
+    """
     trade_id: str
+    asset: str
     market_ticker: str
     event_ticker: str
     title: str
@@ -158,6 +190,7 @@ def record_paper_trades_from_samples(
         contracts = round(notional_per_trade / fill, 4)
         trade = KalshiFifteenMinPaperTrade(
             trade_id=f"{ticker[:24]}_{int(datetime.now(timezone.utc).timestamp())}",
+            asset=str(s.get("asset", "")) or _asset_from_ticker(ticker),
             market_ticker=ticker,
             event_ticker=str(s.get("event_ticker", ""))[:60],
             title=str(s.get("title", ""))[:200],
@@ -276,16 +309,29 @@ def settle_paper_trades() -> dict:
 
 # ── Reporting ────────────────────────────────────────────────────────
 
-def summary() -> dict:
-    """Same shape as btc_5min_paper.summary so the dashboard can
-    consume both."""
+def summary(asset_filter: str | None = None) -> dict:
+    """Aggregate paper P&L stats. Optional ``asset_filter`` restricts to
+    one asset (btc/eth/sol/...) — pass None for all.
+
+    Adds ``by_asset`` and ``by_confidence_bucket`` breakdowns so the
+    operator can see whether the composite signal calibrates
+    differently per asset (it likely does — different liquidity).
+    """
     rows = _load_all()
+    if asset_filter:
+        rows = [
+            r for r in rows
+            if (r.get("asset") or _asset_from_ticker(r.get("market_ticker", "")))
+            == asset_filter
+        ]
     s = {
         "total_trades": len(rows),
+        "asset_filter": asset_filter,
         "open": 0, "won": 0, "lost": 0, "void": 0,
         "total_paper_pnl": 0.0, "capital_deployed": 0.0,
         "per_day_pnl": {},
         "by_confidence_bucket": {},
+        "by_asset": {},
     }
     for r in rows:
         status = r.get("status", "open")
@@ -294,6 +340,11 @@ def summary() -> dict:
         opened = (r.get("opened_at") or "")[:10]
         conf = float(r.get("confidence", 0) or 0)
         bucket = f"{int(conf * 10) * 10}-{int(conf * 10) * 10 + 10}%"
+        asset = (
+            r.get("asset")
+            or _asset_from_ticker(r.get("market_ticker", ""))
+            or "?"
+        )
 
         s["capital_deployed"] += notional
         s["total_paper_pnl"] += pnl
@@ -318,6 +369,16 @@ def summary() -> dict:
                 b["wins"] += 1
             b["pnl"] = round(b["pnl"] + pnl, 4)
 
+        # Per-asset breakdown
+        a = s["by_asset"].setdefault(
+            asset, {"total": 0, "open": 0, "won": 0, "lost": 0, "void": 0,
+                    "pnl": 0.0, "capital": 0.0},
+        )
+        a["total"] += 1
+        a[status] = a.get(status, 0) + 1
+        a["pnl"] = round(a["pnl"] + pnl, 4)
+        a["capital"] = round(a["capital"] + notional, 4)
+
     settled = s["won"] + s["lost"]
     s["win_rate"] = round(s["won"] / settled, 4) if settled > 0 else 0.0
     s["roi_pct"] = (
@@ -326,4 +387,14 @@ def summary() -> dict:
     )
     s["total_paper_pnl"] = round(s["total_paper_pnl"], 4)
     s["capital_deployed"] = round(s["capital_deployed"], 4)
+
+    # Per-asset rollup: WR and ROI
+    for asset, a in s["by_asset"].items():
+        asettled = a.get("won", 0) + a.get("lost", 0)
+        a["win_rate"] = (
+            round(a.get("won", 0) / asettled, 4) if asettled > 0 else 0.0
+        )
+        a["roi_pct"] = (
+            round(a["pnl"] / a["capital"], 4) if a["capital"] > 0 else 0.0
+        )
     return s

@@ -33,58 +33,88 @@ from pathlib import Path
 from lib.audit import log_event
 from lib.btc_5min_signal import (
     fetch_binance_btc_price, fetch_binance_klines,
-    _ema, _rsi,
+    compute_indicators_for_window,
 )
 
 SIGNAL_PATH = Path(__file__).parent.parent / "data" / "kalshi_15min_signal.jsonl"
 KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_SERIES = "KXBTC15M"
+ASSETS_CONFIG_PATH = Path(__file__).parent.parent / "config" / "kalshi_assets.yaml"
 
-# Ticker example: KXBTC15M-26MAY150830-30 (date suffix + strike-level marker)
-TICKER_RE = re.compile(r"^KXBTC15M-(\d{2}[A-Z]{3}\d{2}\d{4})(?:-\d+)?$")
+
+def load_assets_config() -> dict:
+    """Read the asset registry YAML. Returns a dict keyed by asset
+    shortname ("btc", "eth", "sol", ...) → {series, binance_symbol,
+    min_confidence, enabled}. Empty dict on parse failure (caller
+    handles gracefully).
+    """
+    import yaml
+    if not ASSETS_CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(ASSETS_CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("assets", {}) or {}
+    except (yaml.YAMLError, OSError) as e:
+        log_event("kalshi_15min", "assets_config_load_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+        return {}
+
+
+def enabled_assets() -> dict:
+    """Return only the assets with ``enabled: true``."""
+    return {
+        k: v for k, v in load_assets_config().items()
+        if v and v.get("enabled")
+    }
 
 
 @dataclass
 class KalshiFifteenMinSample:
-    """One snapshot of one 15-min Kalshi BTC market."""
+    """One snapshot of one 15-min Kalshi crypto market.
+
+    ``asset`` identifies which crypto this is (btc/eth/sol/...) so the
+    paper module and reports can demux per asset. ``spot_usd`` is the
+    price of THAT asset's underlying on Binance.US — not BTC.
+    """
     sample_at: str
+    asset: str                   # "btc", "eth", "sol", etc — registry key
     market_ticker: str           # e.g. KXBTC15M-26MAY150830-30
     event_ticker: str            # parent event
     title: str
     open_time: str               # ISO from Kalshi
     close_time: str              # ISO from Kalshi
     seconds_to_close: float
-    strike: float                # floor_strike — BTC price at window-open
-    yes_bid: float | None        # dollars, 0..1 (Kalshi returns cents normally,
-    yes_ask: float | None        # but _dollars suffix returns the float directly)
+    strike: float                # floor_strike — underlying at window-open
+    yes_bid: float | None        # dollars, 0..1
+    yes_ask: float | None
     no_bid: float | None
     no_ask: float | None
     last_price: float | None
     volume_24h: float
-    spot_usd: float              # Binance.US spot at sample time
+    spot_usd: float              # underlying's spot at sample time
     indicators: dict | None = None
 
 
 # ── Discovery ────────────────────────────────────────────────────────
 
-def discover_15min_btc_markets(
+def discover_15min_markets(
+    series_ticker: str,
     *,
     max_seconds_out: int = 900,
 ) -> list[dict]:
-    """Find currently-live Kalshi BTC 15-min markets resolving within
-    ``max_seconds_out`` seconds.
+    """Find currently-live Kalshi 15-min markets for ``series_ticker``.
 
     Two-step fetch — events first, then markets per event — because
     Kalshi separates the date container (event) from the strike-priced
-    binary (market). Default ``max_seconds_out=900`` covers a full
-    15-min window so we see every sample of every live market.
+    binary (market). Asset-agnostic: pass KXBTC15M, KXETH15M, KXSOL15M,
+    etc. Default ``max_seconds_out=900`` covers a full 15-min window.
     """
     import requests
 
     try:
         r = requests.get(
             f"{KALSHI_HOST}/events",
-            params={"series_ticker": KALSHI_SERIES,
+            params={"series_ticker": series_ticker,
                     "status": "open", "limit": 50},
             timeout=15,
         )
@@ -92,7 +122,8 @@ def discover_15min_btc_markets(
         events = r.json().get("events", []) or []
     except Exception as e:
         log_event("kalshi_15min", "events_fetch_failed",
-                  {"error": str(e)[:200]}, result="degraded")
+                  {"series": series_ticker, "error": str(e)[:200]},
+                  result="degraded")
         return []
 
     now = datetime.now(timezone.utc)
@@ -180,108 +211,62 @@ def compute_kalshi_indicators(
     strike: float,
     current_spot: float,
 ) -> dict:
-    """Same 6-indicator composite as the Polymarket 5-min path, but
-    uses the Kalshi-provided strike directly as the window-open price
-    (no klines-search needed).
+    """Compute the 6-indicator composite for a Kalshi 15-min market.
 
-    Composite is signed: positive = expect BTC closes ABOVE strike → YES.
-    Negative = expect BTC closes BELOW strike → NO.
+    Strike IS the window-open price (Kalshi pegs it there at market
+    creation), so we hand the shared engine that value directly and
+    skip the klines-search the Polymarket variant has to do.
+
+    The shared core is asset-agnostic — Acceleration normalized in
+    basis points, not dollars — so ETH and SOL work the same way.
+    Direction labels flipped to YES/NO since Kalshi markets are
+    framed as "BTC ≥ strike at close?" not "BTC up?".
     """
-    closes = [k["close"] for k in klines]
-    volumes = [k["volume"] for k in klines]
-
-    # 1. Window Delta — % move from strike (= window open) to now.
-    #    Same 0.10% saturation as the 5-min variant but using a 15-min
-    #    window we expect slightly larger absolute moves; keep the
-    #    threshold the same for cross-platform comparability.
-    if strike > 0:
-        window_delta_pct = (current_spot - strike) / strike * 100.0
-    else:
-        window_delta_pct = None
-
-    # 2-6: identical to btc_5min_signal.compute_indicators
-    if len(klines) >= 2:
-        m1 = klines[-1]["close"] - klines[-1]["open"]
-        m2 = klines[-2]["close"] - klines[-2]["open"]
-        micro_momentum = (1 if m1 > 0 else -1 if m1 < 0 else 0) + \
-                         (1 if m2 > 0 else -1 if m2 < 0 else 0)
-    else:
-        micro_momentum = 0
-
-    if len(closes) >= 3:
-        acceleration = (closes[-1] - closes[-2]) - (closes[-2] - closes[-3])
-    else:
-        acceleration = 0.0
-
-    ema9 = _ema(closes, 9)
-    ema21 = _ema(closes, 21)
-    ema_cross = 0.0
-    if ema9 is not None and ema21 is not None and ema21 > 0:
-        ema_cross = (ema9 - ema21) / ema21 * 100.0
-
-    rsi = _rsi(closes, 14)
-
-    if len(volumes) >= 15:
-        recent = volumes[-1]
-        trailing_avg = sum(volumes[-15:-1]) / 14
-        vol_surge = recent / trailing_avg if trailing_avg > 0 else 1.0
-    else:
-        vol_surge = 1.0
-
-    contribs: dict[str, float] = {}
-    if window_delta_pct is not None:
-        contribs["window_delta"] = max(-1.0, min(1.0, window_delta_pct / 0.10)) * 6.0
-    else:
-        contribs["window_delta"] = 0.0
-    contribs["micro_momentum"] = (micro_momentum / 2.0) * 2.0
-    contribs["acceleration"] = max(-1.0, min(1.0, acceleration / 50.0)) * 1.5
-    contribs["ema_cross"] = max(-1.0, min(1.0, ema_cross / 0.05)) * 1.0
-    if rsi is not None:
-        rsi_norm = (50.0 - rsi) / 20.0
-        contribs["rsi"] = max(-1.5, min(1.5, rsi_norm)) * 1.0
-    else:
-        contribs["rsi"] = 0.0
-    direction_sign = 1 if micro_momentum > 0 else -1 if micro_momentum < 0 else 0
-    if vol_surge >= 1.5 and direction_sign != 0:
-        contribs["volume_surge"] = direction_sign * 1.0
-    else:
-        contribs["volume_surge"] = 0.0
-
-    composite = sum(contribs.values())
-    max_possible = 13.0
-    return {
-        "strike": strike,
-        "current_spot": current_spot,
-        "window_delta_pct": window_delta_pct,
-        "micro_momentum": micro_momentum,
-        "acceleration": acceleration,
-        "ema9": ema9, "ema21": ema21, "ema_cross_pct": ema_cross,
-        "rsi": rsi,
-        "vol_surge_ratio": vol_surge,
-        "contribs": contribs,
-        "composite": composite,
-        "max_possible": max_possible,
-        "confidence": abs(composite) / max_possible if max_possible > 0 else 0.0,
-        "direction": "YES" if composite > 0 else "NO" if composite < 0 else "FLAT",
-    }
+    base = compute_indicators_for_window(
+        klines=klines, window_open_price=strike, current_spot=current_spot,
+    )
+    # Keep the Kalshi-specific labels + add strike for symmetry
+    base["strike"] = strike
+    base["current_spot"] = current_spot
+    base["direction"] = (
+        "YES" if base["composite"] > 0
+        else "NO" if base["composite"] < 0
+        else "FLAT"
+    )
+    return base
 
 
 # ── Sampling ─────────────────────────────────────────────────────────
 
-def sample_signals(
+def sample_signals_for_asset(
+    asset: str,
+    asset_cfg: dict,
     *,
     max_seconds_out: int = 900,
     with_indicators: bool = True,
 ) -> list[KalshiFifteenMinSample]:
-    """One sweep — spot + klines + every qualifying Kalshi 15-min BTC market."""
-    spot = fetch_binance_btc_price()
+    """Sample every live Kalshi market for ONE asset.
+
+    Caller passes the asset shortname + its registry entry. Returns
+    the per-asset samples — empty list if no markets are live or
+    Binance fetch fails (caller logs + moves on).
+    """
+    series = asset_cfg.get("series")
+    binance_symbol = asset_cfg.get("binance_symbol")
+    if not series or not binance_symbol:
+        return []
+
+    spot = fetch_binance_btc_price(symbol=binance_symbol)
     if spot is None:
         return []
-    markets = discover_15min_btc_markets(max_seconds_out=max_seconds_out)
+    markets = discover_15min_markets(series, max_seconds_out=max_seconds_out)
     if not markets:
         return []
 
-    klines = fetch_binance_klines() if with_indicators else None
+    klines = (
+        fetch_binance_klines(symbol=binance_symbol)
+        if with_indicators else None
+    )
     now_iso = datetime.now(timezone.utc).isoformat()
     out: list[KalshiFifteenMinSample] = []
     for m in markets:
@@ -292,6 +277,7 @@ def sample_signals(
             )
         out.append(KalshiFifteenMinSample(
             sample_at=now_iso,
+            asset=asset,
             market_ticker=m["ticker"],
             event_ticker=m["event_ticker"],
             title=m["title"],
@@ -306,6 +292,29 @@ def sample_signals(
             spot_usd=spot,
             indicators=indicators,
         ))
+    return out
+
+
+def sample_signals(
+    *,
+    max_seconds_out: int = 900,
+    with_indicators: bool = True,
+) -> list[KalshiFifteenMinSample]:
+    """Multi-asset sweep — every enabled asset in config/kalshi_assets.yaml.
+
+    Single round trip to Binance.US + Kalshi per asset (no batching;
+    Binance has separate symbols, Kalshi has separate series).
+    Empty list if no assets enabled or no markets live anywhere.
+    """
+    out: list[KalshiFifteenMinSample] = []
+    for asset, cfg in enabled_assets().items():
+        out.extend(sample_signals_for_asset(
+            asset, cfg,
+            max_seconds_out=max_seconds_out,
+            with_indicators=with_indicators,
+        ))
+    # Sort by closest-to-resolving across all assets
+    out.sort(key=lambda s: s.seconds_to_close)
     return out
 
 
@@ -324,18 +333,34 @@ def run_signal_cycle(
     record_paper_trades: bool = True,
     settle_paper_trades: bool = True,
 ) -> dict:
-    """Full sweep: discover + sample + persist + (paper record + settle)."""
+    """Full multi-asset sweep: every enabled asset → discover + sample
+    + persist + (paper record with per-asset min_confidence + settle).
+
+    Per-asset ``min_confidence`` from the registry: BTC=0.35, ETH=0.45,
+    SOL=0.50 by default. ETH/SOL spreads are wider so a higher bar
+    avoids fee drag eating any edge.
+    """
     samples = sample_signals(max_seconds_out=max_seconds_out)
     persist_samples(samples)
 
+    # Group samples by asset for per-asset min_confidence
+    by_asset: dict[str, list] = {}
+    for s in samples:
+        by_asset.setdefault(s.asset, []).append(asdict(s))
+
     n_paper_opened = 0
+    cfg = load_assets_config()
     if record_paper_trades and samples:
         try:
             from lib.kalshi_15min_paper import record_paper_trades_from_samples
-            new_trades = record_paper_trades_from_samples(
-                [asdict(s) for s in samples]
-            )
-            n_paper_opened = len(new_trades)
+            for asset, asset_samples in by_asset.items():
+                asset_min_conf = float(
+                    cfg.get(asset, {}).get("min_confidence", 0.35)
+                )
+                new_trades = record_paper_trades_from_samples(
+                    asset_samples, min_confidence=asset_min_conf,
+                )
+                n_paper_opened += len(new_trades)
         except Exception as e:
             log_event("kalshi_15min", "paper_record_failed",
                       {"error": str(e)[:200]}, result="degraded")
@@ -355,19 +380,24 @@ def run_signal_cycle(
         nearest = samples[0]
         log_event("kalshi_15min", "signal_cycle", {
             "n_markets": len(samples),
+            "n_assets": len(by_asset),
+            "assets": sorted(by_asset.keys()),
+            "nearest_asset": nearest.asset,
             "nearest_seconds_to_close": nearest.seconds_to_close,
             "nearest_strike": nearest.strike,
-            "spot": nearest.spot_usd,
             "paper_trades_opened": n_paper_opened,
             "paper_settled": settle_summary.get("settled_now", 0),
         })
     else:
-        log_event("kalshi_15min", "no_active_markets", {}, result="degraded")
+        log_event("kalshi_15min", "no_active_markets",
+                  {"enabled_assets": sorted(enabled_assets().keys())},
+                  result="degraded")
 
     return {
         "n_markets": len(samples),
+        "n_assets": len(by_asset),
+        "by_asset_counts": {a: len(s) for a, s in by_asset.items()},
         "nearest_seconds_to_close": samples[0].seconds_to_close if samples else None,
-        "spot_usd": samples[0].spot_usd if samples else None,
         "samples": [asdict(s) for s in samples],
         "paper_trades_opened": n_paper_opened,
         "settle_summary": settle_summary,

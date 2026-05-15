@@ -1,0 +1,54 @@
+# Kalshi 15-min asset registry.
+#
+# Each entry maps an asset shortname to its Kalshi series ticker and
+# the Binance.US ticker we use for indicator data.
+#
+# To add a new asset: append a key, find the series via
+#   `python -c "from lib.kalshi_15min_signal import probe_series; probe_series()"`
+# (or browse https://api.elections.kalshi.com/trade-api/v2/series?category=Crypto)
+# and pick the matching Binance.US pair.
+#
+# Phase 2 (paper-trade) uses these uniformly. Phase 3 (real orders)
+# will respect the per-asset ``min_confidence`` override below — ETH
+# and SOL have wider Kalshi spreads + thinner liquidity than BTC, so
+# we require a higher composite confidence before firing.
+
+assets:
+  btc:
+    series: KXBTC15M
+    binance_symbol: BTCUSDT
+    min_confidence: 0.35      # baseline — most liquid Kalshi crypto market
+    enabled: true
+
+  eth:
+    series: KXETH15M
+    binance_symbol: ETHUSDT
+    min_confidence: 0.45      # ETH spreads ~2x wider than BTC on Kalshi
+    enabled: true
+
+  sol:
+    series: KXSOL15M
+    binance_symbol: SOLUSDT
+    min_confidence: 0.50      # thinnest of the three — most conservative
+    enabled: true
+
+  # Below: confirmed-available but not enabled by default.
+  # Flip ``enabled: true`` once the first three prove out.
+
+  ada:
+    series: KXADA15M
+    binance_symbol: ADAUSDT
+    min_confidence: 0.55
+    enabled: false
+
+  xrp:
+    series: KXXRP15M
+    binance_symbol: XRPUSDT
+    min_confidence: 0.55
+    enabled: false
+
+  doge:
+    series: KXDOGE15M
+    binance_symbol: DOGEUSDT
+    min_confidence: 0.55
+    enabled: false

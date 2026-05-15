@@ -90,23 +90,32 @@ class FiveMinSample:
 
 # ── Discovery ────────────────────────────────────────────────────────
 
-def fetch_binance_btc_price() -> float | None:
-    """Single REST poll. Returns spot in USD, or None on failure."""
+def fetch_binance_btc_price(symbol: str = "BTCUSDT") -> float | None:
+    """Single REST poll. Returns spot in USD, or None on failure.
+
+    Default symbol is BTCUSDT for backward compat — every existing
+    caller wanted BTC. New callers (ETH/SOL on Kalshi) pass their own.
+    """
     import requests
     try:
         r = requests.get(
-            BINANCE_US_TICKER, params={"symbol": "BTCUSDT"}, timeout=8,
+            BINANCE_US_TICKER, params={"symbol": symbol}, timeout=8,
         )
         r.raise_for_status()
         return float(r.json()["price"])
     except Exception as e:
         log_event("btc_5min", "binance_fetch_failed",
-                  {"error": str(e)[:200]}, result="degraded")
+                  {"symbol": symbol, "error": str(e)[:200]},
+                  result="degraded")
         return None
 
 
-def fetch_binance_klines(*, limit: int = 50) -> list[dict] | None:
-    """Pull recent BTC/USDT 1-minute candles from Binance.US.
+def fetch_binance_klines(
+    *,
+    symbol: str = "BTCUSDT",
+    limit: int = 50,
+) -> list[dict] | None:
+    """Pull recent 1-minute candles for ``symbol`` from Binance.US.
 
     Returns oldest→newest list of dicts so indicators iterate forward
     naturally. ``limit=50`` gives EMA21 ample headroom and RSI14 + 3-tick
@@ -116,14 +125,15 @@ def fetch_binance_klines(*, limit: int = 50) -> list[dict] | None:
     try:
         r = requests.get(
             BINANCE_US_KLINES,
-            params={"symbol": "BTCUSDT", "interval": "1m", "limit": limit},
+            params={"symbol": symbol, "interval": "1m", "limit": limit},
             timeout=10,
         )
         r.raise_for_status()
         raw = r.json()
     except Exception as e:
         log_event("btc_5min", "klines_fetch_failed",
-                  {"error": str(e)[:200]}, result="degraded")
+                  {"symbol": symbol, "error": str(e)[:200]},
+                  result="degraded")
         return None
     out: list[dict] = []
     for row in raw:
@@ -208,28 +218,26 @@ def _find_window_open_price(
     return best[1] if best else None
 
 
-def compute_indicators(
+def compute_indicators_for_window(
     *,
     klines: list[dict],
-    window_start_ts: int,
+    window_open_price: float | None,
     current_spot: float,
 ) -> dict:
-    """Compute the 6 indicators the open-source latency bots converge on.
+    """Compute the 6-indicator composite when ``window_open_price`` is
+    already known (e.g. given by the exchange as a strike).
 
-    Tick-trend (the 7th) is skipped because a 60s cron can't poll
-    sub-minute; it lives in Phase 3's tight-polling daemon. Weights
-    come from the synthesized strategy doc — Window Delta dominates.
-
-    Returns a dict of raw indicator values plus the composite score.
-    Composite is signed: positive = UP, negative = DOWN.
+    This is the asset-agnostic core. Every value is either a percentage
+    or a unitless ratio, so it works equally well on BTC ($80k) and
+    SOL ($89). Callers responsible for finding window_open_price first.
     """
     closes = [k["close"] for k in klines]
     volumes = [k["volume"] for k in klines]
+    last_close = closes[-1] if closes else None
 
     # 1. Window Delta — dominant signal. % move from window open to now.
-    window_open = _find_window_open_price(klines, window_start_ts)
-    if window_open and window_open > 0:
-        window_delta_pct = (current_spot - window_open) / window_open * 100.0
+    if window_open_price and window_open_price > 0:
+        window_delta_pct = (current_spot - window_open_price) / window_open_price * 100.0
     else:
         window_delta_pct = None
 
@@ -243,14 +251,16 @@ def compute_indicators(
         micro_momentum = 0
 
     # 3. Acceleration — is momentum building or fading?
-    if len(closes) >= 3:
+    # Converted to **basis points** (1 bp = 0.01%) of last_close so the
+    # indicator is asset-agnostic. The prior $-denominated version
+    # ($50 typical 1-min BTC std) saturated permanently on SOL.
+    acceleration_bps = 0.0
+    if len(closes) >= 3 and last_close and last_close > 0:
         d1 = closes[-1] - closes[-2]
         d2 = closes[-2] - closes[-3]
-        acceleration = d1 - d2
-    else:
-        acceleration = 0.0
+        acceleration_bps = ((d1 - d2) / last_close) * 10_000
 
-    # 4. EMA 9 / EMA 21 crossover
+    # 4. EMA 9 / EMA 21 crossover (% of EMA21)
     ema9 = _ema(closes, 9)
     ema21 = _ema(closes, 21)
     ema_cross = 0.0
@@ -260,7 +270,7 @@ def compute_indicators(
     # 5. RSI 14
     rsi = _rsi(closes, 14)
 
-    # 6. Volume Surge — last bar vs trailing avg
+    # 6. Volume Surge — last bar vs trailing avg (unitless ratio)
     if len(volumes) >= 15:
         recent = volumes[-1]
         trailing_avg = sum(volumes[-15:-1]) / 14
@@ -272,8 +282,7 @@ def compute_indicators(
     # Each contribution is normalized to roughly [-1, +1] then weighted.
     contribs: dict[str, float] = {}
 
-    # Window delta: 0.10% → max-strength bullish (per the reference
-    # strategy). Saturate at ±0.10%.
+    # Window delta: 0.10% → max-strength bullish per reference strategy.
     if window_delta_pct is not None:
         contribs["window_delta"] = max(-1.0, min(1.0, window_delta_pct / 0.10)) * 6.0
     else:
@@ -282,15 +291,16 @@ def compute_indicators(
     # Micro momentum: already -2..+2, scale to -1..+1 then weight 2
     contribs["micro_momentum"] = (micro_momentum / 2.0) * 2.0
 
-    # Acceleration in absolute USD — normalize by typical 1-min std (~$50)
-    contribs["acceleration"] = max(-1.0, min(1.0, acceleration / 50.0)) * 1.5
+    # Acceleration: 5bp ≈ max strength (small but consistent move).
+    # That's $40 on BTC@80k, 4.4¢ on SOL@88 — proportional, asset-agnostic.
+    contribs["acceleration"] = max(-1.0, min(1.0, acceleration_bps / 5.0)) * 1.5
 
     # EMA cross %: 0.05% delta ≈ max strength
     contribs["ema_cross"] = max(-1.0, min(1.0, ema_cross / 0.05)) * 1.0
 
-    # RSI: 30/70 are extremes; map 30→+1.5, 70→-1.5 (oversold = bullish)
+    # RSI: 30/70 are extremes; map 30→+1.0, 70→-1.0 (oversold = bullish)
     if rsi is not None:
-        rsi_norm = (50.0 - rsi) / 20.0  # 30→+1.0, 70→-1.0
+        rsi_norm = (50.0 - rsi) / 20.0
         contribs["rsi"] = max(-1.5, min(1.5, rsi_norm)) * 1.0
     else:
         contribs["rsi"] = 0.0
@@ -303,15 +313,14 @@ def compute_indicators(
     else:
         contribs["volume_surge"] = 0.0
 
-    # Composite + max possible score (for normalization downstream)
     composite = sum(contribs.values())
     max_possible = 6.0 + 2.0 + 1.5 + 1.0 + 1.5 + 1.0  # = 13.0
 
     return {
-        "window_open": window_open,
+        "window_open": window_open_price,
         "window_delta_pct": window_delta_pct,
         "micro_momentum": micro_momentum,
-        "acceleration": acceleration,
+        "acceleration_bps": acceleration_bps,
         "ema9": ema9, "ema21": ema21, "ema_cross_pct": ema_cross,
         "rsi": rsi,
         "vol_surge_ratio": vol_surge,
@@ -321,6 +330,24 @@ def compute_indicators(
         "confidence": abs(composite) / max_possible if max_possible > 0 else 0.0,
         "direction": "UP" if composite > 0 else "DOWN" if composite < 0 else "FLAT",
     }
+
+
+def compute_indicators(
+    *,
+    klines: list[dict],
+    window_start_ts: int,
+    current_spot: float,
+) -> dict:
+    """Compute the 6-indicator composite for a Polymarket 5-min window
+    by inferring the window-open price from klines, then delegating.
+
+    Thin wrapper around ``compute_indicators_for_window`` so the
+    Polymarket and Kalshi paths share the same indicator math.
+    """
+    window_open = _find_window_open_price(klines, window_start_ts)
+    return compute_indicators_for_window(
+        klines=klines, window_open_price=window_open, current_spot=current_spot,
+    )
 
 
 def discover_5min_btc_markets(

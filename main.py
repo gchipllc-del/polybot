@@ -948,22 +948,30 @@ def cmd_btc_5min_monitor(max_seconds_out: int = 600):
 
 
 def cmd_kalshi_15min_monitor(max_seconds_out: int = 900):
-    """Kalshi 15-min BTC signal — parallel to btc-5min-monitor.
+    """Multi-asset Kalshi 15-min signal — BTC + ETH + SOL by default.
 
-    Cron-friendly. Public endpoints only (no Kalshi auth required for
-    market data). Auto-records paper trades + auto-settles via the
-    settle path. Phase 3 (real orders) will need auth via kalshi_auth.
+    Reads enabled assets from config/kalshi_assets.yaml. Cron-friendly.
+    Public endpoints only (no Kalshi auth needed for market data).
+    Auto-records paper trades with per-asset min_confidence + auto-settles.
+    Phase 3 (real orders) will plug kalshi_auth into the execute path.
     """
-    from lib.kalshi_15min_signal import run_signal_cycle
+    from lib.kalshi_15min_signal import run_signal_cycle, enabled_assets
     result = run_signal_cycle(max_seconds_out=max_seconds_out)
-    print(f"=== Kalshi 15-min signal cycle ===")
+
+    assets = sorted(enabled_assets().keys())
+    print(f"=== Kalshi 15-min signal cycle (assets: {', '.join(assets) or 'none'}) ===")
     if result["n_markets"] == 0:
-        print("  No active 15-min BTC markets right now.")
-        print("  (Kalshi runs these in sessions — check kalshi.com/category/crypto/frequency/fifteen_min)")
+        print("  No active 15-min crypto markets across enabled assets right now.")
+        print("  (Kalshi runs these in sessions — most active during US trading hours)")
         return
+    counts = result.get("by_asset_counts", {})
+    if counts:
+        breakdown = "  ".join(f"{a}={n}" for a, n in sorted(counts.items()))
+        print(f"  Per-asset counts: {breakdown}")
     print(f"  Sampled {result['n_markets']} market(s). Nearest first:")
-    print(f"  {'T-close':>9} {'strike':>10} {'yes_ask':>8} {'no_ask':>8} {'composite':>10}  ticker")
-    for s in result["samples"][:6]:
+    print(f"  {'asset':<4} {'T-close':>9} {'strike':>10} {'yes_ask':>8} "
+          f"{'no_ask':>8} {'composite':>10}  ticker")
+    for s in result["samples"][:8]:
         tc = s["seconds_to_close"]
         if tc < 60:
             t_str = f"{tc:>+6.1f}s"
@@ -976,10 +984,12 @@ def cmd_kalshi_15min_monitor(max_seconds_out: int = 900):
         na = s.get("no_ask")
         ya_s = f"{ya:.3f}" if ya is not None else "  -  "
         na_s = f"{na:.3f}" if na is not None else "  -  "
-        print(f"  {t_str:>9} ${s['strike']:>8,.0f}  {ya_s:>8} {na_s:>8} "
-              f"{comp:>+9.2f}  {s['market_ticker'][-30:]}")
-    print(f"\n  Binance.US spot: ${result['spot_usd']:,.2f}")
-    print(f"  Paper trades opened this cycle: {result.get('paper_trades_opened', 0)}")
+        # Strikes vary wildly across assets — auto-format
+        strike = s.get("strike", 0) or 0
+        s_str = f"${strike:>8,.2f}" if strike < 1000 else f"${strike:>8,.0f}"
+        print(f"  {s.get('asset','?'):<4} {t_str:>9} {s_str:>10}  "
+              f"{ya_s:>8} {na_s:>8} {comp:>+9.2f}  {s['market_ticker'][-30:]}")
+    print(f"\n  Paper trades opened this cycle: {result.get('paper_trades_opened', 0)}")
     print(f"  Persisted to data/kalshi_15min_signal.jsonl")
 
 
@@ -994,17 +1004,23 @@ def cmd_kalshi_15min_paper_settle():
     print(f"  Total settled:        {result['total_settled']}")
 
 
-def cmd_kalshi_15min_paper_report():
-    """Aggregate Kalshi 15-min paper P&L + confidence-bucket WR.
+def cmd_kalshi_15min_paper_report(asset: str | None = None):
+    """Aggregate Kalshi 15-min paper P&L + per-asset + confidence-bucket WR.
 
-    Same shape as cmd_btc_5min_paper_report so the two strategies
-    compare apples-to-apples.
+    ``asset`` filter narrows to one of btc/eth/sol/... — pass None to
+    see all-up + the per-asset breakdown side-by-side.
     """
     from lib.kalshi_15min_paper import summary
-    s = summary()
-    print(f"=== Kalshi 15-min paper-trade report ===")
+    s = summary(asset_filter=asset)
+    header = f"=== Kalshi 15-min paper-trade report ==="
+    if asset:
+        header = f"=== Kalshi 15-min paper-trade report (asset={asset}) ==="
+    print(header)
     if s["total_trades"] == 0:
-        print("  No paper trades recorded yet — wait for the cron to find a session.")
+        if asset:
+            print(f"  No paper trades for asset={asset} yet.")
+        else:
+            print("  No paper trades recorded yet — wait for the cron to find a session.")
         return
     print(f"  Total trades:      {s['total_trades']}")
     print(f"  Open / Won / Lost / Void: "
@@ -1013,6 +1029,16 @@ def cmd_kalshi_15min_paper_report():
     print(f"  Total paper P&L:    ${s['total_paper_pnl']:+,.2f}")
     print(f"  Capital deployed:   ${s['capital_deployed']:,.2f}")
     print(f"  ROI:                {s['roi_pct']:+.2%}")
+
+    if s.get("by_asset") and not asset:
+        print()
+        print(f"  By asset:")
+        print(f"    {'asset':<6} {'total':>6} {'won':>5} {'lost':>5} "
+              f"{'wr':>7} {'pnl':>10} {'roi':>8}")
+        for a, b in sorted(s["by_asset"].items()):
+            print(f"    {a:<6} {b['total']:>6} {b.get('won',0):>5} "
+                  f"{b.get('lost',0):>5} {b['win_rate']:>6.1%} "
+                  f"${b['pnl']:>+8.2f} {b['roi_pct']:>+7.2%}")
 
     if s["by_confidence_bucket"]:
         print()
@@ -1606,7 +1632,11 @@ def main():
     elif command == "kalshi-15min-paper-settle":
         cmd_kalshi_15min_paper_settle()
     elif command == "kalshi-15min-paper-report":
-        cmd_kalshi_15min_paper_report()
+        asset = None
+        for arg in sys.argv[2:]:
+            if arg.startswith("--asset="):
+                asset = arg.split("=", 1)[1].lower().strip() or None
+        cmd_kalshi_15min_paper_report(asset=asset)
     elif command == "kalshi-auth-status":
         from lib.kalshi_auth import status
         s = status()
