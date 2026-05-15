@@ -34,6 +34,8 @@ Usage:
     python main.py paper-copy-settle # Settle resolved paper-copy trades (Stage 3)
     python main.py paper-copy-report # Aggregate paper P&L per source wallet (Stage 3)
     python main.py btc-arb-monitor   # Sample Binance spot vs Polymarket BTC gaps (Phase 1)
+    python main.py btc-5min-monitor  # Sample 5-min BTC UP/DOWN markets (Gravia-style)
+    python main.py dataset-status    # Check Jon-Becker parquet dataset availability
 """
 
 import json
@@ -905,6 +907,39 @@ def cmd_btc_arb_monitor(once: bool = True):
     print(f"  Persisted to data/btc_arb_signal.jsonl")
 
 
+def cmd_btc_5min_monitor(max_seconds_out: int = 600):
+    """5-min BTC UP/DOWN signal — Gravia-style latency arb.
+
+    Snapshot every currently-live ``btc-updown-5m-*`` market within
+    ``max_seconds_out`` seconds of resolving + the current Binance.US
+    spot, persist to data/btc_5min_signal.jsonl.
+
+    Measurement only. Phase 2 (paper trade) + Phase 3 (T-10s live
+    entry) ride on the trajectory data this cycle produces.
+    """
+    from lib.btc_5min_signal import run_signal_cycle
+    result = run_signal_cycle(max_seconds_out=max_seconds_out)
+    print(f"=== BTC 5-min signal cycle ===")
+    if result["n_markets"] == 0:
+        print("  No active 5-min BTC markets right now.")
+        print("  (Polymarket sometimes pauses these — check polymarket.com/crypto/5M)")
+        return
+    print(f"  Sampled {result['n_markets']} market(s). Nearest first:")
+    print(f"  {'T-close':>9} {'up':>6} {'down':>6}  slug")
+    for s in result["samples"][:6]:
+        tc = s["seconds_to_close"]
+        # Format as seconds if < 60, else mm:ss
+        if tc < 60:
+            t_str = f"{tc:>+6.1f}s"
+        else:
+            m, sec = divmod(int(tc), 60)
+            t_str = f"{m:>2d}m{sec:02d}s"
+        print(f"  {t_str:>9} {s['up_price']:>.3f} {s['down_price']:>.3f}  "
+              f"{s['slug'][-20:]}")
+    print(f"\n  Binance.US spot: ${result['spot_usd']:,.2f}")
+    print(f"  Persisted to data/btc_5min_signal.jsonl")
+
+
 def cmd_btc_arb_paper_settle():
     """Phase 2 — settle open BTC arb paper trades against actual
     market outcomes. Run periodically (manually or cron) so the report
@@ -1414,6 +1449,29 @@ def main():
         cmd_paper_copy_report()
     elif command == "btc-arb-monitor":
         cmd_btc_arb_monitor()
+    elif command == "btc-5min-monitor":
+        max_sec = 600
+        for arg in sys.argv[2:]:
+            if arg.startswith("--max-seconds="):
+                max_sec = max(60, int(arg.split("=", 1)[1]))
+        cmd_btc_5min_monitor(max_seconds_out=max_sec)
+    elif command == "dataset-status":
+        from lib.historical_data import status
+        s = status()
+        print("=== Jon-Becker dataset status ===")
+        print(f"  parquet importable: {s['parquet_available']}")
+        print(f"  reason / path:      {s['reason']}")
+        if s.get("data_dir"):
+            print(f"  data_dir:           {s['data_dir']}")
+            print(f"  poly trades files:  {s.get('poly_trades_files', '?')}")
+            print(f"  poly markets files: {s.get('poly_markets_files', '?')}")
+            print(f"  kalshi trades:      {s.get('kalshi_trades_files', '?')}")
+        else:
+            print()
+            print("  To enable (one-time setup):")
+            print("    git clone https://github.com/Jon-Becker/prediction-market-analysis ~/pma")
+            print("    cd ~/pma && make setup    # 36GB download, ~150GB extracted")
+            print("    export POLYBOT_PMA_DATA_DIR=~/pma/data")
     elif command == "btc-arb-paper-settle":
         cmd_btc_arb_paper_settle()
     elif command == "btc-arb-paper-report":
