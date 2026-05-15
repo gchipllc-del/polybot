@@ -38,6 +38,11 @@ Usage:
     python main.py btc-5min-paper-settle  # Settle resolved 5-min paper trades
     python main.py btc-5min-paper-report  # Aggregate 5-min paper P&L + confidence-bucket WR
     python main.py dataset-status         # Check Jon-Becker parquet dataset availability
+    python main.py kalshi-auth-status     # Verify Kalshi RSA-PSS auth wiring
+    python main.py kalshi-test-auth       # Make one signed call (/portfolio/balance) to prove it works
+    python main.py kalshi-15min-monitor   # Sample Kalshi 15-min BTC markets (cron-friendly)
+    python main.py kalshi-15min-paper-settle  # Settle resolved Kalshi paper trades
+    python main.py kalshi-15min-paper-report  # Aggregate Kalshi paper P&L + WR
 """
 
 import json
@@ -942,6 +947,83 @@ def cmd_btc_5min_monitor(max_seconds_out: int = 600):
     print(f"  Persisted to data/btc_5min_signal.jsonl")
 
 
+def cmd_kalshi_15min_monitor(max_seconds_out: int = 900):
+    """Kalshi 15-min BTC signal — parallel to btc-5min-monitor.
+
+    Cron-friendly. Public endpoints only (no Kalshi auth required for
+    market data). Auto-records paper trades + auto-settles via the
+    settle path. Phase 3 (real orders) will need auth via kalshi_auth.
+    """
+    from lib.kalshi_15min_signal import run_signal_cycle
+    result = run_signal_cycle(max_seconds_out=max_seconds_out)
+    print(f"=== Kalshi 15-min signal cycle ===")
+    if result["n_markets"] == 0:
+        print("  No active 15-min BTC markets right now.")
+        print("  (Kalshi runs these in sessions — check kalshi.com/category/crypto/frequency/fifteen_min)")
+        return
+    print(f"  Sampled {result['n_markets']} market(s). Nearest first:")
+    print(f"  {'T-close':>9} {'strike':>10} {'yes_ask':>8} {'no_ask':>8} {'composite':>10}  ticker")
+    for s in result["samples"][:6]:
+        tc = s["seconds_to_close"]
+        if tc < 60:
+            t_str = f"{tc:>+6.1f}s"
+        else:
+            m, sec = divmod(int(tc), 60)
+            t_str = f"{m:>2d}m{sec:02d}s"
+        ind = s.get("indicators") or {}
+        comp = ind.get("composite", 0)
+        ya = s.get("yes_ask")
+        na = s.get("no_ask")
+        ya_s = f"{ya:.3f}" if ya is not None else "  -  "
+        na_s = f"{na:.3f}" if na is not None else "  -  "
+        print(f"  {t_str:>9} ${s['strike']:>8,.0f}  {ya_s:>8} {na_s:>8} "
+              f"{comp:>+9.2f}  {s['market_ticker'][-30:]}")
+    print(f"\n  Binance.US spot: ${result['spot_usd']:,.2f}")
+    print(f"  Paper trades opened this cycle: {result.get('paper_trades_opened', 0)}")
+    print(f"  Persisted to data/kalshi_15min_signal.jsonl")
+
+
+def cmd_kalshi_15min_paper_settle():
+    """Settle resolved Kalshi 15-min paper trades. Cron also calls this."""
+    from lib.kalshi_15min_paper import settle_paper_trades
+    result = settle_paper_trades()
+    print(f"=== Kalshi 15-min paper-settle ===")
+    print(f"  Newly settled:        {result['settled_now']}")
+    print(f"  Paper P&L this cycle: ${result['paper_pnl_this_cycle']:+,.2f}")
+    print(f"  Total open:           {result['total_open']}")
+    print(f"  Total settled:        {result['total_settled']}")
+
+
+def cmd_kalshi_15min_paper_report():
+    """Aggregate Kalshi 15-min paper P&L + confidence-bucket WR.
+
+    Same shape as cmd_btc_5min_paper_report so the two strategies
+    compare apples-to-apples.
+    """
+    from lib.kalshi_15min_paper import summary
+    s = summary()
+    print(f"=== Kalshi 15-min paper-trade report ===")
+    if s["total_trades"] == 0:
+        print("  No paper trades recorded yet — wait for the cron to find a session.")
+        return
+    print(f"  Total trades:      {s['total_trades']}")
+    print(f"  Open / Won / Lost / Void: "
+          f"{s['open']} / {s['won']} / {s['lost']} / {s['void']}")
+    print(f"  Win rate (settled): {s['win_rate']:.1%}")
+    print(f"  Total paper P&L:    ${s['total_paper_pnl']:+,.2f}")
+    print(f"  Capital deployed:   ${s['capital_deployed']:,.2f}")
+    print(f"  ROI:                {s['roi_pct']:+.2%}")
+
+    if s["by_confidence_bucket"]:
+        print()
+        print(f"  By confidence bucket:")
+        print(f"    {'bucket':<10} {'settled':>8} {'wins':>6} {'wr':>7} {'pnl':>10}")
+        for bucket, b in sorted(s["by_confidence_bucket"].items()):
+            wr = b["wins"] / b["settled"] if b["settled"] > 0 else 0
+            print(f"    {bucket:<10} {b['settled']:>8} {b['wins']:>6} "
+                  f"{wr:>6.1%} ${b['pnl']:>+8.2f}")
+
+
 def cmd_btc_5min_paper_settle():
     """Settle resolved 5-min UP/DOWN paper trades.
 
@@ -1515,6 +1597,55 @@ def main():
         cmd_btc_5min_paper_settle()
     elif command == "btc-5min-paper-report":
         cmd_btc_5min_paper_report()
+    elif command == "kalshi-15min-monitor":
+        max_sec = 900
+        for arg in sys.argv[2:]:
+            if arg.startswith("--max-seconds="):
+                max_sec = max(60, int(arg.split("=", 1)[1]))
+        cmd_kalshi_15min_monitor(max_seconds_out=max_sec)
+    elif command == "kalshi-15min-paper-settle":
+        cmd_kalshi_15min_paper_settle()
+    elif command == "kalshi-15min-paper-report":
+        cmd_kalshi_15min_paper_report()
+    elif command == "kalshi-auth-status":
+        from lib.kalshi_auth import status
+        s = status()
+        print("=== Kalshi auth status ===")
+        print(f"  api_key_present:         {s['api_key_present']}")
+        print(f"  private_key_path_set:    {s['private_key_path_set']}")
+        print(f"  private_key_file_exists: {s['private_key_file_exists']}")
+        print(f"  private_key_loadable:    {s['private_key_loadable']}")
+        print(f"  base_url:                {s['base_url']}")
+        print(f"  can_sign:                {s['can_sign']}")
+        if not s["can_sign"]:
+            print()
+            print("  Setup steps:")
+            print("    1. Add to .env:")
+            print("       KALSHI_API_KEY=<the Key ID Kalshi gave you>")
+            print("       KALSHI_PRIVATE_KEY_PATH=~/.polybot/kalshi_key.pem")
+            print("    2. Place the RSA private key (PEM file Kalshi sent):")
+            print("       mkdir -p ~/.polybot && chmod 700 ~/.polybot")
+            print("       # paste PEM content into ~/.polybot/kalshi_key.pem, then:")
+            print("       chmod 600 ~/.polybot/kalshi_key.pem")
+            print("    3. Re-run this command to verify.")
+    elif command == "kalshi-test-auth":
+        from lib.kalshi_auth import can_sign, signed_get
+        if not can_sign():
+            print("Auth not configured. Run `python main.py kalshi-auth-status` first.")
+            return
+        print("Hitting GET /portfolio/balance to verify signing...")
+        try:
+            data = signed_get("/portfolio/balance")
+            print(f"  ✓ Auth works. Balance response: {data}")
+        except Exception as e:
+            err_str = str(e)
+            # Redact any header values that might leak in error messages
+            print(f"  ✗ Request failed: {err_str[:300]}")
+            print()
+            print("  Common causes:")
+            print("    * 401 Unauthorized → Key ID mismatch or wrong base URL")
+            print("    * SignatureMismatch → string-to-sign format issue")
+            print("    * ConnectionError  → network / wrong KALSHI_API_BASE")
     elif command == "dataset-status":
         from lib.historical_data import status
         s = status()
