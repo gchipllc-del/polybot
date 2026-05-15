@@ -43,6 +43,7 @@ Usage:
     python main.py kalshi-15min-monitor   # Sample Kalshi 15-min BTC markets (cron-friendly)
     python main.py kalshi-15min-paper-settle  # Settle resolved Kalshi paper trades
     python main.py kalshi-15min-paper-report  # Aggregate Kalshi paper P&L + WR
+    python main.py kalshi-dashboard           # Web dashboard at localhost:5053
 """
 
 import json
@@ -1637,6 +1638,13 @@ def main():
             if arg.startswith("--asset="):
                 asset = arg.split("=", 1)[1].lower().strip() or None
         cmd_kalshi_15min_paper_report(asset=asset)
+    elif command == "kalshi-dashboard":
+        port = 5053
+        for arg in sys.argv[2:]:
+            if arg.startswith("--port="):
+                port = int(arg.split("=", 1)[1])
+        from lib.kalshi_dashboard import run_dashboard
+        run_dashboard(port=port)
     elif command == "kalshi-auth-status":
         from lib.kalshi_auth import status
         s = status()
