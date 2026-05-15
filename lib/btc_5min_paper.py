@@ -46,8 +46,13 @@ DEFAULT_BANKROLL = 1000.0
 DEFAULT_RISK_PER_TRADE = 0.01           # 1%
 DEFAULT_MIN_CONFIDENCE = 0.30           # |composite|/max ≥ 0.30
 DEFAULT_MAX_SECONDS_TO_CLOSE = 120.0    # only enter within last 2 min
-EXTREME_PRICE_FLOOR = 0.05
-EXTREME_PRICE_CEIL = 0.95
+DEFAULT_MIN_SECONDS_TO_CLOSE = 20.0     # don't enter under 20s — slippage zone
+# Tightened from 0.05-0.95 to 0.15-0.85 — at the extremes the
+# risk/reward is brutal and edge gets eaten by spread + fees.
+EXTREME_PRICE_FLOOR = 0.15
+EXTREME_PRICE_CEIL = 0.85
+NEUTRAL_MARKET_FLOOR = 0.45
+NEUTRAL_MARKET_CEIL = 0.55
 
 
 @dataclass
@@ -143,7 +148,7 @@ def record_paper_trades_from_samples(
             continue
 
         seconds_to_close = float(s.get("seconds_to_close", 0) or 0)
-        if not (0 < seconds_to_close <= max_seconds_to_close):
+        if not (DEFAULT_MIN_SECONDS_TO_CLOSE <= seconds_to_close <= max_seconds_to_close):
             continue
 
         market_id = s.get("market_id") or ""
@@ -152,6 +157,10 @@ def record_paper_trades_from_samples(
 
         up_price = float(s.get("up_price", 0) or 0)
         if not (0.0 < up_price < 1.0):
+            continue
+
+        # Neutral-market skip — market itself has no opinion, no edge.
+        if NEUTRAL_MARKET_FLOOR <= up_price <= NEUTRAL_MARKET_CEIL:
             continue
 
         # Side selection from composite sign

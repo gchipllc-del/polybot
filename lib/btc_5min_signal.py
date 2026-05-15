@@ -272,6 +272,29 @@ def compute_greeks(
     }
 
 
+def compute_realized_vol(klines: list[dict], *, min_samples: int = 15) -> float | None:
+    """Annualized realized volatility from 1-minute klines.
+
+    σ_per_min = std(log returns of last N closes)
+    σ_annual = σ_per_min × √525,600    (minutes per year)
+
+    Returns None if we don't have enough samples — caller falls back
+    to the configured per-asset value.
+    """
+    closes = [k["close"] for k in klines if k.get("close", 0) > 0]
+    if len(closes) < min_samples + 1:
+        return None
+    rets = []
+    for i in range(1, len(closes)):
+        rets.append(math.log(closes[i] / closes[i - 1]))
+    if not rets:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1)
+    sigma_per_min = math.sqrt(var)
+    return sigma_per_min * math.sqrt(525_600)
+
+
 def compute_indicators_for_window(
     *,
     klines: list[dict],
@@ -280,106 +303,44 @@ def compute_indicators_for_window(
     hours_to_close: float | None = None,
     market_yes_price: float | None = None,
     annual_vol: float = DEFAULT_ANNUAL_VOL,
+    use_realized_vol: bool = True,
 ) -> dict:
-    """Compute the indicator composite when ``window_open_price`` is
-    already known (e.g. given by the exchange as a strike).
+    """Lean composite: ONLY market-respecting, mean-reversion-aware,
+    or theoretically-grounded indicators. The momentum-following
+    indicators (Window Delta, Micro Momentum, Acceleration, EMA Cross,
+    Volume Surge) were removed after empirical proof that they caused
+    a 22% win rate by buying continuation right before reversion.
 
-    7 indicators now — the original 6 mechanical (Window Delta, Micro
-    Momentum, Acceleration, EMA Cross, RSI, Volume Surge) PLUS a
-    Greeks-grounded ``theo_delta_gap`` when ``hours_to_close`` and
-    ``market_yes_price`` are supplied. The delta gap is literally
-    expected-value-per-dollar of buying YES at the current price,
-    so we weight it heavily (4 vs Window Delta's 6).
+    Three indicators only:
+      * RSI (weight 2) — only mean-reverting indicator; overbought
+        → bearish, oversold → bullish.
+      * theo_delta_gap (weight 4) — Greeks-based fair-value vs market
+        YES, the EV-per-dollar signal.
+      * market_agreement (weight 3) — direction must align with where
+        the market is leaning. If market YES > 0.5 → lean YES; below
+        → lean NO. Magnitude scales with conviction.
 
-    Asset-agnostic — every contribution is a percentage / ratio.
-    Callers responsible for finding window_open_price first.
+    When ``use_realized_vol=True`` (default), the Greeks model uses
+    realized vol derived from ``klines`` rather than the configured
+    constant — adapts to current market state.
+
+    Max possible composite: 9.0. Asset-agnostic. Window-open price
+    still used as the Greeks strike but no longer feeds its own
+    directional contribution.
     """
     closes = [k["close"] for k in klines]
-    volumes = [k["volume"] for k in klines]
-    last_close = closes[-1] if closes else None
 
-    # 1. Window Delta — dominant signal. % move from window open to now.
-    if window_open_price and window_open_price > 0:
-        window_delta_pct = (current_spot - window_open_price) / window_open_price * 100.0
-    else:
-        window_delta_pct = None
+    # ── Adaptive vol ──────────────────────────────────────────────
+    effective_vol = annual_vol
+    if use_realized_vol:
+        rv = compute_realized_vol(klines)
+        if rv is not None and rv > 0:
+            effective_vol = rv
 
-    # 2. Micro Momentum — sum of last 2 candles' direction (-2 to +2)
-    if len(klines) >= 2:
-        m1 = klines[-1]["close"] - klines[-1]["open"]
-        m2 = klines[-2]["close"] - klines[-2]["open"]
-        micro_momentum = (1 if m1 > 0 else -1 if m1 < 0 else 0) + \
-                         (1 if m2 > 0 else -1 if m2 < 0 else 0)
-    else:
-        micro_momentum = 0
-
-    # 3. Acceleration — is momentum building or fading?
-    # Converted to **basis points** (1 bp = 0.01%) of last_close so the
-    # indicator is asset-agnostic. The prior $-denominated version
-    # ($50 typical 1-min BTC std) saturated permanently on SOL.
-    acceleration_bps = 0.0
-    if len(closes) >= 3 and last_close and last_close > 0:
-        d1 = closes[-1] - closes[-2]
-        d2 = closes[-2] - closes[-3]
-        acceleration_bps = ((d1 - d2) / last_close) * 10_000
-
-    # 4. EMA 9 / EMA 21 crossover (% of EMA21)
-    ema9 = _ema(closes, 9)
-    ema21 = _ema(closes, 21)
-    ema_cross = 0.0
-    if ema9 is not None and ema21 is not None and ema21 > 0:
-        ema_cross = (ema9 - ema21) / ema21 * 100.0
-
-    # 5. RSI 14
+    # ── RSI 14 ────────────────────────────────────────────────────
     rsi = _rsi(closes, 14)
 
-    # 6. Volume Surge — last bar vs trailing avg (unitless ratio)
-    if len(volumes) >= 15:
-        recent = volumes[-1]
-        trailing_avg = sum(volumes[-15:-1]) / 14
-        vol_surge = recent / trailing_avg if trailing_avg > 0 else 1.0
-    else:
-        vol_surge = 1.0
-
-    # ── Compose ────────────────────────────────────────────────────
-    # Each contribution is normalized to roughly [-1, +1] then weighted.
-    contribs: dict[str, float] = {}
-
-    # Window delta: 0.10% → max-strength bullish per reference strategy.
-    if window_delta_pct is not None:
-        contribs["window_delta"] = max(-1.0, min(1.0, window_delta_pct / 0.10)) * 6.0
-    else:
-        contribs["window_delta"] = 0.0
-
-    # Micro momentum: already -2..+2, scale to -1..+1 then weight 2
-    contribs["micro_momentum"] = (micro_momentum / 2.0) * 2.0
-
-    # Acceleration: 5bp ≈ max strength (small but consistent move).
-    # That's $40 on BTC@80k, 4.4¢ on SOL@88 — proportional, asset-agnostic.
-    contribs["acceleration"] = max(-1.0, min(1.0, acceleration_bps / 5.0)) * 1.5
-
-    # EMA cross %: 0.05% delta ≈ max strength
-    contribs["ema_cross"] = max(-1.0, min(1.0, ema_cross / 0.05)) * 1.0
-
-    # RSI: 30/70 are extremes; map 30→+1.0, 70→-1.0 (oversold = bullish)
-    if rsi is not None:
-        rsi_norm = (50.0 - rsi) / 20.0
-        contribs["rsi"] = max(-1.5, min(1.5, rsi_norm)) * 1.0
-    else:
-        contribs["rsi"] = 0.0
-
-    # Volume surge: confirms direction; 1.5x → +1 weight if direction
-    # agrees, 0 otherwise. Direction comes from micro_momentum sign.
-    direction_sign = 1 if micro_momentum > 0 else -1 if micro_momentum < 0 else 0
-    if vol_surge >= 1.5 and direction_sign != 0:
-        contribs["volume_surge"] = direction_sign * 1.0
-    else:
-        contribs["volume_surge"] = 0.0
-
-    # 7. Greeks-based theoretical delta gap — the EV-per-dollar signal.
-    # Only computed when caller passes both hours_to_close AND the
-    # current market_yes_price (i.e. we have both sides of the gap).
-    # Saturate at ±0.10 (a 10pp gap is enormous; 5pp already strong).
+    # ── Greeks-based theoretical-delta gap ────────────────────────
     greeks: dict | None = None
     theo_yes_gap = 0.0
     if (hours_to_close is not None and hours_to_close > 0
@@ -389,27 +350,48 @@ def compute_indicators_for_window(
             spot=current_spot,
             strike=window_open_price,
             hours_to_close=hours_to_close,
-            annual_vol=annual_vol,
+            annual_vol=effective_vol,
         )
         if greeks is not None:
             theo_yes_gap = greeks["theoretical_yes"] - float(market_yes_price)
+
+    # ── Compose ────────────────────────────────────────────────────
+    contribs: dict[str, float] = {}
+
+    # RSI: 30→+1.0 oversold (bullish), 70→-1.0 overbought (bearish).
+    # Weight bumped from 1.5 → 2.0 since this is now one of only three.
+    if rsi is not None:
+        rsi_norm = (50.0 - rsi) / 20.0
+        contribs["rsi"] = max(-1.0, min(1.0, rsi_norm)) * 2.0
+    else:
+        contribs["rsi"] = 0.0
+
+    # theo_delta_gap: 0.10pp gap → max strength.
     contribs["theo_delta_gap"] = max(-1.0, min(1.0, theo_yes_gap / 0.10)) * 4.0
 
+    # market_agreement: respects the market's directional view. A
+    # market_yes of 0.70 says the market is 70/30 on YES — we lean
+    # YES with conviction. We saturate at ±0.10 (i.e. market_yes
+    # ≤ 0.40 or ≥ 0.60) so the indicator doesn't go nuclear on
+    # mildly-confident markets.
+    if market_yes_price is not None:
+        agreement_raw = float(market_yes_price) - 0.50
+        contribs["market_agreement"] = max(-1.0, min(1.0, agreement_raw / 0.10)) * 3.0
+    else:
+        contribs["market_agreement"] = 0.0
+
     composite = sum(contribs.values())
-    # 6 mechanical + 4 Greeks = 17.0
-    max_possible = 6.0 + 2.0 + 1.5 + 1.0 + 1.5 + 1.0 + 4.0
+    max_possible = 2.0 + 4.0 + 3.0  # = 9.0
 
     return {
         "window_open": window_open_price,
-        "window_delta_pct": window_delta_pct,
-        "micro_momentum": micro_momentum,
-        "acceleration_bps": acceleration_bps,
-        "ema9": ema9, "ema21": ema21, "ema_cross_pct": ema_cross,
         "rsi": rsi,
-        "vol_surge_ratio": vol_surge,
+        "effective_annual_vol": effective_vol,
+        "vol_source": "realized" if (use_realized_vol and effective_vol != annual_vol) else "configured",
         "theoretical_yes": greeks["theoretical_yes"] if greeks else None,
         "theo_yes_gap": theo_yes_gap,
         "T_years": greeks["T_years"] if greeks else None,
+        "market_yes_price": market_yes_price,
         "contribs": contribs,
         "composite": composite,
         "max_possible": max_possible,

@@ -34,8 +34,22 @@ DEFAULT_RISK_PER_TRADE = 0.005          # 0.5% — half the 5-min default
 DEFAULT_MIN_CONFIDENCE = 0.35           # slightly higher bar; Kalshi WIN
                                         # pays only 0.93x post-fee
 DEFAULT_MAX_SECONDS_TO_CLOSE = 300.0    # 5 min — last third of the 15-min window
-EXTREME_PRICE_FLOOR = 0.05
-EXTREME_PRICE_CEIL = 0.95
+DEFAULT_MIN_SECONDS_TO_CLOSE = 30.0     # don't enter under 30s — slippage zone
+
+# Tightened from the old 0.05-0.95 band: at the extremes risk/reward
+# is brutal (winning $0.15 on a $0.85 bet, or vice versa). Stay in
+# the meat of the distribution where edge actually pays.
+EXTREME_PRICE_FLOOR = 0.15
+EXTREME_PRICE_CEIL = 0.85
+
+# Neutral-market skip: if yes_ask is between these, the market is
+# saying "I have no idea." No edge to extract.
+NEUTRAL_MARKET_FLOOR = 0.45
+NEUTRAL_MARKET_CEIL = 0.55
+
+# Spread filter: skip when yes_ask - yes_bid exceeds this. Wide
+# spreads eat any edge we think we have.
+MAX_BID_ASK_SPREAD = 0.05
 
 
 def _asset_from_ticker(ticker: str) -> str:
@@ -130,12 +144,22 @@ def record_paper_trades_from_samples(
     risk_per_trade: float = DEFAULT_RISK_PER_TRADE,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     max_seconds_to_close: float = DEFAULT_MAX_SECONDS_TO_CLOSE,
+    min_seconds_to_close: float = DEFAULT_MIN_SECONDS_TO_CLOSE,
+    debug_skips: bool = False,
 ) -> list[KalshiFifteenMinPaperTrade]:
     """Record paper trades for any qualifying Kalshi 15-min sample.
 
     Side selection from composite sign:
       composite > 0 → buy YES at yes_ask (or last_price fallback)
       composite < 0 → buy NO  at no_ask  (or 1 - yes_ask fallback)
+
+    Hard filter chain (in order, short-circuit on first failure):
+      1. confidence >= min_confidence
+      2. min_seconds_to_close < T-close <= max_seconds_to_close
+      3. ticker not already open
+      4. market not in neutral zone (yes_ask 0.45-0.55 → no edge)
+      5. yes/no fill inside meat of distribution (0.15-0.85)
+      6. bid-ask spread <= MAX_BID_ASK_SPREAD (skip illiquid markets)
     """
     if not samples:
         return []
@@ -148,43 +172,67 @@ def record_paper_trades_from_samples(
     now_iso = datetime.now(timezone.utc).isoformat()
     new_trades: list[KalshiFifteenMinPaperTrade] = []
     new_rows: list[dict] = []
+    skip_counts: dict = {}
 
     for sig in samples:
         s = sig if isinstance(sig, dict) else asdict(sig)
         indicators = s.get("indicators")
         if not isinstance(indicators, dict):
+            skip_counts["no_indicators"] = skip_counts.get("no_indicators", 0) + 1
             continue
         confidence = float(indicators.get("confidence", 0) or 0)
         composite = float(indicators.get("composite", 0) or 0)
         if confidence < min_confidence:
+            skip_counts["low_confidence"] = skip_counts.get("low_confidence", 0) + 1
             continue
 
         seconds_to_close = float(s.get("seconds_to_close", 0) or 0)
-        if not (0 < seconds_to_close <= max_seconds_to_close):
+        if not (min_seconds_to_close <= seconds_to_close <= max_seconds_to_close):
+            skip_counts["out_of_window"] = skip_counts.get("out_of_window", 0) + 1
             continue
 
         ticker = s.get("market_ticker") or ""
         if not ticker or ticker in open_tickers:
+            skip_counts["dup_open"] = skip_counts.get("dup_open", 0) + 1
+            continue
+
+        # Neutral-market skip — if the market itself has no opinion,
+        # we have no edge to extract. This is the cleanest filter
+        # added in the revamp.
+        yes_ask = s.get("yes_ask")
+        yes_bid = s.get("yes_bid")
+        if yes_ask is not None and NEUTRAL_MARKET_FLOOR <= float(yes_ask) <= NEUTRAL_MARKET_CEIL:
+            skip_counts["neutral_market"] = skip_counts.get("neutral_market", 0) + 1
+            continue
+
+        # Spread filter — wide spreads eat any edge
+        if (yes_ask is not None and yes_bid is not None
+                and float(yes_ask) - float(yes_bid) > MAX_BID_ASK_SPREAD):
+            skip_counts["wide_spread"] = skip_counts.get("wide_spread", 0) + 1
             continue
 
         # Side selection
         if composite > 0:
             side = "YES"
-            fill = s.get("yes_ask") or s.get("last_price")
+            fill = yes_ask if yes_ask is not None else s.get("last_price")
             if fill is None:
+                skip_counts["no_fill"] = skip_counts.get("no_fill", 0) + 1
                 continue
         elif composite < 0:
             side = "NO"
             fill = s.get("no_ask")
-            if fill is None and s.get("yes_ask") is not None:
-                fill = round(1.0 - float(s["yes_ask"]), 4)
+            if fill is None and yes_ask is not None:
+                fill = round(1.0 - float(yes_ask), 4)
             if fill is None:
+                skip_counts["no_fill"] = skip_counts.get("no_fill", 0) + 1
                 continue
         else:
+            skip_counts["zero_composite"] = skip_counts.get("zero_composite", 0) + 1
             continue
 
         fill = float(fill)
         if not (EXTREME_PRICE_FLOOR <= fill <= EXTREME_PRICE_CEIL):
+            skip_counts["extreme_price"] = skip_counts.get("extreme_price", 0) + 1
             continue
 
         contracts = round(notional_per_trade / fill, 4)
@@ -218,7 +266,11 @@ def record_paper_trades_from_samples(
         log_event("kalshi_15min_paper", "recorded", {
             "n_new_trades": len(new_rows),
             "min_confidence": min_confidence,
+            "skip_counts": skip_counts,
         })
+    if debug_skips and skip_counts:
+        log_event("kalshi_15min_paper", "filter_skips",
+                  {"counts": skip_counts}, result="degraded")
     return new_trades
 
 
