@@ -210,22 +210,31 @@ def compute_kalshi_indicators(
     klines: list[dict],
     strike: float,
     current_spot: float,
+    hours_to_close: float | None = None,
+    market_yes_price: float | None = None,
+    annual_vol: float = 0.55,
 ) -> dict:
-    """Compute the 6-indicator composite for a Kalshi 15-min market.
+    """Compute the 7-indicator composite for a Kalshi 15-min market.
 
     Strike IS the window-open price (Kalshi pegs it there at market
-    creation), so we hand the shared engine that value directly and
-    skip the klines-search the Polymarket variant has to do.
+    creation), so the Greeks helper uses it directly as the BSM strike.
 
-    The shared core is asset-agnostic — Acceleration normalized in
-    basis points, not dollars — so ETH and SOL work the same way.
-    Direction labels flipped to YES/NO since Kalshi markets are
-    framed as "BTC ≥ strike at close?" not "BTC up?".
+    When ``hours_to_close`` AND ``market_yes_price`` are both supplied
+    (normal cron path) the composite includes the ``theo_delta_gap``
+    contribution — the EV-per-dollar signal grounded in lognormal
+    fair-value vs current market YES.
+
+    Direction labels are YES/NO since Kalshi markets are framed as
+    "BTC ≥ strike at close?" rather than "BTC up?".
     """
     base = compute_indicators_for_window(
-        klines=klines, window_open_price=strike, current_spot=current_spot,
+        klines=klines,
+        window_open_price=strike,
+        current_spot=current_spot,
+        hours_to_close=hours_to_close,
+        market_yes_price=market_yes_price,
+        annual_vol=annual_vol,
     )
-    # Keep the Kalshi-specific labels + add strike for symmetry
     base["strike"] = strike
     base["current_spot"] = current_spot
     base["direction"] = (
@@ -253,6 +262,7 @@ def sample_signals_for_asset(
     """
     series = asset_cfg.get("series")
     binance_symbol = asset_cfg.get("binance_symbol")
+    annual_vol = float(asset_cfg.get("annual_vol", 0.55))
     if not series or not binance_symbol:
         return []
 
@@ -272,8 +282,29 @@ def sample_signals_for_asset(
     for m in markets:
         indicators = None
         if klines:
+            # Pick a single market-YES estimate to compare against the
+            # Greeks model. Preference order: last trade price (most
+            # informative), then mid of bid/ask, then yes_ask alone.
+            yes_bid = m.get("yes_bid")
+            yes_ask = m.get("yes_ask")
+            last_price = m.get("last_price")
+            if last_price is not None:
+                market_yes = float(last_price)
+            elif yes_bid is not None and yes_ask is not None:
+                market_yes = (float(yes_bid) + float(yes_ask)) / 2.0
+            elif yes_ask is not None:
+                market_yes = float(yes_ask)
+            else:
+                market_yes = None
+            hours_to_close = max(m["seconds_to_close"] / 3600.0, 0.0)
+
             indicators = compute_kalshi_indicators(
-                klines=klines, strike=m["strike"], current_spot=spot,
+                klines=klines,
+                strike=m["strike"],
+                current_spot=spot,
+                hours_to_close=hours_to_close,
+                market_yes_price=market_yes,
+                annual_vol=annual_vol,
             )
         out.append(KalshiFifteenMinSample(
             sample_at=now_iso,

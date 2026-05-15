@@ -55,6 +55,7 @@ Risk caps (conservative defaults — Phase 3 will tune):
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -67,6 +68,10 @@ SIGNAL_PATH = Path(__file__).parent.parent / "data" / "btc_5min_signal.jsonl"
 BINANCE_US_TICKER = "https://api.binance.us/api/v3/ticker/price"
 BINANCE_US_KLINES = "https://api.binance.us/api/v3/klines"
 POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
+
+# Default annualized vol if caller doesn't specify. Per-asset overrides
+# come from config/kalshi_assets.yaml; this is the BTC fallback.
+DEFAULT_ANNUAL_VOL = 0.55
 
 # Match `btc-updown-5m-1778883600` (capture the unix-ts suffix).
 SLUG_RE = re.compile(r"^btc-updown-5m-(\d{9,11})$")
@@ -218,18 +223,76 @@ def _find_window_open_price(
     return best[1] if best else None
 
 
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via math.erf — no scipy dep."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def compute_greeks(
+    *,
+    spot: float,
+    strike: float,
+    hours_to_close: float,
+    annual_vol: float = DEFAULT_ANNUAL_VOL,
+) -> dict | None:
+    """Black-Scholes-style binary delta for a cash-or-nothing call:
+    the probability that ``spot`` exceeds ``strike`` at expiry under
+    lognormal returns with drift=0.
+
+    This IS the fair YES price for a Kalshi/Polymarket binary market
+    that pays $1 if spot > strike at expiry. Drift=0 because we're
+    treating the spot as a martingale over the short window —
+    consistent with the risk-neutral measure used by every BSM
+    derivation, and a defensible simplification for sub-hour windows
+    where drift terms are dwarfed by realized vol.
+
+      d  = [ln(S/K) + 0.5·σ²·T] / (σ·√T)
+      P(S_T > K) = Φ(d − σ·√T)
+
+    Returns None if inputs are degenerate (zero/negative).
+    """
+    if (hours_to_close <= 0 or spot <= 0 or strike <= 0
+            or annual_vol <= 0):
+        return None
+    T = hours_to_close / (365 * 24)
+    sigma_sqrt_T = annual_vol * math.sqrt(T)
+    if sigma_sqrt_T <= 0:
+        # Already at expiry — collapse to step function
+        return {
+            "theoretical_yes": 1.0 if spot > strike else 0.0,
+            "T_years": T, "sigma_sqrt_T": 0.0,
+        }
+    d = (math.log(spot / strike) + 0.5 * annual_vol * annual_vol * T) / sigma_sqrt_T
+    theo_yes = _norm_cdf(d - sigma_sqrt_T)
+    return {
+        "theoretical_yes": theo_yes,
+        "T_years": T,
+        "sigma_sqrt_T": sigma_sqrt_T,
+        "d2": d - sigma_sqrt_T,
+    }
+
+
 def compute_indicators_for_window(
     *,
     klines: list[dict],
     window_open_price: float | None,
     current_spot: float,
+    hours_to_close: float | None = None,
+    market_yes_price: float | None = None,
+    annual_vol: float = DEFAULT_ANNUAL_VOL,
 ) -> dict:
-    """Compute the 6-indicator composite when ``window_open_price`` is
+    """Compute the indicator composite when ``window_open_price`` is
     already known (e.g. given by the exchange as a strike).
 
-    This is the asset-agnostic core. Every value is either a percentage
-    or a unitless ratio, so it works equally well on BTC ($80k) and
-    SOL ($89). Callers responsible for finding window_open_price first.
+    7 indicators now — the original 6 mechanical (Window Delta, Micro
+    Momentum, Acceleration, EMA Cross, RSI, Volume Surge) PLUS a
+    Greeks-grounded ``theo_delta_gap`` when ``hours_to_close`` and
+    ``market_yes_price`` are supplied. The delta gap is literally
+    expected-value-per-dollar of buying YES at the current price,
+    so we weight it heavily (4 vs Window Delta's 6).
+
+    Asset-agnostic — every contribution is a percentage / ratio.
+    Callers responsible for finding window_open_price first.
     """
     closes = [k["close"] for k in klines]
     volumes = [k["volume"] for k in klines]
@@ -313,8 +376,28 @@ def compute_indicators_for_window(
     else:
         contribs["volume_surge"] = 0.0
 
+    # 7. Greeks-based theoretical delta gap — the EV-per-dollar signal.
+    # Only computed when caller passes both hours_to_close AND the
+    # current market_yes_price (i.e. we have both sides of the gap).
+    # Saturate at ±0.10 (a 10pp gap is enormous; 5pp already strong).
+    greeks: dict | None = None
+    theo_yes_gap = 0.0
+    if (hours_to_close is not None and hours_to_close > 0
+            and market_yes_price is not None
+            and window_open_price is not None):
+        greeks = compute_greeks(
+            spot=current_spot,
+            strike=window_open_price,
+            hours_to_close=hours_to_close,
+            annual_vol=annual_vol,
+        )
+        if greeks is not None:
+            theo_yes_gap = greeks["theoretical_yes"] - float(market_yes_price)
+    contribs["theo_delta_gap"] = max(-1.0, min(1.0, theo_yes_gap / 0.10)) * 4.0
+
     composite = sum(contribs.values())
-    max_possible = 6.0 + 2.0 + 1.5 + 1.0 + 1.5 + 1.0  # = 13.0
+    # 6 mechanical + 4 Greeks = 17.0
+    max_possible = 6.0 + 2.0 + 1.5 + 1.0 + 1.5 + 1.0 + 4.0
 
     return {
         "window_open": window_open_price,
@@ -324,6 +407,9 @@ def compute_indicators_for_window(
         "ema9": ema9, "ema21": ema21, "ema_cross_pct": ema_cross,
         "rsi": rsi,
         "vol_surge_ratio": vol_surge,
+        "theoretical_yes": greeks["theoretical_yes"] if greeks else None,
+        "theo_yes_gap": theo_yes_gap,
+        "T_years": greeks["T_years"] if greeks else None,
         "contribs": contribs,
         "composite": composite,
         "max_possible": max_possible,
@@ -337,16 +423,26 @@ def compute_indicators(
     klines: list[dict],
     window_start_ts: int,
     current_spot: float,
+    hours_to_close: float | None = None,
+    market_yes_price: float | None = None,
+    annual_vol: float = DEFAULT_ANNUAL_VOL,
 ) -> dict:
-    """Compute the 6-indicator composite for a Polymarket 5-min window
+    """Compute the indicator composite for a Polymarket 5-min window
     by inferring the window-open price from klines, then delegating.
 
     Thin wrapper around ``compute_indicators_for_window`` so the
-    Polymarket and Kalshi paths share the same indicator math.
+    Polymarket and Kalshi paths share the same indicator math —
+    including the Greeks ``theo_delta_gap`` when callers supply
+    ``hours_to_close`` and ``market_yes_price``.
     """
     window_open = _find_window_open_price(klines, window_start_ts)
     return compute_indicators_for_window(
-        klines=klines, window_open_price=window_open, current_spot=current_spot,
+        klines=klines,
+        window_open_price=window_open,
+        current_spot=current_spot,
+        hours_to_close=hours_to_close,
+        market_yes_price=market_yes_price,
+        annual_vol=annual_vol,
     )
 
 
@@ -463,10 +559,14 @@ def sample_signals(
         if klines:
             # Window start = window end - 5 minutes
             window_start_ts = m["window_end_ts"] - 300
+            hours_to_close = max(m["seconds_to_close"] / 3600.0, 0.0)
             indicators = compute_indicators(
                 klines=klines,
                 window_start_ts=window_start_ts,
                 current_spot=spot,
+                hours_to_close=hours_to_close,
+                market_yes_price=m["up_price"],
+                annual_vol=DEFAULT_ANNUAL_VOL,
             )
         out.append(FiveMinSample(
             sample_at=now_iso,

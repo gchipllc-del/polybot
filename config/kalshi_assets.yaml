@@ -13,22 +13,33 @@
 # and SOL have wider Kalshi spreads + thinner liquidity than BTC, so
 # we require a higher composite confidence before firing.
 
+# ``annual_vol`` feeds the Greeks-based theoretical-delta indicator.
+# Tune from realized vol when we have enough data; defaults below come
+# from rolling 30-day realized-vol estimates as of mid-2026.
+#   * BTC ~50-60% — settle around 0.55
+#   * ETH ~60-70% — more reactive
+#   * SOL ~80-100% — substantially noisier
+# Hermes-style tuning can drift these later from per-asset realized.
+
 assets:
   btc:
     series: KXBTC15M
     binance_symbol: BTCUSDT
+    annual_vol: 0.55
     min_confidence: 0.35      # baseline — most liquid Kalshi crypto market
     enabled: true
 
   eth:
     series: KXETH15M
     binance_symbol: ETHUSDT
+    annual_vol: 0.65
     min_confidence: 0.45      # ETH spreads ~2x wider than BTC on Kalshi
     enabled: true
 
   sol:
     series: KXSOL15M
     binance_symbol: SOLUSDT
+    annual_vol: 0.85
     min_confidence: 0.50      # thinnest of the three — most conservative
     enabled: true
 
@@ -38,17 +49,20 @@ assets:
   ada:
     series: KXADA15M
     binance_symbol: ADAUSDT
+    annual_vol: 0.85
     min_confidence: 0.55
     enabled: false
 
   xrp:
     series: KXXRP15M
     binance_symbol: XRPUSDT
+    annual_vol: 0.85
     min_confidence: 0.55
     enabled: false
 
   doge:
     series: KXDOGE15M
     binance_symbol: DOGEUSDT
-    min_confidence: 0.55
+    annual_vol: 1.20          # DOGE is wildly volatile — 100%+ annualized
+    min_confidence: 0.60
     enabled: false
