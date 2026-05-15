@@ -65,6 +65,7 @@ from lib.audit import log_event
 SIGNAL_PATH = Path(__file__).parent.parent / "data" / "btc_5min_signal.jsonl"
 
 BINANCE_US_TICKER = "https://api.binance.us/api/v3/ticker/price"
+BINANCE_US_KLINES = "https://api.binance.us/api/v3/klines"
 POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
 
 # Match `btc-updown-5m-1778883600` (capture the unix-ts suffix).
@@ -83,6 +84,8 @@ class FiveMinSample:
     up_price: float              # current YES (=UP) price, 0..1
     down_price: float            # 1 - up_price (Polymarket binaries sum to ~1)
     spot_usd: float              # Binance.US BTC/USDT spot at sample time
+    indicators: dict | None = None  # composite + raw indicator values
+                                    # (None if klines fetch failed)
 
 
 # ── Discovery ────────────────────────────────────────────────────────
@@ -100,6 +103,224 @@ def fetch_binance_btc_price() -> float | None:
         log_event("btc_5min", "binance_fetch_failed",
                   {"error": str(e)[:200]}, result="degraded")
         return None
+
+
+def fetch_binance_klines(*, limit: int = 50) -> list[dict] | None:
+    """Pull recent BTC/USDT 1-minute candles from Binance.US.
+
+    Returns oldest→newest list of dicts so indicators iterate forward
+    naturally. ``limit=50`` gives EMA21 ample headroom and RSI14 + 3-tick
+    momentum a clean tail. None on failure.
+    """
+    import requests
+    try:
+        r = requests.get(
+            BINANCE_US_KLINES,
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": limit},
+            timeout=10,
+        )
+        r.raise_for_status()
+        raw = r.json()
+    except Exception as e:
+        log_event("btc_5min", "klines_fetch_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+        return None
+    out: list[dict] = []
+    for row in raw:
+        try:
+            out.append({
+                "open_time_ms": int(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+            })
+        except (ValueError, IndexError, TypeError):
+            continue
+    return out
+
+
+# ── Indicators ───────────────────────────────────────────────────────
+
+def _ema(prices: list[float], period: int) -> float | None:
+    """Exponential moving average over the last ``period``+ closes.
+
+    Standard recursion: ema_today = α·price + (1-α)·ema_yesterday
+    with α = 2/(period+1). Bootstrap from the simple average of the
+    first ``period`` values, then iterate.
+    """
+    if len(prices) < period:
+        return None
+    alpha = 2.0 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for p in prices[period:]:
+        ema = alpha * p + (1 - alpha) * ema
+    return ema
+
+
+def _rsi(prices: list[float], period: int = 14) -> float | None:
+    """Standard 14-period RSI on closes. Returns 0..100, None if too
+    few samples. Uses Wilder's smoothing (the original formulation).
+    """
+    if len(prices) < period + 1:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for i in range(1, period + 1):
+        delta = prices[i] - prices[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    # Wilder smoothing for the rest
+    for i in range(period + 1, len(prices)):
+        delta = prices[i] - prices[i - 1]
+        gain = max(delta, 0.0)
+        loss = max(-delta, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _find_window_open_price(
+    klines: list[dict],
+    window_start_ts: int,
+) -> float | None:
+    """Find the 1-minute candle that opened exactly at ``window_start_ts``
+    (a 5-minute boundary) and return its ``open`` price.
+
+    Falls back to the candle with the closest open_time within ±60s if
+    the exact boundary candle isn't present (Binance.US occasionally
+    misses ticks).
+    """
+    target_ms = window_start_ts * 1000
+    best: tuple[int, float] | None = None
+    for k in klines:
+        if k["open_time_ms"] == target_ms:
+            return k["open"]
+        diff = abs(k["open_time_ms"] - target_ms)
+        if diff <= 60_000 and (best is None or diff < best[0]):
+            best = (diff, k["open"])
+    return best[1] if best else None
+
+
+def compute_indicators(
+    *,
+    klines: list[dict],
+    window_start_ts: int,
+    current_spot: float,
+) -> dict:
+    """Compute the 6 indicators the open-source latency bots converge on.
+
+    Tick-trend (the 7th) is skipped because a 60s cron can't poll
+    sub-minute; it lives in Phase 3's tight-polling daemon. Weights
+    come from the synthesized strategy doc — Window Delta dominates.
+
+    Returns a dict of raw indicator values plus the composite score.
+    Composite is signed: positive = UP, negative = DOWN.
+    """
+    closes = [k["close"] for k in klines]
+    volumes = [k["volume"] for k in klines]
+
+    # 1. Window Delta — dominant signal. % move from window open to now.
+    window_open = _find_window_open_price(klines, window_start_ts)
+    if window_open and window_open > 0:
+        window_delta_pct = (current_spot - window_open) / window_open * 100.0
+    else:
+        window_delta_pct = None
+
+    # 2. Micro Momentum — sum of last 2 candles' direction (-2 to +2)
+    if len(klines) >= 2:
+        m1 = klines[-1]["close"] - klines[-1]["open"]
+        m2 = klines[-2]["close"] - klines[-2]["open"]
+        micro_momentum = (1 if m1 > 0 else -1 if m1 < 0 else 0) + \
+                         (1 if m2 > 0 else -1 if m2 < 0 else 0)
+    else:
+        micro_momentum = 0
+
+    # 3. Acceleration — is momentum building or fading?
+    if len(closes) >= 3:
+        d1 = closes[-1] - closes[-2]
+        d2 = closes[-2] - closes[-3]
+        acceleration = d1 - d2
+    else:
+        acceleration = 0.0
+
+    # 4. EMA 9 / EMA 21 crossover
+    ema9 = _ema(closes, 9)
+    ema21 = _ema(closes, 21)
+    ema_cross = 0.0
+    if ema9 is not None and ema21 is not None and ema21 > 0:
+        ema_cross = (ema9 - ema21) / ema21 * 100.0
+
+    # 5. RSI 14
+    rsi = _rsi(closes, 14)
+
+    # 6. Volume Surge — last bar vs trailing avg
+    if len(volumes) >= 15:
+        recent = volumes[-1]
+        trailing_avg = sum(volumes[-15:-1]) / 14
+        vol_surge = recent / trailing_avg if trailing_avg > 0 else 1.0
+    else:
+        vol_surge = 1.0
+
+    # ── Compose ────────────────────────────────────────────────────
+    # Each contribution is normalized to roughly [-1, +1] then weighted.
+    contribs: dict[str, float] = {}
+
+    # Window delta: 0.10% → max-strength bullish (per the reference
+    # strategy). Saturate at ±0.10%.
+    if window_delta_pct is not None:
+        contribs["window_delta"] = max(-1.0, min(1.0, window_delta_pct / 0.10)) * 6.0
+    else:
+        contribs["window_delta"] = 0.0
+
+    # Micro momentum: already -2..+2, scale to -1..+1 then weight 2
+    contribs["micro_momentum"] = (micro_momentum / 2.0) * 2.0
+
+    # Acceleration in absolute USD — normalize by typical 1-min std (~$50)
+    contribs["acceleration"] = max(-1.0, min(1.0, acceleration / 50.0)) * 1.5
+
+    # EMA cross %: 0.05% delta ≈ max strength
+    contribs["ema_cross"] = max(-1.0, min(1.0, ema_cross / 0.05)) * 1.0
+
+    # RSI: 30/70 are extremes; map 30→+1.5, 70→-1.5 (oversold = bullish)
+    if rsi is not None:
+        rsi_norm = (50.0 - rsi) / 20.0  # 30→+1.0, 70→-1.0
+        contribs["rsi"] = max(-1.5, min(1.5, rsi_norm)) * 1.0
+    else:
+        contribs["rsi"] = 0.0
+
+    # Volume surge: confirms direction; 1.5x → +1 weight if direction
+    # agrees, 0 otherwise. Direction comes from micro_momentum sign.
+    direction_sign = 1 if micro_momentum > 0 else -1 if micro_momentum < 0 else 0
+    if vol_surge >= 1.5 and direction_sign != 0:
+        contribs["volume_surge"] = direction_sign * 1.0
+    else:
+        contribs["volume_surge"] = 0.0
+
+    # Composite + max possible score (for normalization downstream)
+    composite = sum(contribs.values())
+    max_possible = 6.0 + 2.0 + 1.5 + 1.0 + 1.5 + 1.0  # = 13.0
+
+    return {
+        "window_open": window_open,
+        "window_delta_pct": window_delta_pct,
+        "micro_momentum": micro_momentum,
+        "acceleration": acceleration,
+        "ema9": ema9, "ema21": ema21, "ema_cross_pct": ema_cross,
+        "rsi": rsi,
+        "vol_surge_ratio": vol_surge,
+        "contribs": contribs,
+        "composite": composite,
+        "max_possible": max_possible,
+        "confidence": abs(composite) / max_possible if max_possible > 0 else 0.0,
+        "direction": "UP" if composite > 0 else "DOWN" if composite < 0 else "FLAT",
+    }
 
 
 def discover_5min_btc_markets(
@@ -186,11 +407,18 @@ def discover_5min_btc_markets(
 
 # ── Sampling ─────────────────────────────────────────────────────────
 
-def sample_signals(*, max_seconds_out: int = 600) -> list[FiveMinSample]:
-    """One sweep — spot price + every qualifying market.
+def sample_signals(
+    *,
+    max_seconds_out: int = 600,
+    with_indicators: bool = True,
+) -> list[FiveMinSample]:
+    """One sweep — spot + klines + every qualifying market.
 
-    Cheap (~1-2s for 2 HTTP calls + however many active markets we find).
-    Designed to be called from a tight loop or a launchd cron.
+    Klines are fetched ONCE per cycle and shared across all markets in
+    the sweep — they all share the same Binance state. Each market
+    gets its own indicator computation (window_start_ts differs per
+    market). Cheap: 3 HTTP calls total regardless of how many markets
+    are live.
     """
     spot = fetch_binance_btc_price()
     if spot is None:
@@ -199,9 +427,20 @@ def sample_signals(*, max_seconds_out: int = 600) -> list[FiveMinSample]:
     if not markets:
         return []
 
+    klines = fetch_binance_klines() if with_indicators else None
+
     now_iso = datetime.now(timezone.utc).isoformat()
     out: list[FiveMinSample] = []
     for m in markets:
+        indicators = None
+        if klines:
+            # Window start = window end - 5 minutes
+            window_start_ts = m["window_end_ts"] - 300
+            indicators = compute_indicators(
+                klines=klines,
+                window_start_ts=window_start_ts,
+                current_spot=spot,
+            )
         out.append(FiveMinSample(
             sample_at=now_iso,
             market_id=str(m["id"]),
@@ -212,6 +451,7 @@ def sample_signals(*, max_seconds_out: int = 600) -> list[FiveMinSample]:
             up_price=m["up_price"],
             down_price=m["down_price"],
             spot_usd=spot,
+            indicators=indicators,
         ))
     return out
 
@@ -230,15 +470,47 @@ def persist_samples(samples: list[FiveMinSample]) -> None:
 
 # ── Public entry ─────────────────────────────────────────────────────
 
-def run_signal_cycle(*, max_seconds_out: int = 600) -> dict:
-    """One full sweep: discover + sample + persist + log.
+def run_signal_cycle(
+    *,
+    max_seconds_out: int = 600,
+    record_paper_trades: bool = True,
+    settle_paper_trades: bool = True,
+) -> dict:
+    """One full sweep: discover + sample + persist + (paper record + settle) + log.
 
-    Returns a summary dict for the cron caller. No paper trading or
-    real execution here — purely measurement, exactly like Phase 1 of
-    btc_arb_signal.
+    ``record_paper_trades=True`` (default) auto-opens a Phase 2 paper
+    trade whenever a sample's confidence + entry-window criteria fire.
+    ``settle_paper_trades=True`` polls open paper trades for resolution
+    every cycle — cheap (only fires if any opens exist).
+
+    Both flags are wired so the launchd cron runs the full pipeline by
+    default; set to False from tests / dry-runs.
     """
     samples = sample_signals(max_seconds_out=max_seconds_out)
     persist_samples(samples)
+
+    n_paper_opened = 0
+    if record_paper_trades and samples:
+        try:
+            from lib.btc_5min_paper import record_paper_trades_from_samples
+            new_trades = record_paper_trades_from_samples(
+                [asdict(s) for s in samples]
+            )
+            n_paper_opened = len(new_trades)
+        except Exception as e:
+            log_event("btc_5min", "paper_record_failed",
+                      {"error": str(e)[:200]}, result="degraded")
+
+    settle_summary = {}
+    if settle_paper_trades:
+        try:
+            from lib.btc_5min_paper import (
+                settle_paper_trades as _settle_paper_trades,
+            )
+            settle_summary = _settle_paper_trades()
+        except Exception as e:
+            log_event("btc_5min", "paper_settle_failed",
+                      {"error": str(e)[:200]}, result="degraded")
 
     if samples:
         nearest = samples[0]
@@ -247,6 +519,8 @@ def run_signal_cycle(*, max_seconds_out: int = 600) -> dict:
             "nearest_seconds_to_close": nearest.seconds_to_close,
             "nearest_up_price": nearest.up_price,
             "spot": nearest.spot_usd,
+            "paper_trades_opened": n_paper_opened,
+            "paper_settled": settle_summary.get("settled_now", 0),
         })
     else:
         log_event("btc_5min", "no_active_markets", {}, result="degraded")
@@ -256,4 +530,6 @@ def run_signal_cycle(*, max_seconds_out: int = 600) -> dict:
         "nearest_seconds_to_close": samples[0].seconds_to_close if samples else None,
         "spot_usd": samples[0].spot_usd if samples else None,
         "samples": [asdict(s) for s in samples],
+        "paper_trades_opened": n_paper_opened,
+        "settle_summary": settle_summary,
     }

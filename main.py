@@ -34,8 +34,10 @@ Usage:
     python main.py paper-copy-settle # Settle resolved paper-copy trades (Stage 3)
     python main.py paper-copy-report # Aggregate paper P&L per source wallet (Stage 3)
     python main.py btc-arb-monitor   # Sample Binance spot vs Polymarket BTC gaps (Phase 1)
-    python main.py btc-5min-monitor  # Sample 5-min BTC UP/DOWN markets (Gravia-style)
-    python main.py dataset-status    # Check Jon-Becker parquet dataset availability
+    python main.py btc-5min-monitor       # Sample 5-min BTC UP/DOWN markets (Gravia-style)
+    python main.py btc-5min-paper-settle  # Settle resolved 5-min paper trades
+    python main.py btc-5min-paper-report  # Aggregate 5-min paper P&L + confidence-bucket WR
+    python main.py dataset-status         # Check Jon-Becker parquet dataset availability
 """
 
 import json
@@ -940,6 +942,60 @@ def cmd_btc_5min_monitor(max_seconds_out: int = 600):
     print(f"  Persisted to data/btc_5min_signal.jsonl")
 
 
+def cmd_btc_5min_paper_settle():
+    """Settle resolved 5-min UP/DOWN paper trades.
+
+    Normally not needed manually — the signal cycle auto-settles every
+    cron tick. This command exists for ad-hoc runs and debugging.
+    """
+    from lib.btc_5min_paper import settle_paper_trades
+    result = settle_paper_trades()
+    print(f"=== BTC 5-min paper-settle ===")
+    print(f"  Newly settled:        {result['settled_now']}")
+    print(f"  Paper P&L this cycle: ${result['paper_pnl_this_cycle']:+,.2f}")
+    print(f"  Total open:           {result['total_open']}")
+    print(f"  Total settled:        {result['total_settled']}")
+
+
+def cmd_btc_5min_paper_report():
+    """Aggregate 5-min paper P&L + confidence-bucket win rates.
+
+    The confidence-bucket breakdown is the most actionable view: if
+    the composite signal is calibrated, higher-confidence trades
+    should have higher win rates. Anti-calibration (or noise) means
+    the strategy isn't ready for Phase 3.
+    """
+    from lib.btc_5min_paper import summary
+    s = summary()
+    print(f"=== BTC 5-min paper-trade report ===")
+    if s["total_trades"] == 0:
+        print("  No paper trades recorded yet — run the cron a while first.")
+        print("  (`launchctl list | grep btc_5min` should show the job.)")
+        return
+    print(f"  Total trades:      {s['total_trades']}")
+    print(f"  Open / Won / Lost / Void: "
+          f"{s['open']} / {s['won']} / {s['lost']} / {s['void']}")
+    print(f"  Win rate (settled): {s['win_rate']:.1%}")
+    print(f"  Total paper P&L:    ${s['total_paper_pnl']:+,.2f}")
+    print(f"  Capital deployed:   ${s['capital_deployed']:,.2f}")
+    print(f"  ROI:                {s['roi_pct']:+.2%}")
+
+    if s["by_confidence_bucket"]:
+        print()
+        print(f"  By confidence bucket:")
+        print(f"    {'bucket':<10} {'settled':>8} {'wins':>6} {'wr':>7} {'pnl':>10}")
+        for bucket, b in sorted(s["by_confidence_bucket"].items()):
+            wr = b["wins"] / b["settled"] if b["settled"] > 0 else 0
+            print(f"    {bucket:<10} {b['settled']:>8} {b['wins']:>6} "
+                  f"{wr:>6.1%} ${b['pnl']:>+8.2f}")
+
+    if s["per_day_pnl"]:
+        print()
+        print("  Per day P&L (most recent 7):")
+        for day in sorted(s["per_day_pnl"].keys())[-7:]:
+            print(f"    {day}: ${s['per_day_pnl'][day]:+,.2f}")
+
+
 def cmd_btc_arb_paper_settle():
     """Phase 2 — settle open BTC arb paper trades against actual
     market outcomes. Run periodically (manually or cron) so the report
@@ -1455,6 +1511,10 @@ def main():
             if arg.startswith("--max-seconds="):
                 max_sec = max(60, int(arg.split("=", 1)[1]))
         cmd_btc_5min_monitor(max_seconds_out=max_sec)
+    elif command == "btc-5min-paper-settle":
+        cmd_btc_5min_paper_settle()
+    elif command == "btc-5min-paper-report":
+        cmd_btc_5min_paper_report()
     elif command == "dataset-status":
         from lib.historical_data import status
         s = status()

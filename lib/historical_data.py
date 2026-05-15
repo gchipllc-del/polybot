@@ -18,18 +18,27 @@ back to the API otherwise.
 
 **Setup** (one-time, user opt-in):
 
-    # 1. Clone Jon-Becker's repo somewhere
+    # 1. Fix pyarrow if it's broken (current env has numpy 2 + pyarrow 11
+    #    which crashes — install a numpy-2-compatible pyarrow)
+    conda install -c conda-forge 'pyarrow>=14'
+    # ...or fall back to downgrading numpy:
+    # conda install 'numpy<2'
+
+    # 2. Clone Jon-Becker's repo somewhere
     git clone https://github.com/Jon-Becker/prediction-market-analysis ~/pma
 
-    # 2. Download the dataset (36GB compressed → ~150GB extracted)
+    # 3. Download the dataset (36GB compressed → ~150GB extracted)
     cd ~/pma && make setup
 
-    # 3. Tell polybot where to find it
+    # 4. Tell polybot where to find it
     export POLYBOT_PMA_DATA_DIR=~/pma/data
 
 After that, ``wallet-backtest --source=parquet`` runs against the
 local dataset and covers the full on-chain history (rather than the
 ~30-day API window).
+
+``dataset-status`` reports current readiness; the module's soft import
+keeps the rest of polybot working even when pyarrow is unavailable.
 
 Schema reference (from Jon-Becker's `docs/SCHEMAS.md`):
     polymarket/trades/*.parquet columns:
