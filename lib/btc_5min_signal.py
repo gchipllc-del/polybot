@@ -304,14 +304,16 @@ def compute_indicators_for_window(
     market_yes_price: float | None = None,
     annual_vol: float = DEFAULT_ANNUAL_VOL,
     use_realized_vol: bool = True,
+    whale_pressure: float | None = None,
 ) -> dict:
     """Lean composite: ONLY market-respecting, mean-reversion-aware,
-    or theoretically-grounded indicators. The momentum-following
-    indicators (Window Delta, Micro Momentum, Acceleration, EMA Cross,
-    Volume Surge) were removed after empirical proof that they caused
-    a 22% win rate by buying continuation right before reversion.
+    theoretically-grounded, or order-flow-based indicators. The
+    momentum-following indicators (Window Delta, Micro Momentum,
+    Acceleration, EMA Cross, Volume Surge) were removed after
+    empirical proof that they caused a 22% win rate by buying
+    continuation right before reversion.
 
-    Three indicators only:
+    Four indicators:
       * RSI (weight 2) — only mean-reverting indicator; overbought
         → bearish, oversold → bullish.
       * theo_delta_gap (weight 4) — Greeks-based fair-value vs market
@@ -319,14 +321,16 @@ def compute_indicators_for_window(
       * market_agreement (weight 3) — direction must align with where
         the market is leaning. If market YES > 0.5 → lean YES; below
         → lean NO. Magnitude scales with conviction.
+      * whale_pressure (weight 3) — net taker-side flow from large
+        recent trades on Binance.US (or 0 if unavailable). The
+        latency-arb edge: if whales just moved spot and the
+        prediction market hasn't repriced yet, we have direction.
 
     When ``use_realized_vol=True`` (default), the Greeks model uses
     realized vol derived from ``klines`` rather than the configured
     constant — adapts to current market state.
 
-    Max possible composite: 9.0. Asset-agnostic. Window-open price
-    still used as the Greeks strike but no longer feeds its own
-    directional contribution.
+    Max possible composite: 12.0 (was 9.0 pre-whale). Asset-agnostic.
     """
     closes = [k["close"] for k in klines]
 
@@ -380,8 +384,16 @@ def compute_indicators_for_window(
     else:
         contribs["market_agreement"] = 0.0
 
+    # whale_pressure: pre-normalized to [-1, +1] by the whale_monitor
+    # (the recency-weighted indicator value). Weight 3 — matches
+    # market_agreement, doesn't dominate theo_delta_gap.
+    if whale_pressure is not None:
+        contribs["whale_pressure"] = max(-1.0, min(1.0, float(whale_pressure))) * 3.0
+    else:
+        contribs["whale_pressure"] = 0.0
+
     composite = sum(contribs.values())
-    max_possible = 2.0 + 4.0 + 3.0  # = 9.0
+    max_possible = 2.0 + 4.0 + 3.0 + 3.0  # = 12.0
 
     return {
         "window_open": window_open_price,
@@ -392,6 +404,7 @@ def compute_indicators_for_window(
         "theo_yes_gap": theo_yes_gap,
         "T_years": greeks["T_years"] if greeks else None,
         "market_yes_price": market_yes_price,
+        "whale_pressure": whale_pressure,
         "contribs": contribs,
         "composite": composite,
         "max_possible": max_possible,

@@ -213,17 +213,14 @@ def compute_kalshi_indicators(
     hours_to_close: float | None = None,
     market_yes_price: float | None = None,
     annual_vol: float = 0.55,
+    whale_pressure: float | None = None,
 ) -> dict:
-    """Compute the 7-indicator composite for a Kalshi 15-min market.
+    """Compute the 4-indicator composite for a Kalshi 15-min market.
 
     Strike IS the window-open price (Kalshi pegs it there at market
     creation), so the Greeks helper uses it directly as the BSM strike.
 
-    When ``hours_to_close`` AND ``market_yes_price`` are both supplied
-    (normal cron path) the composite includes the ``theo_delta_gap``
-    contribution — the EV-per-dollar signal grounded in lognormal
-    fair-value vs current market YES.
-
+    Indicators: RSI, theo_delta_gap, market_agreement, whale_pressure.
     Direction labels are YES/NO since Kalshi markets are framed as
     "BTC ≥ strike at close?" rather than "BTC up?".
     """
@@ -234,6 +231,7 @@ def compute_kalshi_indicators(
         hours_to_close=hours_to_close,
         market_yes_price=market_yes_price,
         annual_vol=annual_vol,
+        whale_pressure=whale_pressure,
     )
     base["strike"] = strike
     base["current_spot"] = current_spot
@@ -277,6 +275,24 @@ def sample_signals_for_asset(
         fetch_binance_klines(symbol=binance_symbol)
         if with_indicators else None
     )
+
+    # Whale snapshot — one brief WebSocket connection per asset per
+    # cycle. Computed once and reused across all markets for this asset
+    # (all KXBTC15M markets share the same underlying Binance order
+    # flow). Costs ~8s of wallclock; cron has 60s budget so this fits.
+    whale_indicator_value: float | None = None
+    if with_indicators and klines:
+        try:
+            from lib.whale_monitor import (
+                collect_whale_trades, whale_pressure_to_indicator_value,
+            )
+            snap = collect_whale_trades(symbol=binance_symbol)
+            whale_indicator_value = whale_pressure_to_indicator_value(snap)
+        except Exception as e:
+            log_event("kalshi_15min", "whale_collect_failed",
+                      {"symbol": binance_symbol, "error": str(e)[:200]},
+                      result="degraded")
+
     now_iso = datetime.now(timezone.utc).isoformat()
     out: list[KalshiFifteenMinSample] = []
     for m in markets:
@@ -305,6 +321,7 @@ def sample_signals_for_asset(
                 hours_to_close=hours_to_close,
                 market_yes_price=market_yes,
                 annual_vol=annual_vol,
+                whale_pressure=whale_indicator_value,
             )
         out.append(KalshiFifteenMinSample(
             sample_at=now_iso,
