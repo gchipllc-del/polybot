@@ -36,6 +36,13 @@ DEFAULT_MIN_CONFIDENCE = 0.35           # slightly higher bar; Kalshi WIN
 DEFAULT_MAX_SECONDS_TO_CLOSE = 300.0    # 5 min — last third of the 15-min window
 DEFAULT_MIN_SECONDS_TO_CLOSE = 30.0     # don't enter under 30s — slippage zone
 
+# Intra-window exit thresholds. When our side's price spikes above
+# this, sell to lock the gain rather than ride out reversion. When it
+# craters below the stop, cut the loss before the inevitable zero.
+INTRA_WINDOW_TAKE_PROFIT = 0.85   # our side reaches this → exit at win
+INTRA_WINDOW_STOP_LOSS = 0.15     # our side falls this low → cut
+                                  # (locking ~0.15-0.20 loss vs total)
+
 # Tightened from the old 0.05-0.95 band: at the extremes risk/reward
 # is brutal (winning $0.15 on a $0.85 bet, or vice versa). Stay in
 # the meat of the distribution where edge actually pays.
@@ -104,8 +111,14 @@ class KalshiFifteenMinPaperTrade:
     close_time: str
     opened_at: str
     status: str = "open"         # "open" | "won" | "lost" | "void"
+                                 #   | "won_early" (TP triggered)
+                                 #   | "cut_loss" (SL triggered)
     resolved_at: str = ""
     paper_pnl: float = 0.0
+    exit_price: float = 0.0      # the our-side price we exited at
+                                 # (0 = never exited intra-window)
+    exit_reason: str = ""        # "take_profit" | "stop_loss" |
+                                 # "settled" | ""
 
 
 # ── State ────────────────────────────────────────────────────────────
@@ -274,6 +287,112 @@ def record_paper_trades_from_samples(
     return new_trades
 
 
+# ── Intra-window exit ────────────────────────────────────────────────
+
+def check_open_trades_for_exit() -> dict:
+    """Walk every open paper trade and check if intra-window
+    take-profit or stop-loss has triggered.
+
+    For each open trade, fetch the live Kalshi market and look at
+    the price of OUR side:
+      * YES position → look at yes_ask
+      * NO position → look at no_ask
+
+    Triggers:
+      * our_side_price >= INTRA_WINDOW_TAKE_PROFIT → exit at TP
+        paper_pnl = (exit_price - fill) * size, applies 7% Kalshi fee
+      * our_side_price <= INTRA_WINDOW_STOP_LOSS → exit at SL
+        paper_pnl = (exit_price - fill) * size (negative; no fee on loss)
+
+    Returns counts dict for logging.
+    """
+    import requests
+    rows = _load_all()
+    if not rows:
+        return {"checked": 0, "tp_exits": 0, "sl_exits": 0, "pnl": 0.0}
+
+    open_rows = [r for r in rows if r.get("status") == "open"]
+    if not open_rows:
+        return {"checked": 0, "tp_exits": 0, "sl_exits": 0, "pnl": 0.0}
+
+    tp_exits = 0
+    sl_exits = 0
+    pnl_locked = 0.0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for r in open_rows:
+        ticker = r.get("market_ticker")
+        side = str(r.get("side", "")).upper()
+        if not ticker or side not in ("YES", "NO"):
+            continue
+        try:
+            resp = requests.get(
+                f"{KALSHI_HOST}/markets/{ticker}", timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            continue
+        market = data.get("market") if isinstance(data, dict) else None
+        if not isinstance(market, dict):
+            continue
+        # Already resolved? Skip — settlement will handle.
+        if market.get("status") not in ("active", "open"):
+            continue
+
+        # Our-side current price (prefer the _dollars form).
+        def _price(key):
+            v = market.get(key + "_dollars")
+            if v is None:
+                v = market.get(key)
+                if v is not None and float(v) > 1.5:
+                    v = float(v) / 100.0
+            try:
+                return float(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+
+        our_price = _price("yes_ask" if side == "YES" else "no_ask")
+        if our_price is None:
+            continue
+
+        size = float(r.get("our_size", 0) or 0)
+        fill = float(r.get("fill_price", 0) or 0)
+
+        if our_price >= INTRA_WINDOW_TAKE_PROFIT:
+            # Take profit — exit at TP threshold
+            gross_profit = (INTRA_WINDOW_TAKE_PROFIT - fill) * size
+            r["status"] = "won_early"
+            r["exit_price"] = INTRA_WINDOW_TAKE_PROFIT
+            r["exit_reason"] = "take_profit"
+            r["resolved_at"] = now_iso
+            # Apply Kalshi 7% fee on profit
+            r["paper_pnl"] = round(gross_profit * (1.0 - 0.07), 4)
+            tp_exits += 1
+            pnl_locked += r["paper_pnl"]
+        elif our_price <= INTRA_WINDOW_STOP_LOSS:
+            # Stop loss — cut at SL threshold (saves remaining capital)
+            r["status"] = "cut_loss"
+            r["exit_price"] = INTRA_WINDOW_STOP_LOSS
+            r["exit_reason"] = "stop_loss"
+            r["resolved_at"] = now_iso
+            r["paper_pnl"] = round((INTRA_WINDOW_STOP_LOSS - fill) * size, 4)
+            sl_exits += 1
+            pnl_locked += r["paper_pnl"]
+
+    if tp_exits + sl_exits > 0:
+        _save_all(rows)
+        log_event("kalshi_15min_paper", "intra_window_exits", {
+            "tp_exits": tp_exits, "sl_exits": sl_exits,
+            "pnl_locked": round(pnl_locked, 2),
+        })
+    return {
+        "checked": len(open_rows),
+        "tp_exits": tp_exits, "sl_exits": sl_exits,
+        "pnl": round(pnl_locked, 2),
+    }
+
+
 # ── Settlement ───────────────────────────────────────────────────────
 
 def settle_paper_trades() -> dict:
@@ -380,10 +499,12 @@ def summary(asset_filter: str | None = None) -> dict:
         "total_trades": len(rows),
         "asset_filter": asset_filter,
         "open": 0, "won": 0, "lost": 0, "void": 0,
+        "won_early": 0, "cut_loss": 0,
         "total_paper_pnl": 0.0, "capital_deployed": 0.0,
         "per_day_pnl": {},
         "by_confidence_bucket": {},
         "by_asset": {},
+        "by_exit_reason": {},
     }
     for r in rows:
         status = r.get("status", "open")
@@ -406,24 +527,41 @@ def summary(asset_filter: str | None = None) -> dict:
             s["won"] += 1
         elif status == "lost":
             s["lost"] += 1
+        elif status == "won_early":
+            s["won_early"] += 1
+            s["won"] += 1   # rolls into wins for headline WR
+        elif status == "cut_loss":
+            s["cut_loss"] += 1
+            s["lost"] += 1  # rolls into losses for headline WR
         else:
             s["void"] += 1
         if opened:
             s["per_day_pnl"][opened] = round(
                 s["per_day_pnl"].get(opened, 0.0) + pnl, 4
             )
-        if status in ("won", "lost"):
+        # Bucket calibration uses ALL settled outcomes (regular + intra-window)
+        if status in ("won", "lost", "won_early", "cut_loss"):
             b = s["by_confidence_bucket"].setdefault(
                 bucket, {"settled": 0, "wins": 0, "pnl": 0.0},
             )
             b["settled"] += 1
-            if status == "won":
+            if status in ("won", "won_early"):
                 b["wins"] += 1
             b["pnl"] = round(b["pnl"] + pnl, 4)
+
+        # Track exit reasons (informative for "did intra-window save us?")
+        reason = r.get("exit_reason") or ("settled" if status in ("won", "lost") else "")
+        if reason:
+            er = s["by_exit_reason"].setdefault(
+                reason, {"count": 0, "pnl": 0.0},
+            )
+            er["count"] += 1
+            er["pnl"] = round(er["pnl"] + pnl, 4)
 
         # Per-asset breakdown
         a = s["by_asset"].setdefault(
             asset, {"total": 0, "open": 0, "won": 0, "lost": 0, "void": 0,
+                    "won_early": 0, "cut_loss": 0,
                     "pnl": 0.0, "capital": 0.0},
         )
         a["total"] += 1
@@ -440,13 +578,21 @@ def summary(asset_filter: str | None = None) -> dict:
     s["total_paper_pnl"] = round(s["total_paper_pnl"], 4)
     s["capital_deployed"] = round(s["capital_deployed"], 4)
 
-    # Per-asset rollup: WR and ROI
+    # Per-asset rollup: WR and ROI. Roll up won_early into wins and
+    # cut_loss into losses so the headline numbers match the all-up
+    # view above.
     for asset, a in s["by_asset"].items():
-        asettled = a.get("won", 0) + a.get("lost", 0)
+        total_wins = a.get("won", 0) + a.get("won_early", 0)
+        total_losses = a.get("lost", 0) + a.get("cut_loss", 0)
+        asettled = total_wins + total_losses
         a["win_rate"] = (
-            round(a.get("won", 0) / asettled, 4) if asettled > 0 else 0.0
+            round(total_wins / asettled, 4) if asettled > 0 else 0.0
         )
         a["roi_pct"] = (
             round(a["pnl"] / a["capital"], 4) if a["capital"] > 0 else 0.0
         )
+        # Surface rolled-up totals for any caller wanting the
+        # "what really happened" view
+        a["total_wins"] = total_wins
+        a["total_losses"] = total_losses
     return s

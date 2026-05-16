@@ -34,14 +34,18 @@ assets:
     binance_symbol: ETHUSDT
     annual_vol: 0.65
     min_confidence: 0.45      # ETH spreads ~2x wider than BTC on Kalshi
-    enabled: true
+    enabled: false            # disabled 2026-05-15 — ETH was 3W/5L=38%
+                              # in initial sample. Re-enable after BTC
+                              # alone proves consistent.
 
   sol:
     series: KXSOL15M
     binance_symbol: SOLUSDT
     annual_vol: 0.85
     min_confidence: 0.50      # thinnest of the three — most conservative
-    enabled: true
+    enabled: false            # disabled 2026-05-15 — SOL was 3W/5L=38%
+                              # and has thinnest liquidity. Re-enable
+                              # after BTC alone proves consistent.
 
   # Below: confirmed-available but not enabled by default.
   # Flip ``enabled: true`` once the first three prove out.

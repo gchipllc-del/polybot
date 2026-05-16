@@ -396,6 +396,18 @@ def run_signal_cycle(
             log_event("kalshi_15min", "paper_record_failed",
                       {"error": str(e)[:200]}, result="degraded")
 
+    # Check open paper trades for intra-window exit BEFORE settling.
+    # Order matters: a trade hitting TP/SL mid-window should lock
+    # in profit/cut loss; the settlement path will then skip it
+    # because status is no longer "open".
+    exit_summary = {}
+    try:
+        from lib.kalshi_15min_paper import check_open_trades_for_exit
+        exit_summary = check_open_trades_for_exit()
+    except Exception as e:
+        log_event("kalshi_15min", "intra_window_check_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+
     settle_summary = {}
     if settle_paper_trades:
         try:
@@ -417,6 +429,8 @@ def run_signal_cycle(
             "nearest_seconds_to_close": nearest.seconds_to_close,
             "nearest_strike": nearest.strike,
             "paper_trades_opened": n_paper_opened,
+            "paper_intra_window_tp": exit_summary.get("tp_exits", 0),
+            "paper_intra_window_sl": exit_summary.get("sl_exits", 0),
             "paper_settled": settle_summary.get("settled_now", 0),
         })
     else:
