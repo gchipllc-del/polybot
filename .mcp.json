@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "polybot": {
+      "command": "/Users/jesse/anaconda3/bin/python",
+      "args": ["mcp_server.py"],
+      "cwd": "/Users/jesse/Desktop/projects/polybot",
+      "env": {}
+    }
+  }
+}
