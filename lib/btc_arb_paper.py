@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 PAPER_PATH = Path(__file__).parent.parent / "data" / "btc_arb_paper.jsonl"
 

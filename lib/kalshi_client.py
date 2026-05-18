@@ -14,7 +14,7 @@ from typing import Literal
 
 from dotenv import load_dotenv
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.market_client import MarketClient, MarketInfo, OrderResult, PositionInfo
 
 load_dotenv()

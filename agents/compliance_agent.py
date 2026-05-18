@@ -20,7 +20,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"

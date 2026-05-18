@@ -31,7 +31,7 @@ from pathlib import Path
 
 import yaml
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.forecaster import ForecastResult, build_forecast_for_market
 from lib.market_client import MarketClient, MarketInfo, get_active_clients
 

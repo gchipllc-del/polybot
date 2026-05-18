@@ -43,7 +43,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 BINANCE_US_WS = "wss://stream.binance.us:9443/ws"
 

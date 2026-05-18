@@ -25,7 +25,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 STATE_PATH = Path(__file__).parent.parent / "data" / "wallet_watch_state.json"
 ALERTS_PATH = Path(__file__).parent.parent / "data" / "wallet_alerts.jsonl"

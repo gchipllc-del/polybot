@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 SCORES_PATH = Path(__file__).parent.parent / "data" / "wallet_scores.json"
 

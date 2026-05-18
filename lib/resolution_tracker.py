@@ -24,8 +24,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
-from lib.calibration import record_forecast
+from tradingcore.audit import log_event
+from tradingcore.calibration import record_forecast
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"

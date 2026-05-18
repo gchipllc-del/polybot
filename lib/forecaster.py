@@ -23,10 +23,10 @@ from pathlib import Path
 
 import yaml
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.base_rates import get_base_rate
-from lib.calibration import brier_score, source_accuracy
-from lib.kelly import expected_value, fractional_kelly, min_edge_for_trade
+from tradingcore.calibration import brier_score, source_accuracy
+from tradingcore.kelly import expected_value, fractional_kelly, min_edge_for_trade
 from lib.market_client import MarketInfo
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "strategy.yaml"

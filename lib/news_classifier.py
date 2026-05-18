@@ -34,7 +34,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 
 @dataclass

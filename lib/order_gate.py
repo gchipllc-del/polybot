@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Literal
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.circuit_breaker import run_all_checks, CircuitBreakerTripped
 
 

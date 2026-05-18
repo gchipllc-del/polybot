@@ -93,7 +93,7 @@ def cmd_scan():
     """Scan markets across all active platforms, score candidates, propose trades."""
     import os
 
-    from lib.audit import log_event
+    from tradingcore.audit import log_event
     from lib.market_client import get_active_clients
     from lib.market_scanner import get_top_candidates, print_scan_report, scan_all_markets
 
@@ -177,7 +177,7 @@ def cmd_trade(dry_run: bool = False, skip_harvester: bool = False):
     import os
 
     from agents.consensus import print_consensus_result, seek_consensus
-    from lib.audit import log_event
+    from tradingcore.audit import log_event
     from lib.harvester import harvest_near_resolution, print_harvester_summary
     from lib.market_client import get_active_clients
     from lib.market_scanner import get_top_candidates, print_scan_report, scan_all_markets
@@ -557,7 +557,7 @@ def cmd_harvest(dry_run: bool = False):
     anytime you want to sweep residual discounts without running the
     full, LLM-heavy conviction pipeline.
     """
-    from lib.audit import log_event
+    from tradingcore.audit import log_event
     from lib.harvester import harvest_near_resolution, print_harvester_summary
     from lib.market_client import get_active_clients
 
@@ -624,7 +624,7 @@ def cmd_status(full: bool = False):
 
 def cmd_calibrate():
     """Print calibration report."""
-    from lib.calibration import print_calibration_report
+    from tradingcore.calibration import print_calibration_report
     print_calibration_report()
 
 
@@ -1326,7 +1326,7 @@ def cmd_wallet_backtest_all(
 
 def cmd_chaos():
     """Run chaos tests to verify safety systems."""
-    from lib.audit import log_event
+    from tradingcore.audit import log_event
     from lib.circuit_breaker import CircuitBreakerTripped, run_all_checks
     from lib.order_gate import OrderIntent, step1_propose, step2_validate
 

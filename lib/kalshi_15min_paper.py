@@ -21,7 +21,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 PAPER_PATH = Path(__file__).parent.parent / "data" / "kalshi_15min_paper.jsonl"
 KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
@@ -51,6 +51,86 @@ DEFAULT_MIN_SECONDS_TO_CLOSE = 30.0     # don't enter under 30s — slippage zon
 INTRA_WINDOW_TAKE_PROFIT = 0.75
 INTRA_WINDOW_STOP_LOSS = 0.15     # our side falls this low → cut
                                   # (locking ~0.15-0.20 loss vs total)
+
+# ── Kelly Criterion sizing ──────────────────────────────────────────
+#
+# Replaces flat-$5 sizing with edge-proportional sizing. The math:
+#   f* = (b·p - q) / b
+# where b = (1-fill)/fill is net odds, p is our estimated win prob,
+# q = 1-p. We use HALF-Kelly (multiplier 0.5) for prudence — full
+# Kelly is mathematically optimal for log-wealth growth but ruinous
+# when p is misestimated. Half-Kelly cuts variance in half while
+# capturing ~75% of the long-run growth.
+#
+# When kelly_f ≤ 0 (no edge), we skip the trade entirely — Kelly's
+# "don't bet" signal is itself information.
+#
+# Bankroll = paper bankroll ($1000 default). When we go live, this
+# should be set to the actual Kalshi balance so cap/floor scale.
+DEFAULT_KELLY_MULTIPLIER = 0.5       # half-Kelly
+DEFAULT_MIN_TRADE_USD = 1.0          # floor — don't fire if Kelly
+                                     # rounds below this
+DEFAULT_MAX_TRADE_USD = 25.0         # cap — 2.5% of $1000 paper, or
+                                     # 50% of real $50 Kalshi balance.
+                                     # Scale this down when going live.
+
+
+def confidence_to_winprob(confidence: float) -> float:
+    """Map composite-signal confidence (0..1) to estimated win prob.
+
+    Deliberately CONSERVATIVE — anchored well below the empirical 82%
+    BTC win rate we've seen, because the sample size (39 trades) isn't
+    enough to commit Kelly to an aggressive prior. Half-Kelly + this
+    underestimate is our two-belt safety system.
+
+    Linear mapping:
+      confidence 0.00 → p_win 0.50  (no edge)
+      confidence 0.65 → p_win 0.64  (just above threshold)
+      confidence 1.00 → p_win 0.72  (max — capped, never above 0.85)
+
+    Will recalibrate from empirical WR-vs-confidence once we have
+    100+ settled trades. The function lives in one place so the
+    recalibration touches only this code.
+    """
+    return max(0.50, min(0.85, 0.50 + 0.22 * float(confidence)))
+
+
+def kelly_sized_notional(
+    *,
+    confidence: float,
+    fill_price: float,
+    bankroll: float,
+    multiplier: float = DEFAULT_KELLY_MULTIPLIER,
+    floor: float = DEFAULT_MIN_TRADE_USD,
+    cap: float = DEFAULT_MAX_TRADE_USD,
+) -> tuple[float, dict]:
+    """Compute the dollar size to bet via half-Kelly + floor/cap.
+
+    Reuses ``lib.kelly.kelly_fraction`` so the math stays in ONE place;
+    this wrapper just adds confidence→p_win calibration + floor/cap.
+
+    Returns ``(notional_usd, meta)`` where ``meta`` carries the
+    diagnostic numbers we want persisted on the trade record:
+    ``{p_win, kelly_fraction, half_kelly_fraction, sized_before_caps}``.
+
+    Returns ``(0.0, meta)`` when Kelly says no edge. The caller MUST
+    treat 0 as "skip this trade" — do NOT fall back to a flat size.
+    """
+    from tradingcore.kelly import kelly_fraction as _shared_kelly_fraction
+    p_win = confidence_to_winprob(confidence)
+    kelly_f = _shared_kelly_fraction(p_win, fill_price)
+    half_f = kelly_f * multiplier
+    sized = bankroll * half_f
+    meta = {
+        "p_win": round(p_win, 4),
+        "kelly_fraction": round(kelly_f, 4),
+        "half_kelly_fraction": round(half_f, 4),
+        "sized_before_caps": round(sized, 4),
+    }
+    if kelly_f <= 0.0:
+        return 0.0, meta
+    notional = max(floor, min(cap, sized))
+    return round(notional, 4), meta
 
 # Tightened from the old 0.05-0.95 band: at the extremes risk/reward
 # is brutal (winning $0.15 on a $0.85 bet, or vice versa). Stay in
@@ -128,6 +208,12 @@ class KalshiFifteenMinPaperTrade:
                                  # (0 = never exited intra-window)
     exit_reason: str = ""        # "take_profit" | "stop_loss" |
                                  # "settled" | ""
+    # Kelly sizing diagnostics (populated on entry). Lets us look back
+    # and see how the sizer was thinking; recalibrate over time.
+    p_win_estimated: float = 0.0     # our estimated win prob from
+                                     # confidence (not actual outcome)
+    kelly_fraction: float = 0.0      # raw Kelly suggestion (pre-half)
+    half_kelly_fraction: float = 0.0  # the fraction actually applied
 
 
 # ── State ────────────────────────────────────────────────────────────
@@ -190,7 +276,11 @@ def record_paper_trades_from_samples(
     open_tickers = {r.get("market_ticker") for r in existing
                     if r.get("status") == "open"}
 
-    notional_per_trade = bankroll * risk_per_trade
+    # Kelly sizing replaces the old `bankroll * risk_per_trade` flat
+    # notional. We still pass `risk_per_trade` through as a soft cap
+    # check (no trade should exceed that fraction of bankroll), but
+    # the per-trade size now varies with edge.
+    soft_cap = bankroll * risk_per_trade * 5.0  # ≤ 2.5% of bankroll per trade
     now_iso = datetime.now(timezone.utc).isoformat()
     new_trades: list[KalshiFifteenMinPaperTrade] = []
     new_rows: list[dict] = []
@@ -257,7 +347,25 @@ def record_paper_trades_from_samples(
             skip_counts["extreme_price"] = skip_counts.get("extreme_price", 0) + 1
             continue
 
-        contracts = round(notional_per_trade / fill, 4)
+        # ── Kelly sizing ────────────────────────────────────────
+        # Replaces the old flat $5 per trade with edge-proportional
+        # sizing. Half-Kelly + caps for safety. Returns 0 when there's
+        # no positive edge (rare given our other filters, but possible
+        # when fill is between our threshold-implied prob and 0.5).
+        kelly_cap = min(DEFAULT_MAX_TRADE_USD, soft_cap)
+        notional, kelly_meta = kelly_sized_notional(
+            confidence=confidence,
+            fill_price=fill,
+            bankroll=bankroll,
+            multiplier=DEFAULT_KELLY_MULTIPLIER,
+            floor=DEFAULT_MIN_TRADE_USD,
+            cap=kelly_cap,
+        )
+        if notional <= 0:
+            skip_counts["kelly_no_edge"] = skip_counts.get("kelly_no_edge", 0) + 1
+            continue
+
+        contracts = round(notional / fill, 4)
         trade = KalshiFifteenMinPaperTrade(
             trade_id=f"{ticker[:24]}_{int(datetime.now(timezone.utc).timestamp())}",
             asset=str(s.get("asset", "")) or _asset_from_ticker(ticker),
@@ -277,6 +385,9 @@ def record_paper_trades_from_samples(
             close_time=str(s.get("close_time", "")),
             opened_at=now_iso,
             status="open",
+            p_win_estimated=kelly_meta["p_win"],
+            kelly_fraction=kelly_meta["kelly_fraction"],
+            half_kelly_fraction=kelly_meta["half_kelly_fraction"],
         )
         new_trades.append(trade)
         new_rows.append(asdict(trade))

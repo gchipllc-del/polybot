@@ -61,7 +61,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 SIGNAL_PATH = Path(__file__).parent.parent / "data" / "btc_5min_signal.jsonl"
 

@@ -9,7 +9,7 @@ Actions (in order):
 4. Log everything
 """
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.market_client import get_active_clients
 
 

@@ -29,9 +29,9 @@ from pathlib import Path
 
 import yaml
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.forecaster import ForecastResult, build_forecast_for_market
-from lib.kelly import (
+from tradingcore.kelly import (
     ensemble_dampener,
     expected_value,
     kelly_bet_size,

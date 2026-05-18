@@ -33,7 +33,7 @@ from pathlib import Path
 
 import requests
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 BASE_RATES_CACHE = DATA_DIR / "base_rates.json"

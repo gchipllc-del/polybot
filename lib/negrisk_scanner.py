@@ -37,7 +37,7 @@ Execution risk:
 
 from dataclasses import dataclass, field
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 
 @dataclass

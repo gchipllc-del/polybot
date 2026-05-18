@@ -30,7 +30,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.btc_5min_signal import (
     fetch_binance_btc_price, fetch_binance_klines,
     compute_indicators_for_window,

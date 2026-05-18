@@ -31,7 +31,7 @@ from urllib.parse import quote_plus
 
 import yaml
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 CONFIG_PATH = Path(__file__).parent.parent / "config"
 CACHE_DIR = Path(__file__).parent.parent / "data" / "news_cache"

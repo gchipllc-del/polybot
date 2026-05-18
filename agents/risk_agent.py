@@ -21,8 +21,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
-from lib.kelly import min_edge_for_trade
+from tradingcore.audit import log_event
+from tradingcore.kelly import min_edge_for_trade
 from lib.phase import effective_phase, effective_max_positions
 
 DATA_DIR = Path(__file__).parent.parent / "data"

@@ -48,7 +48,7 @@ from pathlib import Path
 
 import yaml
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 CONFIG_PATH = Path(__file__).parent.parent / "config"
 CACHE_DIR = Path(__file__).parent.parent / "data" / "llm_cache"

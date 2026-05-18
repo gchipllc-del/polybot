@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 # ── Dataset location (hardcoded, do not parameterize) ─────────────
 _BASE_URL = (

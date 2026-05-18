@@ -16,7 +16,7 @@ Security:
 
 from datetime import datetime, timezone
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.market_scanner import MarketCandidate
 
 

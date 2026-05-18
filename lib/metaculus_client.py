@@ -35,7 +35,7 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 load_dotenv()
 

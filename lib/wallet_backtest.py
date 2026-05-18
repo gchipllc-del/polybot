@@ -25,7 +25,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 BACKTEST_DIR = Path(__file__).parent.parent / "data" / "wallet_backtests"
 

@@ -25,8 +25,8 @@ from pathlib import Path
 
 import yaml
 
-from lib.audit import log_event
-from lib.kelly import (
+from tradingcore.audit import log_event
+from tradingcore.kelly import (
     expected_value,
     fractional_kelly,
     kelly_bet_size,
@@ -723,7 +723,7 @@ def replay_forecastbench(
           "samples": list[dict],                 # first few per-question details
         }
     """
-    from lib.calibration import brier_score, log_loss
+    from tradingcore.calibration import brier_score, log_loss
     from lib.forecastbench_loader import load_resolved_questions
     from lib.forecaster import estimate_probability
     from lib.market_client import MarketInfo
@@ -934,7 +934,7 @@ def pipeline_smoke_test(verbose: bool = True) -> dict:
         }
     """
     from lib.forecaster import estimate_probability
-    from lib.kelly import kelly_bet_size_slippage_aware
+    from tradingcore.kelly import kelly_bet_size_slippage_aware
     from lib.market_client import MarketInfo
 
     checks: list[dict] = []

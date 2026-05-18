@@ -44,7 +44,7 @@ from typing import Optional
 import requests
 import yaml
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 WALLET_REGISTRY_PATH = DATA_DIR / "smart_money_wallets.json"

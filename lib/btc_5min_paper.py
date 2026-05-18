@@ -38,12 +38,13 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.audit import log_event
+from tradingcore.audit import log_event
 
 PAPER_PATH = Path(__file__).parent.parent / "data" / "btc_5min_paper.jsonl"
 
 DEFAULT_BANKROLL = 1000.0
-DEFAULT_RISK_PER_TRADE = 0.01           # 1%
+DEFAULT_RISK_PER_TRADE = 0.01           # 1% — now used as soft-cap
+                                        # input to Kelly, not flat
 DEFAULT_MIN_CONFIDENCE = 0.30           # |composite|/max ≥ 0.30
 DEFAULT_MAX_SECONDS_TO_CLOSE = 120.0    # only enter within last 2 min
 DEFAULT_MIN_SECONDS_TO_CLOSE = 20.0     # don't enter under 20s — slippage zone
@@ -53,6 +54,46 @@ EXTREME_PRICE_FLOOR = 0.15
 EXTREME_PRICE_CEIL = 0.85
 NEUTRAL_MARKET_FLOOR = 0.45
 NEUTRAL_MARKET_CEIL = 0.55
+
+# ── Kelly sizing ──────────────────────────────────────────────────
+# Mirrors kalshi_15min_paper's setup. Shared math lives in
+# tradingcore.kelly so both paper modules stay consistent.
+DEFAULT_KELLY_MULTIPLIER = 0.5
+DEFAULT_MIN_TRADE_USD = 1.0
+DEFAULT_MAX_TRADE_USD = 25.0
+
+
+def confidence_to_winprob(confidence: float) -> float:
+    """Same conservative linear mapping as kalshi_15min_paper.
+    Recalibrate from empirical data after 100+ settled trades.
+    """
+    return max(0.50, min(0.85, 0.50 + 0.22 * float(confidence)))
+
+
+def kelly_sized_notional(
+    *,
+    confidence: float,
+    fill_price: float,
+    bankroll: float,
+    multiplier: float = DEFAULT_KELLY_MULTIPLIER,
+    floor: float = DEFAULT_MIN_TRADE_USD,
+    cap: float = DEFAULT_MAX_TRADE_USD,
+) -> tuple[float, dict]:
+    """Half-Kelly notional with floor/cap. Returns (0, meta) on no edge."""
+    from tradingcore.kelly import kelly_fraction as _shared_kelly_fraction
+    p_win = confidence_to_winprob(confidence)
+    kelly_f = _shared_kelly_fraction(p_win, fill_price)
+    half_f = kelly_f * multiplier
+    sized = bankroll * half_f
+    meta = {
+        "p_win": round(p_win, 4),
+        "kelly_fraction": round(kelly_f, 4),
+        "half_kelly_fraction": round(half_f, 4),
+        "sized_before_caps": round(sized, 4),
+    }
+    if kelly_f <= 0.0:
+        return 0.0, meta
+    return round(max(floor, min(cap, sized)), 4), meta
 
 
 @dataclass
@@ -76,6 +117,10 @@ class BtcFiveMinPaperTrade:
     status: str = "open"         # "open" | "won" | "lost" | "void"
     resolved_at: str = ""
     paper_pnl: float = 0.0
+    # Kelly sizing diagnostics
+    p_win_estimated: float = 0.0
+    kelly_fraction: float = 0.0
+    half_kelly_fraction: float = 0.0
 
 
 # ── State ────────────────────────────────────────────────────────────
@@ -132,7 +177,10 @@ def record_paper_trades_from_samples(
     open_ids = {r.get("market_id") for r in existing
                 if r.get("status") == "open"}
 
-    notional_per_trade = bankroll * risk_per_trade
+    # Kelly sizing replaces flat $5. Soft cap = 5x the legacy
+    # risk_per_trade fraction; the hard cap (DEFAULT_MAX_TRADE_USD)
+    # still bounds it.
+    soft_cap = bankroll * risk_per_trade * 5.0
     now_iso = datetime.now(timezone.utc).isoformat()
     new_trades: list[BtcFiveMinPaperTrade] = []
     new_rows: list[dict] = []
@@ -176,7 +224,20 @@ def record_paper_trades_from_samples(
         if not (EXTREME_PRICE_FLOOR <= fill <= EXTREME_PRICE_CEIL):
             continue
 
-        contracts = round(notional_per_trade / fill, 4)
+        # Kelly sizing — replaces flat $5
+        kelly_cap = min(DEFAULT_MAX_TRADE_USD, soft_cap)
+        notional, kelly_meta = kelly_sized_notional(
+            confidence=confidence,
+            fill_price=fill,
+            bankroll=bankroll,
+            multiplier=DEFAULT_KELLY_MULTIPLIER,
+            floor=DEFAULT_MIN_TRADE_USD,
+            cap=kelly_cap,
+        )
+        if notional <= 0:
+            continue
+
+        contracts = round(notional / fill, 4)
         trade = BtcFiveMinPaperTrade(
             trade_id=f"{market_id[:12]}_{int(datetime.now(timezone.utc).timestamp())}",
             market_id=market_id,
@@ -194,6 +255,9 @@ def record_paper_trades_from_samples(
             window_end_ts=int(s.get("window_end_ts", 0) or 0),
             opened_at=now_iso,
             status="open",
+            p_win_estimated=kelly_meta["p_win"],
+            kelly_fraction=kelly_meta["kelly_fraction"],
+            half_kelly_fraction=kelly_meta["half_kelly_fraction"],
         )
         new_trades.append(trade)
         new_rows.append(asdict(trade))

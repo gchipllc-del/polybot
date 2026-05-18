@@ -2,6 +2,12 @@
 # POLYBOT Dependencies
 # ============================================================
 
+# --- Shared core (sibling repo) ---
+# Install with:  pip install -e ../tradingcore
+# Provides: audit log, Kelly sizing, calibration scoring. See
+# ../tradingcore/README.md.
+tradingcore @ file:../tradingcore
+
 # --- Prediction Market APIs ---
 kalshi-python>=0.3.0
 py-clob-client>=0.17.0

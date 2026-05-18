@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from agents.compliance_agent import ComplianceAgent
 from agents.risk_agent import RiskAgent
 from agents.strategy_agent import StrategyAgent
-from lib.audit import log_event
+from tradingcore.audit import log_event
 from lib.market_scanner import MarketCandidate
 
 strategy = StrategyAgent()

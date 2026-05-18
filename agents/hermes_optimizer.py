@@ -36,8 +36,8 @@ from pathlib import Path
 
 import yaml
 
-from lib.audit import log_event
-from lib.calibration import brier_score, source_accuracy
+from tradingcore.audit import log_event
+from tradingcore.calibration import brier_score, source_accuracy
 from lib.memory_palace import diary_write
 from lib.resolution_tracker import get_performance_summary
 

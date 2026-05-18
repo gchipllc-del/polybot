@@ -17,8 +17,8 @@ from pathlib import Path
 
 import yaml
 
-from lib.audit import get_recent_events
-from lib.calibration import brier_score, calibration_curve, log_loss, source_accuracy
+from tradingcore.audit import get_recent_events
+from tradingcore.calibration import brier_score, calibration_curve, log_loss, source_accuracy
 from lib.resolution_tracker import get_performance_summary
 
 DATA_DIR = Path(__file__).parent.parent / "data"
