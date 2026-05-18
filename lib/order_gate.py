@@ -9,13 +9,65 @@ No single function call can place an order. This is by design.
 """
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from tradingcore.audit import log_event
 from lib.circuit_breaker import run_all_checks, CircuitBreakerTripped
+
+
+# Persistent dedup state — survives process restarts. Without this,
+# the in-memory _recent_intents dict was wiped on every monitor/scan
+# kick, allowing the same trade to be placed minutes apart in different
+# scan cycles. The Hormuz duplicate (-$148.52 loss across 2 identical
+# orders) is the exact failure mode this prevents.
+_DEDUP_PATH = Path(__file__).resolve().parent.parent / "data" / "order_gate_dedup.json"
+
+# Lookback for cross-process duplicate detection. 24h covers nightly
+# restarts AND ensures we don't re-bet a market we already have an open
+# position in. Was a 60s in-memory window — promoting to 24h on-disk.
+PERSISTENT_DUPLICATE_WINDOW_SECONDS = 86400  # 24h
+
+
+def _load_dedup() -> dict[str, float]:
+    """Load the persistent dedup map. Returns {} on missing/corrupt."""
+    try:
+        if _DEDUP_PATH.exists():
+            with open(_DEDUP_PATH) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): float(v) for k, v in data.items()}
+    except (OSError, json.JSONDecodeError, ValueError):
+        # Corrupt file — start fresh rather than blocking trades.
+        log_event("order_gate", "dedup_load_failed",
+                  {"path": str(_DEDUP_PATH)}, result="degraded")
+    return {}
+
+
+def _save_dedup(d: dict[str, float]) -> None:
+    """Atomic-ish save. Never raises into the caller — a dedup save
+    failure must not block trade execution.
+    """
+    try:
+        _DEDUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _DEDUP_PATH.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        tmp.replace(_DEDUP_PATH)
+    except OSError as e:
+        log_event("order_gate", "dedup_save_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+
+
+def _dedup_key(intent: "OrderIntent") -> str:
+    """Stable dedup key — market + platform + side. Intentionally OMITS
+    quantity (so re-attempts at a slightly different size still get
+    blocked) and prices (which change between scan cycles)."""
+    return f"{intent.platform}:{intent.market_id}:{intent.side}"
 
 
 @dataclass
@@ -66,8 +118,22 @@ def step1_propose(intent: OrderIntent) -> OrderIntent:
     """
     Step 1: PROPOSE — Log the intent. No execution happens here.
     Returns the intent for Step 2.
+
+    Dedup has two layers:
+      • In-memory _recent_intents (60s, hash-based) — fast-path block
+        for tight repeat-fire bugs within one process.
+      • On-disk persistent map (24h, market+platform+side key) —
+        survives process restarts and blocks cross-cycle duplicates
+        that previously hit (Hormuz duplicate -$148.52, May 2026).
+
+    The disk dedup is keyed on (platform, market_id, side) so the
+    same market can never be re-opened on the same side within 24h
+    even after a restart. Quantity and limit_price are intentionally
+    excluded so a 1-share retry can't bypass the block.
     """
     now = time.time()
+
+    # ── Layer 1: in-memory tight loop dedup (preserve existing behavior) ──
     if intent.intent_hash in _recent_intents:
         last_time = _recent_intents[intent.intent_hash]
         if now - last_time < DUPLICATE_WINDOW_SECONDS:
@@ -76,6 +142,7 @@ def step1_propose(intent: OrderIntent) -> OrderIntent:
                 "market_id": intent.market_id,
                 "platform": intent.platform,
                 "seconds_since_last": round(now - last_time, 1),
+                "layer": "in_memory",
             }, result="blocked")
             raise ValueError(
                 f"Duplicate order detected for {intent.market_id} on {intent.platform} "
@@ -84,7 +151,37 @@ def step1_propose(intent: OrderIntent) -> OrderIntent:
 
     _recent_intents[intent.intent_hash] = now
 
-    # Clean up old entries
+    # ── Layer 2: persistent 24h dedup ──
+    dedup = _load_dedup()
+    key = _dedup_key(intent)
+    last_persisted = dedup.get(key)
+    if last_persisted is not None and (now - last_persisted) < PERSISTENT_DUPLICATE_WINDOW_SECONDS:
+        log_event("order_gate", "duplicate_blocked", {
+            "hash": intent.intent_hash,
+            "key": key,
+            "market_id": intent.market_id,
+            "platform": intent.platform,
+            "side": intent.side,
+            "seconds_since_last": round(now - last_persisted, 1),
+            "window_seconds": PERSISTENT_DUPLICATE_WINDOW_SECONDS,
+            "layer": "persistent",
+        }, result="blocked")
+        raise ValueError(
+            f"Duplicate order detected: same (market, side) traded "
+            f"{round((now - last_persisted) / 3600, 1)}h ago on "
+            f"{intent.platform} — 24h cooldown active "
+            f"(prevents Hormuz-style repeat losses)"
+        )
+
+    # Record this intent BEFORE step2/step3 so a crash mid-execute
+    # doesn't allow a duplicate on the next cycle. Cleanup old keys
+    # while we're here.
+    cutoff_persisted = now - PERSISTENT_DUPLICATE_WINDOW_SECONDS
+    dedup = {k: t for k, t in dedup.items() if t >= cutoff_persisted}
+    dedup[key] = now
+    _save_dedup(dedup)
+
+    # Clean up old in-memory entries
     cutoff = now - DUPLICATE_WINDOW_SECONDS * 2
     expired = [h for h, t in _recent_intents.items() if t < cutoff]
     for h in expired:
@@ -161,14 +258,44 @@ def step2_validate(
         }, result="blocked")
         raise
 
-    # Load score threshold from config if not provided
+    # Load score threshold + max-stake ceiling from config if not provided.
+    # Strategy.yaml is the source of truth for both.
     if min_composite_score is None:
-        from pathlib import Path
         import yaml
         strategy_path = Path(__file__).parent.parent / "config" / "strategy.yaml"
         with open(strategy_path, "r") as f:
             strategy = yaml.safe_load(f)
         min_composite_score = strategy.get("scoring", {}).get("min_composite_score", 6)
+        max_stake_usd = float(strategy.get("max_stake_usd", 0.0) or 0.0)
+    else:
+        # Caller specified score; still read max_stake_usd for the cap check.
+        import yaml
+        strategy_path = Path(__file__).parent.parent / "config" / "strategy.yaml"
+        try:
+            with open(strategy_path, "r") as f:
+                strategy = yaml.safe_load(f)
+            max_stake_usd = float(strategy.get("max_stake_usd", 0.0) or 0.0)
+        except OSError:
+            max_stake_usd = 0.0
+
+    # Hard absolute stake cap. Layered ON TOP of max_per_market_pct so
+    # even a bankroll explosion can't expose us to a single market beyond
+    # this dollar amount. 0 disables the check (legacy callers).
+    # The Virginia trade ($157) and Hormuz duplicate ($74 x 2) would
+    # have been blocked here with max_stake_usd=30.
+    if max_stake_usd > 0 and order_value > max_stake_usd:
+        log_event("order_gate", "step2_stake_too_large", {
+            "hash": intent.intent_hash,
+            "order_value": round(order_value, 2),
+            "max_stake_usd": max_stake_usd,
+            "quantity": intent.quantity,
+            "price": price,
+        }, result="blocked")
+        raise ValueError(
+            f"Order value ${order_value:.2f} exceeds max_stake_usd "
+            f"cap of ${max_stake_usd:.2f} — bot is sizing too aggressively "
+            f"on a single market (Virginia/Hormuz-style hit prevention)"
+        )
 
     if intent.composite_score < min_composite_score:
         log_event("order_gate", "step2_low_score", {

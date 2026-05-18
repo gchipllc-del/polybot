@@ -181,14 +181,32 @@ scoring:
   # Hermes tighten as more trades resolve.
   min_composite_score: 4        # Relaxed 5→4 [HERMES: 4-8]
   min_edge: 0.06                # No-fee Manifold [HERMES: 0.04 - 0.20]
-  min_confidence: 0.60          # Reject "unsure" forecasts
+  # 2026-05-18: lifted 0.60 → 0.75 after the 39-trade trade_history.json
+  # showed 71.8% WR but -$97 net (asymmetric loss: avg win $2, avg loss $77).
+  # The data also showed below-median stakes had 88.9% WR vs above-median
+  # 57.1%, i.e. the bot was sizing up on weaker-edge trades. Tightening the
+  # confidence gate removes the bottom band of trades that were the
+  # source of the asymmetric losses. Trade frequency expected to drop
+  # ~50%; net P&L expected to flip positive on the same realized base rate.
+  # Pair with kelly_multiplier 0.10 and max_per_market_pct 0.03 below.
+  min_confidence: 0.75          # Reject "unsure" forecasts (was 0.60)
 
 # --- Kelly Criterion Position Sizing ---
-# Sizing tightened for Phase 1 ($50 bankroll). With max_per_market=0.08 we can
-# carry ~12 concurrent $4 positions — a proper portfolio instead of 2 big bets.
-# Hermes can ramp both up once we have 10+ resolved trades with Brier < 0.20.
-kelly_multiplier: 0.20          # Fifth Kelly until calibration proven [HERMES: 0.10 - 0.75]
-max_per_market_pct: 0.08        # Max 8% of bankroll per market [HERMES: 0.05 - 0.20]
+# 2026-05-18: tightened after asymmetric-loss diagnosis. The Virginia
+# Redistricting trade alone took -$157 (4.4x median stake) on a marginal-
+# edge bet that broke against us; the Hormuz duplicate took -$148 across
+# two identical orders 60s apart. Lowering kelly_multiplier 0.20 → 0.10
+# halves stake-on-edge; max_per_market_pct 0.08 → 0.03 caps absolute
+# stake at 3% of bankroll regardless of edge claim — so a $1500 bankroll
+# can never expose more than $45 to a single market. Worst-case loss
+# per trade is now ~$45 instead of ~$157. Pair with the persistent 24h
+# duplicate-blocker in order_gate.py to prevent the Hormuz repeat.
+kelly_multiplier: 0.10          # Tenth Kelly until calibration proven (was 0.20)
+max_per_market_pct: 0.03        # Hard cap at 3% of bankroll per market (was 0.08)
+# Absolute dollar ceiling layered ON TOP of the percent cap. Even if the
+# bankroll explodes, no single market gets more than this. Tune up only
+# after 50+ resolved trades show Brier < 0.20 sustained.
+max_stake_usd: 30.0             # Absolute per-market ceiling, dollars
 
 # --- Market Preferences ---
 markets:
