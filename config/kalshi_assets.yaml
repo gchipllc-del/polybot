@@ -26,7 +26,13 @@ assets:
     series: KXBTC15M
     binance_symbol: BTCUSDT
     annual_vol: 0.55
-    min_confidence: 0.35      # baseline — most liquid Kalshi crypto market
+    # Tightened 2026-05-18 from 0.35 → 0.65 based on 39-trade evidence.
+    # The 50-60% confidence bucket showed 62% WR but -$18 P&L (high WR
+    # but small per-win profit gets eaten by losses at full notional).
+    # 70-80% bucket: 87.5% WR, +$6.85 P&L. Skip the leaky middle band.
+    # Will reduce trade frequency by ~40% but should push net P&L
+    # positive. Revisit after 50 more settled trades.
+    min_confidence: 0.65
     enabled: true
 
   eth:

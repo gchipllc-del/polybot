@@ -39,7 +39,16 @@ DEFAULT_MIN_SECONDS_TO_CLOSE = 30.0     # don't enter under 30s — slippage zon
 # Intra-window exit thresholds. When our side's price spikes above
 # this, sell to lock the gain rather than ride out reversion. When it
 # craters below the stop, cut the loss before the inevitable zero.
-INTRA_WINDOW_TAKE_PROFIT = 0.85   # our side reaches this → exit at win
+#
+# Tuned 2026-05-18 from 0.85 → 0.75. Rationale: in 39 BTC trades the
+# 0.85 threshold triggered 24 times — clearly hittable. Lowering to
+# 0.75 should trigger more often (price reaches 0.75 before 0.85 in
+# most runners), capturing wins that otherwise would have reverted
+# back below 0.85 before resolution. Per-trigger profit shrinks
+# (e.g. fill 0.55 → was locking $0.30/share at 0.85, now $0.20/share
+# at 0.75) but the higher trigger rate should more than compensate
+# in aggregate. Will reassess after ~50 more trades.
+INTRA_WINDOW_TAKE_PROFIT = 0.75
 INTRA_WINDOW_STOP_LOSS = 0.15     # our side falls this low → cut
                                   # (locking ~0.15-0.20 loss vs total)
 
