@@ -4,16 +4,30 @@
 
 # --- Mode ---
 mode: manifold           # manifold (paper) | kalshi | polymarket | all
+                         # NOTE: this field only controls dashboard badge text
+                         # ("PAPER" vs "LIVE"). Actual platform routing is the
+                         # `platforms:` block below. Leaving as `manifold` so
+                         # the dashboard correctly shows PAPER (Kalshi 15-min
+                         # is still paper-traded too).
 live_migration_approved: false   # Requires manual flip for real-money platforms
 
 # --- Active Platforms ---
+# 2026-05-18: Disabled Manifold conviction trading after 39-trade
+# diagnosis showed -$97.59 net P&L (71.8% WR but asymmetric losses —
+# Virginia -$157, Hormuz duplicate -$148). The Kalshi 15-min BTC paper
+# trader remains active (separate launchd job, paper mode). Polybot is
+# now effectively a Kalshi-BTC-only bot in paper mode until the
+# tightened sizing rules (kelly 0.10, max_stake_usd $30, min_confidence
+# 0.75, persistent 24h dedup) prove out on at least 20 resolved trades.
+# Then we'll re-evaluate: re-enable Manifold with the new rules, or
+# flip Kalshi to live, or keep narrow.
 platforms:
   kalshi:
-    enabled: false        # Enable when API key is ready
+    enabled: false        # Stays false until paper P&L is consistently positive
   polymarket:
     enabled: false        # Enable when wallet is funded
   manifold:
-    enabled: true         # Paper trading — always on for testing
+    enabled: false        # 2026-05-18: paused after asymmetric-loss diagnosis
 
 # --- Circuit Breakers ---
 circuit_breakers:
