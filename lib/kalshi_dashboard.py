@@ -222,10 +222,25 @@ def make_app():
             "paper": _paper_payload(),
             "account": _account_payload(),
             "cron": _cron_health_payload(),
+            "enabled_assets": _enabled_assets(),
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
     return app
+
+
+def _enabled_assets() -> list[str]:
+    """Return the list of asset keys currently enabled in
+    config/kalshi_assets.yaml. Used by the dashboard to visually
+    distinguish active assets from historical/disabled ones — so
+    operators don't conflate frozen ETH/SOL losses with current
+    BTC-only performance.
+    """
+    try:
+        from lib.kalshi_15min_signal import enabled_assets
+        return sorted(enabled_assets().keys())
+    except Exception:
+        return []
 
 
 def run_dashboard(port: int = 5053):
@@ -476,21 +491,28 @@ async function refresh() {
           '<td class="muted">' + (t.title||'').slice(0,40) + '</td></tr>'
         ).join('');
 
-    // Per-asset rollup
+    // Per-asset rollup. Visually distinguish disabled assets — their
+    // P&L is historical/frozen, not live.
     const byAssetBody = document.getElementById('by-asset-tbody');
     const ba = (s.by_asset || {});
+    const enabledSet = new Set((data.enabled_assets || []).map(a => a.toLowerCase()));
     const baEntries = Object.entries(ba).sort();
     byAssetBody.innerHTML = baEntries.length === 0
       ? '<tr><td colspan="7" class="muted">No data.</td></tr>'
-      : baEntries.map(([asset, b]) =>
-          '<tr><td>' + asset + '</td>' +
-          '<td class="right">' + b.total + '</td>' +
-          '<td class="right green">' + (b.won||0) + '</td>' +
-          '<td class="right red">' + (b.lost||0) + '</td>' +
-          '<td class="right">' + fmtPct(b.win_rate) + '</td>' +
-          '<td class="right">' + fmtPnl(b.pnl) + '</td>' +
-          '<td class="right ' + pnlClass(b.roi_pct) + '">' + fmtPct(b.roi_pct) + '</td></tr>'
-        ).join('');
+      : baEntries.map(([asset, b]) => {
+          const isEnabled = enabledSet.has(asset.toLowerCase());
+          const rowClass = isEnabled ? '' : ' class="muted"';
+          const badge = isEnabled
+            ? '<span class="badge ok">ACTIVE</span>'
+            : '<span class="badge warn" title="historical only — bot is no longer trading this asset">DISABLED</span>';
+          return '<tr' + rowClass + '><td>' + asset + ' ' + badge + '</td>' +
+            '<td class="right">' + b.total + '</td>' +
+            '<td class="right green">' + (b.won||0) + '</td>' +
+            '<td class="right red">' + (b.lost||0) + '</td>' +
+            '<td class="right">' + fmtPct(b.win_rate) + '</td>' +
+            '<td class="right">' + fmtPnl(b.pnl) + '</td>' +
+            '<td class="right ' + pnlClass(b.roi_pct) + '">' + fmtPct(b.roi_pct) + '</td></tr>';
+        }).join('');
 
     // Confidence buckets
     const bkBody = document.getElementById('bucket-tbody');
