@@ -48,9 +48,29 @@ DEFAULT_MIN_SECONDS_TO_CLOSE = 30.0     # don't enter under 30s — slippage zon
 # (e.g. fill 0.55 → was locking $0.30/share at 0.85, now $0.20/share
 # at 0.75) but the higher trigger rate should more than compensate
 # in aggregate. Will reassess after ~50 more trades.
+# Legacy absolute thresholds (kept for backward compat / docs).
+# DO NOT USE for new TP/SL math — switched to relative below.
 INTRA_WINDOW_TAKE_PROFIT = 0.75
-INTRA_WINDOW_STOP_LOSS = 0.15     # our side falls this low → cut
-                                  # (locking ~0.15-0.20 loss vs total)
+INTRA_WINDOW_STOP_LOSS = 0.15
+
+# 2026-05-19 fix: relative TP/SL around the fill price.
+# The old absolute thresholds were structurally negative-EV at most
+# fill prices. Example: buying YES at fill=0.59 with TP=0.75 / SL=0.15
+# gave R:R = 0.16 / 0.44 = 0.36 — losses 2.75× wins by DESIGN, so
+# even 70% WR couldn't outrun the math. We saw the consequence as a
+# pattern of small wins and one $18.64 loss.
+#
+# Symmetric ±0.20 around fill makes R:R = 1:1 regardless of entry:
+#   fill 0.30 → TP 0.50, SL 0.10 (clamped to 0.05 floor)
+#   fill 0.50 → TP 0.70, SL 0.30
+#   fill 0.78 → TP 0.95 (clamped), SL 0.58
+# This caps single-trade loss at ~stake × 0.20/fill and gives a fair
+# game; the bot's edge then has to come from win-rate, not from
+# disguised asymmetry.
+INTRA_WINDOW_TP_DELTA = 0.20       # take profit when our_side moves +0.20 from fill
+INTRA_WINDOW_SL_DELTA = 0.20       # stop loss when our_side moves -0.20 from fill
+INTRA_WINDOW_PRICE_FLOOR = 0.05    # never let SL go below this (Kalshi quote floor)
+INTRA_WINDOW_PRICE_CEIL = 0.95     # never let TP go above this
 
 # ── Kelly Criterion sizing ──────────────────────────────────────────
 #
@@ -577,24 +597,35 @@ def check_open_trades_for_exit() -> dict:
         size = float(r.get("our_size", 0) or 0)
         fill = float(r.get("fill_price", 0) or 0)
 
-        if our_price >= INTRA_WINDOW_TAKE_PROFIT:
-            # Take profit — exit at TP threshold
-            gross_profit = (INTRA_WINDOW_TAKE_PROFIT - fill) * size
+        # Per-trade RELATIVE TP/SL (symmetric ±0.20 around fill, clamped
+        # to the Kalshi quote band). Computed at evaluation time so we
+        # don't have to rewrite old paper records; new trades inherit
+        # the symmetry implicitly via fill being centered.
+        tp_threshold = min(INTRA_WINDOW_PRICE_CEIL, fill + INTRA_WINDOW_TP_DELTA)
+        sl_threshold = max(INTRA_WINDOW_PRICE_FLOOR, fill - INTRA_WINDOW_SL_DELTA)
+
+        if our_price >= tp_threshold:
+            # Take profit — exit at the relative TP. Symmetric ±0.20
+            # by default means R:R = 1:1 (was 0.36:1 at fill=0.59 under
+            # the old absolute thresholds).
+            gross_profit = (tp_threshold - fill) * size
             r["status"] = "won_early"
-            r["exit_price"] = INTRA_WINDOW_TAKE_PROFIT
+            r["exit_price"] = round(tp_threshold, 4)
             r["exit_reason"] = "take_profit"
             r["resolved_at"] = now_iso
-            # Apply Kalshi 7% fee on profit
+            # Kalshi 7% fee on profit
             r["paper_pnl"] = round(gross_profit * (1.0 - 0.07), 4)
             tp_exits += 1
             pnl_locked += r["paper_pnl"]
-        elif our_price <= INTRA_WINDOW_STOP_LOSS:
-            # Stop loss — cut at SL threshold (saves remaining capital)
+        elif our_price <= sl_threshold:
+            # Stop loss — cut at the relative SL. Caps single-trade
+            # downside at fill × SL_DELTA × size, which is symmetric
+            # with the TP upside.
             r["status"] = "cut_loss"
-            r["exit_price"] = INTRA_WINDOW_STOP_LOSS
+            r["exit_price"] = round(sl_threshold, 4)
             r["exit_reason"] = "stop_loss"
             r["resolved_at"] = now_iso
-            r["paper_pnl"] = round((INTRA_WINDOW_STOP_LOSS - fill) * size, 4)
+            r["paper_pnl"] = round((sl_threshold - fill) * size, 4)
             sl_exits += 1
             pnl_locked += r["paper_pnl"]
 
