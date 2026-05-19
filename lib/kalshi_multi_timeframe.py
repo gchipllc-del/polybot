@@ -126,9 +126,20 @@ def check_multi_timeframe_agreement(
     cache_key = f"{symbol}|{','.join(timeframes)}"
     now = time.time()
     cached = _INMEM_CACHE.get(cache_key)
+    votes = None
     if cached is not None and (now - cached[0]) < _INMEM_TTL_SECONDS:
         votes = cached[1]["votes"]
-    else:
+    if votes is None:
+        # Disk cache check
+        try:
+            from lib.kalshi_cache import get as _disk_get
+            disk_hit = _disk_get("mtf", cache_key, max_age=_INMEM_TTL_SECONDS)
+            if disk_hit is not None:
+                votes = disk_hit
+                _INMEM_CACHE[cache_key] = (now, {"votes": votes})
+        except Exception:
+            votes = None
+    if votes is None:
         # PARALLEL FETCH: 3 timeframes used to serialize ~600ms of network
         # latency. ThreadPoolExecutor fires them concurrently — Python's
         # GIL is released during the requests.get() socket I/O, so threads
@@ -147,11 +158,17 @@ def check_multi_timeframe_agreement(
                            "error": str(e)[:200]}, result="degraded")
                 return tf, None
 
-        votes: dict[str, Optional[int]] = {}
+        votes = {}
         with ThreadPoolExecutor(max_workers=len(timeframes)) as ex:
             for tf, vote in ex.map(_fetch_one, timeframes):
                 votes[tf] = vote
         _INMEM_CACHE[cache_key] = (now, {"votes": votes})
+        # Persist to disk
+        try:
+            from lib.kalshi_cache import put as _disk_put
+            _disk_put("mtf", cache_key, votes)
+        except Exception:
+            pass
 
     agree = sum(1 for v in votes.values() if v == primary_sign)
     disagree = sum(1 for v in votes.values()

@@ -66,7 +66,19 @@ def compute_order_flow_imbalance(
     if cached is not None:
         ts, val, meta = cached
         if (now - ts) < _INMEM_TTL_SECONDS:
-            return val, {**meta, "cache": "hit"}
+            return val, {**meta, "cache": "hit_mem"}
+
+    # Try disk cache (survives process restarts)
+    try:
+        from lib.kalshi_cache import get as _disk_get
+        disk_hit = _disk_get("orderflow", cache_key, max_age=_INMEM_TTL_SECONDS)
+        if disk_hit is not None:
+            ofi_val, meta_disk = disk_hit
+            # Backfill in-memory layer for subsequent hits this process
+            _INMEM_CACHE[cache_key] = (now, ofi_val, meta_disk)
+            return ofi_val, {**meta_disk, "cache": "hit_disk"}
+    except Exception:
+        pass
 
     try:
         import requests
@@ -135,6 +147,12 @@ def compute_order_flow_imbalance(
         "cache": "miss",
     }
     _INMEM_CACHE[cache_key] = (now, ofi, meta)
+    # Persist to disk so next process restart can re-use it if fresh
+    try:
+        from lib.kalshi_cache import put as _disk_put
+        _disk_put("orderflow", cache_key, (ofi, meta))
+    except Exception:
+        pass
     return ofi, meta
 
 

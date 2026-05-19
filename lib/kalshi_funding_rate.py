@@ -73,7 +73,19 @@ def fetch_funding_rate(symbol: str = "BTCUSDT") -> tuple[Optional[float], dict]:
     if cached is not None:
         ts, meta = cached
         if (now - ts) < _INMEM_TTL_SECONDS and meta is not None:
-            return meta.get("funding_rate"), {**meta, "cache": "hit"}
+            return meta.get("funding_rate"), {**meta, "cache": "hit_mem"}
+
+    # Disk cache (survives process restarts; funding only updates every
+    # 8h so this is a big win).
+    try:
+        from lib.kalshi_cache import get as _disk_get
+        disk_hit = _disk_get("funding_rate", cache_key, max_age=_INMEM_TTL_SECONDS)
+        if disk_hit is not None:
+            meta_disk = disk_hit
+            _INMEM_CACHE[cache_key] = (now, meta_disk)
+            return meta_disk.get("funding_rate"), {**meta_disk, "cache": "hit_disk"}
+    except Exception:
+        pass
 
     # NOTE: Tried several funding-rate sources from US IPs:
     #   • Binance global futures (fapi.binance.com) → HTTP 451 geo-blocked
@@ -132,6 +144,11 @@ def fetch_funding_rate(symbol: str = "BTCUSDT") -> tuple[Optional[float], dict]:
         "cache": "miss",
     }
     _INMEM_CACHE[cache_key] = (now, meta)
+    try:
+        from lib.kalshi_cache import put as _disk_put
+        _disk_put("funding_rate", cache_key, meta)
+    except Exception:
+        pass
     return rate, meta
 
 
