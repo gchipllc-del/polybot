@@ -129,17 +129,28 @@ def check_multi_timeframe_agreement(
     if cached is not None and (now - cached[0]) < _INMEM_TTL_SECONDS:
         votes = cached[1]["votes"]
     else:
-        votes: dict[str, Optional[int]] = {}
-        for tf in timeframes:
+        # PARALLEL FETCH: 3 timeframes used to serialize ~600ms of network
+        # latency. ThreadPoolExecutor fires them concurrently — Python's
+        # GIL is released during the requests.get() socket I/O, so threads
+        # are the right primitive here (no asyncio needed). Drops to
+        # max(individual_latency) ≈ 200ms.
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch_one(tf: str) -> tuple[str, Optional[int]]:
             lb = lookbacks.get(tf, 12)
             try:
                 klines = _fetch_klines(symbol, tf, lb)
-                votes[tf] = _direction_from_klines(klines, lb)
+                return tf, _direction_from_klines(klines, lb)
             except Exception as e:
                 log_event("kalshi_mtf", "fetch_failed",
                           {"symbol": symbol, "tf": tf,
                            "error": str(e)[:200]}, result="degraded")
-                votes[tf] = None
+                return tf, None
+
+        votes: dict[str, Optional[int]] = {}
+        with ThreadPoolExecutor(max_workers=len(timeframes)) as ex:
+            for tf, vote in ex.map(_fetch_one, timeframes):
+                votes[tf] = vote
         _INMEM_CACHE[cache_key] = (now, {"votes": votes})
 
     agree = sum(1 for v in votes.values() if v == primary_sign)

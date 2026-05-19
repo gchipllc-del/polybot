@@ -255,36 +255,43 @@ def compute_kalshi_indicators(
         (asset_cfg or {}).get("kronos", {}).get("weight", 3.0)
     )
 
-    # Optional Order-Flow Imbalance signal — Binance.US top-N book.
-    # Adds microstructure directional bias as a 6th contribution.
+    # PARALLEL PREFETCH: OFI and funding are independent REST calls;
+    # firing them concurrently drops wall time from sum(individual)
+    # to max(individual). MTF is included too so the same prefetch
+    # serves the downstream paper-trader gate (no extra latency).
+    # Falls open silently — any failure leaves that signal as None.
+    of_enabled = bool((asset_cfg or {}).get("orderflow", {}).get("enabled"))
+    fund_enabled = bool((asset_cfg or {}).get("funding_rate", {}).get("enabled"))
+    of_symbol = (asset_cfg or {}).get("orderflow", {}).get("symbol", "BTCUSDT")
+    of_depth = int((asset_cfg or {}).get("orderflow", {}).get("depth_levels", 10))
+
     of_signal: float | None = None
     of_meta: dict = {}
-    if asset_cfg and asset_cfg.get("orderflow", {}).get("enabled"):
+    funding_signal: float | None = None
+    funding_meta: dict = {}
+
+    if of_enabled or fund_enabled:
         try:
-            from lib.kalshi_orderflow import compute_order_flow_imbalance
-            of_signal, of_meta = compute_order_flow_imbalance(
-                symbol=asset_cfg["orderflow"].get("symbol", "BTCUSDT"),
-                depth_levels=int(asset_cfg["orderflow"].get("depth_levels", 10)),
+            from lib.kalshi_prefetch import prefetch_market_data
+            data = prefetch_market_data(
+                symbol=of_symbol,
+                primary_direction=None,    # MTF deferred to paper-trader gate
+                enable_orderflow=of_enabled,
+                enable_funding=fund_enabled,
+                enable_mtf=False,
+                orderflow_depth=of_depth,
             )
+            if of_enabled:
+                of_signal, of_meta = data["orderflow"]
+            if fund_enabled:
+                funding_signal, funding_meta = data["funding"]
         except Exception:
-            of_signal = None
-            of_meta = {"reason": "orderflow_unavailable"}
+            of_signal = None; of_meta = {"reason": "prefetch_failed"}
+            funding_signal = None; funding_meta = {"reason": "prefetch_failed"}
+
     of_weight = float(
         (asset_cfg or {}).get("orderflow", {}).get("weight", 2.0)
     )
-
-    # Optional funding-rate divergence (REVERSAL signal)
-    funding_signal: float | None = None
-    funding_meta: dict = {}
-    if asset_cfg and asset_cfg.get("funding_rate", {}).get("enabled"):
-        try:
-            from lib.kalshi_funding_rate import funding_rate_signal
-            funding_signal, funding_meta = funding_rate_signal(
-                symbol=asset_cfg["funding_rate"].get("symbol", "BTCUSDT"),
-            )
-        except Exception:
-            funding_signal = None
-            funding_meta = {"reason": "funding_unavailable"}
     funding_weight = float(
         (asset_cfg or {}).get("funding_rate", {}).get("weight", 1.5)
     )
