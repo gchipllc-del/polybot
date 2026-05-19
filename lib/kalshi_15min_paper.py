@@ -347,6 +347,26 @@ def record_paper_trades_from_samples(
             skip_counts["extreme_price"] = skip_counts.get("extreme_price", 0) + 1
             continue
 
+        # ── Multi-timeframe agreement gate (5m + 15m + 1h) ──────
+        # Require multiple timeframes to lean the same direction as
+        # the composite signal before firing. Disagreement = no trend,
+        # no edge. Configurable required_agreement (default 2-of-3 —
+        # 3-of-3 is too strict and rejects most candidates).
+        try:
+            from lib.kalshi_multi_timeframe import (
+                check_multi_timeframe_agreement,
+            )
+            mtf_pass, mtf_meta = check_multi_timeframe_agreement(
+                primary_direction=side,
+                symbol="BTCUSDT",
+                required_agreement=2,
+            )
+            if not mtf_pass:
+                skip_counts["mtf_disagreement"] = skip_counts.get("mtf_disagreement", 0) + 1
+                continue
+        except Exception:
+            pass
+
         # ── Conformal-prediction safety gate (split CP) ─────────
         # If the strike sits comfortably outside our prediction interval
         # on our side, the trade has strong distribution-free directional
