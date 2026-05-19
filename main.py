@@ -641,7 +641,7 @@ def cmd_hermes(dry_run: bool = False):
 
 def cmd_backtest(monte_carlo_mode: bool = False, paths: int = 1000, trades: int = 500):
     """Run historical replay or Monte Carlo simulation."""
-    from lib.backtest import (
+    from tradingcore.backtest import (
         monte_carlo,
         print_backtest_report,
         replay_historical,
@@ -750,7 +750,7 @@ def cmd_smoke():
     sizing, checks for NaN, bounds, graceful degradation. No external API
     calls. Use before deploying config changes.
     """
-    from lib.backtest import pipeline_smoke_test
+    from tradingcore.backtest import pipeline_smoke_test
     result = pipeline_smoke_test(verbose=True)
     sys.exit(0 if result["passed"] else 1)
 
@@ -768,7 +768,7 @@ def cmd_brier(n: int = 50, use_llm: bool = False, sources: list[str] | None = No
         Δ Brier = 0  → noise, inconclusive
         Δ Brier > 0  → the crowd beats us → recalibrate before deploying
     """
-    from lib.backtest import replay_forecastbench
+    from tradingcore.backtest import replay_forecastbench
     result = replay_forecastbench(
         limit=n,
         sources=sources,
