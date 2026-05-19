@@ -244,8 +244,9 @@ def compute_kalshi_indicators(
                 strike=strike,
                 horizon_bars=int(asset_cfg["kronos"].get("horizon_bars", 3)),
                 interval=asset_cfg["kronos"].get("interval", "5m"),
-                sample_count=int(asset_cfg["kronos"].get("sample_count", 10)),
+                sample_count=int(asset_cfg["kronos"].get("sample_count", 5)),
                 ticker=asset_cfg["kronos"].get("ticker", "BTC-USD"),
+                model_size=asset_cfg["kronos"].get("model_size", "small"),
             )
         except Exception:
             kronos_signal = None

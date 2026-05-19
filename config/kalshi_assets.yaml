@@ -53,9 +53,14 @@ assets:
       enabled: true
       horizon_bars: 3       # 3 × 5min = 15min (matches Kalshi window)
       interval: "5m"        # 5m bars feed Kronos (less noise than 1m)
-      sample_count: 10      # paper Table 6 default
+      sample_count: 5       # was 10 — Kalshi binary questions converge at N=5 (~50% time saved)
       weight: 3.0           # composite weight (max becomes 15.0 vs base 12.0)
       ticker: "BTC-USD"     # Kronos ticker symbol
+      model_size: "small"   # was "base" — 24.7M vs 102.3M params, ~4× faster
+                            # on CPU at ~10-15% accuracy degradation.
+                            # For 15-min binary forecasts this is the right
+                            # trade. Bump to "base" once a 30-day backtest
+                            # shows real wins from the larger model.
     # Order-flow imbalance from Binance.US top-N book. Signed [-1, +1]
     # microstructure signal — orthogonal to the four base indicators
     # (none see the resting limit book). Lighter weight than Kronos
