@@ -693,7 +693,7 @@ def cmd_news(question: str):
 
 def cmd_kronos(ticker: str, pred_bars: int = 30, interval: str = "1d"):
     """Run Kronos zero-shot price forecast for a ticker."""
-    from lib.kronos_forecaster import predict_price, print_forecast_report
+    from tradingcore.kronos_forecaster import predict_price, print_forecast_report
 
     strategy = _load_strategy()
     kronos_cfg = strategy.get("kronos", {})
@@ -713,7 +713,7 @@ def cmd_kronos(ticker: str, pred_bars: int = 30, interval: str = "1d"):
 
 def cmd_kronos_prob(ticker: str, target: float, direction: str = "above", horizon: int = 30):
     """Estimate probability that price crosses a target."""
-    from lib.kronos_forecaster import price_to_probability, print_probability_report
+    from tradingcore.kronos_forecaster import price_to_probability, print_probability_report
 
     strategy = _load_strategy()
     kronos_cfg = strategy.get("kronos", {})
@@ -1645,6 +1645,27 @@ def main():
                 port = int(arg.split("=", 1)[1])
         from lib.kalshi_dashboard import run_dashboard
         run_dashboard(port=port)
+    elif command == "kalshi-backtest":
+        # Replay historical Binance.US bars through the Kalshi signal
+        # pipeline to validate edge offline. See lib/kalshi_backtest.py
+        # for limitations (OFI not backtestable; funding fed as None).
+        days = 14
+        min_confidence = 0.70
+        sample_offset = 1
+        for arg in sys.argv[2:]:
+            if arg.startswith("--days="):
+                days = int(arg.split("=", 1)[1])
+            elif arg.startswith("--min-confidence="):
+                min_confidence = float(arg.split("=", 1)[1])
+            elif arg.startswith("--sample-offset="):
+                sample_offset = int(arg.split("=", 1)[1])
+        from lib.kalshi_backtest import run_backtest, print_summary
+        trades, summary = run_backtest(
+            days=days,
+            min_confidence=min_confidence,
+            sample_offset_bars=sample_offset,
+        )
+        print_summary(summary)
     elif command == "kalshi-auth-status":
         from lib.kalshi_auth import status
         s = status()
