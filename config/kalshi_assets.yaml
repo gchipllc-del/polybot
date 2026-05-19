@@ -27,12 +27,18 @@ assets:
     binance_symbol: BTCUSDT
     annual_vol: 0.55
     # Tightened 2026-05-18 from 0.35 → 0.65 based on 39-trade evidence.
-    # The 50-60% confidence bucket showed 62% WR but -$18 P&L (high WR
-    # but small per-win profit gets eaten by losses at full notional).
-    # 70-80% bucket: 87.5% WR, +$6.85 P&L. Skip the leaky middle band.
-    # Will reduce trade frequency by ~40% but should push net P&L
-    # positive. Revisit after 50 more settled trades.
-    min_confidence: 0.65
+    # 2026-05-20: tightened again 0.65 → 0.70 after re-analyzing the
+    # full 55-trade history broken down by confidence bucket:
+    #   ≥0.80:     n=3   WR=100.0%  pnl=+$3.96   ← ideal cohort
+    #   0.70-0.80: n=8   WR= 87.5%  pnl=+$6.85   ← actual edge zone
+    #   0.60-0.70: n=7   WR= 28.6%  pnl=-$23.06  ← LEAKY BAND (was killing P&L)
+    #   <0.60:     n=37  WR= 67.6%  pnl=-$21.35  ← high WR / negative on noise
+    # The 0.65 cutoff still admitted the leaky 0.60-0.70 band; raising
+    # to 0.70 caps trade frequency at the n=11 high-quality cohort
+    # (≥0.70). Bot will fire far less often but each fire is much
+    # more likely to be profitable. Revisit after 30 more settled
+    # trades at the new threshold.
+    min_confidence: 0.70
     enabled: true
 
   eth:
