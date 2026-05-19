@@ -26,19 +26,20 @@ assets:
     series: KXBTC15M
     binance_symbol: BTCUSDT
     annual_vol: 0.55
-    # Tightened 2026-05-18 from 0.35 → 0.65 based on 39-trade evidence.
-    # 2026-05-20: tightened again 0.65 → 0.70 after re-analyzing the
-    # full 55-trade history broken down by confidence bucket:
-    #   ≥0.80:     n=3   WR=100.0%  pnl=+$3.96   ← ideal cohort
-    #   0.70-0.80: n=8   WR= 87.5%  pnl=+$6.85   ← actual edge zone
-    #   0.60-0.70: n=7   WR= 28.6%  pnl=-$23.06  ← LEAKY BAND (was killing P&L)
-    #   <0.60:     n=37  WR= 67.6%  pnl=-$21.35  ← high WR / negative on noise
-    # The 0.65 cutoff still admitted the leaky 0.60-0.70 band; raising
-    # to 0.70 caps trade frequency at the n=11 high-quality cohort
-    # (≥0.70). Bot will fire far less often but each fire is much
-    # more likely to be profitable. Revisit after 30 more settled
-    # trades at the new threshold.
-    min_confidence: 0.70
+    # Confidence-threshold history:
+    #   2026-05-18: 0.35 → 0.65 (cut <0.60 leaky band)
+    #   2026-05-19 AM: 0.65 → 0.70 (chasing the 0.70-0.80 edge cohort)
+    #   2026-05-19 mid: 0.70 → 0.55 — 0 trades in 19h (still too tight)
+    #   2026-05-19 PM: 0.55 → 0.40 — analyzed 858 signals over 18h:
+    #     conf >= 0.55 + fill <= 0.45: 0 signals (too restrictive)
+    #     conf >= 0.40 + fill <= 0.45: 11 signals (~14 trades/day)
+    #     conf >= 0.40 + fill <= 0.50: 19 signals (~25 trades/day)
+    #     The fill <= 0.45 R:R gate is doing all the heavy lifting
+    #     now — it guarantees wins > losses by entry math. Confidence
+    #     threshold just needs to be high enough to weed out random
+    #     direction. 0.40 = ~10× the no-signal baseline of 0.04, so
+    #     any directional bot opinion clears it.
+    min_confidence: 0.40
     enabled: true
     # Kronos foundation-model 5th signal. Adds P(close > strike) from
     # Monte Carlo path simulation as an orthogonal vote on top of the
