@@ -72,6 +72,27 @@ INTRA_WINDOW_SL_DELTA = 0.20       # stop loss when our_side moves -0.20 from fi
 INTRA_WINDOW_PRICE_FLOOR = 0.05    # never let SL go below this (Kalshi quote floor)
 INTRA_WINDOW_PRICE_CEIL = 0.95     # never let TP go above this
 
+# 2026-05-19: R:R discipline. The fill price in a binary market IS the
+# risk/reward ratio. Only fire trades where the market disagrees with
+# us — i.e. the side we're buying is priced low. Default 0.45 means:
+#   max loss per share <= 0.45
+#   max win per share  >= 0.55
+#   guaranteed R:R     >= 1.22:1 in our favor
+# Trade frequency drops materially (historically ~85% of fires were
+# at fill > 0.45) but every remaining fire has a fundamentally
+# favorable payoff structure. Tune up (more selective) or down
+# (more trades) per asset; this is the single biggest knob for
+# making "wins like the losses were."
+MAX_FILL_FOR_BUY = 0.45
+
+# 2026-05-19: Let winners ride. The intra-window TP at fill+0.20 was
+# locking in 20-cent moves and leaving 50+ cents of potential payout
+# on the table when winning trades settled at 1.0. Disabling early
+# TP means winners ride to resolution (full $1 - fill payout). SL
+# still active to cap downside on losers. To re-enable, set
+# DISABLE_INTRA_WINDOW_TP = False below.
+DISABLE_INTRA_WINDOW_TP = True
+
 # ── Kelly Criterion sizing ──────────────────────────────────────────
 #
 # Replaces flat-$5 sizing with edge-proportional sizing. The math:
@@ -367,6 +388,20 @@ def record_paper_trades_from_samples(
             skip_counts["extreme_price"] = skip_counts.get("extreme_price", 0) + 1
             continue
 
+        # ── R:R discipline: only buy when the market disagrees with us ──
+        # In a binary market the fill price IS the risk/reward ratio:
+        #   buy YES at 0.20 → R:R = 4:1 (wins big, loses small)
+        #   buy YES at 0.50 → R:R = 1:1 (coin flip)
+        #   buy YES at 0.80 → R:R = 0.25:1 (loses big, wins small)
+        # The previous behavior of buying at 0.78-0.84 fills meant
+        # even high WR couldn't generate net profit (small wins, huge
+        # losses). Restricting to fill <= MAX_FILL_FOR_BUY guarantees
+        # R:R >= (1 - MAX_FILL_FOR_BUY) / MAX_FILL_FOR_BUY.
+        # 0.45 default → minimum R:R ~1.22 in our favor.
+        if fill > MAX_FILL_FOR_BUY:
+            skip_counts["fill_too_high"] = skip_counts.get("fill_too_high", 0) + 1
+            continue
+
         # ── Multi-timeframe agreement gate (5m + 15m + 1h) ──────
         # Require multiple timeframes to lean the same direction as
         # the composite signal before firing. Disagreement = no trend,
@@ -604,16 +639,16 @@ def check_open_trades_for_exit() -> dict:
         tp_threshold = min(INTRA_WINDOW_PRICE_CEIL, fill + INTRA_WINDOW_TP_DELTA)
         sl_threshold = max(INTRA_WINDOW_PRICE_FLOOR, fill - INTRA_WINDOW_SL_DELTA)
 
-        if our_price >= tp_threshold:
-            # Take profit — exit at the relative TP. Symmetric ±0.20
-            # by default means R:R = 1:1 (was 0.36:1 at fill=0.59 under
-            # the old absolute thresholds).
+        if (not DISABLE_INTRA_WINDOW_TP) and our_price >= tp_threshold:
+            # Take profit — only fires when DISABLE_INTRA_WINDOW_TP=False.
+            # Default behavior is to let winners ride to settlement so
+            # we capture the full (1 - fill) payout instead of just
+            # the +0.20 partial.
             gross_profit = (tp_threshold - fill) * size
             r["status"] = "won_early"
             r["exit_price"] = round(tp_threshold, 4)
             r["exit_reason"] = "take_profit"
             r["resolved_at"] = now_iso
-            # Kalshi 7% fee on profit
             r["paper_pnl"] = round(gross_profit * (1.0 - 0.07), 4)
             tp_exits += 1
             pnl_locked += r["paper_pnl"]
