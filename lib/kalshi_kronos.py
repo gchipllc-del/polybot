@@ -102,7 +102,7 @@ def kronos_yes_probability(
 
     # ── Cold call ──────────────────────────────────────────────────
     try:
-        from lib.kronos_forecaster import price_to_probability
+        from tradingcore.kronos_forecaster import price_to_probability
         result = price_to_probability(
             ticker=ticker,
             target_price=float(strike),

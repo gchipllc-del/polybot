@@ -718,7 +718,7 @@ def build_forecast_for_market(
     kronos_estimate = None
     if (market.category or "").lower() in _PRICE_SERIES_CATEGORIES:
         try:
-            from lib.kronos_forecaster import get_kronos_estimate
+            from tradingcore.kronos_forecaster import get_kronos_estimate
             kronos_estimate = get_kronos_estimate(
                 market_question=market.question,
                 horizon_days=30,
