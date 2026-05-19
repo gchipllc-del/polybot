@@ -56,6 +56,15 @@ assets:
       sample_count: 10      # paper Table 6 default
       weight: 3.0           # composite weight (max becomes 15.0 vs base 12.0)
       ticker: "BTC-USD"     # Kronos ticker symbol
+    # Order-flow imbalance from Binance.US top-N book. Signed [-1, +1]
+    # microstructure signal — orthogonal to the four base indicators
+    # (none see the resting limit book). Lighter weight than Kronos
+    # because OFI is noisier minute-to-minute.
+    orderflow:
+      enabled: true
+      symbol: "BTCUSDT"
+      depth_levels: 10      # top-10 levels of book
+      weight: 2.0           # composite weight (max becomes 17.0 with Kronos)
 
   eth:
     series: KXETH15M

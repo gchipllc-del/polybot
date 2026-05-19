@@ -307,6 +307,8 @@ def compute_indicators_for_window(
     whale_pressure: float | None = None,
     kronos_signal: float | None = None,
     kronos_weight: float = 3.0,
+    orderflow_signal: float | None = None,
+    orderflow_weight: float = 2.0,
 ) -> dict:
     """Lean composite: ONLY market-respecting, mean-reversion-aware,
     theoretically-grounded, or order-flow-based indicators. The
@@ -408,9 +410,25 @@ def compute_indicators_for_window(
     else:
         contribs["kronos"] = 0.0
 
+    # Order-flow imbalance: signed [-1, +1] from Binance.US top-10 book.
+    # Positive = bid-heavy (bullish); negative = ask-heavy (bearish).
+    # Microstructure signal — orthogonal to the four base indicators
+    # (none of them see the resting order book). Weight 2 (lighter than
+    # Kronos because OFI is noisier minute-to-minute).
+    has_of = orderflow_signal is not None
+    if has_of:
+        ofs = max(-1.0, min(1.0, float(orderflow_signal)))
+        contribs["orderflow"] = ofs * float(orderflow_weight)
+    else:
+        contribs["orderflow"] = 0.0
+
     composite = sum(contribs.values())
     base_max = 2.0 + 4.0 + 3.0 + 3.0  # the original four indicators = 12.0
-    max_possible = base_max + (float(kronos_weight) if has_kronos else 0.0)
+    max_possible = (
+        base_max
+        + (float(kronos_weight) if has_kronos else 0.0)
+        + (float(orderflow_weight) if has_of else 0.0)
+    )
 
     return {
         "window_open": window_open_price,

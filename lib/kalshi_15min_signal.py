@@ -254,6 +254,25 @@ def compute_kalshi_indicators(
     kronos_weight = float(
         (asset_cfg or {}).get("kronos", {}).get("weight", 3.0)
     )
+
+    # Optional Order-Flow Imbalance signal — Binance.US top-N book.
+    # Adds microstructure directional bias as a 6th contribution.
+    of_signal: float | None = None
+    of_meta: dict = {}
+    if asset_cfg and asset_cfg.get("orderflow", {}).get("enabled"):
+        try:
+            from lib.kalshi_orderflow import compute_order_flow_imbalance
+            of_signal, of_meta = compute_order_flow_imbalance(
+                symbol=asset_cfg["orderflow"].get("symbol", "BTCUSDT"),
+                depth_levels=int(asset_cfg["orderflow"].get("depth_levels", 10)),
+            )
+        except Exception:
+            of_signal = None
+            of_meta = {"reason": "orderflow_unavailable"}
+    of_weight = float(
+        (asset_cfg or {}).get("orderflow", {}).get("weight", 2.0)
+    )
+
     base = compute_indicators_for_window(
         klines=klines,
         window_open_price=strike,
@@ -264,6 +283,8 @@ def compute_kalshi_indicators(
         whale_pressure=whale_pressure,
         kronos_signal=kronos_signal,
         kronos_weight=kronos_weight,
+        orderflow_signal=of_signal,
+        orderflow_weight=of_weight,
     )
     base["strike"] = strike
     base["current_spot"] = current_spot
@@ -273,6 +294,7 @@ def compute_kalshi_indicators(
         else "FLAT"
     )
     base["kronos_meta"] = kronos_meta
+    base["orderflow_meta"] = of_meta
     return base
 
 
