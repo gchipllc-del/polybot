@@ -1645,6 +1645,20 @@ def main():
                 port = int(arg.split("=", 1)[1])
         from lib.kalshi_dashboard import run_dashboard
         run_dashboard(port=port)
+    elif command == "kalshi-uptime":
+        # Detect scanner gaps that indicate the Mac slept. Kalshi BTC
+        # markets are 24/7 so any 10+ min gap is almost certainly host
+        # sleep. Use as a morning check.
+        hours = 24.0
+        gap_min = 10.0
+        for arg in sys.argv[2:]:
+            if arg.startswith("--hours="):
+                hours = float(arg.split("=", 1)[1])
+            elif arg.startswith("--max-gap="):
+                gap_min = float(arg.split("=", 1)[1])
+        from lib.kalshi_uptime_check import check_uptime, render_report
+        report = check_uptime(max_gap_minutes=gap_min, hours=hours)
+        print(render_report(report))
     elif command == "kalshi-backtest":
         # Replay historical Binance.US bars through the Kalshi signal
         # pipeline to validate edge offline. See lib/kalshi_backtest.py
