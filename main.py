@@ -669,7 +669,7 @@ def cmd_backtest(monte_carlo_mode: bool = False, paths: int = 1000, trades: int 
 
 def cmd_news(question: str):
     """Test news sentiment for a given question."""
-    from lib.news_feed import get_news_sentiment
+    from tradingcore.news_feed import get_news_sentiment
 
     print(f"Fetching news sentiment for: {question[:80]}")
     result = get_news_sentiment(

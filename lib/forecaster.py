@@ -666,7 +666,7 @@ def build_forecast_for_market(
     news_result = None
     news_sentiment = None
     try:
-        from lib.news_feed import get_news_sentiment
+        from tradingcore.news_feed import get_news_sentiment
         news_result = get_news_sentiment(
             market_id=market.market_id,
             question=market.question,
