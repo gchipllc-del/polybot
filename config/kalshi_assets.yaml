@@ -65,6 +65,15 @@ assets:
       symbol: "BTCUSDT"
       depth_levels: 10      # top-10 levels of book
       weight: 2.0           # composite weight (max becomes 17.0 with Kronos)
+    # Funding-rate divergence — BTC perpetual-futures funding from Binance.
+    # REVERSAL signal: high funding (long bias) → bearish; negative →
+    # bullish. Updates every 8h so cached aggressively. Lighter weight
+    # than the others because it's slow-moving and mainly a "watch out"
+    # signal rather than a primary call. Max composite becomes 18.5.
+    funding_rate:
+      enabled: true
+      symbol: "BTCUSDT"
+      weight: 1.5
 
   eth:
     series: KXETH15M

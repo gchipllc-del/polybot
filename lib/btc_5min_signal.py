@@ -309,6 +309,8 @@ def compute_indicators_for_window(
     kronos_weight: float = 3.0,
     orderflow_signal: float | None = None,
     orderflow_weight: float = 2.0,
+    funding_signal: float | None = None,
+    funding_weight: float = 1.5,
 ) -> dict:
     """Lean composite: ONLY market-respecting, mean-reversion-aware,
     theoretically-grounded, or order-flow-based indicators. The
@@ -422,12 +424,25 @@ def compute_indicators_for_window(
     else:
         contribs["orderflow"] = 0.0
 
+    # Funding-rate divergence: REVERSAL signal from BTC perp funding.
+    # High funding (long bias) → -1 (expect mean reversion down).
+    # Negative funding (shorts paying) → +1 (squeeze upside).
+    # Lighter weight than orderflow because funding is slow-moving
+    # (updates every 8h) — secondary signal, not primary.
+    has_funding = funding_signal is not None
+    if has_funding:
+        fs = max(-1.0, min(1.0, float(funding_signal)))
+        contribs["funding"] = fs * float(funding_weight)
+    else:
+        contribs["funding"] = 0.0
+
     composite = sum(contribs.values())
     base_max = 2.0 + 4.0 + 3.0 + 3.0  # the original four indicators = 12.0
     max_possible = (
         base_max
         + (float(kronos_weight) if has_kronos else 0.0)
         + (float(orderflow_weight) if has_of else 0.0)
+        + (float(funding_weight) if has_funding else 0.0)
     )
 
     return {

@@ -273,6 +273,22 @@ def compute_kalshi_indicators(
         (asset_cfg or {}).get("orderflow", {}).get("weight", 2.0)
     )
 
+    # Optional funding-rate divergence (REVERSAL signal)
+    funding_signal: float | None = None
+    funding_meta: dict = {}
+    if asset_cfg and asset_cfg.get("funding_rate", {}).get("enabled"):
+        try:
+            from lib.kalshi_funding_rate import funding_rate_signal
+            funding_signal, funding_meta = funding_rate_signal(
+                symbol=asset_cfg["funding_rate"].get("symbol", "BTCUSDT"),
+            )
+        except Exception:
+            funding_signal = None
+            funding_meta = {"reason": "funding_unavailable"}
+    funding_weight = float(
+        (asset_cfg or {}).get("funding_rate", {}).get("weight", 1.5)
+    )
+
     base = compute_indicators_for_window(
         klines=klines,
         window_open_price=strike,
@@ -285,6 +301,8 @@ def compute_kalshi_indicators(
         kronos_weight=kronos_weight,
         orderflow_signal=of_signal,
         orderflow_weight=of_weight,
+        funding_signal=funding_signal,
+        funding_weight=funding_weight,
     )
     base["strike"] = strike
     base["current_spot"] = current_spot
@@ -295,6 +313,7 @@ def compute_kalshi_indicators(
     )
     base["kronos_meta"] = kronos_meta
     base["orderflow_meta"] = of_meta
+    base["funding_meta"] = funding_meta
     return base
 
 
