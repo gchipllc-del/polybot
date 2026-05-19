@@ -458,8 +458,37 @@ def record_paper_trades_from_samples(
             kelly_fraction=kelly_meta["kelly_fraction"],
             half_kelly_fraction=kelly_meta["half_kelly_fraction"],
         )
+        # Annotate the trade record with per-model probabilities so
+        # BMA (kalshi_bma.py) can compute per-model Brier from history.
+        # Falls open silently — these are observability fields, not
+        # required for execution.
+        trade_row = asdict(trade)
+        trade_row["confidence_calibrated"] = kelly_meta.get("confidence_calibrated")
+        # Kronos p_yes from the indicators block (logged on signal sample)
+        kronos_meta = (indicators or {}).get("kronos_meta") or {}
+        if kronos_meta.get("kronos_p_yes") is not None:
+            trade_row["kronos_p_yes"] = kronos_meta["kronos_p_yes"]
+        # Conformal-derived confidence — recompute here so we capture it
+        # even though it wasn't a hard skip path
+        try:
+            from lib.kalshi_conformal import (
+                load_calibrator as _load_cp, predict_interval as _cp_int,
+                confidence_from_interval as _cp_conf,
+            )
+            cp_cal_now = _load_cp()
+            strike_v = float(s.get("strike", 0) or 0)
+            spot_v = float(s.get("spot_usd", 0) or 0)
+            if cp_cal_now and not cp_cal_now.get("is_identity") and strike_v > 0 and spot_v > 0:
+                lo_, hi_, _ = _cp_int(spot_v, s.get("klines") or [],
+                                       calibrator=cp_cal_now)
+                cp_p, _ = _cp_conf(strike_v, side, lo_, hi_)
+                if cp_p is not None:
+                    trade_row["conformal_p_yes"] = round(cp_p, 4)
+        except Exception:
+            pass
+
         new_trades.append(trade)
-        new_rows.append(asdict(trade))
+        new_rows.append(trade_row)
         open_tickers.add(ticker)
 
     if new_rows:
