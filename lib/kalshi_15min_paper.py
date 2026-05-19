@@ -347,20 +347,39 @@ def record_paper_trades_from_samples(
             skip_counts["extreme_price"] = skip_counts.get("extreme_price", 0) + 1
             continue
 
+        # ── Calibrated confidence (isotonic regression) ─────────
+        # Raw confidence isn't a probability — it's the bot's internal
+        # signal-strength number. Isotonic calibration fits an empirical
+        # mapping raw → realized win rate over resolved trades, giving
+        # us a TRUE probability to size against. Below MIN_SAMPLES
+        # resolved trades, calibrator returns identity (no change), so
+        # this is safe to flip on with no historical baseline.
+        try:
+            from lib.kalshi_calibration import calibrate, fit_calibrator
+            calibrator = fit_calibrator()  # cached for 1h
+            calibrated_confidence = calibrate(confidence, calibrator)
+        except Exception:
+            calibrated_confidence = confidence
+
         # ── Kelly sizing ────────────────────────────────────────
         # Replaces the old flat $5 per trade with edge-proportional
         # sizing. Half-Kelly + caps for safety. Returns 0 when there's
         # no positive edge (rare given our other filters, but possible
         # when fill is between our threshold-implied prob and 0.5).
+        # Uses the CALIBRATED confidence so Kelly sizes against the
+        # true probability, not the raw composite-ratio.
         kelly_cap = min(DEFAULT_MAX_TRADE_USD, soft_cap)
         notional, kelly_meta = kelly_sized_notional(
-            confidence=confidence,
+            confidence=calibrated_confidence,
             fill_price=fill,
             bankroll=bankroll,
             multiplier=DEFAULT_KELLY_MULTIPLIER,
             floor=DEFAULT_MIN_TRADE_USD,
             cap=kelly_cap,
         )
+        # Record both raw and calibrated on the trade for later analysis.
+        kelly_meta["confidence_raw"] = round(confidence, 4)
+        kelly_meta["confidence_calibrated"] = round(calibrated_confidence, 4)
         if notional <= 0:
             skip_counts["kelly_no_edge"] = skip_counts.get("kelly_no_edge", 0) + 1
             continue
