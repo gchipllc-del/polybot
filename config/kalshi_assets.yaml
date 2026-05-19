@@ -40,6 +40,22 @@ assets:
     # trades at the new threshold.
     min_confidence: 0.70
     enabled: true
+    # Kronos foundation-model 5th signal. Adds P(close > strike) from
+    # Monte Carlo path simulation as an orthogonal vote on top of the
+    # four base indicators. Adapted from the Kronos paper (arXiv:2508.02739)
+    # where short-horizon forecasting was the model's strongest task
+    # (44% MAE reduction). Default ON for BTC because:
+    #   • Kronos paper explicitly validated on BTC + crypto
+    #   • horizon (5m × 3 = 15min) matches Kalshi's resolution window
+    #   • ~6-10s/call is fine at 60s scanner cadence with 5-min cache
+    # Disable via enabled=false if Kronos weights aren't downloaded.
+    kronos:
+      enabled: true
+      horizon_bars: 3       # 3 × 5min = 15min (matches Kalshi window)
+      interval: "5m"        # 5m bars feed Kronos (less noise than 1m)
+      sample_count: 10      # paper Table 6 default
+      weight: 3.0           # composite weight (max becomes 15.0 vs base 12.0)
+      ticker: "BTC-USD"     # Kronos ticker symbol
 
   eth:
     series: KXETH15M
