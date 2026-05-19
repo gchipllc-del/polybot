@@ -216,6 +216,7 @@ def compute_kalshi_indicators(
     whale_pressure: float | None = None,
     asset: str = "btc",
     asset_cfg: dict | None = None,
+    prefetched_data: dict | None = None,
 ) -> dict:
     """Compute the 4-indicator composite for a Kalshi 15-min market.
 
@@ -271,21 +272,25 @@ def compute_kalshi_indicators(
     funding_signal: float | None = None
     funding_meta: dict = {}
 
+    # Use prefetched data when caller supplied it (the market-loop in
+    # sample_signals_for_asset fires prefetch ONCE per cycle and shares
+    # it across markets). Otherwise fall back to firing now.
     if of_enabled or fund_enabled:
         try:
-            from lib.kalshi_prefetch import prefetch_market_data
-            data = prefetch_market_data(
-                symbol=of_symbol,
-                primary_direction=None,    # MTF deferred to paper-trader gate
-                enable_orderflow=of_enabled,
-                enable_funding=fund_enabled,
-                enable_mtf=False,
-                orderflow_depth=of_depth,
-            )
-            if of_enabled:
-                of_signal, of_meta = data["orderflow"]
-            if fund_enabled:
-                funding_signal, funding_meta = data["funding"]
+            if prefetched_data is None:
+                from lib.kalshi_prefetch import prefetch_market_data
+                prefetched_data = prefetch_market_data(
+                    symbol=of_symbol,
+                    primary_direction=None,
+                    enable_orderflow=of_enabled,
+                    enable_funding=fund_enabled,
+                    enable_mtf=False,
+                    orderflow_depth=of_depth,
+                )
+            if of_enabled and "orderflow" in prefetched_data:
+                of_signal, of_meta = prefetched_data["orderflow"]
+            if fund_enabled and "funding" in prefetched_data:
+                funding_signal, funding_meta = prefetched_data["funding"]
         except Exception:
             of_signal = None; of_meta = {"reason": "prefetch_failed"}
             funding_signal = None; funding_meta = {"reason": "prefetch_failed"}
@@ -375,6 +380,34 @@ def sample_signals_for_asset(
                       {"symbol": binance_symbol, "error": str(e)[:200]},
                       result="degraded")
 
+    # PREFETCH market-wide REST signals ONCE per cycle (Speed-E in the
+    # optimization plan). OFI and funding rate depend on the asset only,
+    # NOT on the per-market strike — so firing them once and sharing
+    # across all live markets is correct AND drops total cycle wall-time
+    # proportional to N_markets. Three live markets used to fire 3× OFI,
+    # 3× funding (~1.5s wasted); now fires 1×.
+    prefetched_market_data: dict | None = None
+    if with_indicators and asset_cfg:
+        of_en = bool(asset_cfg.get("orderflow", {}).get("enabled"))
+        fund_en = bool(asset_cfg.get("funding_rate", {}).get("enabled"))
+        if of_en or fund_en:
+            try:
+                from lib.kalshi_prefetch import prefetch_market_data
+                prefetched_market_data = prefetch_market_data(
+                    symbol=asset_cfg.get("orderflow", {}).get("symbol", "BTCUSDT"),
+                    primary_direction=None,
+                    enable_orderflow=of_en,
+                    enable_funding=fund_en,
+                    enable_mtf=False,
+                    orderflow_depth=int(
+                        asset_cfg.get("orderflow", {}).get("depth_levels", 10)
+                    ),
+                )
+            except Exception as e:
+                log_event("kalshi_15min", "prefetch_failed",
+                          {"error": str(e)[:200]}, result="degraded")
+                prefetched_market_data = None
+
     now_iso = datetime.now(timezone.utc).isoformat()
     out: list[KalshiFifteenMinSample] = []
     for m in markets:
@@ -406,6 +439,7 @@ def sample_signals_for_asset(
                 whale_pressure=whale_indicator_value,
                 asset=asset,
                 asset_cfg=asset_cfg,
+                prefetched_data=prefetched_market_data,
             )
         out.append(KalshiFifteenMinSample(
             sample_at=now_iso,
