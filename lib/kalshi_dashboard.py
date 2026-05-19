@@ -71,10 +71,22 @@ def _live_markets_payload() -> list[dict]:
     """Format the live-market panel rows — latest sample per still-open
     market, sorted by seconds_to_close ascending.
 
-    Includes a `passes_threshold` flag computed from per-asset
-    min_confidence so the UI can highlight imminent trade candidates.
+    Each row carries the full decision trace: every gate the trade
+    would have to pass, with a pass/fail flag and a one-line reason.
+    The UI can render the gates side-by-side so the operator sees
+    exactly WHY a trade isn't firing on any given signal.
     """
     from lib.kalshi_15min_signal import load_assets_config
+    # Import the actual gate constants from the paper trader so
+    # dashboard math matches live trader math byte-for-byte.
+    try:
+        from lib.kalshi_15min_paper import (
+            MAX_FILL_FOR_BUY, EXTREME_PRICE_FLOOR, EXTREME_PRICE_CEIL,
+        )
+    except Exception:
+        MAX_FILL_FOR_BUY = 0.45
+        EXTREME_PRICE_FLOOR = 0.15
+        EXTREME_PRICE_CEIL = 0.85
 
     cfg = load_assets_config()
     latest = _latest_signal_per_market()
@@ -86,8 +98,6 @@ def _live_markets_payload() -> list[dict]:
             close_dt = datetime.fromisoformat(close_iso.replace("Z", "+00:00"))
         except (ValueError, TypeError):
             continue
-        # Only show markets that haven't closed yet — be generous (+30s
-        # grace) so windows about to resolve still appear briefly.
         if (close_dt - now).total_seconds() < -30:
             continue
         ind = s.get("indicators") or {}
@@ -95,6 +105,88 @@ def _live_markets_payload() -> list[dict]:
         asset_cfg = cfg.get(asset, {})
         thresh = float(asset_cfg.get("min_confidence", 0.35))
         conf = float(ind.get("confidence", 0) or 0)
+        composite = float(ind.get("composite", 0) or 0)
+        direction = ind.get("direction") or "FLAT"
+
+        # ── Build the gate trace ──────────────────────────────────
+        # Figure out which side the bot would buy + fill price
+        yes_ask = s.get("yes_ask")
+        no_ask = s.get("no_ask")
+        side: str
+        fill: float | None
+        if composite > 0:
+            side = "YES"
+            fill = float(yes_ask) if yes_ask is not None else None
+        elif composite < 0:
+            side = "NO"
+            if no_ask is not None:
+                fill = float(no_ask)
+            elif yes_ask is not None:
+                fill = 1.0 - float(yes_ask)
+            else:
+                fill = None
+        else:
+            side = "FLAT"
+            fill = None
+
+        gates: list[dict] = []
+
+        # Gate 1: confidence
+        g1_pass = conf >= thresh
+        gates.append({
+            "name": "min_confidence",
+            "pass": g1_pass,
+            "value": round(conf, 3),
+            "threshold": round(thresh, 3),
+            "label": f"conf {conf:.2f} {'≥' if g1_pass else '<'} {thresh:.2f}",
+        })
+
+        # Gate 2: direction not FLAT
+        g2_pass = side in ("YES", "NO")
+        gates.append({
+            "name": "direction",
+            "pass": g2_pass,
+            "value": side,
+            "label": f"direction = {side}",
+        })
+
+        # Gate 3: extreme price (Kalshi rejects 0.05/0.95)
+        if fill is None:
+            g3_pass = False
+            g3_label = "fill unavailable"
+        else:
+            g3_pass = EXTREME_PRICE_FLOOR <= fill <= EXTREME_PRICE_CEIL
+            g3_label = f"fill {fill:.2f} in [{EXTREME_PRICE_FLOOR}, {EXTREME_PRICE_CEIL}]"
+        gates.append({
+            "name": "extreme_price",
+            "pass": g3_pass,
+            "value": fill,
+            "label": g3_label,
+        })
+
+        # Gate 4: R:R discipline (the NEW gate)
+        if fill is None:
+            g4_pass = False
+            g4_label = "no fill"
+        else:
+            g4_pass = fill <= MAX_FILL_FOR_BUY
+            rr = (1.0 - fill) / fill if fill > 0 else 0.0
+            g4_label = (
+                f"fill {fill:.2f} ≤ {MAX_FILL_FOR_BUY} (R:R {rr:.2f}:1)"
+                if g4_pass else
+                f"fill {fill:.2f} > {MAX_FILL_FOR_BUY} (R:R {rr:.2f}:1 too unfavorable)"
+            )
+        gates.append({
+            "name": "max_fill_for_buy",
+            "pass": g4_pass,
+            "value": fill,
+            "threshold": MAX_FILL_FOR_BUY,
+            "label": g4_label,
+        })
+
+        all_pass = all(g["pass"] for g in gates)
+        first_fail = next((g["name"] for g in gates if not g["pass"]), None)
+
         out.append({
             "ticker": tk,
             "asset": asset,
@@ -104,13 +196,20 @@ def _live_markets_payload() -> list[dict]:
             "spot": s.get("spot_usd"),
             "yes_ask": s.get("yes_ask"),
             "no_ask": s.get("no_ask"),
-            "composite": ind.get("composite"),
+            "composite": composite,
             "confidence": conf,
             "threshold": thresh,
-            "passes_threshold": conf >= thresh,
+            "passes_threshold": g1_pass,        # legacy field; UI may still use
             "theoretical_yes": ind.get("theoretical_yes"),
             "theo_yes_gap": ind.get("theo_yes_gap"),
-            "direction": ind.get("direction"),
+            "direction": direction,
+            # NEW: full decision trace
+            "side_if_fire": side,
+            "fill_if_fire": fill,
+            "gates": gates,
+            "all_gates_pass": all_pass,
+            "first_fail": first_fail,
+            "verdict": "WOULD FIRE" if all_pass else f"BLOCKED ({first_fail})",
         })
     out.sort(key=lambda x: x["seconds_to_close"])
     return out
@@ -312,6 +411,12 @@ tr:last-child td { border-bottom: none; }
 .yellow { color: var(--yellow); }
 .muted { color: var(--muted); }
 .pass { background: rgba(63, 185, 80, 0.15); }
+.blocked { background: rgba(248, 81, 73, 0.06); }
+.gate-row td.gates-cell { padding: 4px 8px 8px; border-bottom: 1px solid #20262d; }
+.gate { display: inline-block; padding: 1px 6px; margin: 0 4px 4px 0; border-radius: 3px; font-size: 11px; font-family: 'Menlo', monospace; }
+.gate-pass { background: rgba(63, 185, 80, 0.20); color: #3fb950; }
+.gate-fail { background: rgba(248, 81, 73, 0.20); color: #f85149; }
+.tiny { font-size: 11px; }
 .bigstat {
   display: inline-block; margin-right: 18px;
   font-size: 13px;
@@ -349,7 +454,7 @@ tr:last-child td { border-bottom: none; }
       <table><thead><tr>
         <th>asset</th><th>T-close</th><th>strike</th><th>spot</th>
         <th>yes_ask</th><th>theo_yes</th><th>gap</th>
-        <th>composite</th><th>conf</th><th>fires?</th>
+        <th>composite</th><th>conf / min</th><th>dir</th><th>verdict</th>
       </tr></thead><tbody id="live-tbody"></tbody></table>
     </div>
     <div class="panel">
@@ -452,16 +557,29 @@ async function refresh() {
       : '<div class="muted">No trades yet.</div>';
     document.getElementById('summary').innerHTML = summaryHtml;
 
-    // Live markets
+    // Live markets — now with full gate-by-gate decision trace.
+    // Each live signal renders as TWO rows: market state, then a
+    // sub-row showing each gate and pass/fail. Helps operator see
+    // exactly WHY a trade isn't firing.
     const liveBody = document.getElementById('live-tbody');
     const live = data.live || [];
+    function gateBadge(g) {
+      const cls = g.pass ? 'gate-pass' : 'gate-fail';
+      const sym = g.pass ? '✓' : '✗';
+      return '<span class="gate ' + cls + '" title="' + g.label + '">' +
+             sym + ' ' + g.name + '</span>';
+    }
     liveBody.innerHTML = live.length === 0
-      ? '<tr><td colspan="10" class="muted">No active markets right now.</td></tr>'
+      ? '<tr><td colspan="11" class="muted">No active markets right now.</td></tr>'
       : live.map(m => {
-          const rowClass = m.passes_threshold ? 'pass' : '';
+          const rowClass = m.all_gates_pass ? 'pass' : (m.first_fail ? 'blocked' : '');
           const gap = m.theo_yes_gap;
           const gapClass = gap > 0.02 ? 'green' : gap < -0.02 ? 'red' : 'muted';
-          return '<tr class="' + rowClass + '">' +
+          const gates = m.gates || [];
+          const verdict = m.verdict || '?';
+          const verdictClass = m.all_gates_pass ? 'green' : 'muted';
+          // Main row: market state
+          const mainRow = '<tr class="' + rowClass + '">' +
             '<td>' + m.asset + '</td>' +
             '<td>' + fmtT(m.seconds_to_close) + '</td>' +
             '<td class="right">$' + fmt(m.strike, m.strike < 1000 ? 2 : 0) + '</td>' +
@@ -471,8 +589,15 @@ async function refresh() {
             '<td class="right ' + gapClass + '">' + (gap >= 0 ? '+' : '') + fmt(gap*100, 1) + 'pp</td>' +
             '<td class="right">' + fmt(m.composite, 2) + '</td>' +
             '<td class="right">' + fmtPct(m.confidence) + ' / ' + fmtPct(m.threshold) + '</td>' +
-            '<td>' + (m.passes_threshold ? '<span class="green">✓</span>' : '<span class="muted">·</span>') + '</td>' +
+            '<td>' + (m.direction || '·') + '</td>' +
+            '<td class="' + verdictClass + '">' + verdict + '</td>' +
           '</tr>';
+          // Sub-row: gate trace
+          const gatesHtml = gates.map(gateBadge).join(' ');
+          const subRow = '<tr class="gate-row"><td colspan="11" class="gates-cell">' +
+            '<span class="muted tiny">decision trace:</span> ' + gatesHtml +
+          '</td></tr>';
+          return mainRow + subRow;
         }).join('');
 
     // Open paper
