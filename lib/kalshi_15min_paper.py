@@ -347,6 +347,36 @@ def record_paper_trades_from_samples(
             skip_counts["extreme_price"] = skip_counts.get("extreme_price", 0) + 1
             continue
 
+        # ── Conformal-prediction safety gate (split CP) ─────────
+        # If the strike sits comfortably outside our prediction interval
+        # on our side, the trade has strong distribution-free directional
+        # support. If it's INSIDE the interval, we're in coin-flip
+        # territory — even our forecaster can't be confident, so skip.
+        # Falls open (no skip) when calibrator hasn't been fit yet.
+        try:
+            from lib.kalshi_conformal import (
+                load_calibrator as _load_cp,
+                predict_interval as _cp_interval,
+                confidence_from_interval as _cp_conf,
+            )
+            cp_cal = _load_cp()
+            strike = float(s.get("strike", 0) or 0)
+            spot = float(s.get("spot_usd", 0) or 0)
+            klines_local = (s.get("klines") or []) if isinstance(s.get("klines"), list) else []
+            if cp_cal is not None and not cp_cal.get("is_identity") and strike > 0 and spot > 0:
+                lo, hi, _ = _cp_interval(spot, klines_local, calibrator=cp_cal)
+                cp_conf, _ = _cp_conf(strike, side, lo, hi)
+                # Hard skip when our directional confidence per CP is
+                # below 0.50 — the interval contains the strike on our
+                # side. Tunable via the gate threshold.
+                if cp_conf is not None and cp_conf < 0.50:
+                    skip_counts["conformal_skip"] = skip_counts.get("conformal_skip", 0) + 1
+                    continue
+        except Exception:
+            # Conformal is opt-in observability — never block trades on
+            # a failure to evaluate.
+            pass
+
         # ── Calibrated confidence (isotonic regression) ─────────
         # Raw confidence isn't a probability — it's the bot's internal
         # signal-strength number. Isotonic calibration fits an empirical
