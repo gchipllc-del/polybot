@@ -305,6 +305,8 @@ def compute_indicators_for_window(
     annual_vol: float = DEFAULT_ANNUAL_VOL,
     use_realized_vol: bool = True,
     whale_pressure: float | None = None,
+    kronos_signal: float | None = None,
+    kronos_weight: float = 3.0,
 ) -> dict:
     """Lean composite: ONLY market-respecting, mean-reversion-aware,
     theoretically-grounded, or order-flow-based indicators. The
@@ -392,8 +394,23 @@ def compute_indicators_for_window(
     else:
         contribs["whale_pressure"] = 0.0
 
+    # Kronos foundation-model forecast: a 5th orthogonal signal. The
+    # caller (Kalshi signal pipeline) passes a signed value in [-1, +1]
+    # derived from Kronos's P(YES) Monte Carlo over a 15-min horizon.
+    # Adapted from the Kronos paper (arXiv:2508.02739): short-horizon
+    # forecasting is the model's strongest task (44% MAE reduction vs
+    # baselines). Optional — when None, doesn't contribute to either
+    # composite or max_possible (so confidence ratio stays accurate).
+    has_kronos = kronos_signal is not None
+    if has_kronos:
+        ks = max(-1.0, min(1.0, float(kronos_signal)))
+        contribs["kronos"] = ks * float(kronos_weight)
+    else:
+        contribs["kronos"] = 0.0
+
     composite = sum(contribs.values())
-    max_possible = 2.0 + 4.0 + 3.0 + 3.0  # = 12.0
+    base_max = 2.0 + 4.0 + 3.0 + 3.0  # the original four indicators = 12.0
+    max_possible = base_max + (float(kronos_weight) if has_kronos else 0.0)
 
     return {
         "window_open": window_open_price,

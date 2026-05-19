@@ -12,7 +12,7 @@ import pytest
 
 class TestSuperforecasterPromptStructure:
     def test_all_8_steps_present_in_order(self):
-        from lib.llm_analyst import SUPERFORECASTER_PROMPT
+        from tradingcore.llm_analyst import SUPERFORECASTER_PROMPT
         expected_headings = [
             "## Step 1: Decompose the question",
             "## Step 2: Knowledge expansion",
@@ -33,7 +33,7 @@ class TestSuperforecasterPromptStructure:
 
     def test_knowledge_expansion_has_no_fabrication_guard(self):
         """Wave C insight: explicit guardrail against hallucinated facts."""
-        from lib.llm_analyst import SUPERFORECASTER_PROMPT
+        from tradingcore.llm_analyst import SUPERFORECASTER_PROMPT
         # The Knowledge Expansion step needs an anti-fabrication clause.
         ke_section_start = SUPERFORECASTER_PROMPT.find("Knowledge expansion")
         ke_section_end = SUPERFORECASTER_PROMPT.find("## Step 3")
@@ -53,7 +53,7 @@ class TestSuperforecasterPromptStructure:
     def test_output_format_block_intact(self):
         """The aggregator parses PROBABILITY/CONFIDENCE/REFERENCE_CLASS/etc.
         Adding/renumbering steps must not break that contract."""
-        from lib.llm_analyst import SUPERFORECASTER_PROMPT
+        from tradingcore.llm_analyst import SUPERFORECASTER_PROMPT
         for required in (
             "PROBABILITY:",
             "CONFIDENCE:",
@@ -69,7 +69,7 @@ class TestSuperforecasterPromptStructure:
         """Adding Wave C must not have broken any {placeholder} fields the
         builder fills in — corruption here would silently produce malformed
         prompts at runtime."""
-        from lib.llm_analyst import SUPERFORECASTER_PROMPT
+        from tradingcore.llm_analyst import SUPERFORECASTER_PROMPT
         for ph in (
             "{question}",
             "{description}",
@@ -83,7 +83,7 @@ class TestSuperforecasterPromptStructure:
     def test_persona_prefix_references_correct_step_count(self):
         """Persona swarm (T1.2) prefix message must say '8-step', not '7-step',
         after Wave C — otherwise persona prompts contradict the main protocol."""
-        from lib.llm_analyst import _persona_prefix
+        from tradingcore.llm_analyst import _persona_prefix
         prefix = _persona_prefix("analyst")
         assert "8-step" in prefix
         assert "7-step" not in prefix

@@ -214,16 +214,46 @@ def compute_kalshi_indicators(
     market_yes_price: float | None = None,
     annual_vol: float = 0.55,
     whale_pressure: float | None = None,
+    asset: str = "btc",
+    asset_cfg: dict | None = None,
 ) -> dict:
     """Compute the 4-indicator composite for a Kalshi 15-min market.
 
     Strike IS the window-open price (Kalshi pegs it there at market
     creation), so the Greeks helper uses it directly as the BSM strike.
 
-    Indicators: RSI, theo_delta_gap, market_agreement, whale_pressure.
+    Indicators: RSI, theo_delta_gap, market_agreement, whale_pressure,
+    (optional) Kronos foundation-model forecast.
+
+    When `asset_cfg.kronos.enabled = true`, this also calls Kronos
+    (lib/kalshi_kronos.py) to get a 5th signal: P(close > strike) from
+    Monte Carlo path simulation. The result is logged on the sample
+    so calibration analysis can compare Kronos's view to actual outcomes.
+
     Direction labels are YES/NO since Kalshi markets are framed as
     "BTC ≥ strike at close?" rather than "BTC up?".
     """
+    # Optional Kronos 5th-signal lookup. Failures are absorbed and the
+    # composite proceeds without Kronos (returns None signal).
+    kronos_signal: float | None = None
+    kronos_meta: dict = {}
+    if asset_cfg and asset_cfg.get("kronos", {}).get("enabled"):
+        try:
+            from lib.kalshi_kronos import kronos_signed_signal
+            kronos_signal, kronos_meta = kronos_signed_signal(
+                strike=strike,
+                horizon_bars=int(asset_cfg["kronos"].get("horizon_bars", 3)),
+                interval=asset_cfg["kronos"].get("interval", "5m"),
+                sample_count=int(asset_cfg["kronos"].get("sample_count", 10)),
+                ticker=asset_cfg["kronos"].get("ticker", "BTC-USD"),
+            )
+        except Exception:
+            kronos_signal = None
+            kronos_meta = {"reason": "kronos_unavailable"}
+
+    kronos_weight = float(
+        (asset_cfg or {}).get("kronos", {}).get("weight", 3.0)
+    )
     base = compute_indicators_for_window(
         klines=klines,
         window_open_price=strike,
@@ -232,6 +262,8 @@ def compute_kalshi_indicators(
         market_yes_price=market_yes_price,
         annual_vol=annual_vol,
         whale_pressure=whale_pressure,
+        kronos_signal=kronos_signal,
+        kronos_weight=kronos_weight,
     )
     base["strike"] = strike
     base["current_spot"] = current_spot
@@ -240,6 +272,7 @@ def compute_kalshi_indicators(
         else "NO" if base["composite"] < 0
         else "FLAT"
     )
+    base["kronos_meta"] = kronos_meta
     return base
 
 
@@ -322,6 +355,8 @@ def sample_signals_for_asset(
                 market_yes_price=market_yes,
                 annual_vol=annual_vol,
                 whale_pressure=whale_indicator_value,
+                asset=asset,
+                asset_cfg=asset_cfg,
             )
         out.append(KalshiFifteenMinSample(
             sample_at=now_iso,

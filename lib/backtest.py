@@ -786,7 +786,7 @@ def replay_forecastbench(
         llm_est = None
         if use_llm:
             try:
-                from lib.llm_analyst import analyze_market
+                from tradingcore.llm_analyst import analyze_market
                 analysis = analyze_market(
                     market_id=market.market_id,
                     question=market.question,

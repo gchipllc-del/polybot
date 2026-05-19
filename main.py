@@ -467,7 +467,7 @@ def cmd_forecast(market_id: str):
     llm_estimate = None
     if os.environ.get("ANTHROPIC_API_KEY"):
         try:
-            from lib.llm_analyst import analyze_market
+            from tradingcore.llm_analyst import analyze_market
             analysis = analyze_market(
                 market_id=market.market_id,
                 question=market.question,

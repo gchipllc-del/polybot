@@ -686,7 +686,7 @@ def build_forecast_for_market(
     llm_spread = 0.0
     if llm_enabled:
         try:
-            from lib.llm_analyst import analyze_market
+            from tradingcore.llm_analyst import analyze_market
             analysis = analyze_market(
                 market_id=market.market_id,
                 question=market.question,

@@ -239,7 +239,7 @@ def classification_to_probability(
 def _default_complete(prompt: str) -> tuple[str, str]:
     """Use the existing llm_analyst provider chain. Picks the first
     available provider in priority order. Raises on total unavailability."""
-    from lib.llm_analyst import _load_providers, _load_strategy
+    from tradingcore.llm_analyst import _load_providers, _load_strategy
     strategy = _load_strategy()
     providers = _load_providers(strategy)
     if not providers:
