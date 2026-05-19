@@ -123,7 +123,7 @@ class ComplianceAgent:
 
         # Write to diary
         try:
-            from lib.memory_palace import diary_write
+            from tradingcore.memory_palace import diary_write
             status_parts = []
             for name, check in checks.items():
                 status_parts.append(f"{name}_{'ok' if check['pass'] else 'FAIL'}")

@@ -217,7 +217,7 @@ def settle_position(
     # has already succeeded by the time we reach this block — memory palace
     # is an enhancement, not a requirement.
     try:
-        from lib.memory_palace import remember_resolution
+        from tradingcore.memory_palace import remember_resolution
         remember_resolution(
             market_id=market_id,
             platform=platform,

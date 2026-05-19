@@ -38,7 +38,7 @@ import yaml
 
 from tradingcore.audit import log_event
 from tradingcore.calibration import brier_score, source_accuracy
-from lib.memory_palace import diary_write
+from tradingcore.memory_palace import diary_write
 from lib.resolution_tracker import get_performance_summary
 
 CONFIG_PATH = Path(__file__).parent.parent / "config"

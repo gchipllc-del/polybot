@@ -29,7 +29,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from lib.memory_palace import KG_DB
+from tradingcore.memory_palace import KG_DB
 
 # Lazy imports + availability probe -- keep this module importable even when
 # deps are missing so callers can branch cleanly.

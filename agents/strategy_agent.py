@@ -82,7 +82,7 @@ class StrategyAgent:
 
         # Write to diary (memory palace)
         try:
-            from lib.memory_palace import diary_write
+            from tradingcore.memory_palace import diary_write
             diary_write(
                 self.name,
                 f"PROPOSE|{market.platform}|{market.market_id}|"

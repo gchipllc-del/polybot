@@ -216,7 +216,7 @@ class RiskAgent:
 
         # Write to diary
         try:
-            from lib.memory_palace import diary_write
+            from tradingcore.memory_palace import diary_write
             diary_write(
                 self.name,
                 f"{'APPROVE' if approved else 'VETO'}|{platform}|{market_id}|"

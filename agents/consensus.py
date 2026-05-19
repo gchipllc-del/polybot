@@ -70,7 +70,7 @@ def seek_consensus(
 
         # Write to diary
         try:
-            from lib.memory_palace import diary_write
+            from tradingcore.memory_palace import diary_write
             diary_write("consensus",
                 f"VETOED|{platform}|{market_id}|by_risk|{risk_review['reason'][:80]}")
         except ImportError:
@@ -97,7 +97,7 @@ def seek_consensus(
         })
 
         try:
-            from lib.memory_palace import diary_write
+            from tradingcore.memory_palace import diary_write
             diary_write("consensus",
                 f"BLOCKED|{platform}|{market_id}|by_compliance|{compliance_review['reason'][:80]}")
         except ImportError:
@@ -124,7 +124,7 @@ def seek_consensus(
     }, result="success")
 
     try:
-        from lib.memory_palace import diary_write
+        from tradingcore.memory_palace import diary_write
         diary_write("consensus",
             f"APPROVED|{platform}|{market_id}|"
             f"{proposal.get('side')}|edge_{proposal.get('edge', 0):+.2%}|"
