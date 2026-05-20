@@ -25,6 +25,15 @@ import yaml
 
 from tradingcore.audit import log_event
 from lib.base_rates import get_base_rate
+from tradingcore.bayesian import (
+    aggregate_samples,
+    bayesian_update,
+    geomean_log_odds,
+    inv_logit,
+    logit,
+    trimmed_mean_weighted,
+    weighted_blend,
+)
 from tradingcore.calibration import brier_score, source_accuracy
 from tradingcore.kelly import expected_value, fractional_kelly, min_edge_for_trade
 from lib.market_client import MarketInfo
@@ -65,221 +74,11 @@ class ForecastResult:
 
 
 # ── Bayesian Math ─────────────────────────────────────────────────
-
-import math
-
-
-def bayesian_update(prior: float, source_estimate: float, base_rate: float = 0.5) -> float:
-    """
-    Update a prior probability given an independent source's estimate, using
-    the odds-ratio form of Bayes' theorem.
-
-        posterior_odds = prior_odds × likelihood_ratio
-
-    where `likelihood_ratio = odds(source_estimate) / odds(base_rate)`.
-
-    Intuition:
-        - If the source agrees with the base rate, no update (LR=1).
-        - If the source says 80% when base is 50%, LR = (4/1) / (1/1) = 4:
-          prior odds multiply by 4.
-        - Symmetric: if a second source agrees with the first, the effect
-          compounds multiplicatively — correct for independent evidence.
-
-    This replaces an earlier pseudo-Bayesian form that treated the source
-    estimate directly as P(E|H), which systematically under-updated.
-
-    Args:
-        prior: Current probability estimate (0.0 - 1.0)
-        source_estimate: Independent source's estimate of P(H) (0.0 - 1.0)
-        base_rate: Unconditional prior for the hypothesis (0.0 - 1.0)
-
-    Returns:
-        Updated probability (0.0 - 1.0), clamped to [0.01, 0.99].
-    """
-    prior = max(0.01, min(prior, 0.99))
-    source_estimate = max(0.01, min(source_estimate, 0.99))
-    base_rate = max(0.01, min(base_rate, 0.99))
-
-    prior_odds = prior / (1.0 - prior)
-    source_odds = source_estimate / (1.0 - source_estimate)
-    base_odds = base_rate / (1.0 - base_rate)
-
-    likelihood_ratio = source_odds / base_odds
-    # Dampen extreme likelihood ratios so a single 99%→base-50% source can't
-    # overwhelm multiple moderate signals. Caps effective update at ~20:1.
-    likelihood_ratio = max(0.05, min(likelihood_ratio, 20.0))
-
-    posterior_odds = prior_odds * likelihood_ratio
-    posterior = posterior_odds / (1.0 + posterior_odds)
-
-    return max(0.01, min(posterior, 0.99))
-
-
-def logit(p: float) -> float:
-    """Log-odds of a probability. Useful for geomean-of-log-odds aggregation."""
-    p = max(1e-6, min(p, 1 - 1e-6))
-    return math.log(p / (1.0 - p))
-
-
-def inv_logit(x: float) -> float:
-    """Inverse log-odds (sigmoid), converting back to probability."""
-    if x > 500:  # avoid overflow
-        return 1.0 - 1e-6
-    if x < -500:
-        return 1e-6
-    return 1.0 / (1.0 + math.exp(-x))
-
-
-def geomean_log_odds(estimates: dict[str, float], weights: dict[str, float]) -> float:
-    """
-    Aggregate probability estimates using the geometric mean of log-odds.
-
-    This is the aggregator used in ForecastBench (Halawi 2024, NeurIPS) —
-    well-behaved at extremes (unlike arithmetic mean, which is pulled toward
-    0.5), invariant under YES/NO flip, and mathematically equivalent to the
-    log-odds-average. The weighted form weights evidence by trust.
-
-    Args:
-        estimates: {"llm": 0.65, "metaculus": 0.58, ...}
-        weights:   {"llm": 0.30, "metaculus": 0.25, ...}
-
-    Returns:
-        Aggregated probability (0.01 - 0.99).
-    """
-    active = {k: v for k, v in estimates.items() if k in weights and weights[k] > 0}
-    if not active:
-        return 0.50
-
-    total_w = sum(weights[k] for k in active)
-    if total_w <= 0:
-        return 0.50
-
-    log_odds_sum = sum(logit(estimates[k]) * (weights[k] / total_w) for k in active)
-    return max(0.01, min(inv_logit(log_odds_sum), 0.99))
-
-
-def trimmed_mean_weighted(
-    estimates: dict[str, float],
-    weights: dict[str, float],
-    trim: int = 1,
-) -> float:
-    """
-    Trim the highest `trim` and lowest `trim` samples by value, then
-    weighted mean of the remaining ones (renormalized weights).
-
-    Wave B aggregation per Halawi et al. 2024 NeurIPS "Approaching
-    Human-Level Forecasting with Language Models", which compared 5
-    aggregators across N≥6 samples and found trimmed mean optimal.
-
-    Falls back to a plain weighted mean when len(samples) ≤ 2×trim
-    (not enough samples to trim safely). Callers should usually use
-    the `aggregate_samples` dispatcher so small ensembles route to
-    weighted geomean instead of degrading here.
-
-    Args:
-        estimates: {"s0": 0.65, "s1": 0.58, ...}
-        weights:   {"s0": 1.0,  "s1": 1.0,  ...} (renormalized inside)
-        trim: Count to drop from each tail. Default 1 = drop top-1 + bot-1.
-
-    Returns:
-        Aggregated probability (0.01 - 0.99).
-    """
-    active = {k: v for k, v in estimates.items() if k in weights}
-    if not active:
-        return 0.50
-
-    n = len(active)
-    if n <= 2 * trim:
-        # Not enough samples to trim — fall back to plain weighted mean.
-        total_w = sum(weights[k] for k in active)
-        if total_w <= 0:
-            return 0.50
-        return max(0.01, min(
-            sum(active[k] * weights[k] / total_w for k in active),
-            0.99,
-        ))
-
-    pairs = sorted(
-        ((active[k], weights[k]) for k in active),
-        key=lambda pw: pw[0],
-    )
-    middle = pairs[trim:-trim]
-    total_w = sum(w for _, w in middle)
-    if total_w <= 0:
-        # All-zero weights in the middle band — degenerate, return median.
-        mid = middle[len(middle) // 2][0]
-        return max(0.01, min(mid, 0.99))
-
-    blended = sum(p * w / total_w for p, w in middle)
-    return max(0.01, min(blended, 0.99))
-
-
-def aggregate_samples(
-    estimates: dict[str, float],
-    weights: dict[str, float],
-    method: str = "auto",
-    trim: int = 1,
-) -> float:
-    """
-    Single dispatch for ensemble aggregation. Use this from anywhere
-    that combines N independent probability samples.
-
-    Methods:
-      "auto"             — trimmed_mean if N ≥ 5, else weighted_geomean
-                           (preserves backward compatibility for the
-                           default 3-provider × 1-sample setup)
-      "weighted_geomean" — log-odds-weighted geomean (legacy default)
-      "trimmed_mean"     — drop top + bottom `trim`, weighted mean of rest
-      "median"           — middle sample by value (weights ignored)
-      "mean"             — plain unweighted mean
-
-    Returns:
-        Aggregated probability (0.01 - 0.99).
-    """
-    n = len(estimates)
-    if n == 0:
-        return 0.50
-
-    if method == "auto":
-        method = "trimmed_mean" if n >= 5 else "weighted_geomean"
-
-    if method == "weighted_geomean":
-        return geomean_log_odds(estimates, weights)
-    if method == "trimmed_mean":
-        return trimmed_mean_weighted(estimates, weights, trim=trim)
-    if method == "median":
-        vals = sorted(estimates.values())
-        mid = vals[len(vals) // 2]
-        return max(0.01, min(mid, 0.99))
-    if method == "mean":
-        return max(0.01, min(sum(estimates.values()) / n, 0.99))
-
-    raise ValueError(f"unknown aggregation method: {method!r}")
-
-
-def weighted_blend(estimates: dict[str, float], weights: dict[str, float]) -> float:
-    """
-    Weighted average of probability estimates from multiple sources.
-
-    Normalizes weights so they sum to 1.0 (handles missing sources gracefully).
-
-    Args:
-        estimates: {"llm": 0.65, "base_rate": 0.50, ...}
-        weights: {"llm": 0.30, "base_rate": 0.25, ...}
-
-    Returns:
-        Blended probability (0.01 - 0.99).
-    """
-    active = {k: v for k, v in estimates.items() if k in weights}
-    if not active:
-        return 0.50
-
-    total_weight = sum(weights[k] for k in active)
-    if total_weight <= 0:
-        return 0.50
-
-    blended = sum(estimates[k] * weights[k] / total_weight for k in active)
-    return max(0.01, min(blended, 0.99))
+#
+# The math primitives (bayesian_update, logit/inv_logit, geomean_log_odds,
+# trimmed_mean_weighted, aggregate_samples, weighted_blend) live in
+# tradingcore.bayesian — they're pure math with no prediction-market
+# coupling and are imported at the top of this file.
 
 
 # ── Scoring ───────────────────────────────────────────────────────
