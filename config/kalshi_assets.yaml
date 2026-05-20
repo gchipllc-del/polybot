@@ -50,18 +50,21 @@ assets:
     #   • horizon (5m × 3 = 15min) matches Kalshi's resolution window
     #   • ~6-10s/call is fine at 60s scanner cadence with 5-min cache
     # Disable via enabled=false if Kronos weights aren't downloaded.
+    # 2026-05-19 PM: DISABLED Kronos. Empirical: across last 50
+    # signal samples, kronos contribution was 0.000 average AND
+    # 0.000 max — the small model + N=5 + 15-min horizon produces
+    # p_yes ≈ 0.50 every time (no opinion). It adds 3.0 weight to
+    # max_possible without contributing any composite, dragging
+    # confidence ratios down by ~16%. Re-enable when we have
+    # capacity to run base model + N=10 (slower but maybe useful).
     kronos:
-      enabled: true
-      horizon_bars: 3       # 3 × 5min = 15min (matches Kalshi window)
-      interval: "5m"        # 5m bars feed Kronos (less noise than 1m)
-      sample_count: 5       # was 10 — Kalshi binary questions converge at N=5 (~50% time saved)
-      weight: 3.0           # composite weight (max becomes 15.0 vs base 12.0)
-      ticker: "BTC-USD"     # Kronos ticker symbol
-      model_size: "small"   # was "base" — 24.7M vs 102.3M params, ~4× faster
-                            # on CPU at ~10-15% accuracy degradation.
-                            # For 15-min binary forecasts this is the right
-                            # trade. Bump to "base" once a 30-day backtest
-                            # shows real wins from the larger model.
+      enabled: false        # contributing nothing — see note above
+      horizon_bars: 3
+      interval: "5m"
+      sample_count: 5
+      weight: 3.0
+      ticker: "BTC-USD"
+      model_size: "small"
     # Order-flow imbalance from Binance.US top-N book. Signed [-1, +1]
     # microstructure signal — orthogonal to the four base indicators
     # (none see the resting limit book). Lighter weight than Kronos
@@ -75,9 +78,15 @@ assets:
     # REVERSAL signal: high funding (long bias) → bearish; negative →
     # bullish. Updates every 8h so cached aggressively. Lighter weight
     # than the others because it's slow-moving and mainly a "watch out"
-    # signal rather than a primary call. Max composite becomes 18.5.
+    # signal rather than a primary call.
+    # 2026-05-19 PM: DISABLED. BTC funding has been ~+0.005%/8h
+    # (~+5.4%/yr annualized) — sits inside the neutral zone of our
+    # ±0.01% mild threshold. Across last 50 samples: 0.000 contribution
+    # every time. Was dragging confidence ratios down by ~8%. Re-enable
+    # with looser thresholds (~±0.005% mild) if we want a slow-moving
+    # secondary signal again.
     funding_rate:
-      enabled: true
+      enabled: false
       symbol: "BTCUSDT"
       weight: 1.5
 
