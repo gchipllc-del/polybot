@@ -31,15 +31,16 @@ assets:
     #   2026-05-19 AM: 0.65 → 0.70 (chasing the 0.70-0.80 edge cohort)
     #   2026-05-19 mid: 0.70 → 0.55 — 0 trades in 19h (still too tight)
     #   2026-05-19 PM: 0.55 → 0.40 — analyzed 858 signals over 18h:
-    #     conf >= 0.55 + fill <= 0.45: 0 signals (too restrictive)
-    #     conf >= 0.40 + fill <= 0.45: 11 signals (~14 trades/day)
-    #     conf >= 0.40 + fill <= 0.50: 19 signals (~25 trades/day)
-    #     The fill <= 0.45 R:R gate is doing all the heavy lifting
-    #     now — it guarantees wins > losses by entry math. Confidence
-    #     threshold just needs to be high enough to weed out random
-    #     direction. 0.40 = ~10× the no-signal baseline of 0.04, so
-    #     any directional bot opinion clears it.
-    min_confidence: 0.40
+    #     conf >= 0.40 + fill <= 0.45: 11 signals (~14 trades/day) projected
+    #   2026-05-20 PM: 0.40 → 0.35 — 0 trades fired in 48 hours at 0.40.
+    #     After dead signals (kronos+funding) disabled, max_possible
+    #     dropped to 15.0. With rsi weight bumped to 3.0, the active
+    #     base composite can still reach max ~14, but realistic
+    #     contradicting-indicator readings cap composite around 5-6.
+    #     0.40 × 15 = 6 composite needed — almost never hit. 0.35 ×
+    #     15 = 5.25 → small but real population of trades clears it.
+    #     R:R gate (fill ≤ 0.45) still doing the structural protection.
+    min_confidence: 0.35
     enabled: true
     # Kronos foundation-model 5th signal. Adds P(close > strike) from
     # Monte Carlo path simulation as an orthogonal vote on top of the
