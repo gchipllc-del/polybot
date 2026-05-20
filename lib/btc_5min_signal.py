@@ -369,10 +369,16 @@ def compute_indicators_for_window(
     contribs: dict[str, float] = {}
 
     # RSI: 30→+1.0 oversold (bullish), 70→-1.0 overbought (bearish).
-    # Weight bumped from 1.5 → 2.0 since this is now one of only three.
+    # Weight 1.5 → 2.0 → 3.0 (2026-05-20 PM).
+    # Per-indicator WR/PnL analysis on 56 historical trades:
+    #   RSI oversold (-2.1, -1.0) on YES: n=11, 90.9% WR, +$7.55
+    # → the most predictive single indicator in the composite. Bumping
+    # weight 2.0 → 3.0 so its conviction translates more directly into
+    # composite when it's strongly oversold/overbought. max_possible
+    # now becomes 15.0 (was 14.0) for the 5 active indicators.
     if rsi is not None:
         rsi_norm = (50.0 - rsi) / 20.0
-        contribs["rsi"] = max(-1.0, min(1.0, rsi_norm)) * 2.0
+        contribs["rsi"] = max(-1.0, min(1.0, rsi_norm)) * 3.0
     else:
         contribs["rsi"] = 0.0
 
@@ -437,7 +443,7 @@ def compute_indicators_for_window(
         contribs["funding"] = 0.0
 
     composite = sum(contribs.values())
-    base_max = 2.0 + 4.0 + 3.0 + 3.0  # the original four indicators = 12.0
+    base_max = 3.0 + 4.0 + 3.0 + 3.0  # rsi+theo+market+whale = 13.0 (rsi bumped 2.0→3.0)
     max_possible = (
         base_max
         + (float(kronos_weight) if has_kronos else 0.0)
