@@ -24,7 +24,7 @@ from pathlib import Path
 import yaml
 
 from tradingcore.audit import log_event
-from lib.base_rates import get_base_rate
+from tradingcore.base_rates import get_base_rate
 from tradingcore.bayesian import (
     aggregate_samples,
     bayesian_update,
