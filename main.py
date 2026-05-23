@@ -76,17 +76,13 @@ def _load_strategy() -> dict:
 
 
 def _load_positions() -> list[dict]:
-    pos_file = DATA_DIR / "positions.json"
-    if pos_file.exists():
-        with open(pos_file, "r") as f:
-            return json.load(f)
-    return []
+    from lib.positions_store import load_positions
+    return load_positions()
 
 
 def _save_positions(positions: list[dict]):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(DATA_DIR / "positions.json", "w") as f:
-        json.dump(positions, f, indent=2)
+    from lib.positions_store import save_positions
+    save_positions(positions)
 
 
 def cmd_scan():
@@ -140,15 +136,35 @@ def cmd_scan():
 
 
 def _get_bankroll(clients) -> float:
-    """Pull real bankroll from all active platform clients."""
+    """Pull real bankroll from all active platform clients.
+
+    Each platform fetch is fault-tolerant — a single failure shouldn't
+    halt trading on the others — but failures are audit-logged so a
+    silently broken broker connection is visible. The $50 fallback was
+    masking total-failure cases where the bot then sized trades against
+    a phantom balance.
+    """
     bankroll = 0.0
+    failures = 0
     for client in clients:
+        platform = getattr(client, "platform_name", "unknown")
         try:
             bal = client.get_balance()
             if bal > 0:
                 bankroll += bal
-        except Exception:
-            pass
+        except Exception as e:
+            failures += 1
+            from lib.audit import log_event
+            log_event("main", "balance_fetch_failed",
+                      {"platform": platform, "error": str(e)[:200]},
+                      result="degraded")
+    if bankroll <= 0 and failures > 0:
+        # All fetches failed — surface this rather than trading on a
+        # $50 phantom. Caller decides whether to halt or fall through.
+        from lib.audit import log_event
+        log_event("main", "bankroll_unavailable",
+                  {"failures": failures, "client_count": len(clients)},
+                  result="degraded")
     return bankroll if bankroll > 0 else 50.0
 
 
@@ -281,9 +297,22 @@ def cmd_trade(dry_run: bool = False, skip_harvester: bool = False):
         side = proposal["side"]
         price = market.yes_price if side == "YES" else (1 - market.yes_price)
 
-        # Calculate quantity from Kelly bet size
-        # quantity = kelly_bet_usd / price (number of contracts at this price)
-        quantity = max(1, int(candidate.kelly_bet_usd / price)) if price > 0 else 1
+        # Extreme-price guard. On a high-confidence YES market (yes_price≈0.99)
+        # a NO bet would have price≈0.01, and kelly_bet_usd / 0.01 inflates the
+        # position 100× the intended dollar exposure. Reject anything below the
+        # floor outright — at that point the edge isn't worth the slippage.
+        MIN_EXEC_PRICE = 0.05
+        if price < MIN_EXEC_PRICE:
+            log_event("trade_cycle", "extreme_price_skipped", {
+                "market_id": market.market_id,
+                "side": side,
+                "price": round(price, 4),
+                "min_price": MIN_EXEC_PRICE,
+            }, result="skipped")
+            vetoed += 1
+            continue
+
+        quantity = max(1, int(candidate.kelly_bet_usd / price))
 
         intent = OrderIntent(
             market_id=market.market_id,
@@ -366,8 +395,13 @@ def cmd_trade(dry_run: bool = False, skip_harvester: bool = False):
                 "opened_at": datetime.now(timezone.utc).isoformat(),
                 "unrealized_pnl": 0.0,
             }
-            positions.append(position)
-            _save_positions(positions)
+            # Atomic append: another process (monitor) may be writing
+            # positions concurrently. mutate() loads → appends → saves
+            # under a single file lock so neither side loses the other's
+            # update. We also keep the in-memory `positions` in sync so
+            # the loop's running counts stay accurate.
+            from lib.positions_store import mutate
+            positions = mutate(lambda ps: ps + [position])
 
             # Also append to trade history
             _append_trade_history({
@@ -637,6 +671,66 @@ def cmd_hermes(dry_run: bool = False):
 
     result = run_optimization(lookback_days=lookback, dry_run=dry_run)
     print_optimization_report(result)
+
+
+def cmd_goals():
+    """Display unified cross-bot goal tracker (polybot + traderbot)."""
+    try:
+        from tradingcore.unified_goals import (
+            load_goals, get_progress, init_default_goals,
+            update_current_equity, GOALS_PATH,
+        )
+    except ImportError as e:
+        print(f"[goals] tradingcore.unified_goals unavailable: {e}")
+        return
+
+    if not GOALS_PATH.exists():
+        print(f"[goals] No goals file at {GOALS_PATH} — initializing.")
+        init_default_goals()
+
+    # Refresh from baseline_equity.json (lightweight — no platform-client load)
+    try:
+        import json
+        from pathlib import Path
+        baseline = Path(__file__).resolve().parent / "data" / "baseline_equity.json"
+        if baseline.exists():
+            with open(baseline) as f:
+                bd = json.load(f)
+            eq = float(bd.get("baseline_equity") or bd.get("start_baseline") or 0.0)
+            if eq > 0:
+                update_current_equity("polybot", eq)
+    except Exception:
+        pass
+
+    data = load_goals()
+    tb = get_progress("traderbot")
+    pb = get_progress("polybot")
+
+    def _row(label: str, val: str) -> str:
+        return f"  {label:<24} {val}"
+
+    def _halt_badge(state: str) -> str:
+        return "[HALTED]" if state == "halted" else "[ ok   ]"
+
+    print("=" * 70)
+    print(f"UNIFIED GOALS — {data.get('updated_at', 'n/a')}")
+    print(f"File: {GOALS_PATH}")
+    print("=" * 70)
+    for bot, prog in (("traderbot", tb), ("polybot", pb)):
+        print()
+        print(f"{bot.upper():<12}  {_halt_badge(prog['halt_state'])}  "
+              f"${prog['current']:.2f}  (anchor ${prog['anchor']:.2f} → target ${prog['target']:.2f})")
+        print(_row("growth from anchor", f"{prog['pct_growth_from_anchor']:+.2f}%"))
+        print(_row("progress to target", f"{prog['pct_to_target']:.2f}%"))
+        if prog["halt_reason"]:
+            print(_row("halt reason", prog["halt_reason"]))
+            print(_row("halted at", prog["halted_at"] or "?"))
+        ms_line = "  ".join(
+            f"${m['value']}{'✓' if m['hit_at'] else '·'}"
+            for m in prog["milestones"]
+        )
+        print(_row("milestones", ms_line))
+    print()
 
 
 def cmd_backtest(monte_carlo_mode: bool = False, paths: int = 1000, trades: int = 500):
@@ -1740,6 +1834,67 @@ def main():
         cmd_btc_arb_paper_settle()
     elif command == "btc-arb-paper-report":
         cmd_btc_arb_paper_report()
+    elif command == "goals":
+        cmd_goals()
+    elif command == "kalshi-graduation":
+        from lib.kalshi_graduation import evaluate as _kg_eval, render as _kg_render
+        result = _kg_eval()
+        print(_kg_render(result))
+    elif command == "kalshi-calibration-diag":
+        from lib.kalshi_calibration_diag import diagnose, render as _kd_render
+        print(_kd_render(diagnose()))
+    elif command == "kalshi-edge-scan":
+        from lib.kalshi_edge_scan import scan, render as _ke_render
+        print(_ke_render(scan()))
+    elif command == "kalshi-hermes-cycle":
+        from lib.hermes_kalshi import run_cycle, render_cycle
+        force = "live" if "--live" in sys.argv else (
+            "review" if "--review" in sys.argv else None
+        )
+        print(render_cycle(run_cycle(force_mode=force)))
+    elif command == "kalshi-hermes-mode":
+        from lib.hermes_kalshi import get_mode, set_mode
+        if len(sys.argv) > 2 and sys.argv[-1] in ("review", "live"):
+            set_mode(sys.argv[-1])
+            print(f"kalshi_hermes_mode set → {sys.argv[-1]}")
+        else:
+            print(f"kalshi_hermes_mode = {get_mode()}  "
+                  "(set with `python main.py kalshi-hermes-mode review|live`)")
+    elif command == "kalshi-hermes-ledger":
+        from tradingcore.hermes_ledger import history, stats
+        from lib.hermes_kalshi import LEDGER_PATH
+        s = stats(ledger_path=LEDGER_PATH)
+        c = s.get("counts", {})
+        print(f"Kalshi experiments — total {s.get('total', 0)}, "
+              f"keep_rate {s.get('keep_rate') if s.get('keep_rate') is not None else 'n/a'}")
+        print(f"  open={c.get('open', 0)} kept={c.get('kept', 0)} "
+              f"rolled_back={c.get('rolled_back', 0)} expired={c.get('expired', 0)}")
+        print()
+        for e in history(limit=15, ledger_path=LEDGER_PATH):
+            when = (e.get("opened_at") or "")[:19].replace("T", " ")
+            print(f"  {when}  {e.get('status'):<12} "
+                  f"{e.get('param'):<28} "
+                  f"{e.get('old_value')} → {e.get('new_value')}  "
+                  f"verdict={e.get('verdict')}")
+    elif command == "kalshi-goal-score":
+        from lib.hermes_kalshi import compute_kalshi_goal_metrics
+        m = compute_kalshi_goal_metrics()
+        import json as _j
+        print(_j.dumps(m, indent=2, default=str))
+    elif command == "kalshi-signal-replay":
+        from lib.kalshi_signal_replay import (
+            replay, render as _kr_render, save_snapshot as _kr_save,
+        )
+        asset = "btc"
+        min_conf = 0.25  # match new BTC default
+        for arg in sys.argv[1:]:
+            if arg.startswith("--asset="):
+                asset = arg.split("=", 1)[1]
+            elif arg.startswith("--min-conf="):
+                min_conf = float(arg.split("=", 1)[1])
+        result = replay(asset=asset, min_conf=min_conf)
+        print(_kr_render(result))
+        _kr_save(result)
     else:
         print(f"Unknown command: {command}")
         print(__doc__)

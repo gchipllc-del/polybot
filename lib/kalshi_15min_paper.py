@@ -157,6 +157,40 @@ DEFAULT_MAX_TRADE_USD = 5.0          # 2026-05-20: cut 25→5. The ONE
                                      # stops being the worst performer.
 
 
+# 2026-05-23: Kalshi-Hermes overlay. Hermes writes tuning values into
+# config/kalshi_strategy.yaml; this module reads them at module load so
+# the next signal cycle picks up the change without a code edit. Missing
+# YAML or missing keys fall back to the module-level constants above.
+def _apply_hermes_overrides():
+    """Override the relevant module-level constants from kalshi_strategy.yaml."""
+    import yaml
+    from pathlib import Path as _Path
+    strat_path = _Path(__file__).resolve().parent.parent / "config" / "kalshi_strategy.yaml"
+    if not strat_path.exists():
+        return
+    try:
+        with open(strat_path) as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return
+    globs = globals()
+    mapping = {
+        "contrarian_flip_threshold":  "CONTRARIAN_FLIP_THRESHOLD",
+        "default_min_seconds_to_close": "DEFAULT_MIN_SECONDS_TO_CLOSE",
+        "max_fill_for_buy":           "MAX_FILL_FOR_BUY",
+        "default_max_trade_usd":      "DEFAULT_MAX_TRADE_USD",
+    }
+    for yaml_key, const_name in mapping.items():
+        if yaml_key in data:
+            try:
+                globs[const_name] = float(data[yaml_key])
+            except (TypeError, ValueError):
+                pass
+
+
+_apply_hermes_overrides()
+
+
 def confidence_to_winprob(confidence: float) -> float:
     """Map composite-signal confidence (0..1) to estimated win prob.
 
