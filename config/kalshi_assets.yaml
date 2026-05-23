@@ -40,7 +40,20 @@ assets:
     #     0.40 × 15 = 6 composite needed — almost never hit. 0.35 ×
     #     15 = 5.25 → small but real population of trades clears it.
     #     R:R gate (fill ≤ 0.45) still doing the structural protection.
-    min_confidence: 0.35
+    #   2026-05-20 EOD: 0.35 → 0.25 — signal_replay across 6 days of
+    #     historical data with new config (max $5 / composite<8 /
+    #     min_secs 120) shows: 0.25 conf → 34 trades, 65% WR, +250% ROI
+    #     net of estimated 7% Kalshi profit fee. Picks up 4x more trades
+    #     than 0.35 while keeping ROI positive. Path to 200 paper trades
+    #     shrinks from ~110 days to ~35 days.
+    #   2026-05-23: 0.25 → 0.30 — first 4 live trades at conf in
+    #     [0.28, 0.53] went 0-for-4 (all directionally wrong vs the
+    #     Kalshi-confirmed resolutions). 2 of 4 had conf below the prior
+    #     0.35 threshold — quality dropped below the throughput gain.
+    #     Splitting the difference at 0.30 to keep most of the new-trade
+    #     pickup while filtering the weakest cohort. Re-evaluate after
+    #     20 more trades.
+    min_confidence: 0.30
     enabled: true
     # Kronos foundation-model 5th signal. Adds P(close > strike) from
     # Monte Carlo path simulation as an orthogonal vote on top of the
@@ -91,32 +104,49 @@ assets:
       symbol: "BTCUSDT"
       weight: 1.5
 
+  # ─── ALL NON-BTC ASSETS DISABLED 2026-05-21 EVENING ────────────────
+  # Reason: 60-trade audit showed BTC has real edge (43 trades, 77% WR,
+  # +$4.31 net) while ETH and SOL bleed (8 trades each, 25% WR, -$24
+  # and -$28 respectively). The composite formula + indicator weights
+  # were implicitly tuned for BTC microstructure; other assets show
+  # systematic miscalibration. Re-enable each individually only after:
+  #
+  #   1. Backtest harness replays ≥30 days of the asset's historical
+  #      quotes + spot bars through the current gate logic. Net P&L
+  #      must be positive after a 7% Kalshi profit fee.
+  #   2. EITHER (a) tune asset-specific gate thresholds (min_confidence,
+  #      MIN_SPOT_STRIKE_GAP_PCT, MAX_FILL_FOR_BUY) so the replay clears
+  #      the bar, OR (b) confirm the asset already does without tuning.
+  #   3. Then re-enable here with a target of 20+ paper trades to
+  #      validate the backtest's predictions before any live exposure.
+  #
+  # Until then: BTC alone runs. Frequency is lower but edge is real.
+
   eth:
     series: KXETH15M
     binance_symbol: ETHUSDT
     annual_vol: 0.65
-    min_confidence: 0.45      # ETH spreads ~2x wider than BTC on Kalshi
-    enabled: false            # disabled 2026-05-15 — ETH was 3W/5L=38%
-                              # in initial sample. Re-enable after BTC
-                              # alone proves consistent.
+    min_confidence: 0.45
+    # 2026-05-21 PM: paused — pre-fix-era data showed 25% WR / -$24 P&L
+    # over 8 trades. Need backtest-validated retune before re-enable.
+    enabled: false
 
   sol:
     series: KXSOL15M
     binance_symbol: SOLUSDT
     annual_vol: 0.85
-    min_confidence: 0.50      # thinnest of the three — most conservative
-    enabled: false            # disabled 2026-05-15 — SOL was 3W/5L=38%
-                              # and has thinnest liquidity. Re-enable
-                              # after BTC alone proves consistent.
-
-  # Below: confirmed-available but not enabled by default.
-  # Flip ``enabled: true`` once the first three prove out.
+    min_confidence: 0.50
+    # 2026-05-21 PM: paused — 25% WR / -$28 P&L over 8 trades.
+    enabled: false
 
   ada:
     series: KXADA15M
     binance_symbol: ADAUSDT
     annual_vol: 0.85
     min_confidence: 0.55
+    # 2026-05-21 PM: paused — never produced a trade (no live markets
+    # observed). Re-enable when Kalshi starts issuing ADA 15-min markets
+    # AND we have asset-specific gate validation.
     enabled: false
 
   xrp:
@@ -124,11 +154,15 @@ assets:
     binance_symbol: XRPUSDT
     annual_vol: 0.85
     min_confidence: 0.55
+    # 2026-05-21 PM: paused — no asset-specific validation yet.
     enabled: false
 
   doge:
     series: KXDOGE15M
     binance_symbol: DOGEUSDT
-    annual_vol: 1.20          # DOGE is wildly volatile — 100%+ annualized
+    annual_vol: 1.20
     min_confidence: 0.60
+    # 2026-05-21 PM: paused — no asset-specific validation yet. DOGE's
+    # 100%+ annualized vol means the BSM model assumptions need their
+    # own re-derivation; can't reuse BTC tuning.
     enabled: false

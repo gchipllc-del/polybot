@@ -34,7 +34,15 @@ DEFAULT_RISK_PER_TRADE = 0.005          # 0.5% — half the 5-min default
 DEFAULT_MIN_CONFIDENCE = 0.35           # slightly higher bar; Kalshi WIN
                                         # pays only 0.93x post-fee
 DEFAULT_MAX_SECONDS_TO_CLOSE = 300.0    # 5 min — last third of the 15-min window
-DEFAULT_MIN_SECONDS_TO_CLOSE = 30.0     # don't enter under 30s — slippage zone
+DEFAULT_MIN_SECONDS_TO_CLOSE = 180.0    # 2026-05-23: raised 120→180. 62-trade
+                                        # bucketed WR on BTC:
+                                        #   0-60s   n=2  WR=100% (+$4.68)
+                                        #   60-120s n=1  WR=0%   (-$5)
+                                        #   120-180s n=6 WR=50%  (-$24.02)  ← noise zone
+                                        #   180-300s n=36 WR=78% (+$24.55)  ← sweet spot
+                                        # The 120-180s window costs more than
+                                        # the 0-60s edge case earns. Cut the
+                                        # noise zone to lift average WR.
 
 # Intra-window exit thresholds. When our side's price spikes above
 # this, sell to lock the gain rather than ride out reversion. When it
@@ -69,7 +77,16 @@ INTRA_WINDOW_STOP_LOSS = 0.15
 # disguised asymmetry.
 INTRA_WINDOW_TP_DELTA = 0.20       # take profit when our_side moves +0.20 from fill
 INTRA_WINDOW_SL_DELTA = 0.20       # stop loss when our_side moves -0.20 from fill
-INTRA_WINDOW_PRICE_FLOOR = 0.05    # never let SL go below this (Kalshi quote floor)
+# 2026-05-21: bumped 0.05 → 0.10. The old 0.05 floor (the Kalshi quote
+# minimum) meant a cheap-fill trade like fill=0.23 had SL = max(0.05,
+# 0.03) = 0.05 — losing $0.18/share, basically the whole stake on a
+# bad tick. Floor at 0.10 caps single-trade loss while keeping the SL
+# tight enough for the R:R discipline to mean anything. For fill=0.23:
+#   was: loss/share = -0.18  (78% of stake)
+#   now: loss/share = -0.13  (57% of stake)
+# Big-edge trades (fill≤0.20) are now flat-capped — beyond the asset's
+# Kalshi noise floor, the position can't bleed further.
+INTRA_WINDOW_PRICE_FLOOR = 0.10
 INTRA_WINDOW_PRICE_CEIL = 0.95     # never let TP go above this
 
 # 2026-05-19: R:R discipline. The fill price in a binary market IS the
@@ -84,6 +101,24 @@ INTRA_WINDOW_PRICE_CEIL = 0.95     # never let TP go above this
 # (more trades) per asset; this is the single biggest knob for
 # making "wins like the losses were."
 MAX_FILL_FOR_BUY = 0.45
+
+# 2026-05-22: when the composite is weak (low conviction) AND our primary
+# side is too expensive to clear MAX_FILL_FOR_BUY, allow flipping to the
+# OPPOSITE side if the market prices that side cheaply.
+#
+# Semantics: threshold is the UPPER BOUND on |composite_centered| for flip eligibility.
+#   threshold=2 → flips fire only when |comp| < 2 (strictest, fewest flips)
+#   threshold=3 → broader weak band, more flips eligible
+#   threshold=0 → contrarian flips DISABLED entirely
+#
+# 2026-05-23: 2.0 → 1.0. The first contrarian flip in production
+# (KXBTC15M-26MAY230415-15) had raw composite +5.38 (strong bullish)
+# but centered composite landed in (-2, +2), so the flip fired and the
+# bot bet NO at fill 0.41. Market resolved YES — the raw composite was
+# right, the centering+flip was wrong. Tightening to 1.0 keeps the
+# flip available for truly opinionless states (centered ≈ 0) without
+# overriding signals where there's a real directional view.
+CONTRARIAN_FLIP_THRESHOLD = 1.0
 
 # 2026-05-19: Let winners ride. The intra-window TP at fill+0.20 was
 # locking in 20-cent moves and leaving 50+ cents of potential payout
@@ -111,9 +146,15 @@ DISABLE_INTRA_WINDOW_TP = True
 DEFAULT_KELLY_MULTIPLIER = 0.5       # half-Kelly
 DEFAULT_MIN_TRADE_USD = 1.0          # floor — don't fire if Kelly
                                      # rounds below this
-DEFAULT_MAX_TRADE_USD = 25.0         # cap — 2.5% of $1000 paper, or
-                                     # 50% of real $50 Kalshi balance.
-                                     # Scale this down when going live.
+DEFAULT_MAX_TRADE_USD = 5.0          # 2026-05-20: cut 25→5. The ONE
+                                     # outlier $25 trade lost -$18.64 —
+                                     # more than the cumulative BTC PnL
+                                     # of -$4.85. Without it, BTC P&L
+                                     # was +$13.79. Until calibration
+                                     # is proven on 100+ trades, equal
+                                     # $5 bets dominate Kelly here.
+                                     # Re-raise once high-Kelly cohort
+                                     # stops being the worst performer.
 
 
 def confidence_to_winprob(confidence: float) -> float:
@@ -187,6 +228,33 @@ NEUTRAL_MARKET_CEIL = 0.55
 # Spread filter: skip when yes_ask - yes_bid exceeds this. Wide
 # spreads eat any edge we think we have.
 MAX_BID_ASK_SPREAD = 0.05
+
+# 2026-05-21: per-asset minimum |spot/strike - 1| required to take a
+# trade. When spot sits essentially on the strike there's no directional
+# edge regardless of what the composite says — the today's SOL trade
+# lost because spot was at strike exactly. Per-asset thresholds scale
+# with each asset's typical 15-min move size; BTC needs a smaller gap
+# to be "off the line" than DOGE does.
+MIN_SPOT_STRIKE_GAP_PCT = {
+    "btc": 0.0005,    # 0.05%
+    "eth": 0.0010,    # 0.10%
+    "sol": 0.0015,    # 0.15%
+    "ada": 0.0020,    # 0.20%
+    "xrp": 0.0020,    # 0.20%
+    "doge": 0.0025,   # 0.25%
+}
+
+# 2026-05-21: Asset → Binance.US ticker for the multi-timeframe gate.
+# Mirrors config/kalshi_assets.yaml; duplicated here as a fast lookup so
+# we don't reload the YAML on every sample.
+_ASSET_TO_BINANCE_SYMBOL = {
+    "btc": "BTCUSDT",
+    "eth": "ETHUSDT",
+    "sol": "SOLUSDT",
+    "ada": "ADAUSDT",
+    "xrp": "XRPUSDT",
+    "doge": "DOGEUSDT",
+}
 
 
 def _asset_from_ticker(ticker: str) -> str:
@@ -339,6 +407,14 @@ def record_paper_trades_from_samples(
             skip_counts["low_confidence"] = skip_counts.get("low_confidence", 0) + 1
             continue
 
+        # 2026-05-20: |composite| >= 8 is an inverted signal.
+        # 56-trade analysis: composite 8-12 cohort had WR=17% (n=6),
+        # PnL -$37.31. The bot's "high-conviction" trades are the
+        # worst-performing across all three assets. Reject.
+        if abs(composite) >= 8.0:
+            skip_counts["composite_extreme"] = skip_counts.get("composite_extreme", 0) + 1
+            continue
+
         seconds_to_close = float(s.get("seconds_to_close", 0) or 0)
         if not (min_seconds_to_close <= seconds_to_close <= max_seconds_to_close):
             skip_counts["out_of_window"] = skip_counts.get("out_of_window", 0) + 1
@@ -364,56 +440,112 @@ def record_paper_trades_from_samples(
             skip_counts["wide_spread"] = skip_counts.get("wide_spread", 0) + 1
             continue
 
-        # Side selection
+        # ── Side selection (bidirectional with contrarian flip) ──────
+        # Primary direction comes from composite sign. But if our primary
+        # side is too expensive to give favorable R:R AND our model's
+        # conviction is weak (|composite| < CONTRARIAN_FLIP_THRESHOLD),
+        # we'll consider flipping to the OPPOSITE side when the market
+        # has it cheap. Rationale: the composite is biased structurally
+        # positive (theo_delta_gap saturates), so the bot needs a way to
+        # take NO bets when the market itself prices NO cheaply — those
+        # are the genuinely-undervalued contrarian opportunities the
+        # composite-sign rule misses.
+        no_ask_val = s.get("no_ask")
+        if no_ask_val is None and yes_ask is not None:
+            no_ask_val = round(1.0 - float(yes_ask), 4)
+
         if composite > 0:
-            side = "YES"
-            fill = yes_ask if yes_ask is not None else s.get("last_price")
-            if fill is None:
-                skip_counts["no_fill"] = skip_counts.get("no_fill", 0) + 1
-                continue
+            primary_side, primary_fill = "YES", yes_ask if yes_ask is not None else s.get("last_price")
+            opposite_side, opposite_fill = "NO", no_ask_val
         elif composite < 0:
-            side = "NO"
-            fill = s.get("no_ask")
-            if fill is None and yes_ask is not None:
-                fill = round(1.0 - float(yes_ask), 4)
-            if fill is None:
-                skip_counts["no_fill"] = skip_counts.get("no_fill", 0) + 1
-                continue
+            primary_side, primary_fill = "NO", no_ask_val
+            opposite_side, opposite_fill = "YES", yes_ask
         else:
             skip_counts["zero_composite"] = skip_counts.get("zero_composite", 0) + 1
             continue
 
-        fill = float(fill)
+        if primary_fill is None:
+            skip_counts["no_fill"] = skip_counts.get("no_fill", 0) + 1
+            continue
+        primary_fill = float(primary_fill)
+        opposite_fill_f = float(opposite_fill) if opposite_fill is not None else None
+
+        # Decide: primary OR contrarian flip.
+        # Use composite_centered (rolling-mean-subtracted) so the
+        # threshold has consistent meaning per asset — the raw composite
+        # is biased ~+3 on BTC by theo_delta_gap saturation, which would
+        # leave the |comp| < threshold band almost always empty.
+        # During the baseline warmup window (first ~20 samples per asset),
+        # composite_centered falls back to composite_raw so the gate
+        # behaves the same as before until centering is meaningful.
+        composite_for_flip = float(
+            indicators.get("composite_centered", composite)
+        )
+        primary_passes_rr = primary_fill <= MAX_FILL_FOR_BUY
+        flip_eligible = (
+            abs(composite_for_flip) < CONTRARIAN_FLIP_THRESHOLD
+            and opposite_fill_f is not None
+            and opposite_fill_f <= MAX_FILL_FOR_BUY
+            and opposite_fill_f < primary_fill  # only flip if opposite is genuinely cheaper
+        )
+
+        if primary_passes_rr:
+            side, fill = primary_side, primary_fill
+            flip_label = None
+        elif flip_eligible:
+            side, fill = opposite_side, opposite_fill_f
+            flip_label = "contrarian_flip"
+            log_event("kalshi_15min", "contrarian_flip", {
+                "ticker": ticker, "asset": s.get("asset"),
+                "composite_raw": round(composite, 3),
+                "composite_centered": round(composite_for_flip, 3),
+                "baseline_warmed_up": (indicators.get("composite_baseline_meta") or {}).get("warmed_up", False),
+                "from_side": primary_side, "from_fill": round(primary_fill, 3),
+                "to_side": opposite_side, "to_fill": round(opposite_fill_f, 3),
+            }, result="info")
+        else:
+            skip_counts["fill_too_high"] = skip_counts.get("fill_too_high", 0) + 1
+            continue
+
         if not (EXTREME_PRICE_FLOOR <= fill <= EXTREME_PRICE_CEIL):
             skip_counts["extreme_price"] = skip_counts.get("extreme_price", 0) + 1
             continue
 
-        # ── R:R discipline: only buy when the market disagrees with us ──
-        # In a binary market the fill price IS the risk/reward ratio:
-        #   buy YES at 0.20 → R:R = 4:1 (wins big, loses small)
-        #   buy YES at 0.50 → R:R = 1:1 (coin flip)
-        #   buy YES at 0.80 → R:R = 0.25:1 (loses big, wins small)
-        # The previous behavior of buying at 0.78-0.84 fills meant
-        # even high WR couldn't generate net profit (small wins, huge
-        # losses). Restricting to fill <= MAX_FILL_FOR_BUY guarantees
-        # R:R >= (1 - MAX_FILL_FOR_BUY) / MAX_FILL_FOR_BUY.
-        # 0.45 default → minimum R:R ~1.22 in our favor.
-        if fill > MAX_FILL_FOR_BUY:
-            skip_counts["fill_too_high"] = skip_counts.get("fill_too_high", 0) + 1
-            continue
+        # ── Spot ≈ strike skip: no edge when on the line ──────
+        # If the underlying is sitting essentially on the strike, the
+        # outcome is a coin flip regardless of how confident the model
+        # is. 2026-05-21 SOL trade lost on exactly this case (spot ==
+        # strike). Per-asset thresholds scale with typical 15-min vol.
+        strike = float(s.get("strike", 0) or 0)
+        spot = float(s.get("spot_usd", 0) or 0)
+        if strike > 0 and spot > 0:
+            sample_asset = str(s.get("asset", "btc")).lower()
+            min_gap = MIN_SPOT_STRIKE_GAP_PCT.get(sample_asset, 0.0015)
+            gap_pct = abs((spot / strike) - 1.0)
+            if gap_pct < min_gap:
+                skip_counts["spot_at_strike"] = skip_counts.get("spot_at_strike", 0) + 1
+                continue
 
         # ── Multi-timeframe agreement gate (5m + 15m + 1h) ──────
         # Require multiple timeframes to lean the same direction as
         # the composite signal before firing. Disagreement = no trend,
         # no edge. Configurable required_agreement (default 2-of-3 —
         # 3-of-3 is too strict and rejects most candidates).
+        #
+        # 2026-05-21: previously hardcoded ``symbol="BTCUSDT"``, which
+        # meant SOL/ETH/DOGE/etc. trades were checked against BTC's
+        # trend — wrong asset, wrong signal. Now uses the asset's own
+        # Binance ticker from the sample. Falls back to BTCUSDT if the
+        # sample is somehow missing the asset field.
         try:
             from lib.kalshi_multi_timeframe import (
                 check_multi_timeframe_agreement,
             )
+            sample_asset = str(s.get("asset", "btc")).lower()
+            mtf_symbol = _ASSET_TO_BINANCE_SYMBOL.get(sample_asset, "BTCUSDT")
             mtf_pass, mtf_meta = check_multi_timeframe_agreement(
                 primary_direction=side,
-                symbol="BTCUSDT",
+                symbol=mtf_symbol,
                 required_agreement=2,
             )
             if not mtf_pass:
