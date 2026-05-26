@@ -1088,6 +1088,104 @@ def cmd_kalshi_15min_monitor(max_seconds_out: int = 900):
     print(f"  Persisted to data/kalshi_15min_signal.jsonl")
 
 
+def cmd_kalshi_daily_monitor():
+    """Scan Kalshi DAILY strike-ladder crypto markets (KXBTCD, KXETHD, ...).
+
+    Same BSM-Greeks model as the 15-min scanner but applied to the
+    daily horizon (96× better signal-to-noise). Narrows to strikes
+    within ±N positions of current spot — the only ones with real
+    Kalshi liquidity. Records paper trades + auto-settles.
+    """
+    from lib.kalshi_daily_signal import run_signal_cycle, enabled_assets
+    result = run_signal_cycle()
+    assets = sorted(enabled_assets().keys())
+    print(f"=== Kalshi DAILY signal cycle (assets: {', '.join(assets) or 'none'}) ===")
+    if result["n_markets"] == 0:
+        print("  No active daily crypto markets across enabled assets right now.")
+        return
+    print(f"  Sampled {result['n_markets']} market(s). Nearest first:")
+    print(f"  {'asset':<4} {'T-close':>9} {'strike':>12} {'spot_diff':>10} "
+          f"{'yes_ask':>8} {'no_ask':>8} {'theo_yes':>9} {'composite':>10}")
+    for s in result["samples"][:12]:
+        tc = s.get("seconds_to_close") or 0
+        if tc < 3600:
+            t_str = f"{int(tc//60)}m{int(tc%60):02d}s"
+        else:
+            t_str = f"{tc/3600:.1f}h"
+        ind = s.get("indicators") or {}
+        comp = ind.get("composite") or 0
+        theo = ind.get("theoretical_yes")
+        ya = s.get("yes_ask")
+        na = s.get("no_ask")
+        ya_s = f"{ya:.3f}" if ya is not None else "  -  "
+        na_s = f"{na:.3f}" if na is not None else "  -  "
+        theo_s = f"{theo:+9.3f}" if theo is not None else "    -    "
+        diff = s.get("distance_to_spot_pct") or 0
+        print(f"  {s.get('asset','?'):<4} {t_str:>9} "
+              f"${(s.get('strike') or 0):>10,.0f} {diff:>+8.2f}%  "
+              f"{ya_s:>8} {na_s:>8} {theo_s:>9} {comp:>+9.2f}")
+    print(f"\n  Paper trades opened this cycle: {result.get('paper_trades_opened', 0)}")
+    print(f"  Paper settled this cycle:       "
+          f"{result.get('settle_summary', {}).get('settled_now', 0)}")
+    print(f"  Persisted to data/kalshi_daily_signal.jsonl")
+
+
+def cmd_kalshi_daily_paper_settle():
+    """Settle resolved Kalshi DAILY paper trades + check take-profit
+    exits on any open LIVE trades that have reached 0.85+."""
+    from lib.kalshi_daily_paper import settle_paper_trades, check_take_profit_exits
+    # Take-profit pass FIRST so we lock in any 0.85+ wins before
+    # settlement happens at expiration (which would only be worth $1).
+    tp = check_take_profit_exits()
+    if tp.get("tp_exits", 0) > 0:
+        print(f"Take-profit: closed {tp['tp_exits']} positions, "
+              f"locked ${tp['pnl_locked']:+.2f}")
+    result = settle_paper_trades()
+    print(f"Settled {result.get('settled_now',0)} trades. "
+          f"Remaining open: {result.get('total_open',0)}.")
+
+
+def cmd_weather_monitor():
+    """Scan Kalshi hourly-weather markets and trade where NWS forecast
+    disagrees with Kalshi pricing by ≥10pp.
+
+    Cities: NYC, Chicago, DC, Boston, LAX, Miami (NWS-covered).
+    Data sources:
+      - api.weather.gov (free, no API key) — hourly temperature forecast
+      - Kalshi public events/markets endpoints
+    """
+    from lib.weather_signal import run_signal_cycle, CITIES
+    result = run_signal_cycle()
+    print(f"=== Weather signal cycle (cities: {', '.join(CITIES.keys())}) ===")
+    if result["n_markets"] == 0:
+        print("  No active hourly-temp markets right now.")
+        return
+    print(f"  Sampled {result['n_markets']} market(s). Largest edges first:")
+    print(f"  {'city':<8} {'T-close':>9} {'strike':>9} {'NWS':>7} {'mkt_yes':>8} "
+          f"{'nws_p':>7} {'edge':>8}  ticker")
+    for s in result["samples"][:12]:
+        tc = s.get("seconds_to_close") or 0
+        t_str = f"{int(tc//60)}m{int(tc%60):02d}s" if tc < 3600 else f"{tc/3600:.1f}h"
+        ya = s.get("yes_ask")
+        ya_s = f"{ya:.3f}" if ya is not None else "  -  "
+        nws_f = s.get("nws_forecast_f")
+        nws_p = s.get("nws_p_yes")
+        edge = s.get("edge") or 0
+        print(f"  {s.get('city','?'):<8} {t_str:>9} "
+              f"{s.get('strike_f',0):>+6.1f}°F  "
+              f"{(nws_f or 0):>5.1f}°F {ya_s:>8} "
+              f"{(nws_p or 0):>7.3f} {edge:>+8.3f}  {s.get('market_ticker','')[:28]}")
+    print(f"\n  Paper trades opened this cycle: {result.get('paper_trades_opened', 0)}")
+    print(f"  Paper settled this cycle:       "
+          f"{result.get('settle_summary', {}).get('settled_now', 0)}")
+
+
+def cmd_weather_paper_settle():
+    from lib.weather_paper import settle_paper_trades
+    r = settle_paper_trades()
+    print(f"Settled {r.get('settled_now',0)} trades. Remaining open: {r.get('total_open',0)}.")
+
+
 def cmd_kalshi_15min_paper_settle():
     """Settle resolved Kalshi 15-min paper trades. Cron also calls this."""
     from lib.kalshi_15min_paper import settle_paper_trades
@@ -1726,6 +1824,14 @@ def main():
         cmd_kalshi_15min_monitor(max_seconds_out=max_sec)
     elif command == "kalshi-15min-paper-settle":
         cmd_kalshi_15min_paper_settle()
+    elif command == "kalshi-daily-monitor":
+        cmd_kalshi_daily_monitor()
+    elif command == "kalshi-daily-paper-settle":
+        cmd_kalshi_daily_paper_settle()
+    elif command == "weather-monitor":
+        cmd_weather_monitor()
+    elif command == "weather-paper-settle":
+        cmd_weather_paper_settle()
     elif command == "kalshi-15min-paper-report":
         asset = None
         for arg in sys.argv[2:]:
@@ -1846,6 +1952,20 @@ def main():
     elif command == "kalshi-edge-scan":
         from lib.kalshi_edge_scan import scan, render as _ke_render
         print(_ke_render(scan()))
+    elif command == "orderflow-divergence":
+        from lib.orderflow_divergence import (
+            divergence_from_signal_log, render as _of_render,
+        )
+        asset = "btc"
+        lookback = 5
+        for arg in sys.argv[1:]:
+            if arg.startswith("--asset="):
+                asset = arg.split("=", 1)[1].lower()
+            elif arg.startswith("--lookback="):
+                lookback = int(arg.split("=", 1)[1])
+        print(_of_render(
+            divergence_from_signal_log(asset, n_lookback=lookback)
+        ))
     elif command == "kalshi-hermes-cycle":
         from lib.hermes_kalshi import run_cycle, render_cycle
         force = "live" if "--live" in sys.argv else (
@@ -1876,11 +1996,205 @@ def main():
                   f"{e.get('param'):<28} "
                   f"{e.get('old_value')} → {e.get('new_value')}  "
                   f"verdict={e.get('verdict')}")
+    # ── WEATHER Hermes ────────────────────────────────────────────────
+    elif command == "weather-hermes-cycle":
+        from lib.hermes_weather import run_cycle, render_cycle
+        force = "live" if "--live" in sys.argv else (
+            "review" if "--review" in sys.argv else None
+        )
+        print(render_cycle(run_cycle(force_mode=force)))
+    elif command == "weather-hermes-mode":
+        from lib.hermes_weather import get_mode, set_mode
+        if len(sys.argv) > 2 and sys.argv[-1] in ("review", "live"):
+            set_mode(sys.argv[-1])
+            print(f"weather_hermes_mode set → {sys.argv[-1]}")
+        else:
+            print(f"weather_hermes_mode = {get_mode()}  "
+                  "(set with `python main.py weather-hermes-mode review|live`)")
+    elif command == "weather-hermes-ledger":
+        from tradingcore.hermes_ledger import history, stats
+        from lib.hermes_weather import LEDGER_PATH
+        s = stats(ledger_path=LEDGER_PATH)
+        c = s.get("counts", {})
+        print(f"Weather experiments — total {s.get('total', 0)}, "
+              f"keep_rate {s.get('keep_rate') if s.get('keep_rate') is not None else 'n/a'}")
+        print(f"  open={c.get('open', 0)} kept={c.get('kept', 0)} "
+              f"rolled_back={c.get('rolled_back', 0)} expired={c.get('expired', 0)}")
+        print()
+        for e in history(limit=15, ledger_path=LEDGER_PATH):
+            when = (e.get("opened_at") or "")[:19].replace("T", " ")
+            print(f"  {when}  {e.get('status'):<12} "
+                  f"{e.get('param'):<28} "
+                  f"{e.get('old_value')} → {e.get('new_value')}  "
+                  f"verdict={e.get('verdict')}")
+    # ── KXBTCD DAILY Hermes ───────────────────────────────────────────
+    elif command == "kalshi-daily-hermes-cycle":
+        from lib.hermes_daily import run_cycle, render_cycle
+        force = "live" if "--live" in sys.argv else (
+            "review" if "--review" in sys.argv else None
+        )
+        print(render_cycle(run_cycle(force_mode=force)))
+    elif command == "kalshi-daily-hermes-mode":
+        from lib.hermes_daily import get_mode, set_mode
+        if len(sys.argv) > 2 and sys.argv[-1] in ("review", "live"):
+            set_mode(sys.argv[-1])
+            print(f"daily_hermes_mode set → {sys.argv[-1]}")
+        else:
+            print(f"daily_hermes_mode = {get_mode()}  "
+                  "(set with `python main.py kalshi-daily-hermes-mode review|live`)")
+    elif command == "kalshi-daily-hermes-ledger":
+        from tradingcore.hermes_ledger import history, stats
+        from lib.hermes_daily import LEDGER_PATH
+        s = stats(ledger_path=LEDGER_PATH)
+        c = s.get("counts", {})
+        print(f"Daily experiments — total {s.get('total', 0)}, "
+              f"keep_rate {s.get('keep_rate') if s.get('keep_rate') is not None else 'n/a'}")
+        print(f"  open={c.get('open', 0)} kept={c.get('kept', 0)} "
+              f"rolled_back={c.get('rolled_back', 0)} expired={c.get('expired', 0)}")
+        print()
+        for e in history(limit=15, ledger_path=LEDGER_PATH):
+            when = (e.get("opened_at") or "")[:19].replace("T", " ")
+            print(f"  {when}  {e.get('status'):<12} "
+                  f"{e.get('param'):<28} "
+                  f"{e.get('old_value')} → {e.get('new_value')}  "
+                  f"verdict={e.get('verdict')}")
     elif command == "kalshi-goal-score":
         from lib.hermes_kalshi import compute_kalshi_goal_metrics
         m = compute_kalshi_goal_metrics()
         import json as _j
         print(_j.dumps(m, indent=2, default=str))
+    elif command == "kalshi-live-smoke-test":
+        # End-to-end live-execution validation. Places a $0.01 buy order
+        # on a real market (won't fill), immediately cancels it. On
+        # success, writes data/kalshi_live_smoke_passed.marker which
+        # is_live_enabled() requires alongside the settings.yaml flag.
+        from lib.kalshi_live_executor import run_smoke_test
+        import json as _j
+        result = run_smoke_test()
+        print(_j.dumps(result, indent=2, default=str))
+        if result.get("passed"):
+            print("\n✅ SMOKE TEST PASSED — marker file written.")
+            print("   Live trading will engage on next kalshi-daily-monitor cycle")
+            print("   (assuming kalshi_daily_live.enabled: true in settings.yaml).")
+        else:
+            print("\n❌ SMOKE TEST FAILED — marker NOT written. Live mode stays paper.")
+    elif command == "kalshi-live-reset":
+        # Clear kill_switch_tripped + consecutive_losses + warning flags
+        # so trading resumes + monitor re-arms. Use after investigating.
+        from lib.kalshi_live_executor import reset_kill_switch, reset_session_warnings
+        reset_kill_switch()
+        reset_session_warnings()
+        print("Kill switch reset + session warnings cleared. Bot resumes next cycle if other gates pass.")
+    elif command == "live-tail":
+        # Stream the live-alerts log — what would have been Telegram pings
+        # if Telegram were configured. Default: show last 30 entries +
+        # follow (Ctrl-C to exit). Pass --no-follow for a one-shot dump.
+        from lib.kalshi_live_executor import LIVE_ALERTS_PATH
+        import subprocess
+        follow = "--no-follow" not in sys.argv
+        lines = "30"
+        for arg in sys.argv[2:]:
+            if arg.startswith("--lines="):
+                lines = arg.split("=", 1)[1]
+        if not LIVE_ALERTS_PATH.exists():
+            print(f"No alerts yet — file doesn't exist: {LIVE_ALERTS_PATH}")
+            print("Alerts will appear here on the next order place / refuse / fill.")
+            print(f"Watching path: tail -F {LIVE_ALERTS_PATH}")
+            # Touch the file so tail -F can start watching
+            LIVE_ALERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LIVE_ALERTS_PATH.touch()
+        try:
+            cmd = ["tail", "-n", lines]
+            if follow:
+                cmd.append("-F")
+            cmd.append(str(LIVE_ALERTS_PATH))
+            subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print()
+    elif command == "kalshi-shadow-report":
+        # Show what the "refused live trades" (blocked by trade_size,
+        # balance floor, concurrent cap, etc) WOULD have made if placed.
+        # Pass --settle to first run the settle-pass against actual
+        # Kalshi outcomes.
+        from lib.kalshi_live_executor import settle_shadow_trades, shadow_summary
+        if "--settle" in sys.argv:
+            r = settle_shadow_trades()
+            print(f"Settled {r['settled_now']} of {r['checked']} shadow trades")
+            print()
+        # Show projections at common cap sizes
+        summary = shadow_summary(scale_caps=[1.50, 3.00, 5.00, 7.50, 10.00])
+        print("=" * 70)
+        print(f"  KALSHI SHADOW TRADES — what the safety gates blocked")
+        print("=" * 70)
+        print(f"  Total recorded:    {summary['total_records']}")
+        print(f"  Settled:           {summary['settled']}")
+        print(f"  Pending (still open or waiting on Kalshi resolution): {summary['pending']}")
+        print()
+        if summary['settled'] > 0:
+            wr = summary['would_win_rate']
+            print(f"  Would-have-been WR: {wr*100:.1f}%" if wr is not None else "  WR: n/a")
+            print(f"  Missed P&L (at original notional/contracts): ${summary['missed_pnl']:+,.2f}")
+            print()
+            print(f"  By refusal reason:")
+            for reason, stats in summary['by_refusal_reason'].items():
+                print(f"    {reason:<18} n={stats['count']:<3} "
+                      f"settled_pnl=${stats['settled_pnl']:+.2f} "
+                      f"({stats['would_win']}W/{stats['would_lose']}L)")
+            print()
+            projs = summary.get('scaled_projections', [])
+            if projs:
+                print(f"  Projected P&L at different cap sizes (linear scale, settled trades only):")
+                print(f"    {'cap':<8} {'scale':<8} {'projected':<14} {'delta vs $1.50':<14}")
+                print(f"    {'-'*8} {'-'*8} {'-'*14} {'-'*14}")
+                for p in projs:
+                    print(f"    ${p['cap_usd']:<7.2f} {p['scale']:<8.2f} "
+                          f"${p['scaled_pnl']:<+12.2f} ${p['delta_vs_current']:<+12.2f}")
+        else:
+            print("  (no settled shadow trades yet — need refused trades AND their close_time to pass)")
+    elif command == "kalshi-live-reconcile":
+        # Compare local position log with Kalshi truth; alert on drift
+        from lib.kalshi_live_executor import reconcile_positions
+        import json as _j
+        result = reconcile_positions()
+        print(_j.dumps(result, indent=2, default=str))
+    elif command == "kalshi-live-status":
+        # Diagnostic: shows current live-trading config, safety-gate
+        # status, balance, etc. Run this BEFORE flipping enabled: true
+        # to verify the bot won't immediately trade against bad state.
+        from lib.kalshi_live_executor import get_current_safety_status
+        s = get_current_safety_status()
+        cfg = s.get("config", {})
+        print("=" * 70)
+        print(f"  KALSHI LIVE TRADING — safety status snapshot")
+        print("=" * 70)
+        print(f"  live_enabled in settings.yaml: {s['live_enabled']}")
+        print()
+        print(f"  Bounds (from settings.yaml):")
+        for k in ("max_trade_usd", "max_concurrent", "max_daily_loss_usd",
+                  "min_balance_floor", "cooldown_minutes",
+                  "cooldown_loss_count", "cooldown_window_min"):
+            print(f"    {k:<22} = {cfg.get(k)}")
+        print()
+        print(f"  Current state:")
+        bal = s.get("account_balance")
+        print(f"    account_balance:        ${bal:.2f}" if bal is not None
+              else f"    account_balance:        unknown ({s.get('query_error','')[:60]})")
+        print(f"    open live positions:    {s.get('live_positions_count')}")
+        print(f"    today realized PnL:     ${s.get('today_pnl', 0):+.2f}")
+        print()
+        if s["live_enabled"]:
+            print(f"  Safety gates (each runs against a hypothetical max_trade trade):")
+            for name, c in s.get("checks", {}).items():
+                mark = "✓" if c["ok"] else "✗"
+                print(f"    {mark} {name:<12} {c['reason']}")
+            print()
+            print(f"  Overall: {'✓ ALLOWED' if s['overall_allowed'] else '✗ BLOCKED'}")
+            print(f"  Reason:  {s['overall_reason']}")
+        else:
+            print(f"  Live mode is DISABLED. To enable:")
+            print(f"    1. Edit config/settings.yaml → kalshi_daily_live.enabled: true")
+            print(f"    2. Re-run this command to verify safety gates pass")
+            print(f"    3. Next kalshi-daily-monitor cycle will place real orders")
     elif command == "kalshi-signal-replay":
         from lib.kalshi_signal_replay import (
             replay, render as _kr_render, save_snapshot as _kr_save,
