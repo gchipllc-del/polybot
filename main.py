@@ -1952,6 +1952,28 @@ def main():
     elif command == "kalshi-edge-scan":
         from lib.kalshi_edge_scan import scan, render as _ke_render
         print(_ke_render(scan()))
+    elif command == "orderflow-divergence-backtest":
+        from lib.orderflow_divergence_backtest import (
+            run_backtest as _od_bt, render as _od_render,
+        )
+        asset = "btc"
+        window = 5
+        thresh = 0.0
+        max_resolve = 200
+        for arg in sys.argv[1:]:
+            if arg.startswith("--asset="):
+                asset = arg.split("=", 1)[1].lower()
+            elif arg.startswith("--window="):
+                window = int(arg.split("=", 1)[1])
+            elif arg.startswith("--min-score="):
+                thresh = float(arg.split("=", 1)[1])
+            elif arg.startswith("--max-resolve="):
+                max_resolve = int(arg.split("=", 1)[1])
+        print(_od_render(_od_bt(
+            asset=asset, window_size=window,
+            min_score_threshold=thresh,
+            max_markets_to_resolve=max_resolve,
+        )))
     elif command == "orderflow-divergence":
         from lib.orderflow_divergence import (
             divergence_from_signal_log, render as _of_render,
