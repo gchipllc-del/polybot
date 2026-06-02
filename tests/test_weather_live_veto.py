@@ -27,10 +27,14 @@ def _sample(point_f, sigma_f, strike_f, trend_confirms=True):
     }
 
 
-def test_default_flag_is_off():
-    # No live behavior change unless explicitly enabled in yaml.
-    assert _effective_params().get("weather_live_trend_veto") in (False, None) or \
-        _effective_params()["weather_live_trend_veto"] is False
+def test_code_default_is_off(monkeypatch):
+    # The CODE default must be off (safe-by-default): with NO yaml override,
+    # the veto is disabled so live behavior is unchanged. (The live config may
+    # explicitly enable it — that's an opt-in, not the default — so we test the
+    # default by forcing empty overrides rather than reading the live yaml.)
+    import lib.weather_paper as wp
+    monkeypatch.setattr(wp, "_load_overrides", lambda: {})
+    assert wp._effective_params()["weather_live_trend_veto"] is False
 
 
 def test_passes_cheap_no_with_cushion():

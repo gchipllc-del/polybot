@@ -144,6 +144,22 @@
                 <tbody id="weather-open-body"><tr><td colspan="9" style="color:#8b949e">none</td></tr></tbody>
             </table>
         </div>
+
+        <div class="card full">
+            <h2>Weather DAILY (max/min) <span id="wxd-meta" style="font-weight:400;font-size:0.95em;color:#8b949e;margin-left:8px"></span></h2>
+            <div style="font-size:12px;color:#8b949e;margin-bottom:6px">KXHIGHT*/KXLOWT* recalibrated pilot — PAPER only (validation in progress). Pre-fix records excluded.</div>
+            <div id="wxd-stats" style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 14px 0"></div>
+            <h3 style="margin-top:12px;font-size:0.95em">Per-city breakdown</h3>
+            <table id="wxd-by-city">
+                <thead><tr><th>City</th><th>Open</th><th>Closed</th><th>W/L</th><th>WR</th><th>Open notional</th><th>Net P&amp;L</th></tr></thead>
+                <tbody id="wxd-by-city-body"><tr><td colspan="7" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+            <h3 style="margin-top:12px;font-size:0.95em">Daily weather — open paper trades <span id="wxd-open-total" style="font-size:0.85em;color:#58a6ff;margin-left:8px;font-weight:400"></span></h3>
+            <table id="wxd-open">
+                <thead><tr><th>City</th><th>Side</th><th>Fill</th><th>Strike</th><th>Forecast</th><th>Edge</th><th>Total $</th><th>Close</th><th>Ticker</th></tr></thead>
+                <tbody id="wxd-open-body"><tr><td colspan="9" style="color:#8b949e">none</td></tr></tbody>
+            </table>
+        </div>
     </div>
 
     <!-- Cross-bot open trades (polybot + cryptobot + wheel-trader + openclaw-v2) -->
@@ -292,6 +308,10 @@ async function fetchData() {
         const res = await fetch('/api/weather');
         renderWeather(await res.json());
     } catch(e) { console.error('weather fetch error:', e); }
+    try {
+        const res = await fetch('/api/weather_daily');
+        renderWeatherDaily(await res.json());
+    } catch(e) { console.error('weather_daily fetch error:', e); }
     try {
         const res = await fetch('/api/kalshi_paper_summary');
         renderKalshiPaperSummary(await res.json());
@@ -810,6 +830,47 @@ function renderWeather(d) {
                 <td>${fmt(t.our_size,2)}</td>
                 <td><strong>${totalStr}</strong></td>
                 <td>${(t.close_time||'').substring(11,16)}</td>
+            </tr>`;
+        }).join('');
+    }
+}
+
+function renderWeatherDaily(d) {
+    const meta = document.getElementById('wxd-meta');
+    const openBody = document.getElementById('wxd-open-body');
+    if (!d || !d.counts) {
+        if (meta) meta.textContent = '· no data';
+        return;
+    }
+    renderSectionStats('wxd-stats', d.counts);
+    renderGroupBreakdown('wxd-by-city-body', d.by_city || []);
+    setOpenTotalBadge('wxd-open-total', d.open_trades);
+    const pnl = d.counts.net_pnl || 0;
+    const wr = d.counts.closed_total ? (d.counts.won / d.counts.closed_total * 100).toFixed(0) : '—';
+    const exTxt = d.excluded_prefix_records ? ` · ${d.excluded_prefix_records} pre-fix excluded` : '';
+    meta.innerHTML = `· ${d.counts.open} open · ${d.counts.closed_total} closed`
+      + (d.counts.closed_total ? ` · ${d.counts.won}W (${wr}%) · `
+          + `<span class="${pnlClass(pnl)}" style="font-weight:700;font-size:1.15em">net ${pnlSign(pnl)}</span>`
+          : ' · <span style="color:#8b949e">awaiting first settle</span>')
+      + `<span style="color:#8b949e">${exTxt}</span>`;
+    const ot = d.open_trades || [];
+    if (ot.length === 0) {
+        openBody.innerHTML = '<tr><td colspan="9" style="color:#8b949e">none</td></tr>';
+    } else {
+        openBody.innerHTML = ot.map(t => {
+            const totalUsd = (t.notional != null && t.notional > 0) ? Number(t.notional) : 0;
+            const totalStr = totalUsd > 0 ? '$' + fmt(totalUsd, 2) : '—';
+            const edge = t.edge != null ? ((t.edge >= 0 ? '+' : '') + fmt(t.edge, 3)) : '—';
+            return `<tr>
+                <td>${t.city_key || '?'}</td>
+                <td>${t.side}</td>
+                <td>$${fmt(t.fill_price,2)}</td>
+                <td>${fmt(t.strike_f,1)}°F</td>
+                <td>${t.forecast_f != null ? fmt(t.forecast_f,1)+'°F' : '—'}</td>
+                <td>${edge}</td>
+                <td><strong>${totalStr}</strong></td>
+                <td>${(t.close_time||'').substring(5,10)}</td>
+                <td style="font-size:11px;color:#8b949e">${(t.market_ticker||'').substring(0,22)}</td>
             </tr>`;
         }).join('');
     }

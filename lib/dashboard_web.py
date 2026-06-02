@@ -195,6 +195,84 @@ def api_weather():
     return jsonify(out)
 
 
+@app.route("/api/weather_daily")
+def api_weather_daily():
+    """Daily max/min weather sleeve (KXHIGHT*/KXLOWT*) — the recalibrated
+    pilot that the original dashboard predated. Paper-only; reads
+    weather_daily_paper.jsonl. Surfaces open trades + per-city + the post-fix
+    scorecard (filtered to entry_schema in {strike_type_aware_v1, blended_v2}
+    so the corrupt pre-fix records don't pollute the validation numbers)."""
+    import json
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    out: dict = {}
+    paper_path = root / "data" / "weather_daily_paper.jsonl"
+    POSTFIX = ("strike_type_aware_v1", "blended_v2")
+    open_trades, recent_closed = [], []
+    n_prefix = 0
+    if paper_path.exists():
+        with open(paper_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Exclude pre-fix (quarantined) records from the live view.
+                if t.get("entry_schema") not in POSTFIX:
+                    n_prefix += 1
+                    continue
+                if t.get("status") == "open":
+                    open_trades.append(t)
+                elif t.get("status") in ("won", "lost"):
+                    recent_closed.append(t)
+    out["open_trades"] = sorted(open_trades, key=lambda r: str(r.get("opened_at", "")))
+    out["recent_closed"] = recent_closed[-10:]
+    out["excluded_prefix_records"] = n_prefix
+    # Scorecard — reuse the shared helper but on post-fix rows only. The helper
+    # walks the whole file, so compute counts here from the filtered sets.
+    closed = [t for t in (open_trades + recent_closed) if t.get("status") in ("won", "lost")]
+    # recent_closed already only has settled; open_trades only open — combine
+    settled = recent_closed  # all won/lost post-fix collected above (capped at -10 for display)
+    # Full settled set for accurate counts (re-read, post-fix only):
+    all_settled = []
+    if paper_path.exists():
+        for line in paper_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                t = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if t.get("entry_schema") in POSTFIX and t.get("status") in ("won", "lost"):
+                all_settled.append(t)
+    nset = len(all_settled)
+    won = sum(1 for t in all_settled if t.get("status") == "won")
+    net = sum(float(t.get("paper_pnl") or 0) for t in all_settled)
+    invested = sum(float(t.get("notional") or 0) for t in all_settled)
+    out["counts"] = {
+        "open": len(open_trades),
+        "closed_total": nset,
+        "won": won,
+        "lost": nset - won,
+        "wr_pct": round(won / nset * 100, 1) if nset else None,
+        "net_pnl": round(net, 2),
+        "open_notional": round(sum(float(t.get("notional") or 0) for t in open_trades), 2),
+        # Keys the shared renderSectionStats tile expects (kept consistent with
+        # the other paper sections so the UI renders clean values, not undefined).
+        "total_invested": round(invested, 2),
+        "peak_capital": 0.0,
+        "avg_notional": round(invested / nset, 2) if nset else 0.0,
+        "roi_invested_pct": round(net / invested * 100, 1) if invested else None,
+        "roi_peak_pct": None,
+    }
+    out["by_city"] = _group_paper_trades(paper_path, key_field="city_key")
+    return jsonify(out)
+
+
 @app.route("/api/kalshi_15min")
 def api_kalshi_15min():
     """Snapshot of the 15-min crypto scanner: latest signal cycle +
