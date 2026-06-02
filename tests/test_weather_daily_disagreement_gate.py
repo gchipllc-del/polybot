@@ -42,7 +42,7 @@ def _no_sample(ticker, *, nws_p_yes, market_p_yes, no_ask=0.25):
         "event_ticker": "KXHIGHTATL-26JUN01",
         "title": "Will the maximum temperature be 84-85?",
         "city_key": "atl_high", "direction": "max",
-        "close_time": "2026-06-02T05:00:00Z",
+        "close_time": "2035-06-02T05:00:00Z",   # far future → passes close-time guard
         "strike_f": 84.5, "forecast_f": 86.0, "nws_forecast_f": 86.0,
         "yes_margin_f": -5.0,                 # deep in NO zone
         "nws_p_yes": nws_p_yes, "market_p_yes": market_p_yes,

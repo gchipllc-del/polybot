@@ -55,6 +55,14 @@ EXTREME_PRICE_CEIL = 0.95
 DEFAULT_FORECAST_BUFFER_F = 2.0
 DEFAULT_FORECAST_BUFFER_F_YES = 3.0
 KALSHI_PROFIT_FEE = 0.07
+# Close-time guard (#160 follow-up). Never ENTER a market within this many
+# seconds of its close (or already closed). The daily sleeve's first live order
+# FAILED with HTTP 404 market_not_found because the scanner handed it a market
+# that had closed ~11h earlier. 600s = don't open a position that can't even
+# outlive the next 10-min launchd cycle. Tunable via `min_seconds_to_close`.
+# Daily markets open ~24-30h pre-close, so this only blocks the closed/closing
+# tail — never the normal trading window (winners historically led 7-28h).
+MIN_SECONDS_TO_CLOSE = 600
 
 
 def _load_overrides() -> dict:
@@ -74,6 +82,7 @@ def _effective_params() -> dict:
     return {
         "min_edge_threshold":     float(o.get("min_edge_threshold",     MIN_EDGE_THRESHOLD)),
         "max_disagreement_edge":  float(o.get("max_disagreement_edge",  MAX_DISAGREEMENT_EDGE)),
+        "min_seconds_to_close":   float(o.get("min_seconds_to_close",   MIN_SECONDS_TO_CLOSE)),
         "max_fill_for_buy":       float(o.get("max_fill_for_buy",       MAX_FILL_FOR_BUY)),
         "max_trade_usd":          float(o.get("default_max_trade_usd",  DEFAULT_MAX_TRADE_USD)),
         "kelly_multiplier":       float(o.get("default_kelly_multiplier", DEFAULT_KELLY_MULTIPLIER)),
@@ -206,6 +215,21 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
         ticker = s.get("market_ticker", "")
         if not ticker or ticker in open_tickers:
             skip_counts["dup_open"] = skip_counts.get("dup_open", 0) + 1
+            continue
+        # Close-time guard (#160 follow-up): only ever attempt genuinely OPEN
+        # markets. Recompute seconds-to-close at RECORD time (the sample's value
+        # can be minutes stale). Skip if closed/closing, or if close_time is
+        # unparseable (fail closed — real money). Prevents the HTTP 404
+        # market_not_found the first live attempt hit on a market that had
+        # closed ~11h earlier. Applies to paper + live alike.
+        try:
+            _ct = datetime.fromisoformat(
+                str(s.get("close_time", "")).replace("Z", "+00:00"))
+            _secs_to_close = (_ct - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, TypeError):
+            _secs_to_close = None
+        if _secs_to_close is None or _secs_to_close <= params["min_seconds_to_close"]:
+            skip_counts["market_closing_or_closed"] = skip_counts.get("market_closing_or_closed", 0) + 1
             continue
         nws_p = s.get("nws_p_yes")
         market_p = s.get("market_p_yes")

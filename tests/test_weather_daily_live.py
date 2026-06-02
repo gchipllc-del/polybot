@@ -33,7 +33,7 @@ def _no_sample(ticker="KXHIGHTATL-26JUN01-B84.5"):
     return {
         "market_ticker": ticker, "event_ticker": "KXHIGHTATL-26JUN01",
         "title": "max temp 84-85?", "city_key": "atl_high", "direction": "max",
-        "close_time": "2026-06-02T05:00:00Z",
+        "close_time": "2035-06-02T05:00:00Z",   # far future → passes close-time guard
         "strike_f": 84.5, "forecast_f": 78.0, "nws_forecast_f": 78.0,
         "yes_margin_f": -5.0,                 # deep in NO zone
         "nws_p_yes": 0.20, "market_p_yes": 0.32,  # edge -0.12 (in [0.10,0.40])
@@ -79,6 +79,21 @@ def test_entry_places_live_and_records_actual_fill(monkeypatch, tmp_path):
     assert placed["metadata"]["asset"] == "weather_daily"
     assert placed["fill_price"] * placed["contracts"] <= 5.0 + 1e-9
     assert placed["side"] == "NO"
+
+
+def test_closed_market_is_skipped(monkeypatch, tmp_path):
+    # #160 follow-up: the first live order FAILED 404 on a market that had
+    # closed 11h earlier. A sample whose close_time is in the past must be
+    # skipped entirely (no paper row, no live attempt).
+    wp, ex = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(ex, "is_live_enabled", lambda: True)
+    def _boom(**kw):
+        raise AssertionError("must NOT attempt an order on a closed market")
+    monkeypatch.setattr(ex, "place_live_order", _boom)
+    s = _no_sample()
+    s["close_time"] = "2020-01-01T05:00:00Z"   # long past → closed
+    trades = wp.record_paper_trades_from_samples([s])
+    assert trades == []
 
 
 def test_entry_refused_records_paper_only(monkeypatch, tmp_path):
