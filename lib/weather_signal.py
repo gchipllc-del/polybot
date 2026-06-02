@@ -26,6 +26,8 @@ import json
 import math
 import re
 import urllib.request
+
+from lib.forecaster_ensemble import skill_weighted_point as _ensemble_point
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -309,9 +311,10 @@ def _fetch_recent_obs(lat: float, lon: float, limit: int = 4) -> list[tuple[date
 # ── Open-Meteo cross-check (free second-source forecast) ────────────
 
 def _fetch_open_meteo_temp(lat: float, lon: float, target_iso: str) -> float | None:
-    """Hourly temperature forecast from Open-Meteo. Used as a second
-    opinion against NWS — when both models agree we trust the blended
-    point estimate more (and can tighten σ slightly)."""
+    """Hourly temperature forecast from Open-Meteo (DEFAULT model). Kept as a
+    fallback second-opinion for callers (e.g. the trend backtester) that don't
+    use the multi-model ensemble. The live sleeve uses
+    _fetch_open_meteo_models_temp instead."""
     try:
         req = urllib.request.Request(
             f"{OPEN_METEO_BASE}?latitude={lat}&longitude={lon}"
@@ -328,6 +331,68 @@ def _fetch_open_meteo_temp(lat: float, lon: float, target_iso: str) -> float | N
     except Exception:
         pass
     return None
+
+
+# Named NWP models pulled as SEPARATE ensemble members (mirrors the daily
+# sleeve). Per-model hourly skill at NYC Central Park (scripts/forecaster_accuracy
+# .py hourly, 21-day ERA5 verification): ECMWF 0.82°F ≪ GFS 1.65 < ICON 1.78
+# < GEM 2.04 — ECMWF ~2× more accurate, so GEM is excluded and the default
+# (== GFS for US points) is replaced by the named set.
+_OM_MODELS_HOURLY = ["ecmwf_ifs025", "icon_seamless", "gfs_seamless"]
+
+# Inverse-MAE weights for the hourly ensemble. NWS is the settlement source for
+# KXTEMPNYCH and the sleeve's proven primary; set co-equal with the measured-best
+# (ECMWF) as a defensible prior (unverified over the same window). Re-derive via
+# the script as data accrues.
+_HOURLY_FORECASTER_MAE = {
+    "nws": 0.82, "ecmwf_ifs025": 0.82, "gfs_seamless": 1.65, "icon_seamless": 1.78,
+}
+
+
+def _fetch_open_meteo_models_series(lat: float, lon: float) -> dict:
+    """Per-model hourly temperature SERIES (ECMWF/ICON/GFS) for the next ~2 days,
+    fetched ONCE per city. Returns {model: {hour_prefix(YYYY-MM-DDTHH): temp_f}}
+    for O(1) per-market lookup — a city's ~24 markets all index THIS one result
+    instead of each making its own API call. Best-effort: {} on failure, and the
+    blend degrades to NWS-only (or the legacy single fetch) per market."""
+    out: dict = {}
+    try:
+        req = urllib.request.Request(
+            f"{OPEN_METEO_BASE}?latitude={lat}&longitude={lon}"
+            "&hourly=temperature_2m&temperature_unit=fahrenheit&forecast_days=2"
+            f"&models={','.join(_OM_MODELS_HOURLY)}"
+        )
+        h = json.loads(urllib.request.urlopen(req, timeout=10).read()).get("hourly", {})
+        times = h.get("time", [])
+        for mdl in _OM_MODELS_HOURLY:
+            arr = h.get(f"temperature_2m_{mdl}")
+            if not arr:
+                continue
+            by_hour = {t[:13]: float(v) for t, v in zip(times, arr) if v is not None}
+            if by_hour:
+                out[mdl] = by_hour
+    except Exception:
+        pass
+    return out
+
+
+def _models_at(series: dict, target_iso: str) -> dict:
+    """Index a per-model hourly series (from _fetch_open_meteo_models_series) to
+    {model: temp_f} at the target close hour."""
+    tgt = target_iso[:13]
+    out = {}
+    for mdl, by_hour in (series or {}).items():
+        v = by_hour.get(tgt)
+        if v is not None:
+            out[mdl] = v
+    return out
+
+
+def _fetch_open_meteo_models_temp(lat: float, lon: float, target_iso: str) -> dict:
+    """Per-model temps at ONE target hour. Thin wrapper (fetch series + index)
+    for callers outside the per-city loop; the loop indexes a once-per-city
+    series via _models_at instead, to avoid a redundant fetch per market."""
+    return _models_at(_fetch_open_meteo_models_series(lat, lon), target_iso)
 
 
 # Cap on |dT/dt| we'll trust. Surface-air temps rarely move faster than this;
@@ -403,6 +468,7 @@ def _blended_forecast(
     *, city: str, nws_forecast_f: float, open_meteo_f: float | None,
     current_obs_f: float | None, lead_hours: float,
     trend_f_per_hr: float | None = None, trend_k: float = 0.5,
+    model_forecasts: dict | None = None,
 ) -> tuple[float, float, dict]:
     """Combine NWS forecast + Open-Meteo + current observation into a
     single point estimate + σ. Returns (point_f, sigma_f, meta).
@@ -419,6 +485,7 @@ def _blended_forecast(
     meta = {
         "nws_f": nws_forecast_f,
         "open_meteo_f": open_meteo_f,
+        "model_forecasts": model_forecasts,
         "current_obs_f": current_obs_f,
         "lead_hours": lead_hours,
     }
@@ -442,10 +509,49 @@ def _blended_forecast(
     # be when the two models disagree. Stays 0 when there's no second source.
     disagreement_sigma = 0.0
 
-    # Two-model ensemble: when both forecasts agree closely, reduce σ.
-    # We also apply bias to the second-source for consistency (the bias
-    # is about our blended-prediction error, not just NWS in isolation).
-    if open_meteo_f is not None:
+    # Skill-weighted MULTI-MODEL ensemble (ECMWF/ICON/GFS + bias-corrected NWS),
+    # inverse-MAE weighted with median outlier-rejection — the same robust
+    # combiner as the daily sleeve. ECMWF measured ~2× more accurate hourly at
+    # NYC (0.82°F vs GFS 1.65), and Open-Meteo's old "default" source was just
+    # GFS. This upgrades ONLY the forecast component; the current-obs anchor +
+    # trend below (where the cheap-NO edge lives, #161) are byte-for-byte
+    # unchanged. Falls back to the legacy single-Open-Meteo path when no
+    # per-model dict is supplied (e.g. the trend backtester).
+    if model_forecasts:
+        bias = float(cal.get("bias_f") or 0.0)
+        contributions = {"nws": nws_forecast_f + bias}
+        for mname, mval in model_forecasts.items():
+            if mval is not None and math.isfinite(mval):
+                contributions[mname] = float(mval)
+        blended, kept = _ensemble_point(
+            _HOURLY_FORECASTER_MAE, contributions,
+            outlier_reject_f=5.0, default_mae=1.6)
+        if blended is not None:
+            forecast_blend = blended
+        meta["ensemble_used"] = kept
+        dropped = sorted(set(contributions) - set(kept))
+        if dropped:
+            meta["ensemble_dropped"] = dropped
+        # σ from the CREDIBLE (kept) members only. A rejected bust is dropped
+        # from the point, so it must NOT also inflate σ — double-counting its
+        # badness would suppress an otherwise high-conviction consensus trade
+        # (3 models agreeing shouldn't be made "uncertain" by 1 rogue outlier).
+        # When models GENUINELY disagree (none clearly rogue) nothing is dropped,
+        # so the full spread still widens σ as real uncertainty.
+        kept_vals = [contributions[n] for n in kept]
+        if len(kept_vals) > 1:
+            spread = max(kept_vals) - min(kept_vals)
+            disagreement_sigma = spread / 2.0
+            meta["model_spread_f"] = round(spread, 2)
+            if spread <= 1.0:
+                base_sigma *= 0.80   # consensus → tighter
+            elif spread <= 2.0:
+                base_sigma *= 0.90
+            elif spread > 4.0:
+                base_sigma *= 1.30   # credible models fight → wider σ
+    elif open_meteo_f is not None:
+        # Legacy 2-model path (NWS + Open-Meteo default). Kept for callers that
+        # don't pass model_forecasts; identical to pre-ensemble behavior.
         bias = float(cal.get("bias_f") or 0.0)
         adj_open_meteo = open_meteo_f + bias
         diff = abs(nws_forecast_f - open_meteo_f)
@@ -599,6 +705,11 @@ def sample_signals_for_city(city_key: str) -> list[WeatherSample]:
     # weather_trend_aware is OFF, and needs the obs slope to do it.
     obs_series = _fetch_recent_obs(cfg["lat"], cfg["lon"])
 
+    # Per-model Open-Meteo hourly series (ECMWF/ICON/GFS), fetched ONCE per city
+    # and indexed per market below — avoids a redundant API call for each of the
+    # city's ~24 markets (they all read overlapping hours of the same series).
+    om_models_series = _fetch_open_meteo_models_series(cfg["lat"], cfg["lon"])
+
     def to_frac(v):
         if v is None:
             return None
@@ -611,8 +722,19 @@ def sample_signals_for_city(city_key: str) -> list[WeatherSample]:
         nws_forecast_f, lead_h = _forecast_at(periods, m["_close_iso"])
         if nws_forecast_f is None:
             continue
-        # Fetch a second-source forecast (Open-Meteo) for ensemble.
-        open_meteo_f = _fetch_open_meteo_temp(cfg["lat"], cfg["lon"], m["_close_iso"])
+        # Per-model second-source forecasts (ECMWF/ICON/GFS) for the
+        # skill-weighted ensemble — indexed from the once-per-city series (no
+        # per-market fetch). open_meteo_f headline = ECMWF. Only when the whole
+        # series fetch failed do we fall back to the legacy single per-market
+        # call; if the series exists but lacks THIS hour, blend on NWS-only.
+        model_forecasts = _models_at(om_models_series, m["_close_iso"])
+        if model_forecasts:
+            open_meteo_f = model_forecasts.get("ecmwf_ifs025")
+        elif not om_models_series:
+            open_meteo_f = _fetch_open_meteo_temp(
+                cfg["lat"], cfg["lon"], m["_close_iso"])
+        else:
+            open_meteo_f = None
         # Trend (°F/hr) heading into THIS market's close. Computed EVERY cycle
         # (not just when live) so the shadow A/B can evaluate trend-aware
         # against real outcomes while weather_trend_aware is still OFF.
@@ -628,6 +750,7 @@ def sample_signals_for_city(city_key: str) -> list[WeatherSample]:
             open_meteo_f=open_meteo_f, current_obs_f=current_obs_f,
             lead_hours=lead_h or 0,
             trend_f_per_hr=(trend_f if trend_aware else None),
+            model_forecasts=model_forecasts,
         )
         if trend_meta:
             blend_meta["trend"] = trend_meta
@@ -639,6 +762,7 @@ def sample_signals_for_city(city_key: str) -> list[WeatherSample]:
             city=city_key, nws_forecast_f=nws_forecast_f,
             open_meteo_f=open_meteo_f, current_obs_f=current_obs_f,
             lead_hours=lead_h or 0, trend_f_per_hr=trend_f,
+            model_forecasts=model_forecasts,
         )
         shadow_p_yes = _p_above_strike(shadow_point, strike_f, shadow_sigma)
 

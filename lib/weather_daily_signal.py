@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tradingcore import log_event
+from lib.forecaster_ensemble import skill_weighted_point as _ensemble_point
 
 # Reuse shared NWS/Kalshi plumbing from the hourly module.
 from lib.weather_signal import (
@@ -468,12 +469,29 @@ def _parse_event_date(event_ticker: str):
         return None
 
 
+# Named NWP models pulled from Open-Meteo as SEPARATE ensemble members. Chosen
+# by measured airport-station skill (scripts/forecaster_accuracy.py): ECMWF is
+# the clear best, ICON solid on lows, GFS the baseline. GEM is EXCLUDED (MAE
+# 2-3.5°F vs ECMWF's 0.8-1.2). Open-Meteo's unnamed "default" blend turned out to
+# be GFS for these US points — so naming models explicitly is what actually adds
+# ECMWF's skill (the #174 cold-blend bleed came from trading on GFS-as-default).
+_OM_MODELS = ["ecmwf_ifs025", "icon_seamless", "gfs_seamless"]
+
+
 def _fetch_open_meteo_daily(lat: float, lon: float) -> dict:
-    """Open-Meteo forecast — the second model source for the daily sleeve.
-    One call returns BOTH the ensemble daily extremes (the cross-check vs NWS)
-    and an hourly series spanning yesterday→+2d (to compute the observed
-    extreme-so-far for the observation anchor). Returns {} on any failure —
-    the second source is an enhancement, never load-bearing."""
+    """Open-Meteo forecast — the multi-model second source for the daily sleeve.
+    Two calls: (A) the DEFAULT model's daily extremes + an hourly series
+    spanning yesterday→+2d — the default's past_days values are obs-corrected so
+    they double as the realized ACTUAL used by settlement calibration, and the
+    hourly feeds the observed-extreme anchor; (B) the NAMED models' daily
+    extremes (ECMWF/ICON/GFS), each a separate ensemble member for the
+    skill-weighted blend. Returns {} on total failure — the second source is an
+    enhancement, never load-bearing; a partial failure degrades gracefully
+    (missing members just drop out of the weighting)."""
+    daily: dict[str, dict] = {}
+    hourly: list = []
+    utc_off = 0
+    # (A) default daily (obs-corrected actuals) + hourly (observed extreme)
     try:
         url = (f"{_OPEN_METEO_BASE}?latitude={lat}&longitude={lon}"
                "&daily=temperature_2m_max,temperature_2m_min"
@@ -481,21 +499,38 @@ def _fetch_open_meteo_daily(lat: float, lon: float) -> dict:
                "&timezone=auto&past_days=1&forecast_days=3")
         data = json.loads(urllib.request.urlopen(
             urllib.request.Request(url), timeout=10).read())
-        daily: dict[str, dict] = {}
         d = data.get("daily", {}) or {}
         for ds, mx, mn in zip(d.get("time", []),
                               d.get("temperature_2m_max", []),
                               d.get("temperature_2m_min", [])):
-            daily[ds] = {"max": mx, "min": mn}
-        hourly = []
+            daily[ds] = {"max": mx, "min": mn, "models": {}}
         h = data.get("hourly", {}) or {}
         for ts, t in zip(h.get("time", []), h.get("temperature_2m", [])):
             if t is not None:
                 hourly.append((ts, float(t)))
-        return {"daily": daily, "hourly": hourly,
-                "utc_offset_s": int(data.get("utc_offset_seconds", 0) or 0)}
+        utc_off = int(data.get("utc_offset_seconds", 0) or 0)
     except Exception:
         return {}
+    # (B) named per-model daily extremes (suffixed arrays); best-effort.
+    try:
+        murl = (f"{_OPEN_METEO_BASE}?latitude={lat}&longitude={lon}"
+                "&daily=temperature_2m_max,temperature_2m_min"
+                "&temperature_unit=fahrenheit&timezone=auto"
+                "&past_days=1&forecast_days=3"
+                f"&models={','.join(_OM_MODELS)}")
+        md = json.loads(urllib.request.urlopen(
+            urllib.request.Request(murl), timeout=10).read()).get("daily", {}) or {}
+        times = md.get("time", [])
+        for model in _OM_MODELS:
+            mx = md.get(f"temperature_2m_max_{model}", [])
+            mn = md.get(f"temperature_2m_min_{model}", [])
+            for ds, vmx, vmn in zip(times, mx, mn):
+                if ds not in daily:
+                    daily[ds] = {"max": None, "min": None, "models": {}}
+                daily[ds]["models"][model] = {"max": vmx, "min": vmn}
+    except Exception:
+        pass  # degrade to default-only; blend falls back to NWS + default
+    return {"daily": daily, "hourly": hourly, "utc_offset_s": utc_off}
 
 
 def _observed_extreme_and_weight(om: dict, obs_date, direction: str):
@@ -535,15 +570,43 @@ def _observed_extreme_and_weight(om: dict, obs_date, direction: str):
     return ext, max(0.0, min(1.0, w))
 
 
+# Per-forecaster skill (MAE °F) from scripts/forecaster_accuracy.py — a 30-day
+# airport-station verification against ERA5 actuals. Lower MAE => more weight
+# (inverse-MAE). ECMWF is the measured best; ICON solid on lows; GFS the
+# baseline; GEM excluded upstream. NWS is the settlement-aligned source (Kalshi
+# resolves on the NWS station obs) and the proven primary of the live hourly
+# sleeve — we couldn't verify it over the same window (ERA5 lag vs our young
+# log) so we set it co-equal with ECMWF as a defensible prior. These are WEIGHTS,
+# not hard truths: re-derive with the script and update as data accrues.
+_FORECASTER_MAE = {
+    "max": {"nws": 1.17, "ecmwf_ifs025": 1.17, "gfs_seamless": 1.34,
+            "icon_seamless": 1.52},
+    "min": {"nws": 0.80, "ecmwf_ifs025": 0.80, "gfs_seamless": 1.53,
+            "icon_seamless": 1.28},
+}
+_DEFAULT_MAE = 1.6      # unknown source -> modest weight
+_OUTLIER_REJECT_F = 5.0  # a member >5°F from the ensemble median is a model bust
+
+
+def _skill_weighted_point(direction: str, contributions: dict):
+    """Robust inverse-MAE weighted ensemble point for daily max/min. Thin
+    wrapper over the shared lib.forecaster_ensemble combiner with this sleeve's
+    per-direction MAE table. Returns (point_f | None, kept_member_names): a model
+    that busts >5°F from the median is dropped, then survivors are inverse-MAE
+    weighted so ECMWF leads (the #174 fix)."""
+    return _ensemble_point(
+        _FORECASTER_MAE.get(direction, {}), contributions,
+        outlier_reject_f=_OUTLIER_REJECT_F, default_mae=_DEFAULT_MAE)
+
+
 def _blended_daily_forecast(
     *, city_key: str, direction: str, nws_forecast_f: float,
-    open_meteo_f: float | None, observed_extreme_f: float | None,
+    model_forecasts: dict | None, observed_extreme_f: float | None,
     obs_weight: float, lead_hours: float | None, seconds_to_close: float | None,
 ) -> tuple[float, float, dict]:
-    """Combine NWS + Open-Meteo + observed extreme + per-city calibration into
-    a single (point_f, sigma_f, meta). Faithful adaptation of the hourly
-    sleeve's _blended_forecast for daily max/min markets."""
-    meta = {"nws_f": round(nws_forecast_f, 2), "open_meteo_f": open_meteo_f,
+    """Combine NWS + a skill-weighted multi-model Open-Meteo ensemble + observed
+    extreme + per-city calibration into a single (point_f, sigma_f, meta)."""
+    meta = {"nws_f": round(nws_forecast_f, 2), "model_forecasts": model_forecasts,
             "observed_extreme_f": observed_extreme_f,
             "obs_weight": round(obs_weight, 2)}
     try:
@@ -554,25 +617,42 @@ def _blended_daily_forecast(
     bias = float(cal.get("bias_f") or 0.0)
     meta["calibration"] = cal
 
-    # NWS canonical + bias correction; settlement-collapsing horizon prior σ.
-    forecast_blend = nws_forecast_f + bias
     base_sigma = daily_sigma_f(lead_hours, seconds_to_close)
     disagreement_sigma = 0.0
 
-    # Two-model ensemble: average the (bias-corrected) models; tighten σ on
-    # agreement, widen on conflict.
-    if open_meteo_f is not None:
-        adj_om = open_meteo_f + bias
-        diff = abs(nws_forecast_f - open_meteo_f)
-        forecast_blend = ((nws_forecast_f + bias) + adj_om) / 2.0
-        if diff <= 1.0:
-            base_sigma *= 0.80
-        elif diff <= 2.0:
-            base_sigma *= 0.90
-        elif diff > 4.0:
+    # Skill-weighted MULTI-MODEL ensemble. Members: bias-corrected NWS + the
+    # named Open-Meteo models (ECMWF/ICON/GFS), each inverse-MAE weighted. This
+    # REPLACES the old NWS+default 2-model average — the default turned out to be
+    # GFS, and a cold GFS reading dragging NWS off is what manufactured the #174
+    # cold-blend bleed (NWS 86 + GFS 70 -> 78 -> fake confident NO). ECMWF (the
+    # measured best) + NWS now dominate; a single divergent low-skill model can
+    # no longer pull the point. The per-city calibration bias is NWS-specific
+    # (learned from NWS error) so it's applied ONLY to the NWS member.
+    contributions = {"nws": nws_forecast_f + bias}
+    for m, v in (model_forecasts or {}).items():
+        if v is not None and math.isfinite(v):
+            contributions[m] = float(v)
+    blended, kept = _skill_weighted_point(direction, contributions)
+    forecast_blend = blended if blended is not None else nws_forecast_f + bias
+    meta["ensemble_members"] = sorted(contributions)
+    meta["ensemble_used"] = kept
+    dropped = sorted(set(contributions) - set(kept))
+    if dropped:
+        meta["ensemble_dropped"] = dropped   # busted models the median rejected
+    # σ from the CREDIBLE (kept) members only — a rejected bust is dropped from
+    # the point, so it must NOT also inflate σ (double-counting its badness).
+    # GENUINE disagreement (nothing clearly rogue → nothing dropped) still widens
+    # σ as real uncertainty. (#174's market-disagreement gate is the downstream
+    # catch if the ensemble still diverges hard from the market.)
+    kept_vals = [contributions[n] for n in kept]
+    if len(kept_vals) > 1:
+        spread = max(kept_vals) - min(kept_vals)
+        disagreement_sigma = spread / 2.0
+        meta["model_spread_f"] = round(spread, 2)
+        if spread <= 1.5:
+            base_sigma *= 0.85
+        elif spread > 4.0:
             base_sigma *= 1.30
-        disagreement_sigma = diff / 2.0
-        meta["model_disagreement_f"] = round(diff, 2)
 
     # Observation correction. The observed extreme-so-far is a ONE-DIRECTIONAL
     # bound: it can only RAISE a max estimate / LOWER a min estimate (reality
@@ -646,15 +726,23 @@ def sample_signals_for_daily_city(city_key: str) -> list[dict]:
         nws_f, lead_h = _forecast_for_day(periods, cfg["direction"], close_dt)
         if nws_f is None:
             continue
-        # Blend NWS with Open-Meteo + observed extreme + per-city calibration.
+        # Blend NWS with a skill-weighted multi-model Open-Meteo ensemble +
+        # observed extreme + per-city calibration.
         obs_date = _parse_event_date(m.get("event_ticker", ""))
         om_daily = (om.get("daily") or {}).get(obs_date.isoformat()) if obs_date else None
-        open_meteo_f = om_daily.get(cfg["direction"]) if om_daily else None
+        model_forecasts: dict = {}
+        default_om_f = None
+        if om_daily:
+            default_om_f = om_daily.get(cfg["direction"])
+            for mdl, vals in (om_daily.get("models") or {}).items():
+                v = (vals or {}).get(cfg["direction"])
+                if v is not None:
+                    model_forecasts[mdl] = v
         observed_extreme_f, obs_w = _observed_extreme_and_weight(
             om, obs_date, cfg["direction"])
         fc_f, sigma_f, blend_meta = _blended_daily_forecast(
             city_key=city_key, direction=cfg["direction"], nws_forecast_f=nws_f,
-            open_meteo_f=open_meteo_f, observed_extreme_f=observed_extreme_f,
+            model_forecasts=model_forecasts, observed_extreme_f=observed_extreme_f,
             obs_weight=obs_w, lead_hours=lead_h,
             seconds_to_close=m["_seconds_to_close"],
         )
@@ -688,10 +776,13 @@ def sample_signals_for_daily_city(city_key: str) -> list[dict]:
         )
         d = asdict(ws)
         d["sigma_f"] = sigma_f
-        # Forecast-blend transparency: raw NWS, Open-Meteo, observed extreme,
-        # model disagreement, calibration, and σ source all live here.
+        # Forecast-blend transparency: raw NWS, per-model ensemble members,
+        # observed extreme, model spread, calibration, and σ source all live here.
         d["nws_forecast_f"] = nws_f
-        d["open_meteo_f"] = open_meteo_f
+        # Headline OM value kept for dashboard/analyzer continuity = ECMWF (the
+        # most accurate member), falling back to the default blend then None.
+        d["open_meteo_f"] = model_forecasts.get("ecmwf_ifs025", default_om_f)
+        d["model_forecasts"] = model_forecasts
         d["forecast_blend"] = blend_meta
         # SDK 2.1.x renamed liquidity fields to *_fp / *_dollars; fall back to
         # the legacy names so a future liquidity filter sees real volume (not 0,

@@ -35,6 +35,16 @@ DEFAULT_MIN_TRADE_USD = 1.0
 DEFAULT_MAX_TRADE_USD = 5.0           # smaller than hourly ($7.5) — longer hold
 DEFAULT_KELLY_MULTIPLIER = 0.25       # quarter-Kelly
 MIN_EDGE_THRESHOLD = 0.10             # 10pp
+# Market-disagreement ceiling (the between-market bleed fix, #174). A NO bet
+# against a market that prices the YES side meaningfully is almost always us
+# FADING the market's superior short-horizon view: the live order book embeds
+# fresher forecast info (incl. up-revised highs) than our day-ahead wide-σ
+# model, which STRUCTURALLY underprices narrow between-bands. Every loser in the
+# settled pre-fix sample was a violent disagreement (we said 2-9% YES, the
+# market said 44-95%, and the market was right). When our probability differs
+# from the market's by more than this many points, we don't believe our own
+# edge — skip. Robust regardless of which internal path corrupted forecast_f.
+MAX_DISAGREEMENT_EDGE = 0.40
 MAX_FILL_FOR_BUY = 0.45
 EXTREME_PRICE_FLOOR = 0.05
 EXTREME_PRICE_CEIL = 0.95
@@ -63,6 +73,7 @@ def _effective_params() -> dict:
     o = _load_overrides()
     return {
         "min_edge_threshold":     float(o.get("min_edge_threshold",     MIN_EDGE_THRESHOLD)),
+        "max_disagreement_edge":  float(o.get("max_disagreement_edge",  MAX_DISAGREEMENT_EDGE)),
         "max_fill_for_buy":       float(o.get("max_fill_for_buy",       MAX_FILL_FOR_BUY)),
         "max_trade_usd":          float(o.get("default_max_trade_usd",  DEFAULT_MAX_TRADE_USD)),
         "kelly_multiplier":       float(o.get("default_kelly_multiplier", DEFAULT_KELLY_MULTIPLIER)),
@@ -96,6 +107,14 @@ class DailyWeatherPaperTrade:
     paper_pnl: float
     kelly_fraction: float
     half_kelly_fraction: float
+    # Live-trade metadata (#160). Populated ONLY when kalshi_live_executor placed
+    # a real order; is_live=False rows are paper. Settlement reads live_contracts/
+    # live_notional_usd for is_live rows so P&L + kill-switch count REAL fills
+    # (not the paper-intended size); a 0-fill live order settles void.
+    is_live: bool = False
+    live_order_id: str = ""
+    live_contracts: int = 0
+    live_notional_usd: float = 0.0
     # Schema/version tag for the ENTRY logic that produced this record. Records
     # written before the strike-type fix (2026-05-31) were stamped
     # "pre_strike_type_fix" by the backfill and must be excluded from go-forward
@@ -177,6 +196,11 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
     params = _effective_params()
     new_trades: list[DailyWeatherPaperTrade] = []
     skip_counts: dict[str, int] = {}
+    # Live execution per-cycle state (#160). committed_* stop over-deploy before
+    # Kalshi's balance/positions lag catches up; balance is fetched at most once.
+    committed_in_cycle = 0.0
+    committed_count_in_cycle = 0
+    _live_balance_cache: dict = {}
 
     for s in samples:
         ticker = s.get("market_ticker", "")
@@ -191,6 +215,21 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
         edge = nws_p - market_p
         if abs(edge) < params["min_edge_threshold"]:
             skip_counts["edge_too_small"] = skip_counts.get("edge_too_small", 0) + 1
+            continue
+        # Market-disagreement sanity gate (#174 between-market bleed fix). A huge
+        # gap between our probability and the market's is not a huge edge — it is
+        # us fading a market that has fresher forecast info. Investigation of the
+        # settled sample: every loser was a violent disagreement (we said 2-9%
+        # YES on a narrow between-band, the market said 44-95%, and the market
+        # was right — the band DID settle in). Our day-ahead wide-σ model
+        # structurally underprices narrow bands; the live book embeds the
+        # up-revised forecast. Above this ceiling we distrust our own number.
+        # This is the robust catch independent of whichever internal path (cold
+        # Open-Meteo blend, stale forecast, future calibration drift) corrupted
+        # forecast_f. Tunable via config; re-tune on POST-fix paper, not the
+        # pre-fix legacy sample.
+        if abs(edge) > params["max_disagreement_edge"]:
+            skip_counts["disagreement_too_large"] = skip_counts.get("disagreement_too_large", 0) + 1
             continue
 
         # Side selection
@@ -256,6 +295,64 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
             continue
         contracts = round(notional / fill, 4)
 
+        # ── Live execution branch (#160, 2026-06-02) ──────────────────────
+        # Routes through kalshi_live_executor, which enforces EVERY rail
+        # (asset allowlist, balance floor, daily-loss halt, 5-loss kill switch,
+        # per-asset budget, concurrent cap, 24h dedup). The daily sleeve's own
+        # gates (edge/disagreement/forecast-dir/fill) already ran above.
+        # asset="weather_daily" → its OWN tiny budget. Refusal → live_order is
+        # None and the trade records paper-only (is_live=False; no double-spend).
+        # Until "weather_daily" is in settings.live_assets the allowlist gate
+        # makes this a guaranteed no-op — safe to ship BEFORE enabling.
+        live_order = None
+        try:
+            from lib.kalshi_live_executor import (
+                is_live_enabled, _load_live_config, place_live_order,
+                effective_max_trade_usd,
+            )
+            if is_live_enabled():
+                live_cfg = _load_live_config()
+                if not _live_balance_cache.get("fetched"):
+                    try:
+                        from lib.kalshi_client import KalshiClient as _KC
+                        _live_balance_cache["bal"] = _KC().get_balance()
+                    except Exception:
+                        _live_balance_cache["bal"] = None
+                    _live_balance_cache["fetched"] = True
+                _bal0 = _live_balance_cache.get("bal")
+                _pct = float(live_cfg.get("max_trade_bankroll_pct", 0.0) or 0.0)
+                if _pct > 0 and _bal0 is None:
+                    max_live_contracts = 0   # fail closed: pct sizing needs balance
+                else:
+                    _avail = (_bal0 - committed_in_cycle) if _bal0 is not None else None
+                    live_cap_usd = effective_max_trade_usd(live_cfg, available_balance=_avail)
+                    max_live_contracts = int(live_cap_usd / fill) if fill > 0 else 0
+                live_contracts = max(0, min(int(contracts), max_live_contracts))
+                if live_contracts >= 1:
+                    live_order = place_live_order(
+                        market_ticker=ticker, side=side, fill_price=fill,
+                        contracts=live_contracts,
+                        metadata={
+                            "asset": "weather_daily",  # MUST match live_assets + _ticker_to_asset
+                            "p_win": p_win, "strike_f": strike_f,
+                            "forecast_f": forecast_f,
+                            "nws_forecast_f": s.get("nws_forecast_f"),
+                            "edge": round(float(edge), 4),
+                            "close_time": str(s.get("close_time", "")),
+                            "city": s.get("city_key"),
+                            "kelly_fraction": meta["kelly_fraction"],
+                            "paper_contracts": int(contracts),
+                        },
+                        committed_in_cycle=committed_in_cycle,
+                        committed_count_in_cycle=committed_count_in_cycle,
+                    )
+                    if live_order is not None:
+                        committed_in_cycle += float(live_order.get("notional_usd") or 0.0)
+                        committed_count_in_cycle += 1
+        except Exception as e:
+            log_event("weather_daily_paper", "live_branch_exception",
+                      {"ticker": ticker, "error": str(e)[:200]}, result="degraded")
+
         trade = DailyWeatherPaperTrade(
             trade_id=f"{ticker}_{int(datetime.now(timezone.utc).timestamp())}",
             city_key=s.get("city_key", "?"),
@@ -279,6 +376,13 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
             paper_pnl=0.0,
             kelly_fraction=meta["kelly_fraction"],
             half_kelly_fraction=meta["scaled"],
+            # Live metadata — populated only when place_live_order placed a real
+            # order. Book ACTUAL filled qty/notional so settlement + kill-switch
+            # count real risk on partial fills (legacy-safe .get fallbacks).
+            is_live=bool(live_order),
+            live_order_id=str(live_order.get("order_id", "")) if live_order else "",
+            live_contracts=int(live_order.get("filled_quantity", live_order.get("contracts", 0))) if live_order else 0,
+            live_notional_usd=float(live_order.get("filled_notional_usd", live_order.get("notional_usd", 0.0))) if live_order else 0.0,
         )
         rec = asdict(trade)
         # Keep the RAW NWS forecast (pre-bias, pre-blend) so settlement can feed
@@ -387,7 +491,24 @@ def settle_paper_trades() -> dict:
             continue
         side = rec.get("side", "")
         fill = float(rec.get("fill_price") or 0)
-        size = float(rec.get("our_size") or 0)
+        # LIVE trades (#160) settle on the ACTUAL filled size/notional; paper on
+        # the intended paper size. Keeps live P&L, the daily-loss halt, and the
+        # kill-switch counting REAL risk (not the paper-intended quantity).
+        is_live_trade = bool(rec.get("is_live"))
+        if is_live_trade:
+            size = float(rec.get("live_contracts") or 0)
+            loss_notional = float(rec.get("live_notional_usd") or 0)
+        else:
+            size = float(rec.get("our_size") or 0)
+            loss_notional = float(rec.get("notional") or 0)
+        # A live order that filled 0 contracts → nothing at risk → void, NOT loss.
+        if is_live_trade and size == 0:
+            rec["status"] = "void"
+            rec["resolved_at"] = now.isoformat()
+            rec["paper_pnl"] = 0.0
+            rec["kalshi_result"] = result
+            voided_now += 1
+            continue
         won = (side == "YES" and result == "yes") or (side == "NO" and result == "no")
         if won:
             # Payoff = $1 per contract minus the fill we paid; minus Kalshi profit fee.
@@ -396,11 +517,21 @@ def settle_paper_trades() -> dict:
             pnl = gross - fee
             rec["status"] = "won"
         else:
-            pnl = -float(rec.get("notional") or 0)
+            pnl = -loss_notional
             rec["status"] = "lost"
         rec["resolved_at"] = now.isoformat()
         rec["paper_pnl"] = round(pnl, 4)
         rec["kalshi_result"] = result
+        # LIVE outcomes feed the executor's kill-switch (5 consecutive losses),
+        # daily-loss tally, and warning signals — the safety rails the user
+        # asked for. Best-effort; never block settlement.
+        if is_live_trade:
+            try:
+                from lib.kalshi_live_executor import record_outcome
+                record_outcome(market_ticker=ticker, pnl=round(pnl, 4),
+                               opened_at=str(rec.get("opened_at", "")))
+            except Exception:
+                pass
         # Feed per-city calibration the raw forecast error (best-effort).
         try:
             _record_daily_calibration(rec, _om_cache)

@@ -156,6 +156,15 @@
         </div>
 
         <div class="card full">
+            <h2>📊 Paper vs Live reality <span id="pvl-meta" style="font-weight:400;font-size:0.9em;color:#8b949e;margin-left:8px"></span></h2>
+            <div style="font-size:12px;color:#8b949e;margin-bottom:6px">Paper books <em>every</em> qualifying at-bat at hypothetical sizing assuming fills; live takes only the gate/budget-eligible subset at real sizing with real (often partial/no) fills. <strong>Capture</strong> = live ÷ paper at-bats — a low number means paper P&amp;L overstates what live would make. Read paper as <em>signal quality</em>, not a dollar forecast.</div>
+            <table id="paper-vs-live">
+                <thead><tr><th>Sleeve</th><th>Paper (n / WR / net)</th><th>Live (n / WR / net)</th><th>Capture</th></tr></thead>
+                <tbody id="pvl-body"><tr><td colspan="4" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+        </div>
+
+        <div class="card full">
             <h2>Weather DAILY (max/min) <span id="wxd-meta" style="font-weight:400;font-size:0.95em;color:#8b949e;margin-left:8px"></span></h2>
             <div style="font-size:12px;color:#8b949e;margin-bottom:6px">KXHIGHT*/KXLOWT* recalibrated pilot — PAPER only (validation in progress). Pre-fix records excluded.</div>
             <div id="wxd-stats" style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 14px 0"></div>
@@ -326,6 +335,10 @@ async function fetchData() {
         const res = await fetch('/api/live_alerts');
         renderLiveAlerts(await res.json());
     } catch(e) { console.error('live_alerts fetch error:', e); }
+    try {
+        const res = await fetch('/api/paper_vs_live');
+        renderPaperVsLive(await res.json());
+    } catch(e) { console.error('paper_vs_live fetch error:', e); }
     try {
         const res = await fetch('/api/kalshi_paper_summary');
         renderKalshiPaperSummary(await res.json());
@@ -891,6 +904,33 @@ function renderLiveAlerts(d) {
             <td style="white-space:nowrap;font-size:12px">${(a.ts||'').substring(5,19)}</td>
             <td><span style="color:${c};font-weight:700">${label[a.kind]||a.kind}</span></td>
             <td style="font-size:12px">${(a.summary||'').replace(/[✅🚨⚠️🛡️]/g,'').trim()}${rest ? ' — <span style="color:#8b949e">'+rest+'</span>' : ''}</td>
+        </tr>`;
+    }).join('');
+}
+
+function renderPaperVsLive(d) {
+    const body = document.getElementById('pvl-body');
+    const meta = document.getElementById('pvl-meta');
+    if (!body) return;
+    const sleeves = (d && d.sleeves) || [];
+    if (sleeves.length === 0) {
+        body.innerHTML = '<tr><td colspan="4" style="color:#8b949e">no data</td></tr>';
+        return;
+    }
+    if (meta) meta.textContent = '· live ÷ paper at-bats';
+    const cell = (x) => `${x.closed} / ${x.wr_pct == null ? '—' : x.wr_pct.toFixed(0)+'%'} / `
+        + `<span class="${pnlClass(x.net_pnl)}">${pnlSign(x.net_pnl)}</span>`;
+    body.innerHTML = sleeves.map(s => {
+        const cap = s.capture_pct;
+        // low capture = paper overstates live -> warn (red); high = trustworthy (green)
+        const capColor = cap == null ? '#8b949e' : (cap >= 60 ? '#3fb950' : (cap >= 25 ? '#f0883e' : '#f85149'));
+        const capTxt = cap == null ? '—' : cap.toFixed(0) + '%';
+        const liveTxt = (s.live.closed === 0) ? '<span style="color:#8b949e">paper-only</span>' : cell(s.live);
+        return `<tr>
+            <td><strong>${s.label}</strong></td>
+            <td>${cell(s.paper)}</td>
+            <td>${liveTxt}</td>
+            <td><span style="color:${capColor};font-weight:700">${capTxt}</span></td>
         </tr>`;
     }).join('');
 }

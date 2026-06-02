@@ -19,7 +19,17 @@
 # conservative cheap-only cut, still blocks the fragile expensive-NO band.
 # NOTE: still PAPER. Must validate post-fix paper WR before any live path (#160).
 
+# Tradeable edge BAND, not just a floor. min/max bracket the believable zone:
+#   |edge| < min  -> no edge, skip
+#   |edge| > max  -> "edge" too big to be real; we're fading a market that has
+#                    fresher forecast info than our day-ahead wide-σ model. This
+#                    is the #174 between-market bleed fix: every loser in the
+#                    settled (pre-fix) sample was a violent disagreement — we
+#                    said 2-9% YES on a narrow band, the market said 44-95%, and
+#                    the market was right. 0.40 is a humility ceiling; RE-TUNE on
+#                    POST-fix paper (the pre-fix 16 are legacy, do not fit them).
 min_edge_threshold: 0.05        # was 0.10 — daily edges are smaller; catch near-money at-bats
+max_disagreement_edge: 0.40     # #174 — skip when our prob differs from market by >40pp
 forecast_buffer_f: 1.5          # NO-side °F buffer (was 2.0) — daily-appropriate
 forecast_buffer_f_yes: 2.5      # YES-side °F buffer (was 3.0)
 max_fill_for_buy: 0.70          # was 0.45 — allow mid-priced trades; blocks the 0.85-0.95 razor band

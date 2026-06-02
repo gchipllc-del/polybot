@@ -1,90 +1,309 @@
-# ============================================================
-# POLYBOT — RUNTIME SETTINGS (SECURITY CRITICAL)
-# ============================================================
-
-# --- Mode ---
-mode: manifold           # manifold (paper) | kalshi | polymarket | all
-                         # NOTE: this field only controls dashboard badge text
-                         # ("PAPER" vs "LIVE"). Actual platform routing is the
-                         # `platforms:` block below. Leaving as `manifold` so
-                         # the dashboard correctly shows PAPER (Kalshi 15-min
-                         # is still paper-traded too).
-live_migration_approved: false   # Requires manual flip for real-money platforms
-
-# --- Active Platforms ---
-# 2026-05-18: Disabled Manifold conviction trading after 39-trade
-# diagnosis showed -$97.59 net P&L (71.8% WR but asymmetric losses —
-# Virginia -$157, Hormuz duplicate -$148). The Kalshi 15-min BTC paper
-# trader remains active (separate launchd job, paper mode). Polybot is
-# now effectively a Kalshi-BTC-only bot in paper mode until the
-# tightened sizing rules (kelly 0.10, max_stake_usd $30, min_confidence
-# 0.75, persistent 24h dedup) prove out on at least 20 resolved trades.
-# Then we'll re-evaluate: re-enable Manifold with the new rules, or
-# flip Kalshi to live, or keep narrow.
+mode: manifold
+live_migration_approved: false
 platforms:
   kalshi:
-    enabled: false        # Stays false until paper P&L is consistently positive
+    enabled: false
   polymarket:
-    enabled: false        # Enable when wallet is funded
+    enabled: false
   manifold:
-    enabled: false        # 2026-05-18: paused after asymmetric-loss diagnosis
-
-# --- Circuit Breakers ---
+    enabled: false
 circuit_breakers:
-  # Two layers — whichever is more lenient wins:
-  #   max_daily_loss      : hard dollar floor (last-resort absolute stop)
-  #   max_daily_loss_pct  : bankroll-relative ceiling (auto-scales)
-  # Original -10 floor was calibrated to a $50 bankroll. Bankroll grew to
-  # ~$739 by 2026-04-30 and the absolute floor was tripping false-positive
-  # daily; pct rule now does the live work (10% of $739 ≈ -$73.90).
-  max_daily_loss: -50             # absolute floor — never let losses exceed this
-  max_daily_loss_pct: -0.10       # bankroll-relative ceiling (10%)
-  max_per_market_pct: 0.15        # 15% of bankroll per market
-  max_category_pct: 0.40          # 40% in any single category
-  # NOTE: position-count gate of record is strategy.yaml `growth.phase_caps`
-  # (auto-graduates with bankroll, see lib/phase.effective_max_positions).
-  # This breaker is a defense-in-depth absolute ceiling — set strictly higher
-  # than the highest phase_cap (25 at phase 4) so it never silently blocks
-  # phase-allowed entries. If you raise a phase_cap, raise this too.
-  max_open_positions: 30          # Hard ceiling — should exceed max phase_cap
-  max_quantity_per_order: 5000    # Max contracts per order (Manifold uses mana, not contracts)
-  cooldown_after_loss_minutes: 30 # Cooldown after losing trade
-  min_market_volume: 10           # Min 24h volume (Manifold play money; raise for real platforms)
-  max_resolution_date_pct: 0.25   # Max 25% of bankroll resolving same date
-
-# --- Monitoring ---
+  max_daily_loss: -50
+  max_daily_loss_pct: -0.1
+  max_per_market_pct: 0.15
+  max_category_pct: 0.4
+  max_open_positions: 30
+  max_quantity_per_order: 5000
+  cooldown_after_loss_minutes: 30
+  min_market_volume: 10
+  max_resolution_date_pct: 0.25
 monitoring:
-  check_interval_seconds: 120    # 2 minutes (prediction markets move fast)
+  check_interval_seconds: 120
   missed_check_alert: 3
   missed_check_kill: 10
-
-# --- Hermes Optimization ---
 hermes:
   enabled: true
   lookback_days: 14
-  min_trades_to_optimize: 5      # Need 5+ resolved trades before tuning
-
-# --- Rate Limiting ---
+  min_trades_to_optimize: 5
 rate_limits:
   kalshi_calls_per_minute: 60
   polymarket_calls_per_minute: 120
   manifold_calls_per_minute: 120
-  # --- LLM providers (one bucket per provider) ---
-  anthropic_calls_per_minute: 30     # Claude
-  deepseek_calls_per_minute: 30      # DeepSeek (usually generous limits)
-  moonshot_calls_per_minute: 30      # Kimi / Moonshot
+  anthropic_calls_per_minute: 30
+  deepseek_calls_per_minute: 30
+  moonshot_calls_per_minute: 30
   backoff_base_seconds: 2
   backoff_max_seconds: 60
-
-# --- Notifications ---
 notifications:
-  telegram_enabled: false         # Enable when bot token is set
+  telegram_enabled: false
   alert_on:
-    - order_filled
-    - order_rejected
-    - circuit_breaker_triggered
-    - market_resolved
-    - kill_switch_activated
-    - daily_summary
-    - missed_monitoring_check
-    - calibration_report
+  - order_filled
+  - order_rejected
+  - circuit_breaker_triggered
+  - market_resolved
+  - kill_switch_activated
+  - daily_summary
+  - missed_monitoring_check
+  - calibration_report
+kalshi_hermes_mode: review
+weather_hermes_mode: live
+daily_hermes_mode: live
+
+# ── KXBTCD daily LIVE TRADING (real money on Kalshi) ─────────────────
+# 2026-05-24: Live execution wrapper landed. DEFAULTS TO DISABLED for
+# safety — flip enabled: true ONLY after reviewing lib/kalshi_live_executor
+# code AND running `python main.py kalshi-live-status` to verify all
+# safety gates pass.
+#
+# Bounds tuned for a $50 starting balance:
+#   max_trade_usd     = $1.50  → single trade ≤ 3% of $50
+#   max_concurrent    = 8      → peak risk capped at $12 (24%)
+#   max_daily_loss    = $15    → halt for the day if down 30%
+#   min_balance_floor = $35    → trades refused if balance would drop below
+#   cooldown_minutes  = 30     → pause 30m if 3+ losses in 60m window
+#
+# To go live: change `enabled: false` to `enabled: true` and the very
+# NEXT kalshi-daily-monitor cycle will start placing real orders.
+kalshi_daily_live:
+  # 2026-05-24 19:22 UTC: FLIPPED TO LIVE after smoke test passed.
+  # 2026-05-25 EOD: cap raised $1.50 → $5.00 to mirror yesterday's paper
+  # start. Hermes scaled paper from $5 → $12.50 over 24h producing
+  # +$814; we expect similar trajectory live (capped by daily_loss_limit
+  # and kill_switch, see below). The 8x increase means each loss now
+  # hurts proportionally more — kept daily_loss_usd at $15 ($5 cap × 3
+  # losses = $15 = day halts). Worst real-money loss tonight = $15.
+  #
+  # 2026-05-25 PM: HALTED briefly after 26% WR live forensic (7W/20L,
+  # 27 live trades, -$1.31). Root cause: composite YES-bias + LIVE NO
+  # disabled while paper showed NO was the unprofitable side anyway.
+  #
+  # 2026-05-25 PM RE-ENABLED after end-to-end calibration:
+  #   * Rebuilt composite (calibration BEFORE gap calc; widened saturation
+  #     0.10→0.20; dampened RSI 3.0→1.5 for daily horizon).
+  #   * Added directional-alignment gate (corrected theo_yes >= 0.50 for YES).
+  #   * Wired Coinbase whale_pressure into composite + added whale-veto gate.
+  #   * Grid-searched 297 filter combos on 7d BTC paper (n=186):
+  #       YES side: 41% WR, +$1174 P&L  (PROFITABLE)
+  #       NO side:  19% WR, -$46  P&L  (LOSES — now disabled in strategy yaml)
+  #       1-hr time gate would have cost $989 of YES winners → removed.
+  #   * Backtest of EXACT shipped config on 7d BTC: 5 trades, 60% WR,
+  #     +$188.82 total, +$37.76 avg/trade.
+  # User-approved full deploy of remaining $12.70: floor $10→$1,
+  # daily loss $15→$11 (halts after ~2 losses, before wipe-out).
+  # 2026-05-26 PM: HALTED at user request after $11.82 weather bleed.
+  # User asked for 80-90% WR; I refused to claim it exists; user agreed
+  # to stop. ONE BTC NO position ($5.72) remained open (settles ~17:00
+  # UTC tomorrow).
+  #
+  # 2026-05-26 PM RE-ENABLED after calibration to honest realistic
+  # targets. Grid-search of 5829 configs found:
+  #   BTC max achievable: 50% WR (min_conf 0.35) — 16 trades, +$318
+  #   Weather max:        100% WR (1.0°F buffer)  — 11 trades, +$503
+  #   Combined backtest:  ~70% WR / ~$821 over 7d
+  # Plus realistic paper now has notional-scaled slippage + latency drift
+  # so paper P&L tracks live within ~5pp. User-requested re-enable to
+  # deploy the calibrated strategy on remaining $7.93 cash.
+  enabled: true
+  # 2026-05-25 EOD-EU: raised $5 → $9 after first 24h proved out.
+  # 2026-05-25 PM: pulled back $9 → $7 after losing streak (11L of 17).
+  # 2026-05-25 PM: lowered $7 → $6 for the $6 BTC + $6 weather split.
+  # 2026-05-27 PM: HALVED $6 → $3 after honest backtest concerns.
+  # 2026-05-27 PM (later): restored $3 → $6 at user request — live track
+  # record post-calibration is encouraging (4W/1L = 80% WR, +$15.7
+  # combined since hedge). Slippage-leak bug was fixed in the meantime
+  # (was undersizing live trades anyway). Cash $22.24 means $6 cap leaves
+  # $16+ cushion even with two simultaneous trades.
+  # 2026-05-28: BUMPED $6 → $9 after bankroll grew to ~$131 (cash $75 +
+  # $11 in positions + $40 today's wins + recent deposit). Live track
+  # record now 13W/26L lifetime BUT today's +$40 on NYC weather is the
+  # signal that the post-calibration strategy is finally working at
+  # scale. Cap goes from 12% to 7% of bankroll which is more Kelly-
+  # appropriate; daily loss bumped proportionally to keep ~3-loss
+  # tolerance.
+  # 2026-05-28 (later): switched to BANKROLL-RELATIVE per-trade sizing at
+  # user request — "use 15% of the bankroll on eligible trades". Each live
+  # trade is now sized to 15% of AVAILABLE CASH (net of in-cycle
+  # commitments), so it scales as the account grows/shrinks. The
+  # max_trade_usd below is now the ABSOLUTE BACKSTOP (catastrophe guard
+  # against a bad balance read): at $50 it only binds once 15%×balance
+  # would exceed $50 (balance > ~$333). Until then the 15% rule governs
+  # (15% × $125 ≈ $18.75/trade today). See effective cap via
+  # `python main.py kalshi-live-status`.
+  # 2026-05-28 (latest): DIALED BACK 0.15 → 0.10 at user request (chose "Dial
+  # B" — keep all 4 concurrent shots but make each smaller to trim the
+  # worst-case day). 10% × $125 ≈ $12.53/trade today. Weather can still take
+  # all 3 slots (3 × 10% = 30% of bankroll) but the max-deployed ceiling drops
+  # from 60% → 40% of bankroll. Daily-loss pct dropped 0.30 → 0.20 in lockstep
+  # below to preserve the "halt after ~2 losing trades" feel (0.20 = 2 × 0.10).
+  max_trade_bankroll_pct: 0.10
+  max_trade_usd: 50.00
+  # 2026-05-28 (later): tightened 8 → 4 at user request. The bot should hold
+  # at most 4 concurrent live positions, allocated by the per-asset count caps
+  # below (3 weather + 1 btc). Leaning into weather because live history shows
+  # it wins more (weather 50% WR / +$67 vs btc 33% WR / +$15 to date). The
+  # per-asset caps STRUCTURALLY enforce this 4-ceiling across the separate
+  # btc/weather monitor processes (1 + 3 = 4).
+  max_concurrent: 4
+  # 2026-05-25 PM: lowered $15 → $11 — explicit user re-confirm via
+  # AskUserQuestion. Halts the day after ~2 losses at $7 cap rather than
+  # letting the bleed continue to wipe the $12.70 account.
+  # 2026-05-28: bumped $11 → $20 alongside the $6 → $9 cap. Keeps the
+  # 3-loss tolerance at the new cap ($9 × 3 = $27 worst day, halts at
+  # $20 = 2-3 losses). Bankroll ~$131 so $20 is 15% drawdown — sized
+  # to let the bot keep working through a normal losing streak.
+  # 2026-05-28 (later): bumped $20 → $38 to track the 15% per-trade sizing.
+  # At ~$18.75/trade, $38 ≈ 2 full losses before the day halts (~30% of the
+  # $125 bankroll). Aggressive — chosen so the 15% strategy can actually run
+  # rather than halting after a single loss. STATIC: revisit alongside the
+  # absolute backstop as bankroll grows. (Kill switch at 5 consecutive
+  # losses + cooldown after 3-in-60min are the additional guardrails.)
+  # 2026-05-28 (latest): made the daily-loss halt BANKROLL-RELATIVE so it
+  # auto-scales with the account (user-approved follow-up). The halt is now
+  # min(max_daily_loss_usd, max_daily_loss_pct × balance):
+  #   * max_daily_loss_pct GOVERNS day-to-day (= 2× the per-trade pct, so the
+  #     "halt after ~2 full losing trades" tolerance stays CONSTANT at any
+  #     bankroll — no need to re-tune as the account grows).
+  #   * max_daily_loss_usd = 50.00 is now the ABSOLUTE BACKSTOP (catastrophe
+  #     guard against a bad balance read).
+  # 2026-05-28 (latest): dropped 0.30 → 0.20 in lockstep with the per-trade
+  # dial-back (0.15 → 0.10) so the halt stays = 2× the trade pct. Effective
+  # halt now 20% × $125 ≈ $25.06/day (still ~2 losing $12.53 trades). The $50
+  # backstop only binds once 20%×balance > $50 (balance > ~$250); below that
+  # the 20% rule governs. STATIC: revisit the $50 backstop past ~$250.
+  max_daily_loss_pct: 0.20
+  max_daily_loss_usd: 50.00
+  # 2026-05-25 22:35 UTC: floor lowered $35 → $25 to free $10 headroom.
+  # 2026-05-25 EOD: floor lowered $25 → $10 at user request.
+  # 2026-05-25 PM: floor lowered $10 → $1 — explicit user re-confirm via
+  # AskUserQuestion. Deploys the remaining $12.70 with the calibrated
+  # YES-only + alignment-gate + whale-veto config.
+  # 2026-05-26 PM: floor lowered $1 → $0.10 after the $11.82 weather bleed.
+  # Cash on hand $0.88, two weather NO positions locked at $11.59 awaiting
+  # Kalshi resolution. User wants the residual cash deployable for any
+  # tiny BTC setup that might fire while waiting on weather to resolve.
+  # 2026-05-29: balance recovered to ~$125 (net +$75 on 5/28, +$15 on 5/29),
+  # so the $0.10 emergency floor is stale and dangerous (it lets the bot
+  # trade the account down to ~$0). Raised to $25 — aligns with the
+  # 20%×balance daily-loss halt (~$25) and never blocks a trade (10%
+  # per-trade cap ≈ $12.50, so 4 concurrent still leaves ~$75 > $25).
+  # REVISIT as balance grows (same as the $50 daily-loss backstop note above).
+  # 2026-06-02: RAISED $25 → $100 at user request — capital-protection floor:
+  # the bot may only risk the balance ABOVE $100, locking in the live gains.
+  # EFFECT: with balance ~$125 this leaves ~$25 of trading headroom (the
+  # live hourly-weather sleeve's cheap-NO bets are ~$17.50, so ~1 position at a
+  # time fits; a second concurrent would be refused). If balance ever sits
+  # below $100 this halts live entries until it recovers. Executor code-default
+  # fallback stays $35 (only used if this file fails to load). REVISIT as the
+  # account grows — raise the floor to keep protecting most of the bankroll.
+  min_balance_floor: 100.00
+  cooldown_minutes: 30
+  cooldown_loss_count: 3
+  cooldown_window_min: 60
+  kill_switch_consec_losses: 5
+  require_smoke_test: true
+  # Per-asset live allowlist. Paper can trade BTC/ETH/SOL/SPY freely
+  # but live-money only fires on assets that have proven their edge.
+  # 2026-05-25: BTC-only — user explicit decision after 2 ETH live
+  # trades slipped through pre-gate.
+  #
+  # PROMOTION CRITERIA (user-set, conservative):
+  #   Re-add 'eth' (or 'sol') only after that asset's paper trades show
+  #     WR ≥ 68%  AND  n ≥ 20 closed trades
+  #   (Mathematical reality: for binary contracts, ~35% WR with skewed
+  #    payoffs is profitable — but user prefers the higher bar to feel
+  #    confident before adding real-money exposure.)
+  #
+  # To check current paper WR per asset:
+  #   curl -s http://127.0.0.1:5050/api/kalshi_daily | jq '.by_asset'
+  live_assets:
+  - btc
+  # 2026-05-25 PM: weather added after backtest showed +$837 over 7d on
+  # NYC paper trades (43% WR, +$11/trade). Weather code wired to live
+  # via the same kalshi_live_executor that BTC uses. Passes asset="weather"
+  # in place_live_order metadata so the gate accepts it.
+  - weather
+  # 2026-06-02: DAILY weather (KXHIGHT*/KXLOWT*) added live at user request
+  # ("go live now, tiny budget"). DISTINCT sleeve from hourly 'weather' — its
+  # own $10 hard budget + 2-position cap below. HONEST CAVEAT: the #174 gate +
+  # ECMWF-ensemble fixes shipped this session have 0 settled post-fix paper
+  # trades (pre-fix settled record was negative). This is a capped-downside
+  # live PILOT to collect real-fill data, NOT a validated edge. Routes through
+  # the SAME kalshi_live_executor (balance floor, daily-loss halt, 5-loss kill
+  # switch, per-asset budget, concurrent cap, 24h dedup all apply). Pull it if
+  # the post-fix WR doesn't hold.
+  - weather_daily
+  # 2026-05-27 PM: SPY DEFERRED from live. Backtest of 597 SPY samples
+  # against newly-tuned SPY filters found ZERO passes — 67% rejected for
+  # theo_misalign_yes (composite says BUY but model says unlikely),
+  # 30% rejected for too_close. The alignment gate is correctly catching
+  # the same directional-incoherence pattern that bled BTC pre-rebuild.
+  # SPY scanner stays running (data still collected) but no live exec
+  # until paper history shows real positive setups. Re-add when ready.
+  # - spy
+
+  # 2026-05-28 (latest): per-asset CONCURRENT-COUNT caps — at most 3 weather
+  # + 1 btc open simultaneously (sums to the global max_concurrent of 4).
+  # Leaning into weather because it wins more live (50% WR / +$67 vs btc
+  # 33% WR / +$15 to date). The callers carry an in-cycle counter so the cap
+  # holds even before Kalshi's positions list catches up (~1s lag).
+  #   ⚠ btc's single slot is currently FILLED by one open BTC NO position
+  #     (~$5.74) — no NEW btc live trade fires until that one resolves.
+  #   ⚠ CONCENTRATION: 3 weather × 10% = up to 30% of bankroll in correlated
+  #     weather bets; all 4 slots filled = up to 40% deployed. Intentional
+  #     per user, but one bad weather day hits all three at once.
+  live_asset_max_concurrent:
+    weather: 3
+    btc: 1
+    # 2026-06-02: daily-weather pilot — at most 2 open at once. Shares the
+    # global max_concurrent (4) as a backstop, so it can only use spare slots
+    # and won't crowd out the proven hourly-weather/btc sleeves.
+    weather_daily: 2
+
+  # 2026-05-25 PM: HARD per-asset budget. Without this the live_assets
+  # share a single balance pool, so whichever strategy fires first could
+  # eat the other's allocation.
+  # 2026-05-27 PM: halved $6 → $3 each (hedge after backtest finding).
+  # 2026-05-27 PM (later): restored to $6 each at user request — live
+  # post-calibration WR has held above 70%. Combined max in flight $12;
+  # cash $22 leaves $10 cushion above $0.10 floor with both filled.
+  # 2026-05-28: bumped $6 → $9 each alongside max_trade_usd. Combined
+  # max in flight is now $18; cash ~$75 leaves $57 cushion which is
+  # plenty even on a double-fill day. Allows the bot to take a fuller
+  # bite on a high-conviction signal instead of leaving edge on the
+  # table.
+  # 2026-05-28 (later): raised $9 → $25 each to fit one full 15% trade
+  # (~$18.75) plus headroom, while still capping TOTAL per-asset exposure.
+  # Combined btc+weather ceiling = $50 = ~40% of the $125 bankroll. STATIC:
+  # these throttle the 15% sizing once balance climbs past ~$166, so revisit
+  # as the account grows (or make budgets bankroll-relative too).
+  # 2026-05-28 (latest): DID make them bankroll-relative — live_asset_budget_pct
+  # below GOVERNS; these $ values are now the ABSOLUTE BACKSTOP per asset
+  # (effective budget = min(this, pct × balance)).
+  #   * weather backstop $80 → 0.30×balance ($37.59 today) governs until
+  #     balance > ~$267. $37.59 = three 10% weather trades, matching the
+  #     weather count cap of 3.
+  #   * btc backstop $30 → 0.10×balance ($12.53 today) governs until
+  #     balance > ~$300. $12.53 = one 10% btc trade, matching its count cap of 1.
+  #   * spy: no pct entry → static $3 applies (spy not live anyway).
+  live_asset_budgets:
+    btc: 30.00
+    weather: 80.00
+    # 2026-05-27 PM: SPY budget left low but allowlist excludes spy
+    # → no live SPY trades. Kept as scaffolding for when we re-add.
+    spy: 3.00
+    # 2026-06-02: daily-weather PILOT — hard $10 TOTAL exposure cap. No pct
+    # entry below, so this static $10 governs regardless of bankroll (stays
+    # tiny while the unvalidated #174/ensemble fixes prove out). Per-trade is
+    # already ≤ ~$5 (daily yaml max_trade) so $10 ≈ 2 small positions.
+    weather_daily: 10.00
+  # 2026-05-28 (latest): bankroll-relative per-asset budget targets (governs;
+  # live_asset_budgets above is the absolute backstop). weather 0.30 + btc 0.10
+  # = 0.40 → at most 40% of bankroll deployed across all live positions, which
+  # equals 4 trades × the 10% per-trade size. Defense in depth alongside the
+  # count caps (live_asset_max_concurrent).
+  # 2026-05-28 (latest, Dial B): dropped weather 0.45 → 0.30 and btc 0.15 → 0.10
+  # in lockstep with the per-trade dial-back (0.15 → 0.10) so each asset's % budget
+  # still equals (its count cap × the 10% per-trade size).
+  live_asset_budget_pct:
+    weather: 0.30
+    btc: 0.10

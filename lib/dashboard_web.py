@@ -477,7 +477,8 @@ def _group_paper_trades(jsonl_path, key_field: str,
 
 
 def _strategy_pnl_stats(jsonl_path, label: str,
-                        include_live: bool = False) -> dict:
+                        include_live: bool = False,
+                        live_only: bool = False) -> dict:
     """Per-strategy paper-trading scorecard: counts, P&L, capital
     deployed (cumulative + peak concurrent), and ROI on each.
 
@@ -512,8 +513,12 @@ def _strategy_pnl_stats(jsonl_path, label: str,
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not include_live and row.get("is_live"):
-                    continue  # real-money fill — excluded from the paper view
+                is_live_row = bool(row.get("is_live"))
+                if live_only:
+                    if not is_live_row:
+                        continue  # live-only view: skip paper rows
+                elif not include_live and is_live_row:
+                    continue  # paper view: skip real-money fills
                 trades.append(row)
     except OSError:
         return s
@@ -577,6 +582,44 @@ def _strategy_pnl_stats(jsonl_path, label: str,
     s["open_notional"] = round(s["open_notional"], 2)
     s["peak_capital"] = round(peak, 2)
     return s
+
+
+@app.route("/api/paper_vs_live")
+def api_paper_vs_live():
+    """Reality-gap panel. Paper books EVERY qualifying at-bat at hypothetical
+    bankroll sizing assuming fills; live takes only the budget/gate-eligible
+    subset at real sizing with real (often partial/no) fills. The capture rate
+    (live closed ÷ paper closed) makes the selection+fill gap visible so a big
+    paper P&L isn't misread as a live forecast (see #174 parity write-up)."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    sleeves = [
+        ("BTC daily",      root / "data" / "kalshi_daily_paper.jsonl"),
+        ("Weather hourly", root / "data" / "weather_paper.jsonl"),
+        ("Weather daily",  root / "data" / "weather_daily_paper.jsonl"),
+    ]
+    out = []
+    for label, p in sleeves:
+        paper = _strategy_pnl_stats(p, label)                  # paper-only cut
+        live = _strategy_pnl_stats(p, label, live_only=True)   # live-only cut
+        pc, lc = paper["closed"], live["closed"]
+        out.append({
+            "label": label,
+            "paper": {"closed": pc, "wr_pct": paper["wr_pct"],
+                      "net_pnl": paper["net_pnl"], "avg_notional": paper["avg_notional"]},
+            "live": {"closed": lc, "wr_pct": live["wr_pct"],
+                     "net_pnl": live["net_pnl"], "avg_notional": live["avg_notional"]},
+            # what fraction of paper's at-bats live actually took
+            "capture_pct": (round(lc / pc * 100, 1) if pc else None),
+        })
+    return jsonify({
+        "sleeves": out,
+        "note": ("Paper books every qualifying at-bat at hypothetical sizing "
+                 "assuming fills; live takes only the gate/budget-eligible subset "
+                 "at real sizing with real fills. Low capture% means paper P&L "
+                 "overstates what live would make — read paper as signal quality, "
+                 "not a dollar forecast."),
+    })
 
 
 @app.route("/api/kalshi_paper_summary")
