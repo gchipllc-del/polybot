@@ -145,6 +145,7 @@ def _effective_params() -> dict:
         # winner shape on the trend-aware view (see _live_trend_veto). Paper
         # recording is unaffected. Default False → no live behavior change.
         "weather_live_trend_veto": bool(o.get("weather_live_trend_veto", False)),
+        "weather_live_veto_max_fill": float(o.get("weather_live_veto_max_fill", WEATHER_LIVE_VETO_MAX_FILL)),
     }
 
 
@@ -384,7 +385,9 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
             _veto_on = bool(params.get("weather_live_trend_veto", False))
             _veto_ok, _veto_reason = (True, "veto_disabled")
             if _veto_on:
-                _veto_ok, _veto_reason = _live_trend_veto(s, side, raw_fill_live)
+                _veto_ok, _veto_reason = _live_trend_veto(
+                    s, side, raw_fill_live,
+                    max_fill=params["weather_live_veto_max_fill"])
                 if not _veto_ok and is_live_enabled():
                     # Live order blocked by the gauge; paper still records below.
                     skip_counts[_veto_reason] = skip_counts.get(_veto_reason, 0) + 1

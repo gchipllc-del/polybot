@@ -1,8 +1,14 @@
 min_edge_threshold: 0.07
 default_kelly_multiplier: 0.25
 default_max_trade_usd: 20.0
-forecast_buffer_f: 1.0
+forecast_buffer_f: 1.25
 forecast_buffer_f_yes: 2.5
 weather_no_side_only: true
 weather_trend_aware: false
 weather_live_trend_veto: true
+# 2026-06-02 (eve): TEST — veto cheap-NO fill cap 0.15 -> 0.20 ("try 0.20 today").
+# Data caveat: paper showed the 0.15-0.25 band +18pp, but the LIVE sample went
+# 0/4 (-$37.55) — this is testing whether 0.15-0.20 (closer to the proven <0.15)
+# holds up live. REVERT to 0.15 if the new 0.15-0.20 live NO trades don't win.
+# (Trend-confirm + cushion>=0.75sigma still required, so it's not "any NO<0.20".)
+weather_live_veto_max_fill: 0.20

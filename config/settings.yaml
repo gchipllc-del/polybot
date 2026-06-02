@@ -231,6 +231,13 @@ kalshi_daily_live:
   # the SAME kalshi_live_executor (balance floor, daily-loss halt, 5-loss kill
   # switch, per-asset budget, concurrent cap, 24h dedup all apply). Pull it if
   # the post-fix WR doesn't hold.
+  # 2026-06-02 (later): REVERTED to PAPER-ONLY ("it can remain on, on the paper").
+  # 2026-06-02 (later still): RE-ARMED live ("daily weather can be turned on live
+  # and paper") — now safer than the first attempt: the close-time guard fixes
+  # the closed-market 404 that the first live order hit. $10 budget / 2-cap /
+  # close-time guard all in force. Still an UNVALIDATED pilot (post-fix paper
+  # settles tonight) — capped downside. Every trade is still recorded to paper;
+  # ones that fire live are tagged is_live.
   - weather_daily
   # 2026-05-27 PM: SPY DEFERRED from live. Backtest of 597 SPY samples
   # against newly-tuned SPY filters found ZERO passes — 67% rejected for
@@ -257,7 +264,11 @@ kalshi_daily_live:
     # 2026-06-02: daily-weather pilot — at most 2 open at once. Shares the
     # global max_concurrent (4) as a backstop, so it can only use spare slots
     # and won't crowd out the proven hourly-weather/btc sleeves.
-    weather_daily: 2
+    # 2026-06-02 (eve): 2 -> 5 at user request. The 2-cap was blocking new live
+    # trades — it was clogged by a $0 no-fill order occupying a slot. $25 budget
+    # is the real risk cap; cap 5 just stops ghost no-fills from blocking. NOTE:
+    # global max_concurrent may need a bump too if all sleeves fill at once.
+    weather_daily: 5
 
   # 2026-05-25 PM: HARD per-asset budget. Without this the live_assets
   # share a single balance pool, so whichever strategy fires first could
@@ -291,11 +302,14 @@ kalshi_daily_live:
     # 2026-05-27 PM: SPY budget left low but allowlist excludes spy
     # → no live SPY trades. Kept as scaffolding for when we re-add.
     spy: 3.00
-    # 2026-06-02: daily-weather PILOT — hard $10 TOTAL exposure cap. No pct
-    # entry below, so this static $10 governs regardless of bankroll (stays
-    # tiny while the unvalidated #174/ensemble fixes prove out). Per-trade is
-    # already ≤ ~$5 (daily yaml max_trade) so $10 ≈ 2 small positions.
-    weather_daily: 10.00
+    # 2026-06-02: daily-weather PILOT — hard TOTAL exposure cap. No pct entry
+    # below, so this static value governs regardless of bankroll (stays small
+    # while the unvalidated #174/ensemble fixes prove out). Per-trade ≤ ~$5
+    # (daily yaml max_trade).
+    # 2026-06-02 (eve): $10 -> $25 at user request (wanted more live at-bats;
+    # the 2-slot cap was the binding constraint, not budget). $25 ≈ ~5 small
+    # positions. Still UNVALIDATED (post-fix paper not settled) — capped pilot.
+    weather_daily: 25.00
   # 2026-05-28 (latest): bankroll-relative per-asset budget targets (governs;
   # live_asset_budgets above is the absolute backstop). weather 0.30 + btc 0.10
   # = 0.40 → at most 40% of bankroll deployed across all live positions, which

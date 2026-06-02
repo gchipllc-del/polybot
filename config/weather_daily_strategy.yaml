@@ -28,7 +28,12 @@
 #                    said 2-9% YES on a narrow band, the market said 44-95%, and
 #                    the market was right. 0.40 is a humility ceiling; RE-TUNE on
 #                    POST-fix paper (the pre-fix 16 are legacy, do not fit them).
-min_edge_threshold: 0.05        # was 0.10 — daily edges are smaller; catch near-money at-bats
+# 2026-06-02: 0.05 -> 0.00 at user request (wants more at-bats). NOTE: this is
+# the weak lever — it only removes the edge FLOOR; the forecast-direction buffer
+# + disagreement + fill gates still apply, so it admits near-fair-priced markets
+# that clear those. Live ($10-capped). Revert to 0.05 if it just adds breakeven
+# noise. The stronger lever (if more trades still wanted) is forecast_buffer_f.
+min_edge_threshold: 0.00        # was 0.05 — edge floor removed; other gates still gate
 max_disagreement_edge: 0.40     # #174 — skip when our prob differs from market by >40pp
 forecast_buffer_f: 1.5          # NO-side °F buffer (was 2.0) — daily-appropriate
 forecast_buffer_f_yes: 2.5      # YES-side °F buffer (was 3.0)
