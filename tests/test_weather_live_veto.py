@@ -85,6 +85,23 @@ def test_missing_trend_data_blocks():
     assert ok is False  # no trend_confirms -> blocked
 
 
+def test_veto_activity_writer_captures_only_veto_reasons(tmp_path, monkeypatch):
+    # The dashboard activity snapshot must record only veto_* reasons (the live
+    # orders the gauge blocked), not normal skips like edge_too_small/dup_open.
+    import json
+    import lib.weather_paper as wp
+    monkeypatch.setattr(wp, "VETO_ACTIVITY_PATH", tmp_path / "veto.json")
+    wp._write_veto_activity({
+        "veto_trend_not_confirmed": 5, "veto_thin_cushion": 1,
+        "edge_too_small": 9, "dup_open": 2,
+    })
+    d = json.loads((tmp_path / "veto.json").read_text())
+    assert d["last_cycle_vetoed"] == 6  # 5 + 1, not the normal skips
+    assert set(d["last_cycle_reasons"]) == {"veto_trend_not_confirmed", "veto_thin_cushion"}
+    assert "edge_too_small" not in d["last_cycle_reasons"]
+    assert d["enabled"] is True
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))

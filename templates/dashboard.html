@@ -124,6 +124,7 @@
     <div class="grid">
         <div class="card full">
             <h2>Kalshi Weather <span id="weather-meta" style="font-weight:400;font-size:0.95em;color:#8b949e;margin-left:8px"></span></h2>
+            <div id="weather-veto" style="display:none;margin:4px 0 8px 0;padding:6px 10px;border-radius:4px;font-size:12px;background:#161b22;border:1px solid #30363d"></div>
             <div id="weather-stats" style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 14px 0"></div>
             <h3 style="margin-top:12px;font-size:0.95em">Per-city breakdown</h3>
             <table id="weather-by-city">
@@ -793,6 +794,23 @@ function renderWeather(d) {
     const wWR = d.counts.closed_total ? (d.counts.won / d.counts.closed_total * 100).toFixed(0) : '—';
     meta.innerHTML = `· ${d.counts.open} open · ${d.counts.closed_total} closed · ${d.counts.won}W (${wWR}%) · `
       + `<span class="${pnlClass(wPnl)}" style="font-weight:700;font-size:1.15em">net ${pnlSign(wPnl)}</span>`;
+    // LIVE cheap-NO veto banner — shows the gauge filtering live entries.
+    const vEl = document.getElementById('weather-veto');
+    if (vEl) {
+        const v = d.veto || {};
+        if (v.enabled) {
+            const reasons = Object.entries(v.window_reasons || {})
+                .sort((a,b) => b[1]-a[1])
+                .map(([k,n]) => `${k.replace('veto_','')}=${n}`).join(', ') || 'none';
+            vEl.style.display = 'block';
+            vEl.style.borderColor = '#f0883e';
+            vEl.innerHTML = `🛡️ <strong>cheap-NO gauge ACTIVE</strong> · last cycle blocked `
+              + `<strong>${v.last_cycle_vetoed||0}</strong> live order(s) · `
+              + `<span style="color:#8b949e">window: ${v.window_vetoed_total||0} blocked (${reasons})</span>`;
+        } else {
+            vEl.style.display = 'none';
+        }
+    }
     if (d.latest_samples.length === 0) {
         tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">no live markets</td></tr>';
     } else {

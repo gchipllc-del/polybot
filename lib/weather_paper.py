@@ -497,9 +497,61 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
         )
         print(f"  Skipped {total_skipped}: {detail}")
 
+    # 2026-06-02: persist a LIVE-VETO activity snapshot so the dashboard can
+    # show the cheap-NO gauge working in real time. Only the veto_* reasons are
+    # surfaced (the trades the gauge blocked from going live this cycle). Atomic
+    # write; failures never break the trade path.
+    try:
+        if params.get("weather_live_trend_veto"):
+            _write_veto_activity(skip_counts)
+    except Exception:
+        pass
+
     if new_trades:
         _save_all(existing + [asdict(t) for t in new_trades])
     return new_trades
+
+
+VETO_ACTIVITY_PATH = ROOT / "data" / "weather_live_veto_activity.json"
+
+
+def _write_veto_activity(skip_counts: dict) -> None:
+    """Atomically record this cycle's veto outcomes for dashboard display.
+    Keeps a rolling 24h-ish history (last 200 cycles) of veto-reason counts."""
+    import os
+    from datetime import datetime, timezone
+    veto = {k: v for k, v in (skip_counts or {}).items() if k.startswith("veto_")}
+    hist = []
+    if VETO_ACTIVITY_PATH.exists():
+        try:
+            with open(VETO_ACTIVITY_PATH) as f:
+                hist = (json.load(f) or {}).get("cycles", [])
+        except (OSError, json.JSONDecodeError):
+            hist = []
+    hist.append({"at": datetime.now(timezone.utc).isoformat(),
+                 "vetoed": sum(veto.values()), "reasons": veto})
+    hist = hist[-200:]
+    # Aggregate the rolling window for an at-a-glance tile.
+    agg: dict[str, int] = {}
+    for c in hist:
+        for k, v in (c.get("reasons") or {}).items():
+            agg[k] = agg.get(k, 0) + int(v)
+    payload = {
+        "updated_at": hist[-1]["at"],
+        "enabled": True,
+        "last_cycle_vetoed": hist[-1]["vetoed"],
+        "last_cycle_reasons": hist[-1]["reasons"],
+        "window_vetoed_total": sum(agg.values()),
+        "window_reasons": agg,
+        "cycles": hist,
+    }
+    VETO_ACTIVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = VETO_ACTIVITY_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, VETO_ACTIVITY_PATH)
 
 
 def _fetch_actual_temp(city: str, target_iso: str) -> float | None:

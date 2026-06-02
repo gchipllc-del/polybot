@@ -192,6 +192,25 @@ def api_weather():
     # (OKX/LWX/LOT/BOS offices have different forecast biases). Lets the
     # user see at-a-glance which cities are working vs need calibration.
     out["by_city"] = _group_paper_trades(paper_path, key_field="city")
+    # LIVE cheap-NO trend veto activity (the gauge). Surfaced so the user can
+    # see it working: how many live orders it blocked last cycle + over the
+    # rolling window, with reasons. Absent/empty when the veto is disabled.
+    veto_path = root / "data" / "weather_live_veto_activity.json"
+    veto = {}
+    if veto_path.exists():
+        try:
+            with open(veto_path) as vf:
+                veto = json.load(vf) or {}
+        except (OSError, json.JSONDecodeError):
+            veto = {}
+    out["veto"] = {
+        "enabled": bool(veto.get("enabled")),
+        "updated_at": veto.get("updated_at"),
+        "last_cycle_vetoed": veto.get("last_cycle_vetoed", 0),
+        "last_cycle_reasons": veto.get("last_cycle_reasons", {}),
+        "window_vetoed_total": veto.get("window_vetoed_total", 0),
+        "window_reasons": veto.get("window_reasons", {}),
+    }
     return jsonify(out)
 
 
