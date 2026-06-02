@@ -147,6 +147,15 @@
         </div>
 
         <div class="card full">
+            <h2>🔔 Live trade alerts <span id="live-alerts-meta" style="font-weight:400;font-size:0.9em;color:#8b949e;margin-left:8px"></span></h2>
+            <div style="font-size:12px;color:#8b949e;margin-bottom:6px">Every real-money order, partial-fill, refusal &amp; kill-switch event (from logs/live_alerts.log). This is the canonical notification surface when Telegram push isn't configured.</div>
+            <table id="live-alerts">
+                <thead><tr><th>When (UTC)</th><th>Type</th><th>Detail</th></tr></thead>
+                <tbody id="live-alerts-body"><tr><td colspan="3" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+        </div>
+
+        <div class="card full">
             <h2>Weather DAILY (max/min) <span id="wxd-meta" style="font-weight:400;font-size:0.95em;color:#8b949e;margin-left:8px"></span></h2>
             <div style="font-size:12px;color:#8b949e;margin-bottom:6px">KXHIGHT*/KXLOWT* recalibrated pilot — PAPER only (validation in progress). Pre-fix records excluded.</div>
             <div id="wxd-stats" style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 14px 0"></div>
@@ -313,6 +322,10 @@ async function fetchData() {
         const res = await fetch('/api/weather_daily');
         renderWeatherDaily(await res.json());
     } catch(e) { console.error('weather_daily fetch error:', e); }
+    try {
+        const res = await fetch('/api/live_alerts');
+        renderLiveAlerts(await res.json());
+    } catch(e) { console.error('live_alerts fetch error:', e); }
     try {
         const res = await fetch('/api/kalshi_paper_summary');
         renderKalshiPaperSummary(await res.json());
@@ -851,6 +864,35 @@ function renderWeather(d) {
             </tr>`;
         }).join('');
     }
+}
+
+function renderLiveAlerts(d) {
+    const body = document.getElementById('live-alerts-body');
+    const meta = document.getElementById('live-alerts-meta');
+    if (!body) return;
+    const alerts = (d && d.alerts) || [];
+    if (meta) {
+        const tg = d && d.telegram_configured;
+        meta.innerHTML = `· ${d.total||0} total`
+          + (tg ? ' · 📱 Telegram on'
+                : ' · <span style="color:#f0883e">local-only (Telegram not configured)</span>');
+    }
+    if (alerts.length === 0) {
+        body.innerHTML = '<tr><td colspan="3" style="color:#8b949e">no live alerts yet</td></tr>';
+        return;
+    }
+    const color = {placed:'#3fb950', refused:'#8b949e', partial:'#f0883e', kill:'#f85149', info:'#58a6ff'};
+    const label = {placed:'PLACED', refused:'refused', partial:'partial-fill', kill:'KILL SWITCH', info:'info'};
+    body.innerHTML = alerts.map(a => {
+        const c = color[a.kind] || '#8b949e';
+        // detail: drop the first line (it's the summary), join the rest compactly
+        const rest = (a.detail||'').split('\n').slice(1).map(s=>s.trim()).filter(Boolean).join(' · ');
+        return `<tr>
+            <td style="white-space:nowrap;font-size:12px">${(a.ts||'').substring(5,19)}</td>
+            <td><span style="color:${c};font-weight:700">${label[a.kind]||a.kind}</span></td>
+            <td style="font-size:12px">${(a.summary||'').replace(/[✅🚨⚠️🛡️]/g,'').trim()}${rest ? ' — <span style="color:#8b949e">'+rest+'</span>' : ''}</td>
+        </tr>`;
+    }).join('');
 }
 
 function renderWeatherDaily(d) {

@@ -214,6 +214,54 @@ def api_weather():
     return jsonify(out)
 
 
+@app.route("/api/live_alerts")
+def api_live_alerts():
+    """Recent live-trade alerts — the canonical local notification surface
+    (logs/live_alerts.log) that _send_telegram() always writes, whether or not
+    Telegram push is configured. Surfaces live order-placed / partial-fill /
+    refusal / kill-switch events so the user sees real-money activity on the
+    dashboard. Parses the `[ts]\\nmessage` block format; returns newest first."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    log_path = root / "logs" / "live_alerts.log"
+    alerts = []
+    if log_path.exists():
+        try:
+            raw = log_path.read_text()
+        except OSError:
+            raw = ""
+        # Blocks are separated by a blank line then a "[...]" timestamp header.
+        import re
+        # Split on the timestamp header, keeping it.
+        parts = re.split(r"\n*\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC)\]\n", raw)
+        # parts = [pre, ts1, body1, ts2, body2, ...]
+        for i in range(1, len(parts) - 1, 2):
+            ts = parts[i]
+            body = (parts[i + 1] or "").strip()
+            if not body:
+                continue
+            first = body.splitlines()[0].strip()
+            # Classify for the UI badge color.
+            if "KILL SWITCH" in body:
+                kind = "kill"
+            elif "order PLACED" in body:
+                kind = "placed"
+            elif ("REFUSED" in body or "refused" in body
+                  or "BLOCKED" in body or "blocked" in body):
+                kind = "refused"
+            elif "only" in body and "filled" in body:
+                kind = "partial"
+            else:
+                kind = "info"
+            alerts.append({"ts": ts, "kind": kind, "summary": first,
+                           "detail": body})
+    alerts.reverse()  # newest first
+    return jsonify({"alerts": alerts[:25], "total": len(alerts),
+                    "telegram_configured": bool(
+                        __import__("os").environ.get("TELEGRAM_BOT_TOKEN")
+                        and __import__("os").environ.get("TELEGRAM_CHAT_ID"))})
+
+
 @app.route("/api/weather_daily")
 def api_weather_daily():
     """Daily max/min weather sleeve (KXHIGHT*/KXLOWT*) — the recalibrated
