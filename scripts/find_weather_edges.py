@@ -107,11 +107,12 @@ def _trend_edge_row(s: dict) -> dict | None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Trend-aware weather edge finder (read-only).")
-    ap.add_argument("--profile", choices=["any", "no-cheap"], default="no-cheap",
-                    help="'no-cheap' (default) = hunt ONLY the proven live winner shape: "
-                         "NO side, cheap fill, trend keeps temp clear of the strike by a "
-                         "real margin (6-9x asymmetric payout). 'any' = both sides, the "
-                         "generic trend-aware scan.")
+    ap.add_argument("--profile", choices=["any", "no-cheap", "cheap-no"], default="cheap-no",
+                    help="'cheap-no' (default) = the EXACT proven live-money winner: NO side, "
+                         "fill <=0.15, trend-confirmed clear of the strike. Live audit (59 "
+                         "settled): the <=0.15 bucket made +$225 (50%% WR, 6-9x payout) while "
+                         "EVERYTHING >=0.15 was net ~breakeven-to-negative. 'no-cheap' = NO side "
+                         "up to 0.18; 'any' = both sides, generic trend-aware scan.")
     ap.add_argument("--min-edge", type=float, default=0.08,
                     help="minimum trend-aware edge to surface (default 0.08)")
     ap.add_argument("--fill-floor", type=float, default=0.05,
@@ -129,9 +130,14 @@ def main() -> None:
 
     # The proven-winner profile (from 9 live wins, 8 of them NO @ 0.10-0.15,
     # 6-9x payout): NO side, cheap fill, and the projected temp comfortably
-    # AWAY from the strike (not a near-money coin flip). 'no-cheap' encodes it.
-    if args.profile == "no-cheap":
-        args.fill_ceil = min(args.fill_ceil, 0.18)   # cheap NO only
+    # AWAY from the strike (not a near-money coin flip).
+    #   cheap-no : fill <= 0.15 — the EXACT +$225 live bucket (default).
+    #   no-cheap : fill <= 0.18 — slightly looser NO-only.
+    if args.profile == "cheap-no":
+        args.fill_ceil = min(args.fill_ceil, 0.15)   # the proven money bucket
+        args.fill_floor = max(args.fill_floor, 0.05)
+    elif args.profile == "no-cheap":
+        args.fill_ceil = min(args.fill_ceil, 0.18)
         args.fill_floor = max(args.fill_floor, 0.05)
 
     from lib.weather_signal import run_signal_cycle
@@ -147,7 +153,7 @@ def main() -> None:
         reason = "FIRE"
         if r["side"] is None or r["fill"] is None:
             reason = "no_side"
-        elif args.profile == "no-cheap" and r["side"] != "NO":
+        elif args.profile in ("no-cheap", "cheap-no") and r["side"] != "NO":
             reason = "not_no_side"          # winner profile is NO-only
         elif r["trend_edge"] < args.min_edge:
             reason = "edge_too_small"
@@ -155,7 +161,7 @@ def main() -> None:
             reason = "fill_oob"
         elif args.require_trend_confirm and not r["trend_confirms"]:
             reason = "trend_not_confirmed"
-        elif (args.profile == "no-cheap"
+        elif (args.profile in ("no-cheap", "cheap-no")
               and (r["cushion_sigma"] is None
                    or r["cushion_sigma"] < args.min_cushion_sigma)):
             reason = "thin_cushion"          # near-money coin flip — not the winner shape

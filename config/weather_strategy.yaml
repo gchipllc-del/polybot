@@ -5,3 +5,10 @@ forecast_buffer_f: 1.0
 forecast_buffer_f_yes: 2.5
 weather_no_side_only: true
 weather_trend_aware: false
+# 2026-06-02: LIVE cheap-NO trend veto ENABLED (user sign-off). A live weather
+# order now fires ONLY if it also passes the trend-aware gauge: side==NO,
+# raw fill<=0.15, shadow trend_confirms, and projected temp clears the strike
+# by >=0.75 sigma. Paper recording is unaffected. This can only BLOCK trades
+# the bot would otherwise place (the obs-anchor traps), never add/resize one.
+# Set back to false to revert to the obs-anchored live gate.
+weather_live_trend_veto: true
