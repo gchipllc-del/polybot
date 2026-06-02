@@ -58,7 +58,21 @@ CACHE_TTL_SECONDS = 3600  # refit every hour at most
 
 
 def _load_resolved_trades() -> list[dict]:
-    """Read resolved paper trades from the Kalshi 15-min log."""
+    """Read TERMINALLY-resolved paper trades from the Kalshi 15-min log.
+
+    Calibration maps entry-confidence -> P(the model's directional call was
+    right at EXPIRY). Only trades held to resolution (status won/lost) measure
+    that. We deliberately EXCLUDE the path-dependent early exits:
+      * won_early = take-profit fired (price touched TP before expiry)
+      * cut_loss  = stop-loss fired (price touched SL before expiry)
+    Those labels reflect the intra-window PRICE PATH and the TP/SL distances,
+    not whether entry confidence predicted the terminal YES/NO outcome. Fitting
+    on them learns 'P(TP fires before SL)' — a function of the exit policy, not
+    of confidence calibration — and a tighter stop would mechanically depress
+    the realized win-rate at every confidence bucket, making the model look
+    overconfident when it's the exit policy talking. (Audit finding, 2026-06-01.
+    In the live 15-min log these early exits were 52% of resolved trades.)
+    """
     if not _PAPER_PATH.exists():
         return []
     rows = []
@@ -72,7 +86,7 @@ def _load_resolved_trades() -> list[dict]:
                     r = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if r.get("status") in ("won", "won_early", "lost", "cut_loss"):
+                if r.get("status") in ("won", "lost"):
                     rows.append(r)
     except OSError:
         pass
@@ -141,7 +155,8 @@ def fit_calibrator(force: bool = False) -> dict:
     now = time.time()
     if not force and _CALIB_CACHE_PATH.exists():
         try:
-            cached = json.load(open(_CALIB_CACHE_PATH))
+            with open(_CALIB_CACHE_PATH) as f:
+                cached = json.load(f)
             if (now - cached.get("fitted_at_epoch", 0)) < CACHE_TTL_SECONDS:
                 # Tuple roundtrip — JSON converts to list
                 cached["anchors"] = [tuple(a) for a in cached.get("anchors", [])]
@@ -173,7 +188,9 @@ def fit_calibrator(force: bool = False) -> dict:
         end = min(i + bucket_size, n)
         chunk = sorted_trades[i:end]
         x_mean = sum(float(r.get("confidence") or 0) for r in chunk) / len(chunk)
-        wins = sum(1 for r in chunk if r.get("status") in ("won", "won_early"))
+        # _load_resolved_trades now yields only terminal won/lost, so a win is
+        # exactly status=="won" (won_early/cut_loss are excluded upstream).
+        wins = sum(1 for r in chunk if r.get("status") == "won")
         y_rate = wins / len(chunk)
         xs.append(x_mean)
         ys.append(y_rate)
@@ -195,7 +212,10 @@ def fit_calibrator(force: bool = False) -> dict:
         # JSON can't store tuples — convert to lists for storage
         out = {**cal, "anchors": [list(a) for a in anchors],
                "buckets_raw": [list(b) for b in cal["buckets_raw"]]}
-        json.dump(out, open(_CALIB_CACHE_PATH, "w"))
+        tmp = _CALIB_CACHE_PATH.with_suffix(_CALIB_CACHE_PATH.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        tmp.replace(_CALIB_CACHE_PATH)
     except OSError:
         pass
 

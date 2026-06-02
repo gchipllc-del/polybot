@@ -165,8 +165,10 @@ def divergence_from_signal_log(
         return compute_divergence([], [])
 
     # Read the file tail efficiently — for typical hot path we only need
-    # the last few hundred lines. For a first cut, read it all (file is
-    # bounded by data retention). Future: switch to reverse-read.
+    # the last few hundred lines. For a first cut, read it all. NOTE: signal
+    # logs are now bounded by lib/log_rotation (rotate_if_needed in
+    # persist_samples), capped at ~20k rows; this is no longer unbounded.
+    # Future: switch to reverse-read for further speedup.
     rows = []
     try:
         with open(path) as f:

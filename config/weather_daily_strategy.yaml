@@ -1,0 +1,27 @@
+# Weather DAILY sleeve (KXHIGHT*/KXLOWT*) — strategy overrides.
+# Read by lib/weather_daily_paper.py::_effective_params (PAPER-only; this sleeve
+# has NO live execution path, so these knobs never move real money).
+#
+# MODERATE recalibration (2026-05-31), after the strike-type signal fix.
+# Rationale + validation (scripts/analyze_weather_daily_edge.py + a
+# real-Kalshi-outcome backtest on 17 settled markets):
+#   * Fixed signal is 88% directionally accurate vs real settlement (old buggy
+#     logic was 18% — it inverted every 'less'-type market).
+#   * With the prior DEFAULT gate (edge>=0.10, fill<=0.45) the sleeve fired ~0
+#     live trades — a structural squeeze: big-edge markets are deep-OTM penny
+#     longshots (correctly rejected), near-money markets had edges below 0.10.
+#   * The 0.85-0.95 'expensive NO' band went 12/12 in-sample BUT breakeven there
+#     is ~93% WR — one bad forecast day turns it negative. We DELIBERATELY keep
+#     the fill ceiling below it (0.70) so we capture asymmetric value without
+#     betting into razor-thin payouts.
+#
+# This is the MODERATE profile (user-selected 2026-05-31): more at-bats than the
+# conservative cheap-only cut, still blocks the fragile expensive-NO band.
+# NOTE: still PAPER. Must validate post-fix paper WR before any live path (#160).
+
+min_edge_threshold: 0.05        # was 0.10 — daily edges are smaller; catch near-money at-bats
+forecast_buffer_f: 1.5          # NO-side °F buffer (was 2.0) — daily-appropriate
+forecast_buffer_f_yes: 2.5      # YES-side °F buffer (was 3.0)
+max_fill_for_buy: 0.70          # was 0.45 — allow mid-priced trades; blocks the 0.85-0.95 razor band
+default_kelly_multiplier: 0.25  # unchanged — conservative sizing while validating
+default_max_trade_usd: 5.0      # unchanged — small paper stake

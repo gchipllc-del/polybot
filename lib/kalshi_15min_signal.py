@@ -223,8 +223,8 @@ def compute_kalshi_indicators(
     Strike IS the window-open price (Kalshi pegs it there at market
     creation), so the Greeks helper uses it directly as the BSM strike.
 
-    Indicators: RSI, theo_delta_gap, market_agreement, whale_pressure,
-    (optional) Kronos foundation-model forecast.
+    Indicators: RSI, theo_delta_gap, whale_pressure, (optional)
+    Kronos foundation-model forecast, orderflow, funding.
 
     When `asset_cfg.kronos.enabled = true`, this also calls Kronos
     (lib/kalshi_kronos.py) to get a 5th signal: P(close > strike) from
@@ -327,6 +327,27 @@ def compute_kalshi_indicators(
     base["kronos_meta"] = kronos_meta
     base["orderflow_meta"] = of_meta
     base["funding_meta"] = funding_meta
+
+    # 2026-05-22: per-asset rolling-mean centering. The raw composite is
+    # structurally positive (theo_delta_gap saturates positive in ~70% of
+    # samples); subtracting the asset's recent mean restores symmetric
+    # semantics so the |composite_centered| < threshold "weak conviction"
+    # band actually contains samples. composite_raw stays for back-compat
+    # and observability; composite_centered is what downstream gates
+    # (notably the contrarian-flip eligibility check) should consult.
+    try:
+        from lib.composite_baseline import record_and_center
+        centered, baseline_meta = record_and_center(
+            asset, float(base["composite"]),
+        )
+        base["composite_raw"] = base["composite"]
+        base["composite_centered"] = round(centered, 4)
+        base["composite_baseline_meta"] = baseline_meta
+    except Exception:
+        # Centering is observability/optional — never block the pipeline.
+        base["composite_centered"] = base["composite"]
+        base["composite_baseline_meta"] = {"warmed_up": False, "error": True}
+
     return base
 
 
@@ -491,6 +512,12 @@ def persist_samples(samples: list[KalshiFifteenMinSample]) -> None:
     with open(SIGNAL_PATH, "a") as f:
         for s in samples:
             f.write(json.dumps(asdict(s)) + "\n")
+    # Bounded retention (diagnostic tail; was growing unbounded -> 14MB+).
+    try:
+        from lib.log_rotation import rotate_if_needed
+        rotate_if_needed(SIGNAL_PATH)
+    except Exception:
+        pass
 
 
 def run_signal_cycle(

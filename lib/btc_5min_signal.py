@@ -107,7 +107,14 @@ def fetch_binance_btc_price(symbol: str = "BTCUSDT") -> float | None:
             BINANCE_US_TICKER, params={"symbol": symbol}, timeout=8,
         )
         r.raise_for_status()
-        return float(r.json()["price"])
+        px = float(r.json()["price"])
+        # Reject a non-finite tick ('NaN'/'Infinity' parse straight through
+        # float()) at the source so it can't poison theo/composite downstream.
+        if not math.isfinite(px) or px <= 0:
+            log_event("btc_5min", "binance_bad_price",
+                      {"symbol": symbol, "price": str(px)}, result="degraded")
+            return None
+        return px
     except Exception as e:
         log_event("btc_5min", "binance_fetch_failed",
                   {"symbol": symbol, "error": str(e)[:200]},
@@ -249,8 +256,16 @@ def compute_greeks(
       d  = [ln(S/K) + 0.5·σ²·T] / (σ·√T)
       P(S_T > K) = Φ(d − σ·√T)
 
-    Returns None if inputs are degenerate (zero/negative).
+    Returns None if inputs are degenerate (zero/negative OR non-finite).
     """
+    # NaN/inf guard FIRST: `NaN <= 0` is False, so a NaN spot/strike/vol would
+    # slip past the zero-checks below, then math.log(NaN)=NaN propagates to
+    # theo_yes -> composite -> confidence (all NaN) and direction silently
+    # collapses to FLAT. A malformed exchange tick ('NaN'/'Infinity' parsed via
+    # float()) is exactly how that happens. Reject non-finite inputs outright.
+    if not all(math.isfinite(x) for x in
+               (hours_to_close, spot, strike, annual_vol)):
+        return None
     if (hours_to_close <= 0 or spot <= 0 or strike <= 0
             or annual_vol <= 0):
         return None
@@ -272,11 +287,26 @@ def compute_greeks(
     }
 
 
-def compute_realized_vol(klines: list[dict], *, min_samples: int = 15) -> float | None:
-    """Annualized realized volatility from 1-minute klines.
+def compute_realized_vol(
+    klines: list[dict],
+    *,
+    min_samples: int = 15,
+    periods_per_year: float = 525_600.0,
+) -> float | None:
+    """Annualized realized volatility from evenly-spaced kline closes.
 
-    σ_per_min = std(log returns of last N closes)
-    σ_annual = σ_per_min × √525,600    (minutes per year)
+    σ_per_bar = std(log returns of last N closes)
+    σ_annual  = σ_per_bar × √periods_per_year
+
+    `periods_per_year` MUST match the kline bar interval — passing the
+    1-minute default on a different cadence mis-annualizes silently:
+        1-minute bars → 525_600   (60 × 24 × 365)   [default]
+        1-hour   bars → 8_760     (24 × 365, crypto 24/7)
+        1-day    bars → 365       (or 252 for equities)
+    e.g. using 525_600 on HOURLY bars inflates σ by √60 ≈ 7.75×, which
+    flattens the BSM theo S-curve and manufactures false edges (the
+    Task #105 daily-vol bug). Callers on non-minute data must pass the
+    matching value explicitly.
 
     Returns None if we don't have enough samples — caller falls back
     to the configured per-asset value.
@@ -291,8 +321,8 @@ def compute_realized_vol(klines: list[dict], *, min_samples: int = 15) -> float 
         return None
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1)
-    sigma_per_min = math.sqrt(var)
-    return sigma_per_min * math.sqrt(525_600)
+    sigma_per_bar = math.sqrt(var)
+    return sigma_per_bar * math.sqrt(periods_per_year)
 
 
 def compute_indicators_for_window(
@@ -311,6 +341,25 @@ def compute_indicators_for_window(
     orderflow_weight: float = 2.0,
     funding_signal: float | None = None,
     funding_weight: float = 1.5,
+    # ── Composite-shape knobs (2026-05-25 PM, daily-horizon halt fix) ──
+    # All three default to the original 15-min-tuned values so existing
+    # callers see no behavior change. The daily caller passes lower /
+    # wider values to remove the YES bias that was bleeding real money.
+    #
+    # theo_yes_correction_factor: scales BSM theoretical_yes BEFORE the
+    #   gap is computed. The daily caller passes the per-asset calibration
+    #   factor (e.g., 0.85 for BTC) so the corrected probability flows
+    #   into theo_delta_gap and composite — not just sizing.
+    # theo_delta_gap_saturation: denominator that controls how quickly
+    #   the gap pins to +/-1.0. Old 0.10 saturates on every near-money
+    #   strike (real gaps are typically 0.15-0.30). Daily uses 0.20 so
+    #   only genuinely large mispricings dominate.
+    # rsi_weight: lowered for daily contracts. RSI mean-reversion works
+    #   on minute bars but at the hours-long daily horizon BTC can stay
+    #   "oversold" the entire window, contributing structural YES bias.
+    theo_yes_correction_factor: float = 1.0,
+    theo_delta_gap_saturation: float = 0.10,
+    rsi_weight: float = 3.0,
 ) -> dict:
     """Lean composite: ONLY market-respecting, mean-reversion-aware,
     theoretically-grounded, or order-flow-based indicators. The
@@ -319,14 +368,11 @@ def compute_indicators_for_window(
     empirical proof that they caused a 22% win rate by buying
     continuation right before reversion.
 
-    Four indicators:
-      * RSI (weight 2) — only mean-reverting indicator; overbought
+    Three indicators (market_agreement disabled 2026-05-21):
+      * RSI (weight 3) — only mean-reverting indicator; overbought
         → bearish, oversold → bullish.
       * theo_delta_gap (weight 4) — Greeks-based fair-value vs market
         YES, the EV-per-dollar signal.
-      * market_agreement (weight 3) — direction must align with where
-        the market is leaning. If market YES > 0.5 → lean YES; below
-        → lean NO. Magnitude scales with conviction.
       * whale_pressure (weight 3) — net taker-side flow from large
         recent trades on Binance.US (or 0 if unavailable). The
         latency-arb edge: if whales just moved spot and the
@@ -341,11 +387,26 @@ def compute_indicators_for_window(
     closes = [k["close"] for k in klines]
 
     # ── Adaptive vol ──────────────────────────────────────────────
+    # Vol floor: during quiet 15-min windows, realized vol from a short
+    # kline series can drop to 10-15% annualized (vs BTC's long-run
+    # ~55%). The BSM Greeks model then thinks the underlying is "stuck"
+    # and pegs theoretical_yes to ~85% for any spot-strike gap above
+    # 0.10%, producing a structural YES bias in the composite (93% of
+    # samples positive in our audit). Floor the realized vol at a
+    # fraction of the configured per-asset vol so the model can't be
+    # absurdly overconfident in quiet periods. 0.70 keeps the asset-
+    # specific calibration (BTC=0.55→0.385, ETH=0.65→0.455, SOL=0.85→
+    # 0.595) while preventing the runaway-overconfidence failure mode.
+    # Hard fallback if caller passes 0 / negative — the floor below would
+    # otherwise collapse to 0 and silently disable the protection.
+    if annual_vol <= 0:
+        annual_vol = DEFAULT_ANNUAL_VOL
+
     effective_vol = annual_vol
     if use_realized_vol:
         rv = compute_realized_vol(klines)
         if rv is not None and rv > 0:
-            effective_vol = rv
+            effective_vol = max(rv, annual_vol * 0.70)
 
     # ── RSI 14 ────────────────────────────────────────────────────
     rsi = _rsi(closes, 14)
@@ -353,6 +414,7 @@ def compute_indicators_for_window(
     # ── Greeks-based theoretical-delta gap ────────────────────────
     greeks: dict | None = None
     theo_yes_gap = 0.0
+    theo_yes_raw: float | None = None    # preserved for calibration learning
     if (hours_to_close is not None and hours_to_close > 0
             and market_yes_price is not None
             and window_open_price is not None):
@@ -363,7 +425,20 @@ def compute_indicators_for_window(
             annual_vol=effective_vol,
         )
         if greeks is not None:
-            theo_yes_gap = greeks["theoretical_yes"] - float(market_yes_price)
+            theo_yes_raw = float(greeks["theoretical_yes"])
+            # Apply per-asset calibration BEFORE computing the gap, so
+            # the composite is built on the corrected probability — not
+            # the BSM's structurally over-bullish raw estimate. Default
+            # factor 1.0 → no change for callers (e.g., 15-min path).
+            corrected_theo_yes = max(0.02, min(0.98,
+                theo_yes_raw * float(theo_yes_correction_factor)))
+            # Store both on the greeks dict so downstream code sees the
+            # corrected value as `theoretical_yes` (used for sizing) and
+            # raw value as `theoretical_yes_raw` (used for recording
+            # outcomes into the calibration loop without double-correcting).
+            greeks["theoretical_yes_raw"] = theo_yes_raw
+            greeks["theoretical_yes"] = corrected_theo_yes
+            theo_yes_gap = corrected_theo_yes - float(market_yes_price)
 
     # ── Compose ────────────────────────────────────────────────────
     contribs: dict[str, float] = {}
@@ -378,27 +453,30 @@ def compute_indicators_for_window(
     # now becomes 15.0 (was 14.0) for the 5 active indicators.
     if rsi is not None:
         rsi_norm = (50.0 - rsi) / 20.0
-        contribs["rsi"] = max(-1.0, min(1.0, rsi_norm)) * 3.0
+        contribs["rsi"] = max(-1.0, min(1.0, rsi_norm)) * float(rsi_weight)
     else:
         contribs["rsi"] = 0.0
 
-    # theo_delta_gap: 0.10pp gap → max strength.
-    contribs["theo_delta_gap"] = max(-1.0, min(1.0, theo_yes_gap / 0.10)) * 4.0
+    # theo_delta_gap: saturation default 0.10 (15-min). Daily widens to
+    # 0.20 because near-money daily strikes routinely show 0.15-0.30 gaps
+    # — a 0.10 saturation pins this to +1.0 on every sample, structurally
+    # biasing composite + before any other indicator weighs in.
+    _gap_denom = max(1e-6, float(theo_delta_gap_saturation))
+    contribs["theo_delta_gap"] = max(-1.0, min(1.0, theo_yes_gap / _gap_denom)) * 4.0
 
-    # market_agreement: respects the market's directional view. A
-    # market_yes of 0.70 says the market is 70/30 on YES — we lean
-    # YES with conviction. We saturate at ±0.10 (i.e. market_yes
-    # ≤ 0.40 or ≥ 0.60) so the indicator doesn't go nuclear on
-    # mildly-confident markets.
-    if market_yes_price is not None:
-        agreement_raw = float(market_yes_price) - 0.50
-        contribs["market_agreement"] = max(-1.0, min(1.0, agreement_raw / 0.10)) * 3.0
-    else:
-        contribs["market_agreement"] = 0.0
+    # market_agreement: DISABLED 2026-05-21. Anti-correlates with
+    # theo_delta_gap (r=-0.97 when theoretical_yes≈0.50, r=-0.37
+    # overall across 4,619 BTC samples). Both saturate opposite in
+    # 32% of samples → composite was structurally cancelling to ~+1
+    # exactly when the Greeks model had the most edge. The herd-follow
+    # philosophy contradicted the contrarian thesis theo_delta_gap
+    # embodies. RSI + whale + orderflow already supply the orthogonal
+    # sanity-check role.
+    contribs["market_agreement"] = 0.0
 
     # whale_pressure: pre-normalized to [-1, +1] by the whale_monitor
-    # (the recency-weighted indicator value). Weight 3 — matches
-    # market_agreement, doesn't dominate theo_delta_gap.
+    # (the recency-weighted indicator value). Weight 3 — doesn't
+    # dominate theo_delta_gap.
     if whale_pressure is not None:
         contribs["whale_pressure"] = max(-1.0, min(1.0, float(whale_pressure))) * 3.0
     else:
@@ -443,7 +521,10 @@ def compute_indicators_for_window(
         contribs["funding"] = 0.0
 
     composite = sum(contribs.values())
-    base_max = 3.0 + 4.0 + 3.0 + 3.0  # rsi+theo+market+whale = 13.0 (rsi bumped 2.0→3.0)
+    # rsi (configurable) + theo (4.0) + whale (3.0); market_agreement disabled 2026-05-21.
+    # rsi_weight changed from a fixed 3.0 to a parameter on 2026-05-25 so daily
+    # callers can dampen it; max_possible follows so confidence ratio stays correct.
+    base_max = float(rsi_weight) + 4.0 + 3.0
     max_possible = (
         base_max
         + (float(kronos_weight) if has_kronos else 0.0)
@@ -456,7 +537,12 @@ def compute_indicators_for_window(
         "rsi": rsi,
         "effective_annual_vol": effective_vol,
         "vol_source": "realized" if (use_realized_vol and effective_vol != annual_vol) else "configured",
+        # theoretical_yes is the CORRECTED value (or raw if no correction passed).
+        # theoretical_yes_raw is the pre-correction value, preserved for the
+        # calibration loop to learn raw→actual without double-correcting.
         "theoretical_yes": greeks["theoretical_yes"] if greeks else None,
+        "theoretical_yes_raw": greeks.get("theoretical_yes_raw") if greeks else None,
+        "theo_yes_correction_factor": float(theo_yes_correction_factor),
         "theo_yes_gap": theo_yes_gap,
         "T_years": greeks["T_years"] if greeks else None,
         "market_yes_price": market_yes_price,
@@ -644,6 +730,12 @@ def persist_samples(samples: list[FiveMinSample]) -> None:
     with open(SIGNAL_PATH, "a") as f:
         for s in samples:
             f.write(json.dumps(asdict(s)) + "\n")
+    # Bounded retention (diagnostic tail; keep from growing without limit).
+    try:
+        from lib.log_rotation import rotate_if_needed
+        rotate_if_needed(SIGNAL_PATH)
+    except Exception:
+        pass
 
 
 # ── Public entry ─────────────────────────────────────────────────────

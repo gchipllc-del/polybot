@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Polybot Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Chart.js CDN removed 2026-05-28 — only renderPLChart used it. -->
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { background: #0d1117; color: #c9d1d9; font-family: 'Menlo', 'Consolas', monospace; font-size: 14px; }
@@ -42,52 +42,120 @@
 <div class="container">
     <h1>POLYBOT &mdash; Prediction Market Trader</h1>
 
-    <!-- Portfolio Summary -->
+    <!-- ⚡ KALSHI LIVE TRADING — top priority view -->
     <div class="grid">
-        <div class="card full" id="portfolio-card">
-            <h2>Portfolio</h2>
-            <div id="portfolio-stats">Loading...</div>
-        </div>
-    </div>
+        <div class="card full" id="kalshi-live-card" style="border:2px solid #3fb950">
+            <h2>⚡ Kalshi LIVE Trading
+                <span id="live-status-badge" style="font-size:0.65em;padding:3px 10px;border-radius:4px;margin-left:8px;vertical-align:middle">…</span>
+                <span id="live-committed-badge" style="font-size:0.62em;padding:3px 12px;border-radius:4px;margin-left:8px;vertical-align:middle;background:#0d1117;border:2px solid #f0883e;color:#f0883e;font-weight:700"></span>
+                <button id="kill-switch-reset-btn" onclick="resetKillSwitch()" style="display:none;font-size:0.6em;padding:4px 12px;border-radius:4px;margin-left:10px;vertical-align:middle;background:#f85149;color:#fff;border:none;font-weight:700;cursor:pointer">↻ Reset kill switch</button>
+            </h2>
+            <div id="kalshi-live-stats" style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 14px 0">Loading…</div>
 
-    <!-- Positions + Chart -->
-    <div class="grid">
-        <div class="card full">
-            <h2>Open Positions</h2>
-            <table id="positions-table">
-                <thead>
-                    <tr><th>Side</th><th>Question</th><th>Platform</th><th>Invested</th><th>Bets</th><th>Entry</th><th>Current</th><th>P/L</th><th>Edge</th><th>Score</th><th>Resolves</th></tr>
-                </thead>
-                <tbody id="positions-body"><tr><td colspan="11">Loading...</td></tr></tbody>
+            <h3 style="margin-top:14px;font-size:0.95em">Safety gates (all must pass for any order)</h3>
+            <div id="kalshi-live-gates" style="display:flex;gap:12px;flex-wrap:wrap;margin:6px 0 12px 0;font-size:0.9em">Loading…</div>
+
+            <h3 style="margin-top:14px;font-size:0.95em">Open positions (Kalshi truth)</h3>
+            <table id="kalshi-live-positions">
+                <thead><tr><th>Market</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Unrealized P&amp;L</th></tr></thead>
+                <tbody id="kalshi-live-positions-body"><tr><td colspan="5" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+
+            <h3 style="margin-top:14px;font-size:0.95em">Live-eligible scan (latest cycle, filtered to live_assets allowlist)</h3>
+            <table id="kalshi-live-scan">
+                <thead><tr>
+                    <th>Asset</th><th>T-close</th><th>Strike</th><th>Spot Δ</th>
+                    <th>yes_ask</th><th>no_ask</th><th>theo_yes</th><th>composite</th><th>edge</th>
+                </tr></thead>
+                <tbody id="kalshi-live-scan-body"><tr><td colspan="9" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+
+            <h3 style="margin-top:14px;font-size:0.95em">Live trade detail — open trades (full context) <span id="kalshi-live-open-total" style="font-size:0.85em;color:#58a6ff;margin-left:8px;font-weight:400"></span></h3>
+            <table id="kalshi-live-open-detail">
+                <thead><tr><th>Ticker</th><th>Side</th><th>Fill</th><th>Strike</th><th>Spot @ entry</th><th>Size</th><th>Total $</th><th>p_win</th><th>Close</th></tr></thead>
+                <tbody id="kalshi-live-open-detail-body"><tr><td colspan="9" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+
+            <h3 style="margin-top:14px;font-size:0.95em">Recent live activity (last 10 events)</h3>
+            <table id="kalshi-live-events">
+                <thead><tr><th>When</th><th>Action</th><th>Result</th><th>Details</th></tr></thead>
+                <tbody id="kalshi-live-events-body"><tr><td colspan="4" style="color:#8b949e">Loading…</td></tr></tbody>
             </table>
         </div>
     </div>
 
+    <!-- Kalshi paper-trading P&L summary (weather + KXBTCD combined) -->
     <div class="grid">
-        <!-- P/L Chart -->
-        <div class="card">
-            <h2>Cumulative P/L</h2>
-            <div class="chart-container"><canvas id="pl-chart"></canvas></div>
-        </div>
-
-        <!-- Circuit Breakers -->
-        <div class="card">
-            <h2>Circuit Breakers</h2>
-            <div id="breakers-container">Loading...</div>
+        <div class="card full" id="kalshi-paper-pnl-card">
+            <h2>Kalshi Paper P&amp;L
+                <span id="paper-committed-badge" style="font-size:0.62em;padding:3px 12px;border-radius:4px;margin-left:8px;vertical-align:middle;background:#0d1117;border:2px solid #58a6ff;color:#58a6ff;font-weight:700"></span>
+            </h2>
+            <div id="kalshi-paper-pnl" style="display:flex;gap:24px;flex-wrap:wrap">Loading…</div>
         </div>
     </div>
 
+    <!-- Kalshi DAILY scanner (KXBTCD) -->
     <div class="grid">
-        <!-- Performance -->
-        <div class="card">
-            <h2>Performance</h2>
-            <div id="performance-stats">Loading...</div>
+        <div class="card full">
+            <h2>Kalshi Daily Markets <span id="kdaily-meta" style="font-weight:400;font-size:0.95em;color:#8b949e;margin-left:8px"></span></h2>
+            <div id="kdaily-stats" style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 14px 0"></div>
+            <h3 style="margin-top:12px;font-size:0.95em">Per-asset breakdown</h3>
+            <table id="kdaily-by-asset">
+                <thead><tr><th>Asset</th><th>Open</th><th>Closed</th><th>W/L</th><th>WR</th><th>Open notional</th><th>Net P&amp;L</th></tr></thead>
+                <tbody id="kdaily-by-asset-body"><tr><td colspan="7" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+            <h3 style="margin-top:12px;font-size:0.95em">Latest scan</h3>
+            <table id="kdaily-samples">
+                <thead><tr>
+                    <th>Asset</th><th>T-close</th><th>Strike</th><th>Spot Δ</th>
+                    <th>yes_ask</th><th>no_ask</th><th>theo_yes</th><th>composite</th>
+                </tr></thead>
+                <tbody id="kdaily-samples-body"><tr><td colspan="8">Loading…</td></tr></tbody>
+            </table>
+            <h3 style="margin-top:12px;font-size:0.95em">Daily — open paper trades <span id="kdaily-open-total" style="font-size:0.85em;color:#58a6ff;margin-left:8px;font-weight:400"></span></h3>
+            <table id="kdaily-open">
+                <thead><tr><th>Ticker</th><th>Side</th><th>Fill</th><th>Strike</th><th>Spot @ entry</th><th>Size</th><th>Total $</th><th>p_win</th><th>Close</th></tr></thead>
+                <tbody id="kdaily-open-body"><tr><td colspan="9" style="color:#8b949e">none</td></tr></tbody>
+            </table>
         </div>
+    </div>
 
-        <!-- Calibration -->
-        <div class="card">
-            <h2>Calibration</h2>
-            <div id="calibration-stats">Loading...</div>
+    <!-- Weather scanner (Kalshi hourly temp markets + NWS edge) -->
+    <div class="grid">
+        <div class="card full">
+            <h2>Kalshi Weather <span id="weather-meta" style="font-weight:400;font-size:0.95em;color:#8b949e;margin-left:8px"></span></h2>
+            <div id="weather-stats" style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 14px 0"></div>
+            <h3 style="margin-top:12px;font-size:0.95em">Per-city breakdown</h3>
+            <table id="weather-by-city">
+                <thead><tr><th>City</th><th>Open</th><th>Closed</th><th>W/L</th><th>WR</th><th>Open notional</th><th>Net P&amp;L</th></tr></thead>
+                <tbody id="weather-by-city-body"><tr><td colspan="7" style="color:#8b949e">Loading…</td></tr></tbody>
+            </table>
+            <h3 style="margin-top:12px;font-size:0.95em">Latest scan</h3>
+            <table id="weather-samples">
+                <thead><tr>
+                    <th>City</th><th>T-close</th><th>Strike</th><th>NWS forecast</th>
+                    <th>mkt yes_ask</th><th>NWS P(YES)</th><th>Edge</th>
+                </tr></thead>
+                <tbody id="weather-samples-body"><tr><td colspan="7">Loading…</td></tr></tbody>
+            </table>
+            <h3 style="margin-top:12px;font-size:0.95em">Weather — open paper trades <span id="weather-open-total" style="font-size:0.85em;color:#58a6ff;margin-left:8px;font-weight:400"></span></h3>
+            <table id="weather-open">
+                <thead><tr><th>City</th><th>Side</th><th>Fill</th><th>Strike</th><th>NWS</th><th>Edge</th><th>Size</th><th>Total $</th><th>Close</th></tr></thead>
+                <tbody id="weather-open-body"><tr><td colspan="9" style="color:#8b949e">none</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Cross-bot open trades (polybot + cryptobot + wheel-trader + openclaw-v2) -->
+    <div class="grid">
+        <div class="card full">
+            <h2>All Bots — Open Trades <span id="all-bots-totals" style="font-weight:400;font-size:0.85em;color:#8b949e"></span></h2>
+            <table id="all-bots-table">
+                <thead>
+                    <tr><th>Bot</th><th>ID / Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>P&amp;L</th><th>Age</th></tr>
+                </thead>
+                <tbody id="all-bots-body"><tr><td colspan="8">Loading…</td></tr></tbody>
+            </table>
         </div>
     </div>
 
@@ -107,7 +175,6 @@
 </div>
 
 <script>
-let plChart = null;
 let paused = false;
 let countdown = 30;
 
@@ -115,118 +182,677 @@ function fmt(n, decimals=2) { return n != null ? Number(n).toFixed(decimals) : '
 function pnlClass(n) { return n >= 0 ? 'positive' : 'negative'; }
 function pnlSign(n) { return n >= 0 ? '+' + fmt(n) : fmt(n); }
 
+// Total committed in open positions = sum of notional (or fill × size if
+// the row doesn't have a stored notional). Renders into a header badge:
+// e.g. "· 3 open · $18.50 committed". Used by every renderXXX function
+// next to its open-trades table heading.
+function totalCommitted(trades, qtyField) {
+    qtyField = qtyField || 'our_size';
+    let total = 0;
+    for (const t of (trades || [])) {
+        if (t.notional != null && Number(t.notional) > 0) {
+            total += Number(t.notional);
+        } else {
+            const qty = Number(t[qtyField] || t.our_size || t.live_contracts || 0);
+            total += (Number(t.fill_price) || 0) * qty;
+        }
+    }
+    return total;
+}
+function setOpenTotalBadge(elId, trades, qtyField) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    const n = (trades || []).length;
+    if (n === 0) { el.textContent = ''; return; }
+    const tot = totalCommitted(trades, qtyField);
+    el.innerHTML = `· ${n} open · <strong>$${fmt(tot)}</strong> committed`;
+}
+
+// Bankroll badges. LIVE shows live committed in the LIVE section header;
+// paper shows the sum of all paper strategies in the Paper P&L header.
+// Each renderXXX call pushes its slice via updateBankrollSlice; the
+// helper aggregates and updates both badges.
+const __bankroll = {live: null, btc_paper: null, weather_paper: null};
+function updateBankrollSlice(slot, trades, qtyField) {
+    __bankroll[slot] = {
+        n: (trades || []).length,
+        usd: totalCommitted(trades, qtyField),
+    };
+    renderBankrollBadges();
+}
+function renderBankrollBadges() {
+    const live = __bankroll.live;
+    const btc = __bankroll.btc_paper;
+    const wx  = __bankroll.weather_paper;
+
+    const liveEl = document.getElementById('live-committed-badge');
+    if (liveEl) {
+        if (live == null) {
+            liveEl.textContent = '';
+        } else if (live.n === 0) {
+            liveEl.innerHTML = '💰 $0.00 committed';
+        } else {
+            liveEl.innerHTML = `💰 $${fmt(live.usd)} committed (${live.n})`;
+        }
+    }
+
+    const paperEl = document.getElementById('paper-committed-badge');
+    if (paperEl) {
+        const slices = [btc, wx].filter(s => s != null);
+        if (slices.length === 0) {
+            paperEl.textContent = '';
+        } else {
+            const totUsd = slices.reduce((a,s) => a + s.usd, 0);
+            const totN   = slices.reduce((a,s) => a + s.n,   0);
+            if (totN === 0) {
+                paperEl.innerHTML = '💰 $0.00 committed';
+            } else {
+                paperEl.innerHTML = `💰 $${fmt(totUsd)} committed (${totN})`;
+            }
+        }
+    }
+}
+
+// 2026-05-27 BUGFIX: weather strikes are TEMPERATURES (°F), not dollar
+// prices. Detect by asset code and render with appropriate unit.
+//   weather → "67.99°F"
+//   crypto / spy → "$77,499"
+function fmtStrike(strike, asset) {
+    if (strike == null) return '—';
+    const a = String(asset || '').toLowerCase();
+    if (a === 'weather' || a.startsWith('kxtemp')) {
+        return Number(strike).toFixed(2) + '°F';
+    }
+    return '$' + Number(strike).toLocaleString(undefined, {maximumFractionDigits: 2});
+}
+
 async function fetchData() {
+    // /api/state still pulls Recent Events (the only piece of that
+    // payload the dashboard still renders). Portfolio/Positions/
+    // Breakers/Performance/Calibration sections were removed
+    // 2026-05-28 — all Manifold-era stale data.
     try {
         const res = await fetch('/api/state');
         const data = await res.json();
-        renderPortfolio(data.portfolio);
-        renderPositions(data.positions);
-        renderBreakers(data.breakers);
-        renderPerformance(data.performance);
-        renderCalibration(data.calibration);
         renderEvents(data.events);
-        renderPLChart(data.history);
     } catch(e) {
         console.error('Fetch error:', e);
     }
-}
-
-function renderPortfolio(p) {
-    if (!p || p.error) { document.getElementById('portfolio-stats').innerHTML = 'Error: ' + (p?.error || 'unknown'); return; }
-    const modeBadge = p.mode === 'manifold' ? '<span class="badge paper">PAPER</span>' : '<span class="badge live">LIVE</span>';
-    const calClass = {Excellent:'ok',Good:'ok',Fair:'warn',Poor:'trip'}[p.calibration_grade] || '';
-    const lifetimeTitle = `title="Realized $${fmt(p.realized_pnl)} + Unrealized $${fmt(p.unrealized_pnl)}"`;
-    document.getElementById('portfolio-stats').innerHTML = `
-        <div class="stat"><div class="label">Bankroll</div><div class="value">$${fmt(p.total_bankroll)}</div></div>
-        <div class="stat"><div class="label">Cash</div><div class="value">$${fmt(p.cash_balance)}</div></div>
-        <div class="stat"><div class="label">Positions</div><div class="value">$${fmt(p.position_value)}</div></div>
-        <div class="stat" ${lifetimeTitle}><div class="label">Lifetime P/L</div><div class="value ${pnlClass(p.lifetime_pnl)}">${pnlSign(p.lifetime_pnl)}</div></div>
-        <div class="stat"><div class="label">Open P/L</div><div class="value ${pnlClass(p.unrealized_pnl)}">${pnlSign(p.unrealized_pnl)}</div></div>
-        <div class="stat"><div class="label">Mode</div><div class="value">${modeBadge}</div></div>
-        <div class="stat"><div class="label">Phase</div><div class="value">${p.phase}</div></div>
-        <div class="stat"><div class="label">Kelly</div><div class="value">${(p.kelly_multiplier*100).toFixed(0)}%</div></div>
-        <div class="stat"><div class="label">Calibration</div><div class="value"><span class="badge ${calClass}">${p.calibration_grade}</span></div></div>
-    `;
-}
-
-function renderPositions(positions) {
-    const tbody = document.getElementById('positions-body');
-    if (!positions || positions.length === 0) { tbody.innerHTML = '<tr><td colspan="11" style="color:#8b949e">No open positions</td></tr>'; return; }
-    const open = positions.filter(p => p.status === 'open');
-    if (open.length === 0) { tbody.innerHTML = '<tr><td colspan="11" style="color:#8b949e">No open positions</td></tr>'; return; }
-    tbody.innerHTML = open.map(p => {
-        const res = p.resolution_countdown || {};
-        const resLabel = res.label || '—';
-        let resStyle = 'color:#8b949e';
-        if (resLabel === 'RESOLVING') resStyle = 'color:#d29922;font-weight:bold';
-        else if (res.days != null && res.days < 3) resStyle = 'color:#d29922;font-weight:bold';
-        else if (res.days != null && res.days < 14) resStyle = 'color:#58a6ff';
-        const resTitle = res.iso ? `title="Resolves ${res.iso}"` : '';
-        const edge = p.edge_at_entry != null ? (p.edge_at_entry*100).toFixed(0) + '%' : '—';
-        const edgeStyle = p.edge_at_entry > 0 ? 'color:#3fb950' : '';
-        return `
-        <tr>
-            <td style="font-weight:bold">${p.side}</td>
-            <td>${p.question}</td>
-            <td style="color:#8b949e">${p.platform}</td>
-            <td>$${fmt(p.total_invested, 0)}</td>
-            <td style="text-align:center">${p.bet_count || 1}</td>
-            <td>$${fmt(p.entry_price)}</td>
-            <td>$${fmt(p.current_price)}</td>
-            <td class="${pnlClass(p.pnl)}">${pnlSign(p.pnl)} <span style="color:#8b949e;font-size:11px">(${(p.pnl_pct*100).toFixed(1)}%)</span></td>
-            <td style="${edgeStyle}">${p.edge_at_entry > 0 ? '+' : ''}${edge}</td>
-            <td>${p.composite_score}/9</td>
-            <td style="${resStyle}" ${resTitle}>${resLabel}</td>
-        </tr>
-    `;}).join('');
-}
-
-function renderBreakers(cb) {
-    const container = document.getElementById('breakers-container');
-    if (!cb || cb.error) { container.innerHTML = 'Error'; return; }
-    const b = cb.breakers || {};
-    let html = '';
-    for (const [name, data] of Object.entries(b)) {
-        const pct = Math.min(data.pct_used * 100, 100);
-        const color = data.tripped ? '#f85149' : pct > 60 ? '#d29922' : '#3fb950';
-        const label = name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-        const statusBadge = data.tripped ? '<span class="badge trip">TRIPPED</span>' : pct > 60 ? '<span class="badge warn">WARNING</span>' : '<span class="badge ok">OK</span>';
-        html += `<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between"><span>${label}</span><span>${statusBadge} ${data.current} / ${data.limit}</span></div><div class="breaker-bar"><div class="breaker-fill" style="width:${pct}%;background:${color}"></div></div></div>`;
+    try {
+        const res = await fetch('/api/all_open_trades');
+        renderAllBots(await res.json());
+    } catch(e) {
+        console.error('all_open_trades fetch error:', e);
     }
-    const paperBadge = cb.paper_mode ? '<span class="badge paper">PAPER MODE</span>' : '<span class="badge live">LIVE</span>';
-    html += `<div style="margin-top:12px">${paperBadge}</div>`;
-    container.innerHTML = html;
+    try {
+        const res = await fetch('/api/kalshi_daily');
+        renderKalshiDaily(await res.json());
+    } catch(e) { console.error('kalshi_daily fetch error:', e); }
+    try {
+        const res = await fetch('/api/weather');
+        renderWeather(await res.json());
+    } catch(e) { console.error('weather fetch error:', e); }
+    try {
+        const res = await fetch('/api/kalshi_paper_summary');
+        renderKalshiPaperSummary(await res.json());
+    } catch(e) { console.error('kalshi_paper_summary fetch error:', e); }
+    try {
+        const res = await fetch('/api/kalshi_live');
+        renderKalshiLive(await res.json());
+    } catch(e) { console.error('kalshi_live fetch error:', e); }
 }
 
-function renderPerformance(perf) {
-    const el = document.getElementById('performance-stats');
-    if (!perf || perf.total_trades === 0) { el.innerHTML = '<span style="color:#8b949e">No completed trades yet</span>'; return; }
-    el.innerHTML = `
-        <div class="stat"><div class="label">Trades</div><div class="value">${perf.total_trades}</div></div>
-        <div class="stat"><div class="label">Win Rate</div><div class="value ${perf.win_rate>=0.55?'positive':'negative'}">${(perf.win_rate*100).toFixed(0)}%</div></div>
-        <div class="stat"><div class="label">Total P/L</div><div class="value ${pnlClass(perf.total_pnl)}">${pnlSign(perf.total_pnl)}</div></div>
-        <div class="stat"><div class="label">Avg Win</div><div class="value positive">+${fmt(perf.avg_win)}</div></div>
-        <div class="stat"><div class="label">Avg Loss</div><div class="value negative">${fmt(perf.avg_loss)}</div></div>
-        <div class="stat"><div class="label">Fees Paid</div><div class="value">$${fmt(perf.total_fees)}</div></div>
-    `;
+async function resetKillSwitch() {
+    // Prompt for the secret each click — the page never stores it.
+    const token = prompt(
+        "Reset the kill switch and RE-ARM real-money trading?\n\n" +
+        "Enter the KILL_SWITCH_RESET_TOKEN to confirm:");
+    if (!token) return;  // cancelled
+    const btn = document.getElementById('kill-switch-reset-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '…resetting'; }
+    try {
+        const res = await fetch('/api/kalshi_live/reset_kill_switch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({token: token}),
+        });
+        const j = await res.json();
+        if (res.ok && j.ok) {
+            alert('✅ ' + (j.note || 'kill switch reset') +
+                  '\nconsecutive_losses now: ' + j.consecutive_losses);
+        } else {
+            alert('❌ Reset failed: ' + (j.error || ('HTTP ' + res.status)));
+        }
+    } catch (e) {
+        alert('❌ Reset request error: ' + e);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '↻ Reset kill switch'; }
+        fetchData();  // refresh the dashboard to reflect new state
+    }
 }
 
-function renderCalibration(cal) {
-    const el = document.getElementById('calibration-stats');
-    if (!cal || cal.brier_score == null) { el.innerHTML = '<span style="color:#8b949e">No resolved forecasts yet</span>'; return; }
-    let html = `
-        <div class="stat"><div class="label">Brier Score</div><div class="value">${fmt(cal.brier_score,4)}</div></div>
-        <div class="stat"><div class="label">Log Loss</div><div class="value">${fmt(cal.log_loss,4)}</div></div>
-    `;
-    const sa = cal.source_accuracy || {};
-    if (Object.keys(sa).length > 0) {
-        html += '<div style="margin-top:8px"><span class="label">Source Accuracy:</span></div>';
-        for (const [src, data] of Object.entries(sa)) {
-            html += `<div style="font-size:12px;margin-left:8px">${src}: Brier=${fmt(data.brier,4)} (n=${data.count})</div>`;
+function renderKalshiLive(d) {
+    if (!d) return;
+    const badge = document.getElementById('live-status-badge');
+    const statsEl = document.getElementById('kalshi-live-stats');
+    const gatesEl = document.getElementById('kalshi-live-gates');
+    const posBody = document.getElementById('kalshi-live-positions-body');
+    const evtBody = document.getElementById('kalshi-live-events-body');
+    const card = document.getElementById('kalshi-live-card');
+
+    // Top-line status badge — four states:
+    //   KILL SWITCH    → red,    consecutive-loss threshold tripped
+    //   LIVE           → green,  real money trading
+    //   HALTED         → orange, smoke marker present + live config
+    //                    EXISTS but `enabled: false`. Means user
+    //                    intentionally stopped live (vs never engaged it).
+    //                    This is the state after a manual halt — the
+    //                    badge tells the user the difference at a glance.
+    //   PAPER ONLY     → grey,   default state, never went live
+    const isLive = d.is_live_enabled;
+    const ks = (d.state && d.state.kill_switch_tripped) ? true : false;
+    const smokePassed = !!d.smoke_marker_present;
+    let badgeText, badgeBg, borderColor;
+    if (ks) {
+        badgeText = '🚨 KILL SWITCH TRIPPED';
+        badgeBg = '#f85149'; borderColor = '#f85149';
+    } else if (isLive) {
+        badgeText = '🟢 LIVE — REAL MONEY';
+        badgeBg = '#3fb950'; borderColor = '#3fb950';
+    } else if (smokePassed) {
+        // Smoke passed but enabled=false → user halted intentionally
+        badgeText = '🛑 LIVE HALTED — paper continues';
+        badgeBg = '#f0883e'; borderColor = '#f0883e';
+    } else {
+        badgeText = '⏸️  PAPER ONLY';
+        badgeBg = '#8b949e'; borderColor = '#30363d';
+    }
+    if (badge) {
+        badge.textContent = badgeText;
+        badge.style.background = badgeBg;
+        badge.style.color = '#0d1117';
+        badge.style.fontWeight = 'bold';
+    }
+    if (card) card.style.borderColor = borderColor;
+
+    // Reset-kill-switch button — only shown when the kill switch is tripped.
+    // Token-gated server-side (KILL_SWITCH_RESET_TOKEN); the page never holds
+    // the secret — we prompt for it per click and POST it.
+    const resetBtn = document.getElementById('kill-switch-reset-btn');
+    if (resetBtn) resetBtn.style.display = ks ? 'inline-block' : 'none';
+
+    // 5 stat tiles: balance, today PnL, consec losses, positions count, smoke
+    const safety = d.safety || {};
+    const cfg = safety.config || {};
+    const balance = safety.account_balance;
+    const todayPnl = safety.today_pnl != null ? safety.today_pnl : 0;
+    const consecLosses = d.state.consecutive_losses != null ? d.state.consecutive_losses : '?';
+    const posCount = (d.live_positions || []).length;
+    if (statsEl) {
+        const localSum = d.local_live_summary || {};
+        statsEl.innerHTML = `
+          <div class="stat" style="min-width:170px">
+            <div class="label">Kalshi Balance</div>
+            <div class="value" style="font-size:1.8em">${balance != null ? '$' + fmt(balance) : '?'}</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px">floor: $${fmt(cfg.min_balance_floor || 0)}</div>
+          </div>
+          <div class="stat" style="min-width:170px">
+            <div class="label">Today P&L (UTC)</div>
+            <div class="value ${pnlClass(todayPnl)}" style="font-size:1.8em">${pnlSign(todayPnl)}</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px">limit: −$${fmt(cfg.max_daily_loss_usd || 0)}</div>
+          </div>
+          <div class="stat" style="min-width:140px">
+            <div class="label">Consecutive Losses</div>
+            <div class="value" style="font-size:1.8em;color:${consecLosses >= 3 ? '#f0883e' : '#c9d1d9'}">${consecLosses}</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px">kill at: ${cfg.kill_switch_consec_losses || 5}</div>
+          </div>
+          <div class="stat" style="min-width:140px">
+            <div class="label">Open Live Positions</div>
+            <div class="value" style="font-size:1.8em">${posCount}</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px">max: ${cfg.max_concurrent || 8}</div>
+          </div>
+          <div class="stat" style="min-width:170px">
+            <div class="label">Live Trade Summary</div>
+            <div class="value ${pnlClass(localSum.net_pnl || 0)}" style="font-size:1.4em">${pnlSign(localSum.net_pnl || 0)}</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px">
+              ${localSum.total || 0} trades · ${localSum.won || 0}W/${localSum.lost || 0}L · ${localSum.open || 0} open
+            </div>
+          </div>`;
+    }
+
+    // Safety gate badges
+    if (gatesEl) {
+        const checks = (safety && safety.checks) || {};
+        const gateNames = ['trade_size', 'daily_loss', 'cooldown', 'balance', 'concurrent'];
+        gatesEl.innerHTML = gateNames.map(name => {
+            const g = checks[name];
+            if (!g) return `<span style="color:#8b949e">${name}: —</span>`;
+            const color = g.ok ? '#3fb950' : '#f85149';
+            const mark = g.ok ? '✓' : '✗';
+            return `<span style="border:1px solid ${color};color:${color};padding:3px 8px;border-radius:4px"
+                title="${g.reason}">${mark} ${name}</span>`;
+        }).join('') +
+        // Extra meta items
+        `<span style="margin-left:auto;color:#8b949e">smoke_marker: ${d.smoke_marker_present ? '✓' : '✗'}</span>`;
+    }
+
+    // Open positions
+    if (posBody) {
+        const positions = d.live_positions || [];
+        if (!positions.length) {
+            posBody.innerHTML = `<tr><td colspan="5" style="color:#8b949e">no open live positions</td></tr>`;
+        } else {
+            posBody.innerHTML = positions.map(p => `
+                <tr>
+                    <td style="font-family:monospace;font-size:0.85em">${p.market_id}</td>
+                    <td>${p.side}</td>
+                    <td>${p.quantity}</td>
+                    <td>$${fmt(p.avg_price, 3)}</td>
+                    <td class="${pnlClass(p.unrealized_pnl)}">${pnlSign(p.unrealized_pnl)}</td>
+                </tr>`).join('');
         }
     }
-    el.innerHTML = html;
+
+    // Live-eligible scan table — shows what the bot is currently looking
+    // at for LIVE trade decisions (filtered to live_assets allowlist).
+    const scanBody = document.getElementById('kalshi-live-scan-body');
+    if (scanBody) {
+        const scan = d.live_scan || [];
+        if (!scan.length) {
+            scanBody.innerHTML = `<tr><td colspan="9" style="color:#8b949e">no live-eligible samples this cycle</td></tr>`;
+        } else {
+            scanBody.innerHTML = scan.map(s => {
+                const tclose = s.seconds_to_close != null ? fmtSecsToHMS(s.seconds_to_close) : '—';
+                const strike = fmtStrike(s.strike, s.asset);
+                const spotDelta = s.distance_to_spot_pct != null
+                    ? (s.distance_to_spot_pct >= 0 ? '+' : '') + s.distance_to_spot_pct.toFixed(2) + '%'
+                    : '—';
+                const ya = s.yes_ask != null ? '$' + fmt(s.yes_ask, 3) : '—';
+                const na = s.no_ask  != null ? '$' + fmt(s.no_ask, 3)  : '—';
+                const theo = s.theoretical_yes != null ? fmt(s.theoretical_yes, 3) : '—';
+                const comp = s.composite != null
+                    ? (s.composite >= 0 ? '+' : '') + fmt(s.composite, 2)
+                    : '—';
+                // Color composite by sign for quick scan
+                const compColor = s.composite > 0.5 ? '#3fb950'
+                              : s.composite < -0.5 ? '#f85149'
+                              : '#c9d1d9';
+                // Side-aware price edge: model_P(side) − market_P(side), in
+                // percentage points. Positive = bot's side has real edge;
+                // ≤0 = market already priced what the model thinks (no trade).
+                // Shown alongside composite so "high conviction, no edge" is
+                // visible at a glance instead of buried in downstream gates.
+                const edgePp = s.edge != null ? s.edge * 100 : null;
+                const edgeStr = edgePp != null
+                    ? (edgePp >= 0 ? '+' : '') + edgePp.toFixed(1) + 'pp'
+                      + (s.side ? ' ' + s.side : '')
+                    : '—';
+                const edgeColor = edgePp != null
+                    ? (edgePp >= 2 ? '#3fb950'
+                       : edgePp >= 0 ? '#c9d1d9'
+                       : '#f85149')
+                    : '#8b949e';
+                return `<tr>
+                    <td><b>${s.asset || '?'}</b></td>
+                    <td>${tclose}</td>
+                    <td>${strike}</td>
+                    <td>${spotDelta}</td>
+                    <td>${ya}</td>
+                    <td>${na}</td>
+                    <td>${theo}</td>
+                    <td style="color:${compColor}"><b>${comp}</b></td>
+                    <td style="color:${edgeColor}"><b>${edgeStr}</b></td>
+                </tr>`;
+            }).join('');
+        }
+    }
+
+    // Detailed open live trades — same column layout as the paper-side
+    // open-trade tables (Ticker/Side/Fill/Strike/Spot@entry/Size/p_win/Close).
+    // Pulls from local_live_trades filtered to status=open.
+    const openDetailBody = document.getElementById('kalshi-live-open-detail-body');
+    if (openDetailBody) {
+        const openLive = (d.local_live_trades || []).filter(t => t.status === 'open');
+        setOpenTotalBadge('kalshi-live-open-total', openLive, 'live_contracts');
+        updateBankrollSlice('live', openLive, 'live_contracts');
+        if (!openLive.length) {
+            openDetailBody.innerHTML = `<tr><td colspan="9" style="color:#8b949e">no open live trades</td></tr>`;
+        } else {
+            openDetailBody.innerHTML = openLive.map(t => {
+                const closeStr = (t.close_time || '').substr(11, 5);   // HH:MM
+                const strike = fmtStrike(t.strike, t.asset);
+                // spot_at_entry only makes sense for crypto trades (weather
+                // doesn't have a "spot price" — it has a forecast). Render
+                // weather as — to avoid confusion.
+                const spot = (t.spot_at_entry != null && t.asset !== 'weather')
+                    ? '$' + Number(t.spot_at_entry).toLocaleString(undefined, {maximumFractionDigits: 2})
+                    : '—';
+                const pwin = t.p_win_estimated != null ? fmt(t.p_win_estimated, 3) : '—';
+                // Total notional in the position = fill × contracts.
+                // For live trades we use live_contracts; fall back to our_size.
+                const liveQty = t.live_contracts || t.our_size || 0;
+                const rowTotal = (t.notional != null && t.notional > 0)
+                    ? Number(t.notional)
+                    : (Number(t.fill_price) || 0) * Number(liveQty);
+                const totalStr = rowTotal > 0 ? '$' + fmt(rowTotal, 2) : '—';
+                return `<tr>
+                    <td style="font-family:monospace;font-size:0.85em">${t.market_ticker}</td>
+                    <td>${t.side}</td>
+                    <td>$${fmt(t.fill_price, 3)}</td>
+                    <td>${strike}</td>
+                    <td>${spot}</td>
+                    <td>${t.live_contracts || '—'}</td>
+                    <td><strong>${totalStr}</strong></td>
+                    <td>${pwin}</td>
+                    <td>${closeStr}</td>
+                </tr>`;
+            }).join('');
+        }
+    }
+
+    // Recent live events
+    if (evtBody) {
+        const events = (d.recent_events || []).slice(-10).reverse();
+        if (!events.length) {
+            evtBody.innerHTML = `<tr><td colspan="4" style="color:#8b949e">no live events yet</td></tr>`;
+        } else {
+            evtBody.innerHTML = events.map(e => {
+                const when = (e.timestamp || '').substr(11, 8);  // HH:MM:SS
+                const resultColor = (e.result === 'success' ? '#3fb950' :
+                                     e.result === 'failed'  ? '#f85149' :
+                                     e.result === 'critical'? '#f85149' :
+                                     e.result === 'degraded'? '#f0883e' : '#8b949e');
+                const det = e.details || {};
+                const detStr = Object.entries(det).slice(0,4)
+                    .map(([k,v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
+                    .join(' · ');
+                return `<tr>
+                    <td style="font-family:monospace">${when}</td>
+                    <td>${e.action}</td>
+                    <td style="color:${resultColor}">${e.result}</td>
+                    <td style="font-family:monospace;font-size:0.85em">${detStr.slice(0, 120)}</td>
+                </tr>`;
+            }).join('');
+        }
+    }
 }
+
+
+// Generic per-group table renderer. Used by daily by_asset, 15-min
+// by_asset, and weather by_city — all return the same shape (label +
+// open/closed/W/L/WR/notional/P&L) so one render function works for all.
+// Disabled assets/cities — hide their historical-only rows since they
+// won't open new trades. Update when re-enabling: remove from this set,
+// or just `enabled: true` in the YAML and they reappear automatically
+// once a new trade fires (rows with open>0 are always shown).
+const DISABLED_GROUPS = new Set([
+    'eth','sol','xrp','ada','doge',
+    // Inactive weather cities (Kalshi stopped posting events ~Apr 16-21,
+    // they may reappear if Kalshi turns them back on)
+    'chicago','dc','boston','lax','miami',
+]);
+
+function renderGroupBreakdown(bodyId, rows, colspan=7) {
+    const body = document.getElementById(bodyId);
+    if (!body) return;
+    // Filter out dead groups that have 0 open positions. We still show
+    // them if they unexpectedly have an open trade (defensive: never hide
+    // money currently in play).
+    const filtered = (rows || []).filter(g => {
+        const key = ((g.label || g.asset || g.city || '') + '').toLowerCase();
+        if (!DISABLED_GROUPS.has(key)) return true;
+        return (Number(g.open) || 0) > 0;
+    });
+    if (!filtered.length) {
+        body.innerHTML = `<tr><td colspan="${colspan}" style="color:#8b949e">no trades yet</td></tr>`;
+        return;
+    }
+    body.innerHTML = filtered.map(g => {
+        const label = g.label || g.asset || g.city || '?';
+        const wrStr = g.wr_pct != null ? `${g.wr_pct.toFixed(0)}%` : '—';
+        const cls = pnlClass(g.net_pnl);
+        return `<tr>
+            <td><b>${label}</b></td>
+            <td>${g.open}</td>
+            <td>${g.closed}</td>
+            <td>${g.won}W / ${g.lost}L</td>
+            <td>${wrStr}</td>
+            <td>$${fmt(g.open_notional)}</td>
+            <td class="${cls}"><b>${pnlSign(g.net_pnl)}</b></td>
+        </tr>`;
+    }).join('');
+}
+
+// renderKalshi15min removed 2026-05-28 along with the 15-min Crypto card
+// (strategy killed 2026-05-24). Function lived here previously.
+
+function renderKalshiPaperSummary(d) {
+    const host = document.getElementById('kalshi-paper-pnl');
+    if (!host || !d || !d.totals) return;
+    // Build per-strategy tiles + one big total tile on the right.
+    const stratHtml = (d.strategies || []).map(s => {
+        const wrStr = s.wr_pct != null ? `${s.wr_pct.toFixed(0)}%` : '—';
+        return `
+          <div class="stat" style="min-width:160px">
+            <div class="label">${s.label}</div>
+            <div class="value ${pnlClass(s.net_pnl)}" style="font-size:1.4em">${pnlSign(s.net_pnl)}</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px">
+              ${s.open} open · ${s.won}W/${s.lost}L (${wrStr})
+            </div>
+          </div>`;
+    }).join('');
+    const t = d.totals;
+    const tWR = t.wr_pct != null ? `${t.wr_pct.toFixed(0)}%` : '—';
+    const totalHtml = `
+      <div class="stat" style="min-width:200px;border-left:2px solid #30363d;padding-left:20px;margin-left:8px">
+        <div class="label">All Kalshi Paper</div>
+        <div class="value ${pnlClass(t.net_pnl)}" style="font-size:1.8em">${pnlSign(t.net_pnl)}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:2px">
+          ${t.total} total · ${t.open} open · ${t.won}W/${t.lost}L (${tWR})
+        </div>
+      </div>`;
+    host.innerHTML = stratHtml + totalHtml;
+}
+
+function fmtSecsToHMS(s) {
+    if (s == null) return '?';
+    if (s < 3600) return Math.floor(s/60) + 'm' + String(Math.floor(s%60)).padStart(2,'0') + 's';
+    return (s/3600).toFixed(1) + 'h';
+}
+
+// Renders the per-section P&L + capital stat block (P&L, peak capital,
+// ROI on peak, cumulative invested, avg trade size). Used by both
+// renderKalshiDaily and renderWeather so each section has its own
+// self-contained "how am I doing here" view.
+function renderSectionStats(hostId, counts) {
+    const host = document.getElementById(hostId);
+    if (!host || !counts) return;
+    const pnl = counts.net_pnl;
+    const roiPeak = counts.roi_peak_pct;
+    const roiInv  = counts.roi_invested_pct;
+    const wr = counts.wr_pct;
+    host.innerHTML = `
+      <div class="stat" style="min-width:160px">
+        <div class="label">Paper P&L</div>
+        <div class="value ${pnlClass(pnl)}" style="font-size:1.6em">${pnlSign(pnl)}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:2px">
+          ${counts.open} open · ${counts.closed_total} closed · ${counts.won}W/${counts.lost}L${wr != null ? ` (${wr.toFixed(0)}%)` : ''}
+        </div>
+      </div>
+      <div class="stat" style="min-width:160px">
+        <div class="label">Peak Capital at Risk</div>
+        <div class="value" style="font-size:1.6em">$${fmt(counts.peak_capital)}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:2px">
+          ROI on peak: <span class="${pnlClass(roiPeak||0)}">${roiPeak != null ? (roiPeak >= 0 ? '+' : '') + roiPeak.toFixed(1) + '%' : '—'}</span>
+        </div>
+      </div>
+      <div class="stat" style="min-width:160px">
+        <div class="label">Cumulative Invested</div>
+        <div class="value" style="font-size:1.6em">$${fmt(counts.total_invested)}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:2px">
+          avg $${fmt(counts.avg_notional)} / trade · ROI ${roiInv != null ? (roiInv >= 0 ? '+' : '') + roiInv.toFixed(1) + '%' : '—'}
+        </div>
+      </div>
+      <div class="stat" style="min-width:140px">
+        <div class="label">Open Notional</div>
+        <div class="value" style="font-size:1.6em">$${fmt(counts.open_notional)}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:2px">
+          currently at risk in ${counts.open} live trades
+        </div>
+      </div>`;
+}
+
+function renderKalshiDaily(d) {
+    const tbody = document.getElementById('kdaily-samples-body');
+    const meta = document.getElementById('kdaily-meta');
+    const openBody = document.getElementById('kdaily-open-body');
+    if (!d || !d.latest_samples) { tbody.innerHTML = '<tr><td colspan="8">no data</td></tr>'; return; }
+    setOpenTotalBadge('kdaily-open-total', d.open_trades);
+    updateBankrollSlice('btc_paper', d.open_trades);
+    renderSectionStats('kdaily-stats', d.counts);
+    renderGroupBreakdown('kdaily-by-asset-body', d.by_asset || []);
+
+    const kdPnl = d.counts.net_pnl;
+    const kdWR = d.counts.closed_total ? (d.counts.won / d.counts.closed_total * 100).toFixed(0) : '—';
+    meta.innerHTML = `· ${d.counts.open} open · ${d.counts.closed_total} closed · ${d.counts.won}W (${kdWR}%) · `
+      + `<span class="${pnlClass(kdPnl)}" style="font-weight:700;font-size:1.15em">net ${pnlSign(kdPnl)}</span>`;
+    if (d.latest_samples.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="color:#8b949e">no live markets</td></tr>';
+    } else {
+        tbody.innerHTML = d.latest_samples.slice(0,10).map(s => {
+            const ind = s.indicators || {};
+            const ya = s.yes_ask != null ? '$' + fmt(s.yes_ask, 3) : '—';
+            const na = s.no_ask != null ? '$' + fmt(s.no_ask, 3) : '—';
+            const theo = ind.theoretical_yes != null ? fmt(ind.theoretical_yes, 3) : '—';
+            const comp = ind.composite != null ? (ind.composite >= 0 ? '+' : '') + fmt(ind.composite, 2) : '—';
+            const diff = s.distance_to_spot_pct;
+            const diffStr = diff != null ? (diff >= 0 ? '+' : '') + fmt(diff, 2) + '%' : '—';
+            return `<tr>
+                <td>${s.asset}</td>
+                <td>${fmtSecsToHMS(s.seconds_to_close)}</td>
+                <td>$${fmt(s.strike, 0)}</td>
+                <td>${diffStr}</td>
+                <td>${ya}</td><td>${na}</td>
+                <td>${theo}</td><td>${comp}</td>
+            </tr>`;
+        }).join('');
+    }
+    if (d.open_trades.length === 0) {
+        openBody.innerHTML = '<tr><td colspan="9" style="color:#8b949e">none</td></tr>';
+    } else {
+        openBody.innerHTML = d.open_trades.map(t => {
+            const totalUsd = (t.notional != null && t.notional > 0)
+                ? Number(t.notional)
+                : (Number(t.fill_price) || 0) * (Number(t.our_size) || 0);
+            const totalStr = totalUsd > 0 ? '$' + fmt(totalUsd, 2) : '—';
+            return `<tr>
+                <td title="${t.market_ticker}">${(t.market_ticker||'').substring(0,28)}</td>
+                <td>${t.side}</td>
+                <td>$${fmt(t.fill_price,3)}</td>
+                <td>$${fmt(t.strike,0)}</td>
+                <td>$${fmt(t.spot_at_entry,0)}</td>
+                <td>${fmt(t.our_size,2)}</td>
+                <td><strong>${totalStr}</strong></td>
+                <td>${fmt(t.p_win_estimated,3)}</td>
+                <td>${(t.close_time||'').substring(0,16)}</td>
+            </tr>`;
+        }).join('');
+    }
+}
+
+function renderWeather(d) {
+    const tbody = document.getElementById('weather-samples-body');
+    const meta = document.getElementById('weather-meta');
+    const openBody = document.getElementById('weather-open-body');
+    if (!d || !d.latest_samples) { tbody.innerHTML = '<tr><td colspan="7">no data</td></tr>'; return; }
+    setOpenTotalBadge('weather-open-total', d.open_trades);
+    updateBankrollSlice('weather_paper', d.open_trades);
+    renderSectionStats('weather-stats', d.counts);
+    renderGroupBreakdown('weather-by-city-body', d.by_city || []);
+    const wPnl = d.counts.net_pnl;
+    const wWR = d.counts.closed_total ? (d.counts.won / d.counts.closed_total * 100).toFixed(0) : '—';
+    meta.innerHTML = `· ${d.counts.open} open · ${d.counts.closed_total} closed · ${d.counts.won}W (${wWR}%) · `
+      + `<span class="${pnlClass(wPnl)}" style="font-weight:700;font-size:1.15em">net ${pnlSign(wPnl)}</span>`;
+    if (d.latest_samples.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">no live markets</td></tr>';
+    } else {
+        const rows = [...d.latest_samples].sort((a,b) => Math.abs(b.edge||0) - Math.abs(a.edge||0));
+        tbody.innerHTML = rows.slice(0,12).map(s => {
+            const ya = s.yes_ask != null ? '$' + fmt(s.yes_ask, 3) : '—';
+            const edge = s.edge != null ? (s.edge >= 0 ? '+' : '') + fmt(s.edge, 3) : '—';
+            const edgeCls = (s.edge||0) > 0.1 ? 'positive' : ((s.edge||0) < -0.1 ? 'negative' : '');
+            return `<tr>
+                <td>${s.city}</td>
+                <td>${fmtSecsToHMS(s.seconds_to_close)}</td>
+                <td>${fmt(s.strike_f,1)}°F</td>
+                <td>${s.nws_forecast_f != null ? fmt(s.nws_forecast_f,1)+'°F' : '—'}</td>
+                <td>${ya}</td>
+                <td>${s.nws_p_yes != null ? fmt(s.nws_p_yes,3) : '—'}</td>
+                <td class="${edgeCls}">${edge}</td>
+            </tr>`;
+        }).join('');
+    }
+    if (d.open_trades.length === 0) {
+        openBody.innerHTML = '<tr><td colspan="9" style="color:#8b949e">none</td></tr>';
+    } else {
+        openBody.innerHTML = d.open_trades.map(t => {
+            const totalUsd = (t.notional != null && t.notional > 0)
+                ? Number(t.notional)
+                : (Number(t.fill_price) || 0) * (Number(t.our_size) || 0);
+            const totalStr = totalUsd > 0 ? '$' + fmt(totalUsd, 2) : '—';
+            return `<tr>
+                <td>${t.city}</td>
+                <td>${t.side}</td>
+                <td>$${fmt(t.fill_price,3)}</td>
+                <td>${fmt(t.strike_f,1)}°F</td>
+                <td>${fmt(t.nws_forecast_f,1)}°F</td>
+                <td>${(t.edge||0) >= 0 ? '+' : ''}${fmt(t.edge,3)}</td>
+                <td>${fmt(t.our_size,2)}</td>
+                <td><strong>${totalStr}</strong></td>
+                <td>${(t.close_time||'').substring(11,16)}</td>
+            </tr>`;
+        }).join('');
+    }
+}
+
+function renderAllBots(d) {
+    const tbody = document.getElementById('all-bots-body');
+    const totEl = document.getElementById('all-bots-totals');
+    if (!d || !d.rows) { tbody.innerHTML = '<tr><td colspan="8">No data</td></tr>'; return; }
+    totEl.textContent = `· ${d.totals.open} open · ${d.totals.stale} stale ⚠`;
+    if (d.rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="color:#8b949e">No open positions across any bot.</td></tr>';
+        return;
+    }
+    // Sort: stale first, then by bot, then by age descending
+    const rows = [...d.rows].sort((a,b) => (b.stale - a.stale) || a.bot.localeCompare(b.bot) || (b.age_days||0) - (a.age_days||0));
+    tbody.innerHTML = rows.map(r => {
+        const stale = r.stale ? '<span style="color:#f85149" title="past per-kind staleness threshold">⚠</span> ' : '';
+        const upnl = (r.upnl != null && r.upnl !== 0)
+            ? `<span class="${pnlClass(r.upnl)}">${pnlSign(r.upnl)}</span>`
+            : '<span style="color:#8b949e">—</span>';
+        const mark = r.mark > 0 ? '$' + fmt(r.mark, 4) : '<span style="color:#8b949e">—</span>';
+        const age = r.age_days != null
+            ? (r.age_days < 1 ? `${Math.round(r.age_days*24*60)}m` : `${r.age_days.toFixed(1)}d`)
+            : '?';
+        const id = (r.label || r.id || '?').toString().substring(0, 40);
+        return `<tr>
+            <td>${stale}${r.bot}</td>
+            <td title="${(r.id||'').replace(/"/g,'&quot;')}">${id}</td>
+            <td>${r.side}</td>
+            <td>${fmt(r.size, 4)}</td>
+            <td>$${fmt(r.entry, 4)}</td>
+            <td>${mark}</td>
+            <td>${upnl}</td>
+            <td>${age}</td>
+        </tr>`;
+    }).join('');
+}
+
+// renderPortfolio / renderPositions / renderBreakers / renderPerformance /
+// renderCalibration removed 2026-05-28 along with their dashboard
+// sections — all Manifold-era stale data (mode=manifold, baseline from
+// pre-Kalshi era). Functions lived here previously.
 
 function renderEvents(events) {
     const container = document.getElementById('events-container');
@@ -240,38 +866,7 @@ function renderEvents(events) {
     `).join('');
 }
 
-function renderPLChart(history) {
-    if (!history || !history.pl_series || history.pl_series.length === 0) return;
-    const ctx = document.getElementById('pl-chart').getContext('2d');
-    const labels = history.pl_series.map(p => p.date);
-    const data = history.pl_series.map(p => p.pl);
-
-    if (plChart) plChart.destroy();
-    plChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: labels,
-            datasets: [{
-                label: 'Cumulative P/L ($)',
-                data: data,
-                borderColor: '#58a6ff',
-                backgroundColor: 'rgba(88, 166, 255, 0.1)',
-                fill: true,
-                tension: 0.3,
-                pointRadius: 3,
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
-                y: { ticks: { color: '#8b949e', callback: v => '$'+v }, grid: { color: '#21262d' } }
-            },
-            plugins: { legend: { labels: { color: '#c9d1d9' } } }
-        }
-    });
-}
+// renderPLChart removed 2026-05-28 with the Cumulative P/L canvas.
 
 function togglePause() { paused = !paused; }
 function refreshNow() { countdown = 0; }
