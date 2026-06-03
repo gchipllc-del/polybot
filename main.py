@@ -1186,6 +1186,65 @@ def cmd_weather_paper_settle():
     print(f"Settled {r.get('settled_now',0)} trades. Remaining open: {r.get('total_open',0)}.")
 
 
+def cmd_weather_mispricing_cycle():
+    """Mispricing-edge sleeve: bet the measured-underpriced NO side from the
+    realized-WR gauge, ignoring the forecast. Paper by default; routes LIVE
+    through the executor rails only when MISPRICING_LIVE=1 (+ global live on),
+    capped by MISPRICING_LIVE_BUDGET."""
+    from lib.mispricing_paper import record_mispricing_trades
+    new = record_mispricing_trades()
+    n_live = sum(1 for r in new if r.get("is_live"))
+    print(f"Mispricing arm: opened {len(new)} trade(s) ({n_live} LIVE).")
+
+
+def cmd_weather_daily_monitor():
+    """Scan Kalshi DAILY max/min weather markets (KXHIGHT* + KXLOWT*).
+
+    Parallel pilot to the hourly scanner — different format, ~20 cities
+    in catalog. Pilot covers 8 cities (4 max + 4 min). Paper only.
+
+    Data sources:
+      - api.weather.gov /forecast (12-period daily)
+      - Kalshi public events/markets endpoints
+    """
+    from lib.weather_daily_signal import run_signal_cycle, DAILY_CITIES
+    result = run_signal_cycle()
+    print(f"=== Weather DAILY signal cycle ({len(DAILY_CITIES)} cities) ===")
+    if result["n_markets"] == 0:
+        print("  No active daily-temp markets right now.")
+        return
+    print(f"  Sampled {result['n_markets']} market(s). Largest edges first:")
+    print(f"  {'city':<10} {'dir':<4} {'T-close':>8} {'strike':>9} {'fc':>7} "
+          f"{'mkt_y':>6} {'p_yes':>6} {'edge':>7}  ticker")
+    for s in result["samples"][:15]:
+        tc = s.get("seconds_to_close") or 0
+        t_str = f"{tc/3600:.1f}h" if tc >= 3600 else f"{int(tc//60)}m"
+        ya = s.get("yes_ask")
+        ya_s = f"{ya:.3f}" if ya is not None else "  -  "
+        fc = s.get("forecast_f")
+        p = s.get("nws_p_yes")
+        edge = s.get("edge") or 0
+        print(f"  {s.get('city_key','?'):<10} {s.get('direction','?'):<4} "
+              f"{t_str:>8} "
+              f"{s.get('strike_f',0):>+6.1f}°F  "
+              f"{(fc or 0):>5.1f}°F {ya_s:>6} "
+              f"{(p or 0):>6.3f} {edge:>+7.3f}  {s.get('market_ticker','')[:28]}")
+    print(f"\n  Paper trades opened this cycle: {result.get('paper_trades_opened', 0)}")
+    print(f"  Paper settled this cycle:       "
+          f"{result.get('settle_summary', {}).get('settled_now', 0)}")
+    print(f"  Persisted to data/weather_daily_signal.jsonl")
+
+
+def cmd_weather_daily_paper_settle():
+    """Settle any resolved Kalshi daily-temp paper trades + void stale."""
+    from lib.weather_daily_paper import settle_paper_trades
+    r = settle_paper_trades()
+    print(f"Settled {r.get('settled_now',0)} trades. "
+          f"Voided {r.get('voided_now',0)}. "
+          f"Remaining open: {r.get('total_open',0)}. "
+          f"P&L this cycle: ${r.get('paper_pnl_this_cycle',0):+.2f}")
+
+
 def cmd_kalshi_15min_paper_settle():
     """Settle resolved Kalshi 15-min paper trades. Cron also calls this."""
     from lib.kalshi_15min_paper import settle_paper_trades
@@ -1832,6 +1891,12 @@ def main():
         cmd_weather_monitor()
     elif command == "weather-paper-settle":
         cmd_weather_paper_settle()
+    elif command == "weather-mispricing-cycle":
+        cmd_weather_mispricing_cycle()
+    elif command == "weather-daily-monitor":
+        cmd_weather_daily_monitor()
+    elif command == "weather-daily-paper-settle":
+        cmd_weather_daily_paper_settle()
     elif command == "kalshi-15min-paper-report":
         asset = None
         for arg in sys.argv[2:]:
@@ -2196,6 +2261,46 @@ def main():
                   "min_balance_floor", "cooldown_minutes",
                   "cooldown_loss_count", "cooldown_window_min"):
             print(f"    {k:<22} = {cfg.get(k)}")
+        # Bankroll-relative sizing: show the % rule and the EFFECTIVE cap
+        # (what a trade is actually sized to right now), which scales with
+        # the live balance rather than being a fixed dollar amount.
+        bpct = s.get("max_trade_bankroll_pct", 0.0) or 0.0
+        if bpct > 0:
+            eff = s.get("effective_max_trade_usd")
+            print(f"    {'max_trade_bankroll_pct':<22} = {bpct:.0%}  "
+                  f"→ effective per-trade cap ${eff:.2f} "
+                  f"(min of {bpct:.0%}×balance and ${cfg.get('max_trade_usd')} backstop)")
+        # Bankroll-relative daily-loss halt (same min(absolute, pct×bal) model).
+        dpct = s.get("max_daily_loss_pct", 0.0) or 0.0
+        if dpct > 0:
+            deff = s.get("effective_daily_loss_usd")
+            print(f"    {'max_daily_loss_pct':<22} = {dpct:.0%}  "
+                  f"→ effective daily-loss halt ${deff:.2f} "
+                  f"(min of {dpct:.0%}×balance and ${cfg.get('max_daily_loss_usd')} backstop)")
+        # Per-asset concurrent-COUNT caps (e.g. weather 3 + btc 1 = 4 total).
+        # Shown as current/cap so a maxed-out asset (e.g. btc 1/1) is obvious.
+        asset_conc = s.get("live_asset_max_concurrent") or {}
+        if asset_conc:
+            open_by_asset = s.get("live_positions_by_asset") or {}
+            parts = []
+            for a, n in sorted(asset_conc.items()):
+                cur = open_by_asset.get(a, 0)
+                flag = "  ← FULL" if cur >= n else ""
+                parts.append(f"{a} {cur}/{n}{flag}")
+            print(f"    {'live_asset_max_concurrent':<22} = " + ", ".join(parts))
+        # Per-asset $ budgets — show the EFFECTIVE (possibly bankroll-scaled) cap.
+        eff_budgets = s.get("effective_asset_budgets") or {}
+        if eff_budgets:
+            bpcts = cfg.get("live_asset_budget_pct") or {}
+            for a in sorted(eff_budgets):
+                v = eff_budgets[a]
+                if v is None:
+                    continue
+                apct = float(bpcts.get(a, 0.0) or 0.0)
+                tag = (f"  ({apct:.0%}×balance, capped at "
+                       f"${(cfg.get('live_asset_budgets') or {}).get(a)} backstop)"
+                       if apct > 0 else "  (static)")
+                print(f"    {'budget['+a+']':<22} = ${v:.2f}{tag}")
         print()
         print(f"  Current state:")
         bal = s.get("account_balance")

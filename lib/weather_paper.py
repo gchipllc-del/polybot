@@ -11,6 +11,7 @@ Kalshi-resolution data feed).
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +19,16 @@ from pathlib import Path
 from tradingcore import log_event
 
 ROOT = Path(__file__).resolve().parent.parent
-PAPER_LOG = ROOT / "data" / "weather_paper.jsonl"
-STRATEGY_PATH = ROOT / "config" / "weather_strategy.yaml"
+# Output + config are env-overridable so a SECOND, parallel paper instance can
+# run the same code against a different strategy profile and write to a separate
+# ledger (the "original/ungated" A-B replica). Env unset → production defaults,
+# i.e. ZERO behavior change for the live hourly sleeve.
+PAPER_LOG = Path(os.environ.get("WEATHER_PAPER_LOG") or (ROOT / "data" / "weather_paper.jsonl"))
+STRATEGY_PATH = Path(os.environ.get("WEATHER_STRATEGY_PATH") or (ROOT / "config" / "weather_strategy.yaml"))
+# HARD live kill-switch for the shadow A-B instance. When WEATHER_PAPER_ONLY=1
+# this process is physically incapable of placing a real Kalshi order, no matter
+# what the global live config says. Default off → live sleeve unaffected.
+_PAPER_ONLY = os.environ.get("WEATHER_PAPER_ONLY") == "1"
 
 DEFAULT_BANKROLL = 1000.0
 DEFAULT_MIN_TRADE_USD = 1.0
@@ -135,6 +144,12 @@ def _effective_params() -> dict:
         # is None, falls back to the symmetric forecast_buffer_f.
         "forecast_buffer_f_yes": (None if o.get("forecast_buffer_f_yes") is None
                                    else float(o.get("forecast_buffer_f_yes"))),
+        # Master switch for the forecast-direction (coherence) gate below.
+        # True (default) = production 2026-05-26 HALT-fix behaviour. False =
+        # pure probability-edge trading (the pre-HALT "original" behaviour),
+        # used ONLY by the ungated PAPER A/B replica. Re-enables the exact
+        # against-the-forecast bleed the HALT fix removed, so it is paper-only.
+        "forecast_dir_gate": bool(o.get("forecast_dir_gate", True)),
         # 2026-05-26 PM: disable YES side. NO trades had 77% WR (+$608)
         # while YES had 40% WR (-$2). Same pattern as BTC ended up at —
         # one side is the moneymaker, the other is structural drag.
@@ -292,20 +307,21 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
         # predicted) more than they miss high.
         buf_no  = params["forecast_buffer_f"]
         buf_yes = params.get("forecast_buffer_f_yes") or buf_no
-        if side == "YES":
-            # YES wins if temp >= strike. Need forecast clearly above.
-            if forecast_f < (strike_f + buf_yes):
-                skip_counts["forecast_dir_yes"] = (
-                    skip_counts.get("forecast_dir_yes", 0) + 1
-                )
-                continue
-        else:   # NO
-            # NO wins if temp < strike. Need forecast clearly below.
-            if forecast_f > (strike_f - buf_no):
-                skip_counts["forecast_dir_no"] = (
-                    skip_counts.get("forecast_dir_no", 0) + 1
-                )
-                continue
+        if params["forecast_dir_gate"]:
+            if side == "YES":
+                # YES wins if temp >= strike. Need forecast clearly above.
+                if forecast_f < (strike_f + buf_yes):
+                    skip_counts["forecast_dir_yes"] = (
+                        skip_counts.get("forecast_dir_yes", 0) + 1
+                    )
+                    continue
+            else:   # NO
+                # NO wins if temp < strike. Need forecast clearly below.
+                if forecast_f > (strike_f - buf_no):
+                    skip_counts["forecast_dir_no"] = (
+                        skip_counts.get("forecast_dir_no", 0) + 1
+                    )
+                    continue
 
         # YES side disable gate. Backtest showed weather YES = 40% WR /
         # -$2; NO = 77% WR / +$608. Mirror of BTC where one side was
@@ -391,7 +407,7 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
                 if not _veto_ok and is_live_enabled():
                     # Live order blocked by the gauge; paper still records below.
                     skip_counts[_veto_reason] = skip_counts.get(_veto_reason, 0) + 1
-            if is_live_enabled() and (not _veto_on or _veto_ok):
+            if is_live_enabled() and (not _veto_on or _veto_ok) and not _PAPER_ONLY:
                 live_cfg = _load_live_config()
                 # Per-trade cap may be bankroll-relative — size off live cash
                 # (net of in-cycle commitments). Fetch balance once per cycle.

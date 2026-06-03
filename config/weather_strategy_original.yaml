@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────
+# RECONSTRUCTED "ORIGINAL / UNGATED" hourly-weather profile  —  PAPER-ONLY A/B
+# ─────────────────────────────────────────────────────────────────────────
+# Purpose: replicate the behaviour of the original hourly-weather sleeve from
+# the 2026-05-23..26 run (the "$60 → $110 → $557 → $864" paper climb) so we can
+# A/B it, GOING FORWARD, against the current edge-gated live sleeve on the same
+# markets — under the SAME realistic paper settlement.
+#
+# PROVENANCE / HONESTY:
+#   * The literal original code is NOT in git (lib/weather_paper.py wasn't
+#     tracked until 2026-06-01, and that first commit already had the veto), so
+#     this is a faithful *behavioural* reconstruction, not a byte-exact replica.
+#   * That original $864 figure was PAPER. The same strategy run live booked
+#     +$163. Expect this profile's paper P&L to be similarly inflated — the
+#     VALUE here is the *relative* comparison vs the current sleeve, not the
+#     absolute number.
+#
+# WHAT MAKES THIS "UNGATED" (vs config/weather_strategy.yaml):
+#   * forecast_buffer_f 1.25 -> 0.0   : the 2026-05-26 "HALT fix" raised the
+#       directional buffer to 1.25 and cut at-bats hard (backtest: buffer 0.5 →
+#       N=36, buffer 1.0 → N=9). The original run predates that. 0.0 ≈ "no
+#       directional filter" = the original high-volume behaviour.
+#   * weather_no_side_only false       : original traded BOTH sides (79 NO / 16
+#       YES over the run). Current sleeve is NO-only.
+#   * max_fill_for_buy 0.45 -> 0.55    : original took fills up to ~0.51.
+#   * min_edge_threshold -> 0.05       : loose edge floor for max at-bats.
+#
+# HELD EQUAL to the current sleeve (so the A/B isolates GATING, not sizing):
+#   * default_kelly_multiplier 0.25, default_max_trade_usd 20.0.
+#
+# SAFETY: this profile is only ever loaded by the shadow runner
+# (scripts/launchd/run_weather_original.sh) which exports WEATHER_PAPER_ONLY=1
+# — the code path that places real Kalshi orders is HARD-DISABLED for it. This
+# file must NEVER be pointed at the production live sleeve.
+# ─────────────────────────────────────────────────────────────────────────
+
+min_edge_threshold: 0.05         # loose floor (original was high-volume)
+max_fill_for_buy: 0.55           # original took fills up to ~0.51
+forecast_dir_gate: false         # KEY: fully disable the 2026-05-26 directional
+                                 # coherence gate -> pure probability-edge trading
+                                 # (pre-HALT-fix "original" behaviour). Re-enables
+                                 # against-the-forecast bets; PAPER-ONLY for that
+                                 # reason. This is what makes the replica faithful.
+forecast_buffer_f: 0.0           # moot when dir_gate off, set for clarity
+forecast_buffer_f_yes: 0.0       # moot when dir_gate off, set for clarity
+weather_no_side_only: false      # BOTH sides, like the original run
+weather_trend_aware: false
+weather_live_trend_veto: false   # moot under WEATHER_PAPER_ONLY, set for clarity
+
+# Sizing held EQUAL to the current live sleeve for a clean comparison:
+default_kelly_multiplier: 0.25
+default_max_trade_usd: 20.0
