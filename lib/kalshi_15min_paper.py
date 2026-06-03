@@ -460,15 +460,22 @@ def check_open_trades_for_exit() -> dict:
         if market.get("status") not in ("active", "open"):
             continue
 
-        # Our-side current price (prefer the _dollars form).
+        # Our-side current price. Prefer the canonical *_dollars float;
+        # fall back to the cents integer, which is ALWAYS cents and so
+        # always divides by 100 (the old `> 1.5` heuristic misread a
+        # 1-cent price as $1.00).
         def _price(key):
-            v = market.get(key + "_dollars")
-            if v is None:
-                v = market.get(key)
-                if v is not None and float(v) > 1.5:
-                    v = float(v) / 100.0
+            dollars = market.get(key + "_dollars")
+            if dollars is not None:
+                try:
+                    return float(dollars)
+                except (ValueError, TypeError):
+                    return None
+            cents = market.get(key)
+            if cents is None:
+                return None
             try:
-                return float(v) if v is not None else None
+                return float(cents) / 100.0
             except (ValueError, TypeError):
                 return None
 
@@ -685,7 +692,19 @@ def summary(asset_filter: str | None = None) -> dict:
                     "pnl": 0.0, "capital": 0.0},
         )
         a["total"] += 1
-        a[status] = a.get(status, 0) + 1
+        # Mirror the all-up convention (see won/lost rollups above):
+        # won_early counts as a win, cut_loss as a loss. Keep the
+        # granular intra-window counts alongside for drill-down. Without
+        # this, the per-asset W/L columns under-report every intra-window
+        # exit and stop matching the displayed win-rate.
+        if status == "won_early":
+            a["won_early"] += 1
+            a["won"] += 1
+        elif status == "cut_loss":
+            a["cut_loss"] += 1
+            a["lost"] += 1
+        else:
+            a[status] = a.get(status, 0) + 1
         a["pnl"] = round(a["pnl"] + pnl, 4)
         a["capital"] = round(a["capital"] + notional, 4)
 
@@ -702,8 +721,11 @@ def summary(asset_filter: str | None = None) -> dict:
     # cut_loss into losses so the headline numbers match the all-up
     # view above.
     for asset, a in s["by_asset"].items():
-        total_wins = a.get("won", 0) + a.get("won_early", 0)
-        total_losses = a.get("lost", 0) + a.get("cut_loss", 0)
+        # a["won"]/a["lost"] already fold in won_early/cut_loss (above),
+        # so read them directly — re-adding the granular counts would
+        # double-count the intra-window exits.
+        total_wins = a.get("won", 0)
+        total_losses = a.get("lost", 0)
         asettled = total_wins + total_losses
         a["win_rate"] = (
             round(total_wins / asettled, 4) if asettled > 0 else 0.0

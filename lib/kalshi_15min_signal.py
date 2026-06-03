@@ -162,17 +162,25 @@ def discover_15min_markets(
             if strike is None:
                 continue
 
-            # Kalshi has both *_bid/*_ask in cents and *_bid_dollars/*_ask_dollars
-            # as the canonical 0..1 floats. Prefer the dollars form.
-            def _as_price(val):
-                if val is None:
+            # Kalshi exposes both *_bid/*_ask in cents and the canonical
+            # *_bid_dollars/*_ask_dollars 0..1 floats. Prefer the dollars
+            # form; the cents form is ALWAYS cents, so divide by 100
+            # unconditionally (the old `> 1.5` guess misread a 1-cent
+            # price as $1.00).
+            def _as_price(key):
+                dollars = m.get(key + "_dollars")
+                if dollars is not None:
+                    try:
+                        return float(dollars)
+                    except (ValueError, TypeError):
+                        return None
+                cents = m.get(key)
+                if cents is None:
                     return None
                 try:
-                    f = float(val)
+                    return float(cents) / 100.0
                 except (ValueError, TypeError):
                     return None
-                # If looks like cents (>1.0), convert
-                return f / 100.0 if f > 1.5 else f
 
             qualified.append({
                 "ticker": m.get("ticker", ""),
@@ -182,21 +190,11 @@ def discover_15min_markets(
                 "close_time": close_iso,
                 "seconds_to_close": seconds_to_close,
                 "strike": float(strike),
-                "yes_bid": _as_price(m.get("yes_bid_dollars")
-                                     if m.get("yes_bid_dollars") is not None
-                                     else m.get("yes_bid")),
-                "yes_ask": _as_price(m.get("yes_ask_dollars")
-                                     if m.get("yes_ask_dollars") is not None
-                                     else m.get("yes_ask")),
-                "no_bid": _as_price(m.get("no_bid_dollars")
-                                    if m.get("no_bid_dollars") is not None
-                                    else m.get("no_bid")),
-                "no_ask": _as_price(m.get("no_ask_dollars")
-                                    if m.get("no_ask_dollars") is not None
-                                    else m.get("no_ask")),
-                "last_price": _as_price(m.get("last_price_dollars")
-                                        if m.get("last_price_dollars") is not None
-                                        else m.get("last_price")),
+                "yes_bid": _as_price("yes_bid"),
+                "yes_ask": _as_price("yes_ask"),
+                "no_bid": _as_price("no_bid"),
+                "no_ask": _as_price("no_ask"),
+                "last_price": _as_price("last_price"),
                 "volume_24h": float(m.get("volume_24h_fp", 0) or 0),
             })
     qualified.sort(key=lambda x: x["seconds_to_close"])

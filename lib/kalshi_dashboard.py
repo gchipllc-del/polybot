@@ -128,7 +128,13 @@ def _paper_payload() -> dict:
     rows = _load_jsonl(PAPER_PATH)
     open_trades = [r for r in rows if r.get("status") == "open"]
     settled = [r for r in rows if r.get("status") != "open"]
-    settled.sort(key=lambda r: r.get("opened_at", ""), reverse=True)
+    # Sort by when they actually RESOLVED (intra-window exits resolve
+    # mid-window, regular settlements at close), falling back to
+    # opened_at for any legacy row missing resolved_at.
+    settled.sort(
+        key=lambda r: r.get("resolved_at") or r.get("opened_at", ""),
+        reverse=True,
+    )
     return {
         "summary": summary(),
         "open_trades": open_trades[:20],
@@ -398,7 +404,8 @@ function fmtPct(v) {
 }
 function pnlClass(v) { return v > 0 ? 'green' : v < 0 ? 'red' : 'muted'; }
 function statusClass(s) {
-  if (s === 'won') return 'green'; if (s === 'lost') return 'red';
+  if (s === 'won' || s === 'won_early') return 'green';
+  if (s === 'lost' || s === 'cut_loss') return 'red';
   if (s === 'void') return 'yellow'; return 'muted';
 }
 
