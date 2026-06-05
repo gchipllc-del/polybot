@@ -237,6 +237,35 @@ def test_record_paper_trade_skips_when_no_edge(tmp_path, monkeypatch):
     assert trades == []
 
 
+def test_lead_time_recorded_and_split(tmp_path, monkeypatch):
+    # The entry lead is recorded, and summary() splits settled P&L into
+    # near-close (phantom) vs genuine-lead buckets so contamination is visible.
+    import lib.kalshi_weather_paper as wp
+    path = tmp_path / "wx.jsonl"
+    monkeypatch.setattr(wp, "PAPER_PATH", path)
+    monkeypatch.setattr(wp, "_load_params", lambda: {"min_seconds_to_close": 1800})
+
+    rows = [
+        # near-close win (lead 300s) — phantom edge
+        {"city": "ny", "market_ticker": "M1", "side": "YES", "fill_price": 0.5,
+         "our_size": 10, "notional": 5.0, "edge": 0.3, "paper_pnl": 4.65,
+         "status": "won", "seconds_to_close_at_entry": 300,
+         "opened_at": "2026-06-01T00:00:00"},
+        # genuine-lead loss (lead 3600s)
+        {"city": "ny", "market_ticker": "M2", "side": "NO", "fill_price": 0.4,
+         "our_size": 10, "notional": 4.0, "edge": 0.2, "paper_pnl": -4.0,
+         "status": "lost", "seconds_to_close_at_entry": 3600,
+         "opened_at": "2026-06-01T00:00:00"},
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    s = wp.summary()
+    ls = s["lead_split"]
+    assert ls["near_close"]["settled"] == 1 and ls["near_close"]["wins"] == 1
+    assert ls["near_close"]["pnl"] == pytest.approx(4.65)
+    assert ls["genuine_lead"]["settled"] == 1 and ls["genuine_lead"]["wins"] == 0
+    assert ls["min_entry_lead_min"] == pytest.approx(5.0)  # 300s
+
+
 def test_settle_books_pnl(tmp_path, monkeypatch):
     import lib.kalshi_weather_paper as wp
     path = tmp_path / "wx.jsonl"

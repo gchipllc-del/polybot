@@ -88,6 +88,10 @@ class WeatherPaperTrade:
     cap_strike: float | None
     close_time: str
     opened_at: str
+    # Forecast lead at entry. Recorded so we can PROVE no near-resolution
+    # (phantom-edge) trades slip through — post lead-fix this should always
+    # be >= min_seconds_to_close (1800s / 30 min).
+    seconds_to_close_at_entry: float = 0.0
     status: str = "open"      # open | won | lost | void
     resolved_at: str = ""
     paper_pnl: float = 0.0
@@ -244,6 +248,7 @@ def record_paper_trades_from_samples(
             cap_strike=s.get("cap_strike"),
             close_time=str(s.get("close_time", "")),
             opened_at=now_iso,
+            seconds_to_close_at_entry=round(stc, 1),
             status="open",
             p_win_estimated=meta["p_win"],
             kelly_fraction=meta["kelly_fraction"],
@@ -337,12 +342,27 @@ def summary(city_filter: str | None = None) -> dict:
     rows = _load_all()
     if city_filter:
         rows = [r for r in rows if r.get("city") == city_filter]
+    # Trades entered with less than this lead are "near-close" — at that
+    # horizon the forecast is ~the observed temp, so they're the phantom-edge
+    # trades the lead-fix removed. Splitting P&L by this exposes how much of
+    # any run-up came from them (pre-fix contamination).
+    lead_guard = float((_load_params() or {}).get("min_seconds_to_close",
+                                                   DEFAULT_MIN_SECONDS_TO_CLOSE))
     s = {
         "total_trades": len(rows), "city_filter": city_filter,
         "open": 0, "won": 0, "lost": 0, "void": 0,
         "total_paper_pnl": 0.0, "capital_deployed": 0.0,
         "by_city": {}, "by_edge_bucket": {},
+        # near = entered < lead_guard (contaminated); genuine = >= lead_guard
+        "lead_split": {
+            "lead_guard_seconds": lead_guard,
+            "near_close": {"settled": 0, "wins": 0, "pnl": 0.0},
+            "genuine_lead": {"settled": 0, "wins": 0, "pnl": 0.0},
+            "unknown_lead": {"settled": 0, "wins": 0, "pnl": 0.0},
+            "min_entry_lead_min": None,
+        },
     }
+    leads_seen: list[float] = []
     for r in rows:
         status = r.get("status", "open")
         notional = float(r.get("notional", 0) or 0)
@@ -350,6 +370,23 @@ def summary(city_filter: str | None = None) -> dict:
         city = r.get("city") or "?"
         edge = float(r.get("edge", 0) or 0)
         bucket = f"{int(edge * 100 // 5) * 5}-{int(edge * 100 // 5) * 5 + 5}%"
+
+        # Lead-time split (settled trades only; older rows may lack the field).
+        lead = r.get("seconds_to_close_at_entry")
+        if lead is not None:
+            leads_seen.append(float(lead))
+        if status in ("won", "lost"):
+            if lead is None:
+                key = "unknown_lead"
+            elif float(lead) < lead_guard:
+                key = "near_close"
+            else:
+                key = "genuine_lead"
+            ls = s["lead_split"][key]
+            ls["settled"] += 1
+            if status == "won":
+                ls["wins"] += 1
+            ls["pnl"] = round(ls["pnl"] + pnl, 4)
 
         s["capital_deployed"] += notional
         s["total_paper_pnl"] += pnl
@@ -381,4 +418,6 @@ def summary(city_filter: str | None = None) -> dict:
         cs = c["won"] + c["lost"]
         c["win_rate"] = round(c["won"] / cs, 4) if cs else 0.0
         c["roi_pct"] = round(c["pnl"] / c["capital"], 4) if c["capital"] > 0 else 0.0
+    if leads_seen:
+        s["lead_split"]["min_entry_lead_min"] = round(min(leads_seen) / 60.0, 1)
     return s

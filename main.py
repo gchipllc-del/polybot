@@ -1138,6 +1138,26 @@ def cmd_kalshi_weather_paper_report(city: str | None = None):
             print(f"    {bucket:<10} {b['settled']:>8} {b['wins']:>6} "
                   f"{wr:>6.1%} ${b['pnl']:>+8.2f}")
 
+    ls = s.get("lead_split")
+    if ls:
+        guard_min = int(ls["lead_guard_seconds"] / 60)
+        print(f"\n  Forecast-lead split (guard = {guard_min} min; "
+              f"min entry lead seen = {ls.get('min_entry_lead_min')} min):")
+        print(f"    {'bucket':<16} {'settled':>8} {'wins':>6} {'wr':>7} {'pnl':>10}")
+        labels = {"near_close": f"near (<{guard_min}m)",
+                  "genuine_lead": f"genuine (>={guard_min}m)",
+                  "unknown_lead": "pre-fix (no lead)"}
+        for key in ("near_close", "genuine_lead", "unknown_lead"):
+            b = ls[key]
+            if b["settled"] == 0:
+                continue
+            wr = b["wins"] / b["settled"]
+            print(f"    {labels[key]:<16} {b['settled']:>8} {b['wins']:>6} "
+                  f"{wr:>6.1%} ${b['pnl']:>+8.2f}")
+        if ls["near_close"]["settled"] or ls["unknown_lead"]["settled"]:
+            print("    ^ near/pre-fix rows are the phantom-edge trades the "
+                  "lead-fix removes — discount them.")
+
 
 def cmd_btc_5min_paper_settle():
     """Settle resolved 5-min UP/DOWN paper trades.
