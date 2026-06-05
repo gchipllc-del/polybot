@@ -195,6 +195,29 @@ def test_record_paper_trade_picks_underpriced_side(tmp_path, monkeypatch):
     assert trades[0].our_size > 0
 
 
+def test_record_paper_trade_skips_near_resolution(tmp_path, monkeypatch):
+    # Anti-look-ahead: a big-edge bucket resolving in 5 min must be skipped,
+    # because at that lead the "forecast" is ~the observed temp and the fill
+    # is unrealistic. With the 30-min default lead it should NOT trade.
+    import lib.kalshi_weather_paper as wp
+    monkeypatch.setattr(wp, "PAPER_PATH", tmp_path / "wx.jsonl")
+    now = datetime.now(timezone.utc)
+    near = {
+        "city": "ny", "market_ticker": "KXTEMPNY-NEAR", "event_ticker": "E",
+        "title": "near close", "seconds_to_close": 300,  # 5 min
+        "yes_ask": 0.50, "yes_bid": 0.48, "no_ask": 0.48,
+        "fair_yes": 0.90, "close_time": "",
+        "floor_strike": 63, "cap_strike": 64,
+    }
+    # Same market with a genuine 1-hour lead SHOULD trade.
+    far = dict(near, market_ticker="KXTEMPNY-FAR", seconds_to_close=3600)
+    # Use config defaults (min lead 1800s) by passing no override.
+    trades = wp.record_paper_trades_from_samples([near, far])
+    tickers = {t.market_ticker for t in trades}
+    assert "KXTEMPNY-NEAR" not in tickers, "near-resolution trade must be filtered"
+    assert "KXTEMPNY-FAR" in tickers, "genuine-lead trade should still fire"
+
+
 def test_record_paper_trade_skips_when_no_edge(tmp_path, monkeypatch):
     import lib.kalshi_weather_paper as wp
     monkeypatch.setattr(wp, "PAPER_PATH", tmp_path / "wx.jsonl")

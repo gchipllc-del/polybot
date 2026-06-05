@@ -49,10 +49,15 @@ DEFAULT_MAX_TRADE_USD = 25.0
 DEFAULT_BANKROLL = 1000.0
 KALSHI_FEE = 0.07
 
-# Don't enter a market that's about to close — no time for the forecast
-# edge to be a real edge, and slippage spikes. Also skip ones too far out
-# (forecast revisions will move our fair value before resolution).
-DEFAULT_MIN_SECONDS_TO_CLOSE = 120.0       # 2 min
+# Forecast LEAD-TIME guard. This is the critical realism control for the
+# weather sleeve: a market resolving in ~2 minutes has a "forecast" that is
+# essentially the CURRENT observed temperature (the provider's hourly value
+# for the closing hour ≈ what's already happening), so the model shows huge,
+# near-certain edge and "wins" almost every such trade on paper — edge that
+# (a) isn't a real forecast and (b) you couldn't actually fill into a thin,
+# about-to-settle book. We therefore require a genuine lead so the fair value
+# is a real PREDICTION, not a peek at the outcome. 30 min minimum.
+DEFAULT_MIN_SECONDS_TO_CLOSE = 1800.0      # 30 min — genuine forecast lead
 DEFAULT_MAX_SECONDS_TO_CLOSE = 6 * 3600.0  # 6 h
 
 

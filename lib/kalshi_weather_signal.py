@@ -280,9 +280,20 @@ def _price_market(
     n_src = 0
     per_source: dict = {}
     if sources and (floor is not None or cap is not None):
+        # For daily-high markets the resolving value is the day's MAX, so
+        # the forecast max must span the whole window from market open
+        # (a peak earlier in the day still counts), not just from now.
+        open_dt = None
+        open_iso = m.get("open_time") or ""
+        if open_iso:
+            try:
+                open_dt = datetime.fromisoformat(open_iso.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                open_dt = None
         res = forecast_bucket_fair_value(
             sources, target_time=close_dt,
             floor=floor, cap=cap, daily_high=daily_high,
+            window_start=open_dt if daily_high else None,
         )
         if res is not None:
             fair, blended = res

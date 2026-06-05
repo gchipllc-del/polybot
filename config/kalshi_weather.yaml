@@ -52,6 +52,13 @@ params:
   # the Kelly math). Weather forecasts are good but not perfect — demand
   # real edge before paying the spread.
   min_edge: 0.08
+  # Forecast lead-time window for entries (seconds to market close).
+  # min is a REALISM/anti-look-ahead guard: trading a market resolving in
+  # minutes prices off the current observed temp, not a forecast, and
+  # inflates paper P&L with fills you couldn't get. Require >= 30 min lead.
+  # max keeps us inside the horizon where the hourly forecast is trustworthy.
+  min_seconds_to_close: 1800      # 30 min
+  max_seconds_to_close: 21600     # 6 h
   # Avoid only the brutal extremes (tiny payout per dollar at risk).
   # NOTE: unlike the crypto sleeve there is deliberately NO mid-range
   # "neutral" skip — a bucket priced near 0.50 that our forecast
