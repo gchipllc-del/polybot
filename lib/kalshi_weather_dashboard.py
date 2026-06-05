@@ -208,8 +208,17 @@ th{color:var(--muted);font-weight:500;font-size:11px;}tr:last-child td{border-bo
 .bigstat{display:inline-block;margin-right:18px;font-size:13px;}
 .bigstat .v{display:block;font-size:18px;color:var(--text);}.bigstat .k{color:var(--muted);font-size:11px;}
 .pill{font-size:10px;padding:1px 5px;border-radius:8px;border:1px solid var(--border);}
+.nav{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;}
+.nav a{font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:6px;color:var(--muted);text-decoration:none;}
+.nav a:hover{color:var(--text);border-color:var(--blue);}
+.nav a.active{color:var(--blue);border-color:var(--blue);background:rgba(88,166,255,0.12);}
 </style></head><body>
 <h1>Kalshi Weather — Hourly Temperature</h1>
+<div class="nav">
+  <a href="http://localhost:5050/">📊 Main</a>
+  <a href="http://localhost:5053/">₿ Crypto 15-min</a>
+  <a href="http://localhost:5054/" class="active">🌡 Weather</a>
+</div>
 <div class="sub" id="ts">loading…</div>
 <div class="grid">
   <div class="panel"><h2>Account</h2><div id="account">…</div></div>

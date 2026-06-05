@@ -313,10 +313,19 @@ tr:last-child td { border-bottom: none; }
 .tiny { font-size: 10px; color: var(--muted); }
 .bar { display: inline-block; height: 6px; background: var(--border); border-radius: 3px; width: 60px; vertical-align: middle; position: relative; }
 .bar .fill { position: absolute; top: 0; left: 0; height: 100%; border-radius: 3px; background: var(--blue); }
+.nav { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.nav a { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); text-decoration: none; }
+.nav a:hover { color: var(--text); border-color: var(--blue); }
+.nav a.active { color: var(--blue); border-color: var(--blue); background: rgba(88,166,255,0.12); }
 </style>
 </head>
 <body>
   <h1>Kalshi 15-min Trader</h1>
+  <div class="nav">
+    <a href="http://localhost:5050/">📊 Main</a>
+    <a href="http://localhost:5053/" class="active">₿ Crypto 15-min</a>
+    <a href="http://localhost:5054/">🌡 Weather</a>
+  </div>
   <div class="sub" id="ts">loading…</div>
 
   <div class="grid">
