@@ -50,8 +50,9 @@ params:
   # Only trade when our blended fair value beats the market price by at
   # least this edge (after Kalshi's 7% win fee is implicitly absorbed by
   # the Kelly math). Weather forecasts are good but not perfect — demand
-  # real edge before paying the spread.
-  min_edge: 0.08
+  # real edge before paying the spread. Lowered 0.08 -> 0.05 to capture more
+  # fills; Kelly still sizes by the actual edge so thin-edge trades stay small.
+  min_edge: 0.05
   # Forecast lead-time window for entries (seconds to market close).
   # min is a REALISM/anti-look-ahead guard: trading a market resolving in
   # minutes prices off the current observed temp, not a forecast, and
@@ -60,11 +61,14 @@ params:
   min_seconds_to_close: 1800      # 30 min
   max_seconds_to_close: 21600     # 6 h
   # Avoid only the brutal extremes (tiny payout per dollar at risk).
+  # Widened 0.10/0.90 -> 0.05/0.95 to stop dropping NO trades near the
+  # edges. CAVEAT: at 0.95 the payout is ~5c per $0.95 risked, so one loss
+  # erases ~19 wins — Kelly sizes these tiny, but watch them in the report.
   # NOTE: unlike the crypto sleeve there is deliberately NO mid-range
   # "neutral" skip — a bucket priced near 0.50 that our forecast
   # disagrees with is exactly the edge we want.
-  extreme_floor: 0.10
-  extreme_ceil: 0.90
+  extreme_floor: 0.05
+  extreme_ceil: 0.95
   max_spread: 0.06
   # Forecast sources to blend, in preference order. The two no-key
   # providers are always on; openweather self-skips unless a key is set.
