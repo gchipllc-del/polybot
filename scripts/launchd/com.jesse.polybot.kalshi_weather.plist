@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jesse.polybot.kalshi_weather</string>
+    <!--
+        Kalshi hourly-weather sleeve — fires every 300s (5 min).
+
+        Each cycle: auto-discovers Kalshi "Climate and Weather" series,
+        keeps only HOURLY temperature markets (short window), prices each
+        bucket against a blended NWS + Open-Meteo (+ OpenWeather if keyed)
+        forecast, records Phase 2 paper trades on >= min_edge, and settles
+        resolved ones. Persists to data/kalshi_weather_signal.jsonl +
+        data/kalshi_weather_paper.jsonl.
+
+        Read-only: never places real orders. Phase 3 (real execution)
+        stays gated behind live_migration_approved until paper proves edge.
+
+        HOST SETUP: edit the cd path + python path below to match this
+        machine, then:
+            cp scripts/launchd/com.jesse.polybot.kalshi_weather.plist \
+               ~/Library/LaunchAgents/
+            launchctl load ~/Library/LaunchAgents/com.jesse.polybot.kalshi_weather.plist
+        Allowlist api.weather.gov + api.open-meteo.com on the host network.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/jesse/Desktop/projects/polybot &amp;&amp; set -a &amp;&amp; source .env &amp;&amp; set +a &amp;&amp; /Users/jesse/anaconda3/bin/python main.py kalshi-weather-monitor 2&gt;&amp;1</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_kalshi_weather.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_kalshi_weather_err.log</string>
+</dict>
+</plist>

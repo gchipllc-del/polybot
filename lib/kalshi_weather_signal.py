@@ -107,7 +107,9 @@ class WeatherSample:
     title: str
     floor_strike: float | None
     cap_strike: float | None
-    daily_high: bool
+    daily_high: bool             # True → resolves on the day's max temp
+    is_hourly: bool              # True → short-window hourly temp market
+    window_minutes: float | None  # [open, close] span; drives classification
     close_time: str
     seconds_to_close: float
     yes_bid: float | None
@@ -202,117 +204,192 @@ def _bucket_strikes(m: dict) -> tuple[float | None, float | None]:
     return floor, cap
 
 
-def sample_city(city_key: str, city_cfg: dict, params: dict) -> list[WeatherSample]:
-    """Discover + price every open bucket for one city. Forecast fetched
-    once and reused across all of the city's buckets."""
-    # A city can map to several series (the registry lists series
-    # globally); sample_all pre-resolves which series belong to this city.
-    markets = []
-    for s in params.get("_series_for_city", {}).get(city_key, []):
-        markets.extend(discover_city_markets(s))
-    if not markets:
-        return []
+def discover_weather_series(configured: list[str]) -> list[str]:
+    """Configured series ∪ Kalshi's live "Climate and Weather" series.
 
-    sources = fetch_all_sources(
-        float(city_cfg["lat"]), float(city_cfg["lon"]),
-        sources=params.get("sources"),
+    Auto-discovery means we pick up HOURLY temperature series without
+    having to enumerate their exact tickers (which we can't verify from
+    the sandbox). Falls back to just the configured list on failure.
+    """
+    import requests
+
+    series = list(dict.fromkeys(configured or []))  # de-dup, keep order
+    try:
+        r = requests.get(
+            f"{KALSHI_HOST}/series",
+            params={"category": "Climate and Weather"}, timeout=15,
+        )
+        r.raise_for_status()
+        for s in r.json().get("series", []) or []:
+            t = s.get("ticker") or s.get("series_ticker")
+            if t and t not in series:
+                series.append(t)
+    except Exception as e:
+        log_event("kalshi_weather", "series_discovery_failed",
+                  {"error": str(e)[:200]}, result="degraded")
+    return series
+
+
+def _window_minutes(m: dict, close_dt: datetime) -> float | None:
+    """[open, close] span in minutes, or None if open_time is missing."""
+    open_iso = m.get("open_time") or ""
+    if not open_iso:
+        return None
+    try:
+        open_dt = datetime.fromisoformat(open_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return (close_dt - open_dt).total_seconds() / 60.0
+
+
+def _classify_hourly(m: dict, close_dt: datetime, hourly_max_min: float) -> tuple[bool, float | None]:
+    """Decide hourly vs daily-high by window length.
+
+    Hourly temperature markets run ~1 hour; daily-high markets run a full
+    day. When open_time is missing we fall back to the title: a market
+    without "HIGH" wording is treated as hourly.
+    """
+    wm = _window_minutes(m, close_dt)
+    if wm is not None:
+        return (wm <= hourly_max_min), wm
+    text = (str(m.get("title", "")) + " " + str(m.get("_event_title", ""))).upper()
+    return ("HIGH" not in text), None
+
+
+def _price_market(
+    m: dict, city_key: str, city_cfg: dict, sources: list,
+    *, hourly_max_min: float, now: datetime, now_iso: str,
+) -> WeatherSample | None:
+    """Price one Kalshi temperature bucket against the blended forecast."""
+    close_iso = m.get("close_time") or ""
+    try:
+        close_dt = datetime.fromisoformat(close_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    seconds_to_close = (close_dt - now).total_seconds()
+    if seconds_to_close < -60:
+        return None
+
+    is_hourly, window_min = _classify_hourly(m, close_dt, hourly_max_min)
+    # Hourly markets resolve on the reading AT the close hour; daily-high
+    # markets on the day's max → drives which forecast aggregation we use.
+    daily_high = not is_hourly
+    floor, cap = _bucket_strikes(m)
+
+    fair = edge_yes = edge_no = mu = sigma = None
+    n_src = 0
+    per_source: dict = {}
+    if sources and (floor is not None or cap is not None):
+        res = forecast_bucket_fair_value(
+            sources, target_time=close_dt,
+            floor=floor, cap=cap, daily_high=daily_high,
+        )
+        if res is not None:
+            fair, blended = res
+            mu, sigma = blended.mu, blended.sigma
+            n_src = blended.n_sources
+            per_source = blended.per_source
+            yes_ask = _as_price(m, "yes_ask")
+            no_ask = _as_price(m, "no_ask")
+            if yes_ask is not None:
+                edge_yes = round(fair - yes_ask, 4)
+            if no_ask is not None:
+                edge_no = round((1.0 - fair) - no_ask, 4)
+
+    return WeatherSample(
+        sample_at=now_iso,
+        city=city_key,
+        label=city_cfg.get("label", city_key),
+        series_ticker=m.get("series_ticker", "") or "",
+        market_ticker=m.get("ticker", ""),
+        event_ticker=m.get("_event_ticker", ""),
+        title=str(m.get("title", ""))[:200],
+        floor_strike=floor,
+        cap_strike=cap,
+        daily_high=daily_high,
+        is_hourly=is_hourly,
+        window_minutes=round(window_min, 1) if window_min is not None else None,
+        close_time=close_iso,
+        seconds_to_close=round(seconds_to_close, 2),
+        yes_bid=_as_price(m, "yes_bid"),
+        yes_ask=_as_price(m, "yes_ask"),
+        no_bid=_as_price(m, "no_bid"),
+        no_ask=_as_price(m, "no_ask"),
+        last_price=_as_price(m, "last_price"),
+        fair_yes=round(fair, 4) if fair is not None else None,
+        edge_yes=edge_yes,
+        edge_no=edge_no,
+        forecast_mu=round(mu, 2) if mu is not None else None,
+        forecast_sigma=round(sigma, 2) if sigma is not None else None,
+        n_sources=n_src,
+        per_source={k: round(v, 1) for k, v in per_source.items()},
     )
-    if not sources:
-        log_event("kalshi_weather", "no_forecast_sources",
-                  {"city": city_key}, result="degraded")
-        # Still emit samples (market data) but without fair value.
-    now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
-    out: list[WeatherSample] = []
-
-    for m in markets:
-        close_iso = m.get("close_time") or ""
-        try:
-            close_dt = datetime.fromisoformat(close_iso.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            continue
-        seconds_to_close = (close_dt - now).total_seconds()
-        if seconds_to_close < -60:
-            continue
-
-        floor, cap = _bucket_strikes(m)
-        title = str(m.get("title", ""))
-        daily_high = "HIGH" in title.upper() or "HIGH" in str(
-            m.get("_event_title", "")).upper()
-
-        fair = edge_yes = edge_no = mu = sigma = None
-        n_src = 0
-        per_source: dict = {}
-        if sources and (floor is not None or cap is not None):
-            res = forecast_bucket_fair_value(
-                sources, target_time=close_dt,
-                floor=floor, cap=cap, daily_high=daily_high,
-            )
-            if res is not None:
-                fair, blended = res
-                mu, sigma = blended.mu, blended.sigma
-                n_src = blended.n_sources
-                per_source = blended.per_source
-                yes_ask = _as_price(m, "yes_ask")
-                no_ask = _as_price(m, "no_ask")
-                if yes_ask is not None:
-                    edge_yes = round(fair - yes_ask, 4)
-                if no_ask is not None:
-                    edge_no = round((1.0 - fair) - no_ask, 4)
-
-        out.append(WeatherSample(
-            sample_at=now_iso,
-            city=city_key,
-            label=city_cfg.get("label", city_key),
-            series_ticker=m.get("series_ticker", "") or "",
-            market_ticker=m.get("ticker", ""),
-            event_ticker=m.get("_event_ticker", ""),
-            title=title[:200],
-            floor_strike=floor,
-            cap_strike=cap,
-            daily_high=daily_high,
-            close_time=close_iso,
-            seconds_to_close=round(seconds_to_close, 2),
-            yes_bid=_as_price(m, "yes_bid"),
-            yes_ask=_as_price(m, "yes_ask"),
-            no_bid=_as_price(m, "no_bid"),
-            no_ask=_as_price(m, "no_ask"),
-            last_price=_as_price(m, "last_price"),
-            fair_yes=round(fair, 4) if fair is not None else None,
-            edge_yes=edge_yes,
-            edge_no=edge_no,
-            forecast_mu=round(mu, 2) if mu is not None else None,
-            forecast_sigma=round(sigma, 2) if sigma is not None else None,
-            n_sources=n_src,
-            per_source={k: round(v, 1) for k, v in per_source.items()},
-        ))
-    return out
 
 
 def sample_all() -> list[WeatherSample]:
-    """Sweep every enabled city across every configured weather series."""
+    """Sweep every weather series, tag each market to a city, classify
+    hourly-vs-daily, filter to ``market_type``, and price.
+
+    Forecast is fetched ONCE per city and reused across that city's
+    markets. A discovered market whose city can't be identified is logged
+    (deduped) as ``unmapped_city`` so the registry is easy to extend.
+    """
     cfg = load_config()
     cities = enabled_cities(cfg)
     if not cities:
         return []
     params = dict(cfg.get("params") or {})
+    market_type = str(params.get("market_type", "hourly")).lower()
+    hourly_max_min = float(params.get("hourly_max_minutes", 90))
 
-    # Map each configured series to the city it belongs to (by alias), so
-    # sample_city only discovers that city's series.
-    all_series = cfg.get("series") or []
-    series_for_city: dict[str, list[str]] = {k: [] for k in cities}
-    for s in all_series:
-        ck = _match_city(s, cities)
-        if ck:
-            series_for_city[ck].append(s)
-    params["_series_for_city"] = series_for_city
+    series_list = discover_weather_series(cfg.get("series") or [])
 
+    # Discover all markets across all series, tagging each to a city.
+    markets_by_city: dict[str, list[dict]] = {k: [] for k in cities}
+    unmapped: set[str] = set()
+    for s in series_list:
+        for m in discover_city_markets(s):
+            text = " ".join([
+                m.get("series_ticker", "") or s,
+                str(m.get("_event_title", "")),
+                str(m.get("title", "")),
+            ])
+            ck = _match_city(text, cities)
+            if ck is None:
+                unmapped.add(m.get("series_ticker", "") or s)
+                continue
+            markets_by_city[ck].append(m)
+    if unmapped:
+        log_event("kalshi_weather", "unmapped_city",
+                  {"series": sorted(unmapped)[:20]}, result="degraded")
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     out: list[WeatherSample] = []
     for city_key, city_cfg in cities.items():
-        if not series_for_city.get(city_key):
+        markets = markets_by_city.get(city_key) or []
+        if not markets:
             continue
         try:
-            out.extend(sample_city(city_key, city_cfg, params))
+            sources = fetch_all_sources(
+                float(city_cfg["lat"]), float(city_cfg["lon"]),
+                sources=params.get("sources"),
+            )
+            if not sources:
+                log_event("kalshi_weather", "no_forecast_sources",
+                          {"city": city_key}, result="degraded")
+            for m in markets:
+                samp = _price_market(
+                    m, city_key, city_cfg, sources,
+                    hourly_max_min=hourly_max_min, now=now, now_iso=now_iso,
+                )
+                if samp is None:
+                    continue
+                if market_type == "hourly" and not samp.is_hourly:
+                    continue
+                if market_type == "daily" and samp.is_hourly:
+                    continue
+                out.append(samp)
         except Exception as e:
             log_event("kalshi_weather", "city_sample_failed",
                       {"city": city_key, "error": str(e)[:200]},

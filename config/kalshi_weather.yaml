@@ -21,8 +21,12 @@
 # documented set as of mid-2026; tune once `kalshi-weather-monitor`
 # surfaces the real tickers.
 
-# Weather series to discover. Kalshi groups daily-high-temperature markets
-# per city under these series; the sampler iterates events→markets for each.
+# Weather series to discover. These are the documented daily-high series;
+# at runtime the sampler ALSO auto-discovers every live series in Kalshi's
+# "Climate and Weather" category (so hourly temperature series are picked
+# up even though their exact tickers aren't enumerated here). Markets are
+# then classified hourly-vs-daily by their window length, and filtered to
+# `market_type` below.
 series:
   - KXHIGHNY
   - KXHIGHCHI
@@ -35,6 +39,14 @@ series:
 
 # Signal + risk parameters for the sleeve.
 params:
+  # Which markets to trade. "hourly" = only short-window temperature
+  # markets (priced on the reading AT the close hour). "daily" = daily-high
+  # markets (priced on the day's max). "any" = both.
+  market_type: hourly
+  # A market whose [open, close] window is <= this many minutes is treated
+  # as hourly. Daily-high markets run a full day, so this cleanly splits
+  # them without relying on title wording.
+  hourly_max_minutes: 90
   # Only trade when our blended fair value beats the market price by at
   # least this edge (after Kalshi's 7% win fee is implicitly absorbed by
   # the Kelly math). Weather forecasts are good but not perfect — demand

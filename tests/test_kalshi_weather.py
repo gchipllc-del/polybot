@@ -105,6 +105,73 @@ def test_forecast_bucket_daily_high_uses_max():
     assert far < fair
 
 
+def test_classify_hourly_by_window():
+    from lib.kalshi_weather_signal import _classify_hourly
+    now = datetime.now(timezone.utc)
+    close = now + timedelta(minutes=30)
+    # 1-hour window -> hourly.
+    hourly = {"open_time": (close - timedelta(hours=1)).isoformat(),
+              "title": "63 to 64"}
+    is_h, wm = _classify_hourly(hourly, close, 90)
+    assert is_h is True and wm == pytest.approx(60.0)
+    # 12-hour window -> daily-high.
+    daily = {"open_time": (close - timedelta(hours=12)).isoformat(),
+             "title": "High temp"}
+    is_h2, wm2 = _classify_hourly(daily, close, 90)
+    assert is_h2 is False and wm2 == pytest.approx(720.0)
+
+
+def test_classify_hourly_fallback_on_missing_open_time():
+    from lib.kalshi_weather_signal import _classify_hourly
+    now = datetime.now(timezone.utc)
+    close = now + timedelta(minutes=30)
+    # No open_time: title without "HIGH" -> assume hourly.
+    is_h, wm = _classify_hourly({"title": "Temp at 3pm"}, close, 90)
+    assert is_h is True and wm is None
+    # No open_time but "HIGH" in title -> daily.
+    is_h2, _ = _classify_hourly({"title": "Daily HIGH temp"}, close, 90)
+    assert is_h2 is False
+
+
+def test_sample_all_filters_to_hourly(monkeypatch):
+    import lib.kalshi_weather_signal as ws
+    from lib.weather_forecast import HourlyForecast
+    now = datetime.now(timezone.utc)
+    close_h = now + timedelta(minutes=40)
+    close_d = now + timedelta(hours=4)
+
+    def iso(d):
+        return d.isoformat().replace("+00:00", "Z")
+
+    hourly_mkt = {
+        "ticker": "KXTEMPNY-H", "_event_ticker": "E", "status": "active",
+        "_event_title": "Temperature in NYC at 3pm", "title": "63 to 64",
+        "series_ticker": "KXTEMPNY", "strike_type": "between",
+        "floor_strike": 63, "cap_strike": 64,
+        "open_time": iso(close_h - timedelta(hours=1)), "close_time": iso(close_h),
+        "yes_ask_dollars": 0.40, "no_ask_dollars": 0.58,
+    }
+    daily_mkt = {
+        "ticker": "KXHIGHNY-D", "_event_ticker": "E2", "status": "active",
+        "_event_title": "Highest temperature in NYC today", "title": "63 or above",
+        "series_ticker": "KXHIGHNY", "strike_type": "greater_or_equal",
+        "floor_strike": 63, "cap_strike": None,
+        "open_time": iso(close_d - timedelta(hours=12)), "close_time": iso(close_d),
+        "yes_ask_dollars": 0.55, "no_ask_dollars": 0.43,
+    }
+    monkeypatch.setattr(ws, "discover_weather_series", lambda cfg: ["KXTEMPNY", "KXHIGHNY"])
+    monkeypatch.setattr(ws, "discover_city_markets",
+                        lambda s: [hourly_mkt] if s == "KXTEMPNY" else [daily_mkt])
+    monkeypatch.setattr(ws, "fetch_all_sources",
+                        lambda lat, lon, sources=None: [
+                            HourlyForecast("nws", [(close_h, 63.5), (close_d, 64.0)]),
+                            HourlyForecast("open_meteo", [(close_h, 63.5), (close_d, 64.0)]),
+                        ])
+    samples = ws.sample_all()  # market_type defaults to "hourly"
+    assert len(samples) == 1
+    assert samples[0].is_hourly is True and samples[0].daily_high is False
+
+
 def test_record_paper_trade_picks_underpriced_side(tmp_path, monkeypatch):
     import lib.kalshi_weather_paper as wp
     monkeypatch.setattr(wp, "PAPER_PATH", tmp_path / "wx.jsonl")

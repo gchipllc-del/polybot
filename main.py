@@ -46,6 +46,7 @@ Usage:
     python main.py kalshi-weather-monitor     # Sample Kalshi temp markets, price vs blended forecast (cron-friendly)
     python main.py kalshi-weather-paper-settle # Settle resolved Kalshi weather paper trades
     python main.py kalshi-weather-paper-report # Aggregate Kalshi weather paper P&L + per-city WR
+    python main.py kalshi-weather-dashboard    # Weather sleeve dashboard at localhost:5054
     python main.py kalshi-dashboard           # Web dashboard at localhost:5053
 """
 
@@ -1735,6 +1736,13 @@ def main():
             if arg.startswith("--city="):
                 city = arg.split("=", 1)[1].lower().strip() or None
         cmd_kalshi_weather_paper_report(city=city)
+    elif command == "kalshi-weather-dashboard":
+        port = 5054
+        for arg in sys.argv[2:]:
+            if arg.startswith("--port="):
+                port = int(arg.split("=", 1)[1])
+        from lib.kalshi_weather_dashboard import run_dashboard
+        run_dashboard(port=port)
     elif command == "kalshi-dashboard":
         port = 5053
         for arg in sys.argv[2:]:
