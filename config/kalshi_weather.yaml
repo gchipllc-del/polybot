@@ -1,0 +1,125 @@
+# Kalshi weather sleeve — city → forecast-location registry.
+#
+# Kalshi temperature markets resolve on the official reading at a specific
+# city station (usually an airport / park climate site). To price a bucket
+# we need a forecast for THAT location, so each city maps to the lat/lon
+# we hand the weather providers (NWS, Open-Meteo, OpenWeather).
+#
+# Discovery is "all available temp cities": the sampler pulls every open
+# market in the Kalshi weather series below, identifies the city by
+# matching `aliases` against the series ticker / event title, and looks up
+# the coordinates here. A discovered city with no registry entry is logged
+# as `unmapped_city` and skipped — add an entry to enable it (no code
+# change needed).
+#
+# `station` is informational (the NWS/airport id Kalshi settles against);
+# the forecast is driven purely by lat/lon.
+#
+# VALIDATION NOTE: the exact Kalshi series tickers + station mapping must
+# be confirmed against the live API on the host (the dev sandbox can't
+# reach api.elections.kalshi.com). `series` / `aliases` below are the
+# documented set as of mid-2026; tune once `kalshi-weather-monitor`
+# surfaces the real tickers.
+
+# Weather series to discover. Kalshi groups daily-high-temperature markets
+# per city under these series; the sampler iterates events→markets for each.
+series:
+  - KXHIGHNY
+  - KXHIGHCHI
+  - KXHIGHMIA
+  - KXHIGHAUS
+  - KXHIGHDEN
+  - KXHIGHLAX
+  - KXHIGHPHIL
+  - KXHIGHDC
+
+# Signal + risk parameters for the sleeve.
+params:
+  # Only trade when our blended fair value beats the market price by at
+  # least this edge (after Kalshi's 7% win fee is implicitly absorbed by
+  # the Kelly math). Weather forecasts are good but not perfect — demand
+  # real edge before paying the spread.
+  min_edge: 0.08
+  # Avoid only the brutal extremes (tiny payout per dollar at risk).
+  # NOTE: unlike the crypto sleeve there is deliberately NO mid-range
+  # "neutral" skip — a bucket priced near 0.50 that our forecast
+  # disagrees with is exactly the edge we want.
+  extreme_floor: 0.10
+  extreme_ceil: 0.90
+  max_spread: 0.06
+  # Forecast sources to blend, in preference order. The two no-key
+  # providers are always on; openweather self-skips unless a key is set.
+  sources:
+    - nws
+    - open_meteo
+    - openweather
+  # Half-Kelly + caps mirror the crypto sleeve.
+  kelly_multiplier: 0.5
+  min_trade_usd: 1.0
+  max_trade_usd: 25.0
+  bankroll: 1000.0
+
+cities:
+  ny:
+    label: "New York City (Central Park)"
+    station: KNYC
+    lat: 40.7790
+    lon: -73.9693
+    aliases: ["KXHIGHNY", "NYC", "NEW YORK", "CENTRAL PARK"]
+    enabled: true
+
+  chi:
+    label: "Chicago (Midway)"
+    station: KMDW
+    lat: 41.7860
+    lon: -87.7524
+    aliases: ["KXHIGHCHI", "CHICAGO", "MIDWAY"]
+    enabled: true
+
+  mia:
+    label: "Miami (MIA)"
+    station: KMIA
+    lat: 25.7932
+    lon: -80.2906
+    aliases: ["KXHIGHMIA", "MIAMI"]
+    enabled: true
+
+  aus:
+    label: "Austin (Camp Mabry / AUS)"
+    station: KAUS
+    lat: 30.1945
+    lon: -97.6699
+    aliases: ["KXHIGHAUS", "AUSTIN"]
+    enabled: true
+
+  den:
+    label: "Denver (DEN)"
+    station: KDEN
+    lat: 39.8466
+    lon: -104.6562
+    aliases: ["KXHIGHDEN", "DENVER"]
+    enabled: true
+
+  lax:
+    label: "Los Angeles (LAX)"
+    station: KLAX
+    lat: 33.9381
+    lon: -118.3889
+    aliases: ["KXHIGHLAX", "LOS ANGELES", "LAX"]
+    enabled: true
+
+  phil:
+    label: "Philadelphia (PHL)"
+    station: KPHL
+    lat: 39.8729
+    lon: -75.2437
+    aliases: ["KXHIGHPHIL", "PHILADELPHIA", "PHILLY"]
+    enabled: true
+
+  dc:
+    label: "Washington DC (DCA)"
+    station: KDCA
+    lat: 38.8472
+    lon: -77.0349
+    aliases: ["KXHIGHDC", "KXHIGHWASH", "WASHINGTON", "DULLES", "REAGAN"]
+    enabled: true

@@ -14,6 +14,9 @@ venv/
 data/positions.json
 data/trade_history.json
 data/calibration_log.json
+# Per-sleeve paper/signal ledgers (BTC 5-min, Kalshi 15-min, weather, ...)
+# are local measurement state — never commit them.
+data/*.jsonl
 data/palace/chroma/
 data/palace/knowledge_graph.db
 data/palace/diaries/*.jsonl

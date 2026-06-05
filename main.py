@@ -43,6 +43,9 @@ Usage:
     python main.py kalshi-15min-monitor   # Sample Kalshi 15-min BTC markets (cron-friendly)
     python main.py kalshi-15min-paper-settle  # Settle resolved Kalshi paper trades
     python main.py kalshi-15min-paper-report  # Aggregate Kalshi paper P&L + WR
+    python main.py kalshi-weather-monitor     # Sample Kalshi temp markets, price vs blended forecast (cron-friendly)
+    python main.py kalshi-weather-paper-settle # Settle resolved Kalshi weather paper trades
+    python main.py kalshi-weather-paper-report # Aggregate Kalshi weather paper P&L + per-city WR
     python main.py kalshi-dashboard           # Web dashboard at localhost:5053
 """
 
@@ -1051,6 +1054,90 @@ def cmd_kalshi_15min_paper_report(asset: str | None = None):
                   f"{wr:>6.1%} ${b['pnl']:>+8.2f}")
 
 
+def cmd_kalshi_weather_monitor():
+    """Sample Kalshi temperature markets across all enabled cities, price
+    each bucket against a blended weather forecast, record paper trades on
+    edge, and auto-settle resolved ones. Cron-friendly.
+    """
+    from lib.kalshi_weather_signal import run_signal_cycle, load_config, enabled_cities
+    result = run_signal_cycle()
+    print("=== Kalshi weather signal cycle ===")
+    print(f"  Markets sampled: {result['n_markets']} across {result['n_cities']} cities")
+    if result["by_city"]:
+        print("  By city: " + ", ".join(
+            f"{c}={n}" for c, n in sorted(result["by_city"].items())))
+    print(f"  Paper trades opened: {result['paper_trades_opened']}")
+    ss = result.get("settle_summary") or {}
+    if ss:
+        print(f"  Settled this cycle:  {ss.get('settled_now', 0)} "
+              f"(P&L ${ss.get('paper_pnl_this_cycle', 0):+.2f})")
+    if result["n_markets"] == 0:
+        cities = sorted(enabled_cities(load_config()).keys())
+        print(f"  No open temp markets found. Enabled cities: {cities}")
+        print("  (Verify Kalshi series tickers in config/kalshi_weather.yaml "
+              "against the live API.)")
+    else:
+        # Show the strongest current edges as a quick sanity check.
+        edged = [s for s in result["samples"]
+                 if s.get("edge_yes") is not None or s.get("edge_no") is not None]
+        edged.sort(key=lambda s: max(s.get("edge_yes") or -9,
+                                     s.get("edge_no") or -9), reverse=True)
+        for s in edged[:5]:
+            ey, en = s.get("edge_yes"), s.get("edge_no")
+            best = "YES" if (ey or -9) >= (en or -9) else "NO"
+            edge = ey if best == "YES" else en
+            print(f"    [{s['city']}] {s['title'][:48]:<48} "
+                  f"fair={s.get('fair_yes')} {best} edge={edge:+.2f} "
+                  f"mu={s.get('forecast_mu')}±{s.get('forecast_sigma')}")
+    print("  Persisted to data/kalshi_weather_signal.jsonl")
+
+
+def cmd_kalshi_weather_paper_settle():
+    """Settle resolved Kalshi weather paper trades (also runs each cycle)."""
+    from lib.kalshi_weather_paper import settle_paper_trades
+    result = settle_paper_trades()
+    print("=== Kalshi weather paper-settle ===")
+    print(f"  Newly settled:        {result['settled_now']}")
+    print(f"  Paper P&L this cycle: ${result['paper_pnl_this_cycle']:+,.2f}")
+    print(f"  Total open:           {result['total_open']}")
+    print(f"  Total settled:        {result['total_settled']}")
+
+
+def cmd_kalshi_weather_paper_report(city: str | None = None):
+    """Aggregate Kalshi weather paper P&L + per-city + edge-bucket WR."""
+    from lib.kalshi_weather_paper import summary
+    s = summary(city_filter=city)
+    header = "=== Kalshi weather paper-trade report ==="
+    if city:
+        header = f"=== Kalshi weather paper-trade report (city={city}) ==="
+    print(header)
+    if s["total_trades"] == 0:
+        print("  No weather paper trades recorded yet.")
+        return
+    print(f"  Total trades:       {s['total_trades']}")
+    print(f"  Open / Won / Lost / Void: "
+          f"{s['open']} / {s['won']} / {s['lost']} / {s['void']}")
+    print(f"  Win rate (settled): {s['win_rate']:.1%}")
+    print(f"  Total paper P&L:    ${s['total_paper_pnl']:+,.2f}")
+    print(f"  Capital deployed:   ${s['capital_deployed']:,.2f}")
+    print(f"  ROI:                {s['roi_pct']:+.2%}")
+    if s.get("by_city") and not city:
+        print("\n  By city:")
+        print(f"    {'city':<6} {'total':>6} {'won':>5} {'lost':>5} "
+              f"{'wr':>7} {'pnl':>10} {'roi':>8}")
+        for c, b in sorted(s["by_city"].items()):
+            print(f"    {c:<6} {b['total']:>6} {b.get('won', 0):>5} "
+                  f"{b.get('lost', 0):>5} {b['win_rate']:>6.1%} "
+                  f"${b['pnl']:>+8.2f} {b['roi_pct']:>+7.2%}")
+    if s.get("by_edge_bucket"):
+        print("\n  By edge bucket:")
+        print(f"    {'bucket':<10} {'settled':>8} {'wins':>6} {'wr':>7} {'pnl':>10}")
+        for bucket, b in sorted(s["by_edge_bucket"].items()):
+            wr = b["wins"] / b["settled"] if b["settled"] > 0 else 0
+            print(f"    {bucket:<10} {b['settled']:>8} {b['wins']:>6} "
+                  f"{wr:>6.1%} ${b['pnl']:>+8.2f}")
+
+
 def cmd_btc_5min_paper_settle():
     """Settle resolved 5-min UP/DOWN paper trades.
 
@@ -1638,6 +1725,16 @@ def main():
             if arg.startswith("--asset="):
                 asset = arg.split("=", 1)[1].lower().strip() or None
         cmd_kalshi_15min_paper_report(asset=asset)
+    elif command == "kalshi-weather-monitor":
+        cmd_kalshi_weather_monitor()
+    elif command == "kalshi-weather-paper-settle":
+        cmd_kalshi_weather_paper_settle()
+    elif command == "kalshi-weather-paper-report":
+        city = None
+        for arg in sys.argv[2:]:
+            if arg.startswith("--city="):
+                city = arg.split("=", 1)[1].lower().strip() or None
+        cmd_kalshi_weather_paper_report(city=city)
     elif command == "kalshi-dashboard":
         port = 5053
         for arg in sys.argv[2:]:
