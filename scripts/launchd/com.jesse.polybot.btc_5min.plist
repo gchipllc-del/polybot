@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jesse.polybot.btc_5min</string>
+    <!--
+        BTC 5-min UP/DOWN sleeve (Polymarket) — fires every 60s.
+
+        Each cycle samples the live 5-min BTC strike-binary markets,
+        computes the composite signal, records Phase 2 paper trades, and
+        settles resolved ones. Persists to data/btc_5min_signal.jsonl +
+        data/btc_5min_paper.jsonl.
+
+        Read-only: never places real orders. Phase 3 (real execution)
+        stays gated behind live_migration_approved.
+
+        HOST SETUP: edit the cd path + python path below to match this
+        machine, then:
+            cp scripts/launchd/com.jesse.polybot.btc_5min.plist \
+               ~/Library/LaunchAgents/
+            launchctl load ~/Library/LaunchAgents/com.jesse.polybot.btc_5min.plist
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/jesse/Desktop/projects/polybot &amp;&amp; set -a &amp;&amp; source .env &amp;&amp; set +a &amp;&amp; /Users/jesse/anaconda3/bin/python main.py btc-5min-monitor 2&gt;&amp;1</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_btc_5min.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_btc_5min_err.log</string>
+</dict>
+</plist>
