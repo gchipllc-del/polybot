@@ -1,0 +1,82 @@
+# Kalshi DAILY-crypto asset registry.
+#
+# Mirrors config/kalshi_assets.yaml (the 15-min registry) but points at
+# the daily strike-ladder series (KX{ASSET}D). Same per-asset shape:
+#   series — Kalshi series ticker
+#   binance_symbol — for spot + klines
+#   annual_vol — used by BSM Greeks for theoretical YES probability
+#   min_confidence — gate floor (looser than 15-min because daily samples
+#     have ~10× the signal/noise ratio)
+#   enabled — whether the scanner trades this asset
+#
+# Daily markets have an inherent strike ladder (20 strikes per window).
+# The signal pipeline auto-narrows to ±NEAR_SPOT_STRIKE_COUNT around the
+# current spot price (the only strikes where Kalshi pricing is contested).
+
+assets:
+  btc:
+    series: KXBTCD
+    binance_symbol: BTCUSDT
+    annual_vol: 0.55
+    # min_confidence is the ratio |composite| / max_possible. The daily
+    # horizon has lower noise than 15-min, so we start LOOSER (0.20 vs
+    # 0.25 on the 15-min path) to capture enough samples for calibration.
+    min_confidence: 0.20
+    enabled: true
+
+  eth:
+    series: KXETHD
+    binance_symbol: ETHUSDT
+    annual_vol: 0.65
+    min_confidence: 0.30
+    # 2026-05-25 EOD: DISABLED after 7d paper showed catastrophic
+    # 8% WR (2W/24L), -$189 net. The BSM model + composite signal
+    # that works on BTC (38% WR positive EV) does NOT transfer to ETH.
+    # Re-enable when paper WR ≥ 30% on n ≥ 20 closed trades.
+    # Until then, ETH samples flow through scanner but no paper trades
+    # open, so Hermes learning isn't polluted by bad data.
+    enabled: false
+
+  sol:
+    series: KXSOLD
+    binance_symbol: SOLUSDT
+    annual_vol: 0.85
+    min_confidence: 0.35
+    # 2026-05-24 EOD: PAUSED pending ETH validation. Strategy: prove the
+    # daily horizon math on ETH (BTC's closest correlated alt) before
+    # adding SOL's higher vol. The 5 already-open SOL trades will settle
+    # naturally; no new SOL trades open until re-enable. Re-enable when:
+    #   • ETH daily shows WR ≥ 30% on n ≥ 10 closed trades, AND
+    #   • ETH daily net P&L ≥ +$5 (so we have signal it's not luck)
+    enabled: false
+
+  xrp:
+    series: KXXRPD
+    binance_symbol: XRPUSDT
+    annual_vol: 0.85
+    min_confidence: 0.40
+    enabled: false
+
+  # ── Non-crypto assets (yfinance-sourced) ────────────────────────────
+  # Same BSM math, different data source. Markets only trade during
+  # their respective exchange hours — KXINX (S&P 500) is US-market only
+  # (events open M-F roughly 9:30am ET → next close), FX/commodities
+  # have their own windows. The scanner gracefully skips when no events
+  # are open.
+
+  spy:
+    series: KXINX           # Kalshi's S&P 500 strike-ladder series (weekly close)
+    data_source: yfinance
+    yfinance_symbol: ^GSPC  # S&P 500 index value (matches Kalshi settlement)
+    annual_vol: 0.18
+    min_confidence: 0.25
+    max_horizon_seconds: 604800
+    # 2026-05-24: Re-enabled after direction-aware BSM landed. The signal
+    # pipeline now detects above/below/between markets from floor/cap
+    # presence and applies the right CDF formula per direction.
+    # 2026-06-04: KILLED (paper) — went 0/9, -$93.32, every trade lost on BOTH
+    # sides. 0% WR smells like residual #165 below/between sign-inversion. Was
+    # paper-only (excluded from live_assets) so NO real money lost. Re-enable
+    # ONLY after the SPY settlement/direction is re-audited + paper WR proves out.
+    enabled: false
+

@@ -1893,6 +1893,13 @@ def main():
         cmd_weather_paper_settle()
     elif command == "weather-mispricing-cycle":
         cmd_weather_mispricing_cycle()
+    elif command == "perps-funding-log":
+        # Phase 0 measure-first: read-only Kalshi perps funding+basis logger.
+        from lib.perps_funding_logger import log_once
+        print("perps-funding-log:", log_once())
+    elif command == "perps-funding-report":
+        from lib.perps_funding_logger import report
+        report()
     elif command == "weather-daily-monitor":
         cmd_weather_daily_monitor()
     elif command == "weather-daily-paper-settle":
