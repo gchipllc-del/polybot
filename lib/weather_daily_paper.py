@@ -89,6 +89,18 @@ def _effective_params() -> dict:
         "forecast_buffer_f":      float(o.get("forecast_buffer_f",      DEFAULT_FORECAST_BUFFER_F)),
         "forecast_buffer_f_yes":  float(o.get("forecast_buffer_f_yes",  DEFAULT_FORECAST_BUFFER_F_YES)),
         "no_side_only":           bool(o.get("no_side_only", False)),
+        # ── Timing + margin gates (2026-06-06; RESTRICT-ONLY, default OFF) ──
+        # Lever 1 (trade late): cap the UPPER end of seconds-to-close (the lower
+        # end is already guarded by min_seconds_to_close). Day-ahead daily-high σ
+        # is 3-4°F, so a narrow bucket is unwinnable that far out; only enter once
+        # the extreme has (mostly) formed and the observed-extreme anchor is real.
+        # Default 1e12 = off. e.g. 28800 = only within 8h of close.
+        "max_seconds_to_close":   float(o.get("max_seconds_to_close", 1e12)),
+        # Lever 2 (margin clears noise): require |yes_margin_f| >=
+        # min_margin_sigma * sigma_f so a normal forecast miss can't flip our
+        # side. 0.0 = off; ~1.5 = forecast must sit 1.5σ from the strike.
+        # RESTRICT-ONLY (only ever removes trades).
+        "min_margin_sigma":       float(o.get("min_margin_sigma", 0.0)),
     }
 
 
@@ -231,6 +243,12 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
         if _secs_to_close is None or _secs_to_close <= params["min_seconds_to_close"]:
             skip_counts["market_closing_or_closed"] = skip_counts.get("market_closing_or_closed", 0) + 1
             continue
+        # ── Lever 1: trade-late ceiling (restrict-only; off by default) ──
+        # Skip day-ahead entries; only trade once the extreme has formed so the
+        # observed-extreme anchor is real rather than 3-4°F day-ahead variance.
+        if _secs_to_close > params["max_seconds_to_close"]:
+            skip_counts["too_early_to_trade"] = skip_counts.get("too_early_to_trade", 0) + 1
+            continue
         nws_p = s.get("nws_p_yes")
         market_p = s.get("market_p_yes")
         if nws_p is None or market_p is None:
@@ -289,6 +307,22 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
             # (i.e. margin-toward-yes more negative than -buf_no).
             if yes_margin > -buf_no:
                 skip_counts["forecast_dir_no"] = skip_counts.get("forecast_dir_no", 0) + 1
+                continue
+
+        # ── Lever 2: margin must clear forecast noise (restrict-only; off) ──
+        # Require |forecast margin toward our side| >= min_margin_sigma * sigma.
+        # At day-ahead σ≈3-4°F this blocks narrow buckets the forecast can't
+        # resolve; near close σ collapses so genuine edges still pass.
+        _mms = params["min_margin_sigma"]
+        if _mms > 0:
+            _sigma = s.get("sigma_f")
+            try:
+                _sigma = float(_sigma) if _sigma is not None else None
+            except (TypeError, ValueError):
+                _sigma = None
+            if _sigma and _sigma > 0 and abs(yes_margin) < _mms * _sigma:
+                skip_counts["margin_below_sigma"] = (
+                    skip_counts.get("margin_below_sigma", 0) + 1)
                 continue
 
         # YES disable (defensive — daily YES may have same issue as hourly)
