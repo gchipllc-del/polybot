@@ -161,6 +161,18 @@ def _effective_params() -> dict:
         # recording is unaffected. Default False → no live behavior change.
         "weather_live_trend_veto": bool(o.get("weather_live_trend_veto", False)),
         "weather_live_veto_max_fill": float(o.get("weather_live_veto_max_fill", WEATHER_LIVE_VETO_MAX_FILL)),
+        # ── Timing + margin gates (2026-06-06; RESTRICT-ONLY, default OFF) ──
+        # Lever 1 (trade late): only enter inside a [min, max] seconds-to-close
+        # window. For hourly a tight max (e.g. 7200 = 2h) keeps entries where the
+        # live-observation anchor dominates the forecast. Defaults wide-open
+        # (0 .. 1e12) so behavior is UNCHANGED until set in weather_strategy.yaml.
+        "min_seconds_to_close": float(o.get("min_seconds_to_close", 0.0)),
+        "max_seconds_to_close": float(o.get("max_seconds_to_close", 1e12)),
+        # Lever 2 (margin clears noise): require |forecast - strike| >=
+        # min_margin_sigma * sigma, so a normal forecast miss can't flip the
+        # outcome. 0.0 = off; ~1.5 means the forecast must sit 1.5σ from the
+        # strike on our side. RESTRICT-ONLY (only ever removes trades).
+        "min_margin_sigma": float(o.get("min_margin_sigma", 0.0)),
     }
 
 
@@ -275,6 +287,18 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
         if not ticker or ticker in open_tickers:
             skip_counts["dup_open"] = skip_counts.get("dup_open", 0) + 1
             continue
+        # ── Lever 1: trade-late timing window (restrict-only; off by default) ──
+        # Skip entries outside [min, max] seconds-to-close. A tight max means we
+        # only bet once the temperature has nearly settled (obs anchor strong),
+        # which is where the hourly edge is real rather than forecast-variance.
+        _stc = s.get("seconds_to_close")
+        if _stc is not None:
+            _stc = float(_stc)
+            if (_stc < params["min_seconds_to_close"]
+                    or _stc > params["max_seconds_to_close"]):
+                skip_counts["outside_timing_window"] = (
+                    skip_counts.get("outside_timing_window", 0) + 1)
+                continue
         nws_p = s.get("nws_p_yes")
         market_p = s.get("market_p_yes")
         if nws_p is None or market_p is None:
@@ -322,6 +346,22 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
                         skip_counts.get("forecast_dir_no", 0) + 1
                     )
                     continue
+
+        # ── Lever 2: margin must clear forecast noise (restrict-only; off) ──
+        # Require the forecast to sit min_margin_sigma * sigma from the strike,
+        # so a normal forecast miss (~σ) can't flip our side. sigma is the
+        # signal's blended estimate. Off (0.0) → no change.
+        _mms = params["min_margin_sigma"]
+        if _mms > 0:
+            _sigma = (s.get("blend_meta") or {}).get("sigma_f")
+            try:
+                _sigma = float(_sigma) if _sigma is not None else None
+            except (TypeError, ValueError):
+                _sigma = None
+            if _sigma and _sigma > 0 and abs(forecast_f - strike_f) < _mms * _sigma:
+                skip_counts["margin_below_sigma"] = (
+                    skip_counts.get("margin_below_sigma", 0) + 1)
+                continue
 
         # YES side disable gate. Backtest showed weather YES = 40% WR /
         # -$2; NO = 77% WR / +$608. Mirror of BTC where one side was
