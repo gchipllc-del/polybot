@@ -77,9 +77,9 @@ def _fnum(v):
         return None
 
 
-def load_rows(path: Path, price_col, result_col, time_col, yes_bid_col, no_bid_col):
-    """[{price, yes, time, yes_bid, no_bid}] from JSONL or Parquet."""
-    want = [c for c in (price_col, result_col, time_col, yes_bid_col, no_bid_col) if c]
+def load_rows(path: Path, price_col, result_col, time_col, yes_bid_col, no_bid_col, market_col=None):
+    """[{price, yes, time, yes_bid, no_bid, market}] from JSONL or Parquet."""
+    want = [c for c in (price_col, result_col, time_col, yes_bid_col, no_bid_col, market_col) if c]
     recs: list[dict]
     if path.suffix in (".parquet", ".pq"):
         try:
@@ -108,8 +108,35 @@ def load_rows(path: Path, price_col, result_col, time_col, yes_bid_col, no_bid_c
             "time": r.get(time_col) if time_col else None,
             "yes_bid": _fnum(r.get(yes_bid_col)) if yes_bid_col else None,
             "no_bid": _fnum(r.get(no_bid_col)) if no_bid_col else None,
+            "market": r.get(market_col) if market_col else None,
         })
     return rows
+
+
+def dedup_by_market(rows, how):
+    """Collapse to ONE row per market (by the 'market' key), keeping the
+    earliest/latest by 'time'. CRITICAL when the input is one-row-per-SAMPLE
+    (a market scanned many times) — without it the calibration both leaks the
+    train/test split and counts a single outcome dozens of times. 'none' = off
+    (already one row per market). Rows with no market id are kept as-is."""
+    if how == "none":
+        return rows
+    best: dict = {}
+    passthrough: list = []
+    for r in rows:
+        m = r.get("market")
+        if m is None:
+            passthrough.append(r)
+            continue
+        cur = best.get(m)
+        if cur is None:
+            best[m] = r
+            continue
+        rt, ct = r.get("time"), cur.get("time")
+        if rt is not None and ct is not None:
+            if (rt < ct) if how == "earliest" else (rt > ct):
+                best[m] = r
+    return list(best.values()) + passthrough
 
 
 def fit_calibration(pairs, nbins):
@@ -189,6 +216,11 @@ def main() -> None:
     ap.add_argument("--time-col", default=None)
     ap.add_argument("--yes-bid-col", default=None)
     ap.add_argument("--no-bid-col", default=None)
+    ap.add_argument("--market-col", default=None,
+                    help="market-id column to collapse ONE row per market (e.g. market_ticker). "
+                         "REQUIRED for per-sample inputs or the split leaks + outcomes double-count.")
+    ap.add_argument("--dedup", choices=("earliest", "latest", "none"), default="earliest",
+                    help="with --market-col: keep earliest (how live fires) or latest sample per market")
     ap.add_argument("--bins", type=int, default=20)
     ap.add_argument("--split", type=float, default=0.6, help="train fraction (single-venue mode)")
     ap.add_argument("--thr", type=float, default=0.05)
@@ -196,10 +228,21 @@ def main() -> None:
     ap.add_argument("--sweep", action="store_true")
     a = ap.parse_args()
 
-    trade = load_rows(a.data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col)
-    print(f"loaded {len(trade)} resolved markets to TRADE from {a.data}")
+    trade = load_rows(a.data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col, a.market_col)
+    if a.market_col:
+        before = len(trade)
+        trade = dedup_by_market(trade, a.dedup)
+        print(f"loaded {before} rows from {a.data}; collapsed to {len(trade)} markets "
+              f"(one-per-market, {a.dedup})")
+    else:
+        print(f"loaded {len(trade)} rows to TRADE from {a.data}\n"
+              f"  ⚠️  no --market-col: NOT deduped. If this is a per-SAMPLE file (a market "
+              f"scanned many times),\n      the OOS split LEAKS and outcomes double-count — "
+              f"pass --market-col market_ticker.")
     if a.fit_data:
-        fit = load_rows(a.fit_data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col)
+        fit = load_rows(a.fit_data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col, a.market_col)
+        if a.market_col:
+            fit = dedup_by_market(fit, a.dedup)
         print(f"fitting calibration on {len(fit)} markets from {a.fit_data} (cross-venue)")
         fit_rows, trade_rows = fit, trade
         mode = f"fit={a.fit_data.name} → trade={a.data.name}"
@@ -213,7 +256,7 @@ def main() -> None:
     # diagnostic calibration table on the fit set
     c, r, cnt = fit_calibration([(x["price"], x["yes"]) for x in fit_rows], a.bins)
     print("\ncalibration (fit set) — price bin vs realized YES rate:")
-    print(f"  {'price':>6} {'realized':>9} {'gap':>+8} {'n':>6}")
+    print(f"  {'price':>6} {'realized':>9} {'gap':>8} {'n':>6}")
     for cc, rr, nn in zip(c, r, cnt):
         print(f"  {cc:>6.2f} {rr:>9.3f} {rr-cc:>+8.3f} {nn:>6}")
 
