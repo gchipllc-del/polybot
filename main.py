@@ -37,6 +37,7 @@ Usage:
     python main.py btc-5min-monitor       # Sample 5-min BTC UP/DOWN markets (Gravia-style)
     python main.py btc-5min-paper-settle  # Settle resolved 5-min paper trades
     python main.py btc-5min-paper-report  # Aggregate 5-min paper P&L + confidence-bucket WR
+    python main.py btc-5min-paper-reset   # Zero the 5-min paper ledger (archives old, fresh start)
     python main.py dataset-status         # Check Jon-Becker parquet dataset availability
     python main.py kalshi-auth-status     # Verify Kalshi RSA-PSS auth wiring
     python main.py kalshi-test-auth       # Make one signed call (/portfolio/balance) to prove it works
@@ -1356,6 +1357,25 @@ def cmd_btc_5min_paper_report():
             print(f"    {day}: ${s['per_day_pnl'][day]:+,.2f}")
 
 
+def cmd_btc_5min_paper_reset():
+    """Reset the BTC 5-min paper ledger to zero (fresh start).
+
+    Archives the current ledger to a timestamped .bak.jsonl first (reversible),
+    then empties it so P&L / trade counts begin again at zero. Does NOT touch
+    any live position or the btc_arb sleeve.
+    """
+    from lib.btc_5min_paper import reset
+    r = reset()
+    print("=== BTC 5-min paper RESET ===")
+    print(f"  Cleared {r['cleared_trades']} trades "
+          f"(net paper P&L was ${r['cleared_net_pnl']:+,.2f}).")
+    if r["archived_to"]:
+        print(f"  Archived previous ledger -> {r['archived_to']}")
+    else:
+        print("  Nothing to archive (ledger was already empty).")
+    print(f"  Ledger now zeroed: {r['ledger']}")
+
+
 def cmd_btc_arb_paper_settle():
     """Phase 2 — settle open BTC arb paper trades against actual
     market outcomes. Run periodically (manually or cron) so the report
@@ -1875,6 +1895,8 @@ def main():
         cmd_btc_5min_paper_settle()
     elif command == "btc-5min-paper-report":
         cmd_btc_5min_paper_report()
+    elif command == "btc-5min-paper-reset":
+        cmd_btc_5min_paper_reset()
     elif command == "kalshi-15min-monitor":
         max_sec = 900
         for arg in sys.argv[2:]:

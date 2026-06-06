@@ -150,6 +150,37 @@ def _save_all(rows: list[dict]) -> None:
     tmp.replace(PAPER_PATH)
 
 
+def reset() -> dict:
+    """Zero the BTC 5-min paper ledger. The existing file is ARCHIVED to a
+    timestamped sibling first (reversible — nothing is destroyed), then the
+    live ledger is emptied so P&L / trade counts start fresh at zero.
+
+    Returns a summary of what was cleared. Does NOT touch any live position or
+    the btc_arb sleeve — only this paper ledger.
+    """
+    from datetime import datetime, timezone
+    rows = _load_all()
+    cleared = len(rows)
+    net = 0.0
+    for r in rows:
+        v = r.get("paper_pnl", r.get("net_profit"))
+        if isinstance(v, (int, float)):
+            net += float(v)
+    archive = None
+    if PAPER_PATH.exists() and PAPER_PATH.stat().st_size > 0:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive = PAPER_PATH.with_name(f"{PAPER_PATH.stem}.{stamp}.bak.jsonl")
+        PAPER_PATH.replace(archive)
+    # Recreate an empty ledger so downstream readers find a clean file.
+    _save_all([])
+    return {
+        "cleared_trades": cleared,
+        "cleared_net_pnl": round(net, 2),
+        "archived_to": str(archive) if archive else None,
+        "ledger": str(PAPER_PATH),
+    }
+
+
 # ── Recording ────────────────────────────────────────────────────────
 
 def record_paper_trades_from_samples(
