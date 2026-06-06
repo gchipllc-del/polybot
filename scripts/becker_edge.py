@@ -1,42 +1,49 @@
 #!/usr/bin/env python3
 """
 becker_edge.py — calibration / favorite-longshot mispricing edge across ALL
-markets, fit from the Jon-Becker historical Kalshi dataset.
+markets, fit from historical prediction-market (price, outcome) data.
 
-THE IDEA (your "gate = the edge Becker says a trade has")
---------------------------------------------------------
-The edge is  fair_prob(market_price) - market_price , where fair_prob is an
-EMPIRICAL CALIBRATION map fit from history: of all markets that traded near
-price p, what fraction actually resolved YES? If longshots are systematically
-overpriced and favorites underpriced (the classic favorite-longshot bias),
-that gap is a real edge — and it's computable from market data ALONE (no
-weather/crypto forecast), so it scans every category.
+⚠️ DATA REALITY (read before using)
+-----------------------------------
+The Jon-Becker dataset is **Polymarket-only** (markets: condition_id, outcome_
+prices, closed, end_date; trades: on-chain price history). It has **no Kalshi
+data and no ready (price, result) pair** — getting one decision-price + outcome
+per market needs a trades→markets JOIN first. Historical Kalshi quotes are NOT
+public (the repo synthesizes Kalshi fills for that reason), so:
+  * For a Polymarket calibration study → feed this Becker data (after the join).
+  * For KALSHI → there is no public history; use your own accumulating signal
+    logs via build_trials.py instead.
 
-WHY THIS IS THE HONEST VERSION
-------------------------------
-Calibration fit on the SAME data you trade is guaranteed to look profitable and
-means nothing. So this splits history by TIME: fit the calibration on the
-earlier portion, then trade `edge > threshold` on the LATER portion and settle
-on real outcomes. ONLY the out-of-sample (OOS) result counts. If the OOS sweep
-is flat/negative, there is no calibration edge — and we do NOT build a sleeve.
+This tool is venue-agnostic: it scores ANY file of (price, outcome) rows. It
+does NOT itself do the Becker trades↔markets join — produce that pair file
+first, then point this at it.
 
-INPUT
------
-Historical RESOLVED markets, JSONL or Parquet, one row per market (a decision-
-time snapshot). Columns are configurable:
-  --price-col   market YES price in [0,1]  (e.g. last_price / yes_ask / mid)
+THE IDEA ("gate = the edge a trade has")
+----------------------------------------
+edge = fair_prob(price) - price, where fair_prob is an EMPIRICAL CALIBRATION map
+fit from history: of all markets near price p, what fraction resolved YES? If
+longshots are overpriced / favorites underpriced (favorite-longshot bias), that
+gap is a real edge from market data alone — scans every category.
+
+HONEST BY CONSTRUCTION
+----------------------
+Fits calibration on the time-EARLIER split, trades edge>threshold on the LATER
+split, settles on real outcomes, sweeps the threshold. Only the OOS EV counts.
+
+INPUT — JSONL or Parquet of resolved markets, one row each. Columns configurable:
+  --price-col   YES price in [0,1] at the decision point
   --result-col  settlement: yes/no or 1/0/true/false
   --time-col    timestamp for the train/test split (optional; else row order)
-Parquet needs pandas+pyarrow; JSONL needs nothing.
 
 USAGE
 -----
-  python scripts/becker_edge.py --data data/becker/kalshi_markets.parquet \\
-      --price-col last_price --result-col result --time-col close_time --sweep
-  python scripts/becker_edge.py --data pairs.jsonl --price-col p --result-col y
+  # generic (any pre-built pairs file):
+  python scripts/becker_edge.py --data pairs.jsonl --price-col p --result-col y --sweep
+  # Polymarket (after a trades→markets join produces these columns):
+  python scripts/becker_edge.py --data poly_pairs.parquet \\
+      --price-col yes_price --result-col resolved_yes --time-col t --sweep
 
-READ-ONLY. No network, no trading. Pure measurement — the make-or-break test
-for whether a scan-all-markets mispricing sleeve is worth building.
+READ-ONLY. No network, no trading. Pure measurement.
 """
 from __future__ import annotations
 
