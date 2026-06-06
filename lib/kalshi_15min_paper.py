@@ -779,15 +779,24 @@ def check_open_trades_for_exit() -> dict:
         if market.get("status") not in ("active", "open"):
             continue
 
-        # Our-side current price (prefer the _dollars form).
+        # Our-side current price. Prefer the canonical *_dollars float;
+        # the cents fallback is ALWAYS cents, so divide by 100
+        # unconditionally. The old `> 1.5` heuristic misread a 1-cent
+        # price as $1.00 — and at the catastrophe extreme (our side
+        # nearly worthless) that makes a losing position look like it's
+        # winning, so a price-floor / stop check silently never fires.
         def _price(key):
             v = market.get(key + "_dollars")
+            if v is not None:
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    return None
+            v = market.get(key)
             if v is None:
-                v = market.get(key)
-                if v is not None and float(v) > 1.5:
-                    v = float(v) / 100.0
+                return None
             try:
-                return float(v) if v is not None else None
+                return float(v) / 100.0
             except (ValueError, TypeError):
                 return None
 
