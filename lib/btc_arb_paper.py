@@ -94,6 +94,26 @@ def _save_all(rows: list[dict]) -> None:
     tmp.replace(PAPER_PATH)
 
 
+def reset() -> dict:
+    """Zero the BTC arb paper ledger. Archives the current file to a timestamped
+    .bak.jsonl first (reversible), then empties it so P&L starts fresh at zero."""
+    rows = _load_all()
+    cleared = len(rows)
+    net = sum(float(r.get("paper_pnl", 0) or 0) for r in rows)
+    archive = None
+    if PAPER_PATH.exists() and PAPER_PATH.stat().st_size > 0:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive = PAPER_PATH.with_name(f"{PAPER_PATH.stem}.{stamp}.bak.jsonl")
+        PAPER_PATH.replace(archive)
+    _save_all([])
+    return {
+        "cleared_trades": cleared,
+        "cleared_net_pnl": round(net, 2),
+        "archived_to": str(archive) if archive else None,
+        "ledger": str(PAPER_PATH),
+    }
+
+
 def record_paper_trades_from_signals(
     signals: list[dict] | list,
     *,
