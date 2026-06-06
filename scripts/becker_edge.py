@@ -1,47 +1,53 @@
 #!/usr/bin/env python3
 """
-becker_edge.py — calibration / favorite-longshot mispricing edge across ALL
-markets, fit from historical prediction-market (price, outcome) data.
+becker_edge.py — calibration / favorite-longshot mispricing edge, with two
+powers: (1) test the edge on ANY (price, outcome) data, and (2) REPURPOSE a
+curve fit on one venue to TRADE another (Polymarket → Kalshi).
 
-⚠️ DATA REALITY (read before using)
------------------------------------
-The Jon-Becker dataset is **Polymarket-only** (markets: condition_id, outcome_
-prices, closed, end_date; trades: on-chain price history). It has **no Kalshi
-data and no ready (price, result) pair** — getting one decision-price + outcome
-per market needs a trades→markets JOIN first. Historical Kalshi quotes are NOT
-public (the repo synthesizes Kalshi fills for that reason), so:
-  * For a Polymarket calibration study → feed this Becker data (after the join).
-  * For KALSHI → there is no public history; use your own accumulating signal
-    logs via build_trials.py instead.
+THE IDEA
+--------
+edge = fair_prob(price) - price, where fair_prob is an EMPIRICAL CALIBRATION
+map: of all markets near price p, what fraction resolved YES? Longshots
+overpriced / favorites underpriced (favorite-longshot bias) = a real edge from
+market data alone. Bias is a general market property, so the CURVE transfers
+across venues even though the data doesn't.
 
-This tool is venue-agnostic: it scores ANY file of (price, outcome) rows. It
-does NOT itself do the Becker trades↔markets join — produce that pair file
-first, then point this at it.
+REPURPOSING BECKER (POLYMARKET) FOR KALSHI
+------------------------------------------
+The Jon-Becker dataset is Polymarket-only (no Kalshi quotes — those aren't
+public). But you can fit the calibration curve on Polymarket history (lots of
+data) and TRADE/settle it on Kalshi outcomes:
 
-THE IDEA ("gate = the edge a trade has")
-----------------------------------------
-edge = fair_prob(price) - price, where fair_prob is an EMPIRICAL CALIBRATION map
-fit from history: of all markets near price p, what fraction resolved YES? If
-longshots are overpriced / favorites underpriced (favorite-longshot bias), that
-gap is a real edge from market data alone — scans every category.
+  --fit-data  = where the calibration curve is fit (e.g. normalized Polymarket
+                pairs).  If omitted, the curve is fit on the time-EARLIER split
+                of the trade data (single-venue OOS).
+  data (pos.) = where trades are placed + settled on REAL outcomes (e.g. your
+                Kalshi trials file).
 
-HONEST BY CONSTRUCTION
-----------------------
-Fits calibration on the time-EARLIER split, trades edge>threshold on the LATER
-split, settles on real outcomes, sweeps the threshold. Only the OOS EV counts.
+If fitting on Polymarket and trading Kalshi turns a profit on real Kalshi
+outcomes, the bias transfers — a genuine, data-backed Kalshi edge.
 
-INPUT — JSONL or Parquet of resolved markets, one row each. Columns configurable:
-  --price-col   YES price in [0,1] at the decision point
-  --result-col  settlement: yes/no or 1/0/true/false
-  --time-col    timestamp for the train/test split (optional; else row order)
+FILLS
+-----
+--fills taker (default): pay the ask side (price / 1-price).
+--fills maker: rest at the bid (needs --yes-bid-col/--no-bid-col) + rebate;
+falls back to taker for any row missing the needed bid.
+
+INPUT: JSONL or Parquet; columns configurable. Both files (fit + trade) must use
+the SAME column names — normalize a Polymarket export to (price,result[,bids])
+first. Parquet needs pandas+pyarrow.
 
 USAGE
 -----
-  # generic (any pre-built pairs file):
-  python scripts/becker_edge.py --data pairs.jsonl --price-col p --result-col y --sweep
-  # Polymarket (after a trades→markets join produces these columns):
-  python scripts/becker_edge.py --data poly_pairs.parquet \\
-      --price-col yes_price --result-col resolved_yes --time-col t --sweep
+  # direct, on your Kalshi trials (no Becker needed):
+  python scripts/becker_edge.py data/trials_daily.jsonl \\
+      --price-col market_p_yes --result-col result --time-col sample_at --sweep
+  # repurpose: fit on Polymarket, trade Kalshi:
+  python scripts/becker_edge.py data/trials_daily.jsonl --fit-data poly_pairs.jsonl \\
+      --price-col market_p_yes --result-col result --sweep
+  # maker fills on Kalshi trials (needs yes_bid/no_bid columns):
+  python scripts/becker_edge.py data/trials_daily.jsonl --price-col market_p_yes \\
+      --result-col result --fills maker --yes-bid-col yes_bid --no-bid-col no_bid --sweep
 
 READ-ONLY. No network, no trading. Pure measurement.
 """
@@ -51,10 +57,11 @@ import argparse
 import json
 from pathlib import Path
 
-FEE = 0.07  # Kalshi profit fee
+FEE = 0.07       # Kalshi profit fee
+REBATE = 0.005   # maker rebate $/contract (from maker_fill_sim)
 
 
-def _as_yes(v) -> bool | None:
+def _as_yes(v):
     s = str(v).strip().lower()
     if s in ("yes", "1", "true", "y", "t"):
         return True
@@ -63,46 +70,50 @@ def _as_yes(v) -> bool | None:
     return None
 
 
-def load_rows(path: Path, price_col: str, result_col: str, time_col: str | None):
-    """Return [(price, result_yes_bool, time_or_None)] from JSONL or Parquet."""
-    rows: list[tuple[float, bool, object]] = []
+def _fnum(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_rows(path: Path, price_col, result_col, time_col, yes_bid_col, no_bid_col):
+    """[{price, yes, time, yes_bid, no_bid}] from JSONL or Parquet."""
+    want = [c for c in (price_col, result_col, time_col, yes_bid_col, no_bid_col) if c]
+    recs: list[dict]
     if path.suffix in (".parquet", ".pq"):
         try:
             import pandas as pd
         except ImportError:
-            raise SystemExit("parquet needs pandas+pyarrow (pip install pandas pyarrow), "
-                             "or pass a .jsonl")
-        df = pd.read_parquet(path, columns=[c for c in (price_col, result_col, time_col) if c])
-        for rec in df.to_dict("records"):
-            _add(rows, rec, price_col, result_col, time_col)
+            raise SystemExit("parquet needs pandas+pyarrow, or pass a .jsonl")
+        recs = pd.read_parquet(path, columns=want).to_dict("records")
     else:
+        recs = []
         with open(path) as f:
             for line in f:
                 line = line.strip()
-                if not line:
-                    continue
-                try:
-                    _add(rows, json.loads(line), price_col, result_col, time_col)
-                except json.JSONDecodeError:
-                    continue
+                if line:
+                    try:
+                        recs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    rows = []
+    for r in recs:
+        p = _fnum(r.get(price_col))
+        y = _as_yes(r.get(result_col))
+        if p is None or y is None or not (0.0 < p < 1.0):
+            continue
+        rows.append({
+            "price": p, "yes": y,
+            "time": r.get(time_col) if time_col else None,
+            "yes_bid": _fnum(r.get(yes_bid_col)) if yes_bid_col else None,
+            "no_bid": _fnum(r.get(no_bid_col)) if no_bid_col else None,
+        })
     return rows
 
 
-def _add(rows, rec, price_col, result_col, time_col):
-    try:
-        p = float(rec[price_col])
-    except (KeyError, TypeError, ValueError):
-        return
-    y = _as_yes(rec.get(result_col))
-    if y is None or not (0.0 < p < 1.0):
-        return
-    rows.append((p, y, rec.get(time_col) if time_col else None))
-
-
-def fit_calibration(pairs: list[tuple[float, bool]], nbins: int):
-    """Binned empirical YES-rate by price bin. Returns (centers, rates) for the
-    non-empty bins, usable by fair_prob()."""
-    buckets: list[list[bool]] = [[] for _ in range(nbins)]
+def fit_calibration(pairs, nbins):
+    buckets = [[] for _ in range(nbins)]
     for p, y in pairs:
         buckets[min(nbins - 1, int(p * nbins))].append(y)
     centers, rates, counts = [], [], []
@@ -114,8 +125,7 @@ def fit_calibration(pairs: list[tuple[float, bool]], nbins: int):
     return centers, rates, counts
 
 
-def fair_prob(price: float, centers: list[float], rates: list[float]) -> float:
-    """Calibrated P(YES) at `price` via linear interpolation between bin rates."""
+def fair_prob(price, centers, rates):
     if not centers:
         return price
     if price <= centers[0]:
@@ -129,38 +139,36 @@ def fair_prob(price: float, centers: list[float], rates: list[float]) -> float:
     return rates[-1]
 
 
-def trade_pnl(price: float, result_yes: bool, fair: float, thr: float, fee: float = FEE):
-    """Per-$1-stake P&L (1 contract) for the calibration trade, or (None, None)
-    if no edge clears the threshold. Buy YES at `price` if underpriced; buy NO
-    at (1-price) if overpriced."""
+def trade_pnl(row, fair, thr, fills):
+    """Per-$1 P&L for the calibration trade, or (None, None) if no edge clears
+    thr. Buy YES if underpriced, NO if overpriced. Maker rests at the side's
+    bid + rebate (falls back to taker if that bid is missing)."""
+    price = row["price"]
     e = fair - price
-    if e > thr:                       # YES underpriced → buy YES at price
-        if result_yes:
-            g = 1.0 - price
-            return g - max(0.0, g * fee), "YES"
-        return -price, "YES"
-    if -e > thr:                      # YES overpriced → buy NO at (1-price)
-        q = 1.0 - price
-        if not result_yes:
-            g = 1.0 - q
-            return g - max(0.0, g * fee), "NO"
-        return -q, "NO"
-    return None, None
+    if e > thr:
+        side, taker_fill, bid = "YES", price, row.get("yes_bid")
+    elif -e > thr:
+        side, taker_fill, bid = "NO", 1.0 - price, row.get("no_bid")
+    else:
+        return None, None
+    if fills == "maker" and bid is not None and 0.0 < bid < 1.0:
+        fill, reb = bid, REBATE
+    else:
+        fill, reb = taker_fill, 0.0
+    won = (side == "YES" and row["yes"]) or (side == "NO" and not row["yes"])
+    if won:
+        g = 1.0 - fill
+        return g - max(0.0, g * FEE) + reb, side
+    return -fill + reb, side
 
 
-def backtest_oos(rows, nbins: int, thr: float, split_frac: float):
-    """Fit calibration on the first split_frac of (time-sorted) rows, trade
-    edge>thr on the rest, settle on real outcomes. Returns stats dict."""
-    ordered = sorted(rows, key=lambda r: (r[2] is None, r[2]))  # by time if present
-    k = int(len(ordered) * split_frac)
-    train = [(p, y) for p, y, _ in ordered[:k]]
-    test = ordered[k:]
-    centers, rates, _ = fit_calibration(train, nbins)
+def backtest(fit_rows, trade_rows, nbins, thr, fills):
+    centers, rates, _ = fit_calibration([(r["price"], r["yes"]) for r in fit_rows], nbins)
     n = wins = 0
     pnl = 0.0
-    for p, y, _ in test:
-        f = fair_prob(p, centers, rates)
-        x, side = trade_pnl(p, y, f, thr)
+    for r in trade_rows:
+        f = fair_prob(r["price"], centers, rates)
+        x, _ = trade_pnl(r, f, thr, fills)
         if x is None:
             continue
         n += 1
@@ -168,46 +176,57 @@ def backtest_oos(rows, nbins: int, thr: float, split_frac: float):
         if x > 0:
             wins += 1
     return {"n": n, "wr": wins / n if n else 0.0, "pnl": round(pnl, 3),
-            "ev": round(pnl / n, 4) if n else 0.0,
-            "train": len(train), "test": len(test)}
+            "ev": round(pnl / n, 4) if n else 0.0}
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Becker calibration-edge OOS backtest")
-    ap.add_argument("--data", required=True, type=Path)
-    ap.add_argument("--price-col", default="last_price")
+    ap = argparse.ArgumentParser(description="Calibration-edge backtest (+cross-venue, +maker)")
+    ap.add_argument("data", type=Path, help="trade-on file (settle on its real outcomes)")
+    ap.add_argument("--fit-data", type=Path, default=None,
+                    help="fit calibration on THIS file (e.g. Polymarket); else time-split data")
+    ap.add_argument("--price-col", default="market_p_yes")
     ap.add_argument("--result-col", default="result")
     ap.add_argument("--time-col", default=None)
+    ap.add_argument("--yes-bid-col", default=None)
+    ap.add_argument("--no-bid-col", default=None)
     ap.add_argument("--bins", type=int, default=20)
-    ap.add_argument("--split", type=float, default=0.6, help="train fraction (time-ordered)")
+    ap.add_argument("--split", type=float, default=0.6, help="train fraction (single-venue mode)")
     ap.add_argument("--thr", type=float, default=0.05)
-    ap.add_argument("--sweep", action="store_true", help="sweep the edge threshold")
-    args = ap.parse_args()
+    ap.add_argument("--fills", choices=("taker", "maker"), default="taker")
+    ap.add_argument("--sweep", action="store_true")
+    a = ap.parse_args()
 
-    rows = load_rows(args.data, args.price_col, args.result_col, args.time_col)
-    print(f"loaded {len(rows)} resolved markets from {args.data}")
-    if len(rows) < 50:
-        print("  too few rows for a meaningful calibration — need hundreds+.")
-    # show the in-sample calibration table (diagnostic)
-    centers, rates, counts = fit_calibration([(p, y) for p, y, _ in rows], args.bins)
-    print("\ncalibration (all data) — price bin vs realized YES rate:")
-    print(f"  {'price':>6} {'realized':>9} {'gap(real-price)':>16} {'n':>6}")
-    for c, r, cnt in zip(centers, rates, counts):
-        print(f"  {c:>6.2f} {r:>9.3f} {r-c:>+16.3f} {cnt:>6}")
+    trade = load_rows(a.data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col)
+    print(f"loaded {len(trade)} resolved markets to TRADE from {a.data}")
+    if a.fit_data:
+        fit = load_rows(a.fit_data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col)
+        print(f"fitting calibration on {len(fit)} markets from {a.fit_data} (cross-venue)")
+        fit_rows, trade_rows = fit, trade
+        mode = f"fit={a.fit_data.name} → trade={a.data.name}"
+    else:
+        ordered = sorted(trade, key=lambda r: (r["time"] is None, r["time"]))
+        k = int(len(ordered) * a.split)
+        fit_rows, trade_rows = ordered[:k], ordered[k:]
+        mode = f"single-venue OOS (fit first {a.split:.0%}, trade rest)"
+        print(f"  {mode}: fit={len(fit_rows)} trade={len(trade_rows)}")
 
-    if args.sweep:
-        print(f"\nOUT-OF-SAMPLE backtest (fit on first {args.split:.0%}, trade the rest):")
+    # diagnostic calibration table on the fit set
+    c, r, cnt = fit_calibration([(x["price"], x["yes"]) for x in fit_rows], a.bins)
+    print("\ncalibration (fit set) — price bin vs realized YES rate:")
+    print(f"  {'price':>6} {'realized':>9} {'gap':>+8} {'n':>6}")
+    for cc, rr, nn in zip(c, r, cnt):
+        print(f"  {cc:>6.2f} {rr:>9.3f} {rr-cc:>+8.3f} {nn:>6}")
+
+    print(f"\nOUT-OF-SAMPLE backtest  [{mode}]  fills={a.fills}")
+    if a.sweep:
         print(f"  {'thr':>6} {'trades':>7} {'WR%':>6} {'net$':>9} {'EV$/ct':>8}")
         for thr in (0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20):
-            s = backtest_oos(rows, args.bins, thr, args.split)
-            print(f"  {thr:>6.2f} {s['n']:>7} {s['wr']*100:>5.1f} "
-                  f"{s['pnl']:>+9.2f} {s['ev']:>+8.4f}")
-        print("\n  Read the EV$/ct column: positive across thresholds = a real,"
-              "\n  out-of-sample calibration edge worth building a sleeve on."
-              "\n  Flat/negative = no edge; do NOT build the sleeve.")
+            s = backtest(fit_rows, trade_rows, a.bins, thr, a.fills)
+            print(f"  {thr:>6.2f} {s['n']:>7} {s['wr']*100:>5.1f} {s['pnl']:>+9.2f} {s['ev']:>+8.4f}")
+        print("\n  EV$/ct positive across thresholds = real edge worth building on."
+              "\n  Flat/negative = no edge; don't build.")
     else:
-        s = backtest_oos(rows, args.bins, args.thr, args.split)
-        print(f"\nOOS @ thr={args.thr}: {s}")
+        print("  ", backtest(fit_rows, trade_rows, a.bins, a.thr, a.fills))
 
 
 if __name__ == "__main__":
