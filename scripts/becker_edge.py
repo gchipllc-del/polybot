@@ -24,6 +24,11 @@ data) and TRADE/settle it on Kalshi outcomes:
   data (pos.) = where trades are placed + settled on REAL outcomes (e.g. your
                 Kalshi trials file).
 
+The fit file may use DIFFERENT column names than the trade file — override them
+with --fit-price-col/--fit-result-col/--fit-time-col/--fit-market-col (each
+falls back to the trade-side col). So a Polymarket pairs export keeps its own
+schema while the Kalshi trials keep theirs.
+
 If fitting on Polymarket and trading Kalshi turns a profit on real Kalshi
 outcomes, the bias transfers — a genuine, data-backed Kalshi edge.
 
@@ -42,9 +47,12 @@ USAGE
   # direct, on your Kalshi trials (no Becker needed):
   python scripts/becker_edge.py data/trials_daily.jsonl \\
       --price-col market_p_yes --result-col result --time-col sample_at --sweep
-  # repurpose: fit on Polymarket, trade Kalshi:
-  python scripts/becker_edge.py data/trials_daily.jsonl --fit-data poly_pairs.jsonl \\
-      --price-col market_p_yes --result-col result --sweep
+  # repurpose: fit on Polymarket, trade Kalshi (each file its own schema):
+  python scripts/becker_edge.py data/trials_daily.jsonl --fit-data data/poly_pairs.jsonl \\
+      --price-col market_p_yes --result-col result --time-col sample_at \\
+      --market-col market_ticker --dedup earliest \\
+      --fit-price-col price --fit-result-col result --fit-time-col time \\
+      --fit-market-col market --sweep
   # maker fills on Kalshi trials (needs yes_bid/no_bid columns):
   python scripts/becker_edge.py data/trials_daily.jsonl --price-col market_p_yes \\
       --result-col result --fills maker --yes-bid-col yes_bid --no-bid-col no_bid --sweep
@@ -221,6 +229,16 @@ def main() -> None:
                          "REQUIRED for per-sample inputs or the split leaks + outcomes double-count.")
     ap.add_argument("--dedup", choices=("earliest", "latest", "none"), default="earliest",
                     help="with --market-col: keep earliest (how live fires) or latest sample per market")
+    # Optional fit-file column overrides — let the --fit-data file (e.g. a
+    # Polymarket pairs export) use its OWN natural column names instead of being
+    # forced to match the trade file's schema. Each defaults to the trade-side
+    # column when omitted.
+    ap.add_argument("--fit-price-col", default=None)
+    ap.add_argument("--fit-result-col", default=None)
+    ap.add_argument("--fit-time-col", default=None)
+    ap.add_argument("--fit-yes-bid-col", default=None)
+    ap.add_argument("--fit-no-bid-col", default=None)
+    ap.add_argument("--fit-market-col", default=None)
     ap.add_argument("--bins", type=int, default=20)
     ap.add_argument("--split", type=float, default=0.6, help="train fraction (single-venue mode)")
     ap.add_argument("--thr", type=float, default=0.05)
@@ -240,8 +258,17 @@ def main() -> None:
               f"scanned many times),\n      the OOS split LEAKS and outcomes double-count — "
               f"pass --market-col market_ticker.")
     if a.fit_data:
-        fit = load_rows(a.fit_data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col, a.market_col)
-        if a.market_col:
+        # fit-side cols fall back to the trade-side cols when not overridden, so
+        # a same-schema fit file "just works" while a Polymarket export can keep
+        # its own column names via --fit-*-col.
+        fp = a.fit_price_col or a.price_col
+        fr = a.fit_result_col or a.result_col
+        ft = a.fit_time_col or a.time_col
+        fyb = a.fit_yes_bid_col or a.yes_bid_col
+        fnb = a.fit_no_bid_col or a.no_bid_col
+        fm = a.fit_market_col or a.market_col
+        fit = load_rows(a.fit_data, fp, fr, ft, fyb, fnb, fm)
+        if fm:
             fit = dedup_by_market(fit, a.dedup)
         print(f"fitting calibration on {len(fit)} markets from {a.fit_data} (cross-venue)")
         fit_rows, trade_rows = fit, trade
