@@ -69,6 +69,30 @@ BINANCE_US_TICKER = "https://api.binance.us/api/v3/ticker/price"
 BINANCE_US_KLINES = "https://api.binance.us/api/v3/klines"
 POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
 
+# Coinbase Exchange public market-data API (no key, no login). PRIMARY price
+# source as of 2026-06-06: Binance.US REST is geo-blocked from our host, which
+# left the crypto sleeves with no klines (btc_5min produced 0 trades, and the
+# 15-min sleeve's RSI/Greeks ran on stale/missing data). Coinbase is also a CF
+# Benchmarks RTI constituent, so it tracks Kalshi's settlement index closely.
+# Binance.US is kept as a fallback for hosts where it IS reachable.
+COINBASE_TICKER = "https://api.exchange.coinbase.com/products/{pid}/ticker"
+COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/{pid}/candles"
+_COINBASE_UA = {"User-Agent": "polybot-crypto-feed"}
+
+# Binance "BTCUSDT" → Coinbase "BTC-USD". Unmapped symbols fall back to
+# stripping a trailing USDT/USD and hyphenating against USD.
+_BINANCE_TO_COINBASE = {
+    "BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD",
+    "ADAUSDT": "ADA-USD", "XRPUSDT": "XRP-USD", "DOGEUSDT": "DOGE-USD",
+}
+
+
+def _coinbase_product(symbol: str) -> str:
+    if symbol in _BINANCE_TO_COINBASE:
+        return _BINANCE_TO_COINBASE[symbol]
+    base = symbol.upper().removesuffix("USDT").removesuffix("USD")
+    return f"{base}-USD"
+
 # Default annualized vol if caller doesn't specify. Per-asset overrides
 # come from config/kalshi_assets.yaml; this is the BTC fallback.
 DEFAULT_ANNUAL_VOL = 0.55
@@ -95,21 +119,71 @@ class FiveMinSample:
 
 # ── Discovery ────────────────────────────────────────────────────────
 
-def fetch_binance_btc_price(symbol: str = "BTCUSDT") -> float | None:
-    """Single REST poll. Returns spot in USD, or None on failure.
-
-    Default symbol is BTCUSDT for backward compat — every existing
-    caller wanted BTC. New callers (ETH/SOL on Kalshi) pass their own.
-    """
+def _fetch_coinbase_price(symbol: str) -> float | None:
+    """Spot from Coinbase Exchange public ticker. None on failure."""
     import requests
+    pid = _coinbase_product(symbol)
     try:
-        r = requests.get(
-            BINANCE_US_TICKER, params={"symbol": symbol}, timeout=8,
-        )
+        r = requests.get(COINBASE_TICKER.format(pid=pid),
+                         headers=_COINBASE_UA, timeout=8)
         r.raise_for_status()
         px = float(r.json()["price"])
-        # Reject a non-finite tick ('NaN'/'Infinity' parse straight through
-        # float()) at the source so it can't poison theo/composite downstream.
+        if not math.isfinite(px) or px <= 0:
+            return None
+        return px
+    except Exception as e:
+        log_event("crypto_feed", "coinbase_price_failed",
+                  {"pid": pid, "error": str(e)[:200]}, result="degraded")
+        return None
+
+
+def _fetch_coinbase_klines(symbol: str, limit: int) -> list[dict] | None:
+    """1-minute candles from Coinbase Exchange (granularity=60), normalized
+    to oldest→newest dicts matching the Binance shape. Coinbase returns
+    [time, low, high, open, close, volume] newest-first."""
+    import requests
+    pid = _coinbase_product(symbol)
+    try:
+        r = requests.get(COINBASE_CANDLES.format(pid=pid),
+                         params={"granularity": 60}, headers=_COINBASE_UA,
+                         timeout=10)
+        r.raise_for_status()
+        raw = r.json()
+    except Exception as e:
+        log_event("crypto_feed", "coinbase_klines_failed",
+                  {"pid": pid, "error": str(e)[:200]}, result="degraded")
+        return None
+    if not isinstance(raw, list) or not raw:
+        return None
+    rows = sorted(raw, key=lambda c: c[0])[-limit:]   # oldest→newest, last `limit`
+    out: list[dict] = []
+    for c in rows:
+        try:
+            out.append({
+                "open_time_ms": int(c[0]) * 1000,   # Coinbase time is seconds
+                "open": float(c[3]), "high": float(c[2]),
+                "low": float(c[1]), "close": float(c[4]),
+                "volume": float(c[5]),
+            })
+        except (ValueError, IndexError, TypeError):
+            continue
+    return out or None
+
+
+def fetch_binance_btc_price(symbol: str = "BTCUSDT") -> float | None:
+    """Spot in USD (name kept for back-compat across all crypto sleeves).
+
+    Coinbase Exchange is the PRIMARY source as of 2026-06-06; Binance.US is the
+    fallback for hosts where it's reachable. Returns None only if BOTH fail.
+    """
+    px = _fetch_coinbase_price(symbol)
+    if px is not None:
+        return px
+    import requests
+    try:
+        r = requests.get(BINANCE_US_TICKER, params={"symbol": symbol}, timeout=8)
+        r.raise_for_status()
+        px = float(r.json()["price"])
         if not math.isfinite(px) or px <= 0:
             log_event("btc_5min", "binance_bad_price",
                       {"symbol": symbol, "price": str(px)}, result="degraded")
@@ -117,8 +191,7 @@ def fetch_binance_btc_price(symbol: str = "BTCUSDT") -> float | None:
         return px
     except Exception as e:
         log_event("btc_5min", "binance_fetch_failed",
-                  {"symbol": symbol, "error": str(e)[:200]},
-                  result="degraded")
+                  {"symbol": symbol, "error": str(e)[:200]}, result="degraded")
         return None
 
 
@@ -127,12 +200,14 @@ def fetch_binance_klines(
     symbol: str = "BTCUSDT",
     limit: int = 50,
 ) -> list[dict] | None:
-    """Pull recent 1-minute candles for ``symbol`` from Binance.US.
+    """Recent 1-minute candles, oldest→newest (name kept for back-compat).
 
-    Returns oldest→newest list of dicts so indicators iterate forward
-    naturally. ``limit=50`` gives EMA21 ample headroom and RSI14 + 3-tick
-    momentum a clean tail. None on failure.
+    Coinbase Exchange PRIMARY; Binance.US fallback. ``limit=50`` gives EMA21
+    headroom and RSI14 a clean tail. None only if BOTH sources fail.
     """
+    kl = _fetch_coinbase_klines(symbol, limit)
+    if kl:
+        return kl
     import requests
     try:
         r = requests.get(
@@ -144,8 +219,7 @@ def fetch_binance_klines(
         raw = r.json()
     except Exception as e:
         log_event("btc_5min", "klines_fetch_failed",
-                  {"symbol": symbol, "error": str(e)[:200]},
-                  result="degraded")
+                  {"symbol": symbol, "error": str(e)[:200]}, result="degraded")
         return None
     out: list[dict] = []
     for row in raw:
