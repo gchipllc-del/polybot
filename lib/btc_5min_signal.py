@@ -93,6 +93,17 @@ def _coinbase_product(symbol: str) -> str:
     base = symbol.upper().removesuffix("USDT").removesuffix("USD")
     return f"{base}-USD"
 
+
+# RTI settlement-shadow: Kalshi settles crypto on a ~1-min average of CF
+# Benchmarks RTI. We approximate it with a trailing trimmed-mean of Coinbase
+# trades over the last 60s — a single REST call (no WebSocket), so it drops
+# straight into the one-shot cron. Pricing off this denoised, settlement-aligned
+# value beats a single instantaneous tick. Flip USE_RTI_PROXY to disable.
+COINBASE_TRADES = "https://api.exchange.coinbase.com/products/{pid}/trades"
+RTI_WINDOW_SECONDS = 60
+RTI_TRIM_FRACTION = 0.20
+USE_RTI_PROXY = True
+
 # Default annualized vol if caller doesn't specify. Per-asset overrides
 # come from config/kalshi_assets.yaml; this is the BTC fallback.
 DEFAULT_ANNUAL_VOL = 0.55
@@ -170,12 +181,63 @@ def _fetch_coinbase_klines(symbol: str, limit: int) -> list[dict] | None:
     return out or None
 
 
+def _trimmed_mean(values: list[float], trim: float) -> float | None:
+    """Mean after dropping the top & bottom ``trim`` fraction of samples."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    k = int(len(ordered) * trim)
+    core = ordered[k: len(ordered) - k] or ordered
+    return sum(core) / len(core)
+
+
+def fetch_coinbase_rti_proxy(
+    symbol: str = "BTCUSDT", *,
+    window_seconds: int = RTI_WINDOW_SECONDS,
+    trim_fraction: float = RTI_TRIM_FRACTION,
+) -> float | None:
+    """Settlement-aligned price: trailing trimmed-mean of Coinbase trades over
+    the last ``window_seconds``. Mirrors how Kalshi settles crypto (≈1-min RTI
+    average) in ONE REST call — no WebSocket, so it fits the one-shot cron.
+    Returns None on failure (caller falls back to a single tick)."""
+    import requests
+    pid = _coinbase_product(symbol)
+    try:
+        r = requests.get(COINBASE_TRADES.format(pid=pid),
+                         params={"limit": 400}, headers=_COINBASE_UA, timeout=8)
+        r.raise_for_status()
+        trades = r.json()
+    except Exception as e:
+        log_event("crypto_feed", "coinbase_rti_failed",
+                  {"pid": pid, "error": str(e)[:200]}, result="degraded")
+        return None
+    if not isinstance(trades, list) or not trades:
+        return None
+    cutoff = datetime.now(timezone.utc).timestamp() - window_seconds
+    prices: list[float] = []
+    for t in trades:
+        try:
+            ts = datetime.fromisoformat(
+                str(t["time"]).replace("Z", "+00:00")).timestamp()
+            if ts >= cutoff:
+                px = float(t["price"])
+                if math.isfinite(px) and px > 0:
+                    prices.append(px)
+        except (KeyError, ValueError, TypeError):
+            continue
+    return _trimmed_mean(prices, trim_fraction)
+
+
 def fetch_binance_btc_price(symbol: str = "BTCUSDT") -> float | None:
     """Spot in USD (name kept for back-compat across all crypto sleeves).
 
-    Coinbase Exchange is the PRIMARY source as of 2026-06-06; Binance.US is the
-    fallback for hosts where it's reachable. Returns None only if BOTH fail.
+    Priority: RTI 60s settlement-shadow (denoised, matches Kalshi settlement) →
+    single Coinbase tick → Binance.US. Returns None only if all fail.
     """
+    if USE_RTI_PROXY:
+        proxy = fetch_coinbase_rti_proxy(symbol)
+        if proxy is not None:
+            return proxy
     px = _fetch_coinbase_price(symbol)
     if px is not None:
         return px
