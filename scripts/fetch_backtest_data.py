@@ -150,31 +150,50 @@ def _iso(v) -> str | None:
 
 
 def _read_parquet_dir(path: Path, columns: list[str]) -> list[dict]:
-    """Read every .parquet under `path`, projecting `columns`. Returns dicts."""
-    try:
-        import pandas as pd
-    except ImportError:
-        print("  ! pandas/pyarrow required: pip install pandas pyarrow", file=sys.stderr)
-        return []
+    """Read every .parquet under `path`, projecting `columns`. Returns dicts.
+
+    Prefers pyarrow directly (avoids the pandas<->pyarrow version coupling that
+    breaks pandas.read_parquet when, e.g., pandas 3.x meets pyarrow 11). Falls
+    back to pandas only if pyarrow isn't importable.
+    """
     files = sorted(path.rglob("*.parquet"))
     if not files:
         print(f"  ! no parquet under {path}", file=sys.stderr)
         return []
+
+    # --- preferred path: pyarrow only ---
+    try:
+        import pyarrow.parquet as pq
+        rows: list[dict] = []
+        for fp in files:
+            try:
+                have = set(pq.ParquetFile(fp).schema.names)
+                cols = [c for c in columns if c in have] or None  # only existing
+                rows.extend(pq.read_table(fp, columns=cols).to_pylist())
+            except Exception as e:
+                print(f"  ! skip {fp.name}: {e}", file=sys.stderr)
+        return rows
+    except ImportError:
+        pass
+
+    # --- fallback: pandas ---
+    try:
+        import pandas as pd
+    except ImportError:
+        print("  ! need pyarrow (preferred) or pandas: pip install pyarrow", file=sys.stderr)
+        return []
     frames = []
     for fp in files:
         try:
-            df = pd.read_parquet(fp, columns=[c for c in columns])
-            frames.append(df)
+            frames.append(pd.read_parquet(fp, columns=[c for c in columns]))
         except Exception as e:
-            # Column set may vary per file; retry without projection.
             try:
                 frames.append(pd.read_parquet(fp))
             except Exception:
                 print(f"  ! skip {fp.name}: {e}", file=sys.stderr)
     if not frames:
         return []
-    df = pd.concat(frames, ignore_index=True)
-    return df.to_dict("records")
+    return pd.concat(frames, ignore_index=True).to_dict("records")
 
 
 def cmd_becker(args) -> None:
