@@ -187,7 +187,7 @@ def reset() -> dict:
 def record_paper_trades_from_samples(
     samples: list[dict] | list,
     *,
-    bankroll: float = DEFAULT_BANKROLL,
+    bankroll: float | None = None,
     risk_per_trade: float = DEFAULT_RISK_PER_TRADE,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     max_seconds_to_close: float = DEFAULT_MAX_SECONDS_TO_CLOSE,
@@ -201,9 +201,19 @@ def record_paper_trades_from_samples(
         already-resolved markets, and we wait until near close)
       * fill price inside extreme-price band
       * no existing open paper trade on the same market_id
+
+    ``bankroll`` defaults to the live account balance (mirrored via
+    account_balance.live_account_balance) so paper sizing tracks the real account.
     """
     if not samples:
         return []
+
+    if bankroll is None:
+        try:
+            from lib.account_balance import live_account_balance
+            bankroll = live_account_balance()
+        except Exception:
+            bankroll = DEFAULT_BANKROLL
 
     existing = _load_all()
     open_ids = {r.get("market_id") for r in existing

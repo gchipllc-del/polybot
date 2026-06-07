@@ -656,20 +656,17 @@ def api_kalshi_paper_summary():
     totals["roi_peak_pct"] = (round(totals["net_pnl"] / totals["peak_capital"] * 100, 1)
                               if totals["peak_capital"] else None)
 
-    # Paper bankroll: the same operator-set account size the paper sleeves now
-    # size off ($233), read live from config so it tracks the real account.
+    # Paper bankroll mirrors the LIVE Kalshi account: signed balance when
+    # available, else the operator-set config value, else a hard default.
     # Portfolio value = bankroll + realized paper P&L, so the tile shows the
-    # $233 base and how paper trading has moved it.
-    paper_bankroll = 233.0
+    # mirrored base and how paper trading has moved it.
     try:
-        import yaml
-        cfg = yaml.safe_load((root / "config" / "settings.yaml").read_text()) or {}
-        fb = (cfg.get("kalshi_daily_live", {}) or {}).get("account_balance_fallback")
-        if fb is not None:
-            paper_bankroll = float(fb)
+        from lib.account_balance import balance_with_source
+        paper_bankroll, bankroll_source = balance_with_source()
     except Exception:
-        pass
+        paper_bankroll, bankroll_source = 233.0, "default"
     totals["bankroll"] = round(paper_bankroll, 2)
+    totals["bankroll_source"] = bankroll_source
     totals["portfolio_value"] = round(paper_bankroll + totals["net_pnl"], 2)
     return jsonify({
         "as_of": datetime.now(timezone.utc).isoformat(),

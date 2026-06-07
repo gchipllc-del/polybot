@@ -66,19 +66,21 @@ KALSHI_PROFIT_FEE = 0.07
 MIN_SECONDS_TO_CLOSE = 600
 
 
-def reset_paper(log_path: Path | None = None) -> dict:
-    """Zero the DAILY-weather paper P&L. This sleeve is paper-only, but the
-    reset still PRESERVES any is_live=true rows (defensive — mirrors the hourly
-    reset) so it can never destroy a real fill if one ever lands here.
+def reset_paper(log_path: Path | None = None, include_live: bool = False) -> dict:
+    """Zero the DAILY-weather paper ledger. This sleeve is paper-only, but the
+    reset is defensive and mirrors the hourly one:
 
-    Archives the full ledger to a timestamped .bak.jsonl (reversible), then
-    rewrites it keeping only is_live=true rows (typically none → empty file).
+    Default (``include_live=False``): clears paper rows, preserves any
+    is_live=true rows (typically none). ``include_live=True`` clears everything
+    for a clean-slate model test. The full ledger is archived first (reversible).
     """
     path = Path(log_path) if log_path else PAPER_LOG
+    empty = {"cleared_paper_trades": 0, "cleared_paper_pnl": 0.0,
+             "cleared_live_trades": 0, "cleared_live_pnl": 0.0,
+             "kept_live_trades": 0, "kept_live_pnl": 0.0,
+             "archived_to": None, "ledger": str(path)}
     if not path.exists():
-        return {"cleared_paper_trades": 0, "cleared_paper_pnl": 0.0,
-                "kept_live_trades": 0, "kept_live_pnl": 0.0,
-                "archived_to": None, "ledger": str(path)}
+        return empty
 
     rows: list[dict] = []
     with open(path) as f:
@@ -93,15 +95,15 @@ def reset_paper(log_path: Path | None = None) -> dict:
 
     live = [r for r in rows if bool(r.get("is_live"))]
     paper = [r for r in rows if not bool(r.get("is_live"))]
-    cleared_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in paper)
-    kept_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in live)
+    paper_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in paper)
+    live_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in live)
 
-    # Nothing to clear → no-op. Don't archive/rewrite (avoids piling up
-    # redundant .bak files on repeated runs of an already-clean ledger).
-    if not paper:
-        return {"cleared_paper_trades": 0, "cleared_paper_pnl": 0.0,
-                "kept_live_trades": len(live), "kept_live_pnl": round(kept_pnl, 2),
-                "archived_to": None, "ledger": str(path)}
+    keep = [] if include_live else live
+    to_clear = rows if include_live else paper
+
+    if not to_clear:
+        return {**empty, "kept_live_trades": len(live),
+                "kept_live_pnl": round(live_pnl, 2), "ledger": str(path)}
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     archive = path.with_name(f"{path.stem}.{stamp}.bak.jsonl")
@@ -109,16 +111,18 @@ def reset_paper(log_path: Path | None = None) -> dict:
 
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w") as f:
-        for r in live:
+        for r in keep:
             f.write(json.dumps(r) + "\n")
     tmp.replace(path)
 
     return {
         "cleared_paper_trades": len(paper),
-        "cleared_paper_pnl": round(cleared_pnl, 2),
-        "kept_live_trades": len(live),
-        "kept_live_pnl": round(kept_pnl, 2),
-        "archived_to": str(archive) if archive else None,
+        "cleared_paper_pnl": round(paper_pnl, 2),
+        "cleared_live_trades": len(live) if include_live else 0,
+        "cleared_live_pnl": round(live_pnl, 2) if include_live else 0.0,
+        "kept_live_trades": 0 if include_live else len(live),
+        "kept_live_pnl": 0.0 if include_live else round(live_pnl, 2),
+        "archived_to": str(archive),
         "ledger": str(path),
     }
 
@@ -263,6 +267,13 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
     params = _effective_params()
     new_trades: list[DailyWeatherPaperTrade] = []
     skip_counts: dict[str, int] = {}
+    # Paper bankroll mirrors the live account (signed balance → config → default),
+    # resolved once per cycle so paper sizing tracks the real account size.
+    try:
+        from lib.account_balance import live_account_balance
+        eff_bankroll = live_account_balance()
+    except Exception:
+        eff_bankroll = DEFAULT_BANKROLL
     # Live execution per-cycle state (#160). committed_* stop over-deploy before
     # Kalshi's balance/positions lag catches up; balance is fetched at most once.
     committed_in_cycle = 0.0
@@ -368,7 +379,7 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
             continue
 
         notional, meta = _kelly_size(
-            p_win=p_win, fill=fill, bankroll=DEFAULT_BANKROLL,
+            p_win=p_win, fill=fill, bankroll=eff_bankroll,
             multiplier=params["kelly_multiplier"],
             floor=DEFAULT_MIN_TRADE_USD, cap=params["max_trade_usd"],
         )

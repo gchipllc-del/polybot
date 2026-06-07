@@ -694,12 +694,16 @@ function renderKalshiPaperSummary(d) {
     // portfolio value (bankroll + realized paper P&L) so you can see it move.
     const bank = (t.bankroll != null) ? t.bankroll : null;
     const pv = (t.portfolio_value != null) ? t.portfolio_value : null;
+    const src = t.bankroll_source;
+    const srcLabel = src === 'live' ? 'mirrors live account'
+                   : src === 'config' ? 'mirrors live (config)'
+                   : 'default';
     const bankHtml = (bank == null) ? '' : `
       <div class="stat" style="min-width:170px;border-left:2px solid #30363d;padding-left:20px;margin-left:8px">
         <div class="label">Paper Bankroll</div>
         <div class="value" style="font-size:1.8em">$${fmt(bank)}</div>
         <div style="font-size:11px;color:#8b949e;margin-top:2px">
-          portfolio ${pv != null ? `<span class="${pnlClass(pv - bank)}">$${fmt(pv)}</span>` : '—'}
+          ${srcLabel} · portfolio ${pv != null ? `<span class="${pnlClass(pv - bank)}">$${fmt(pv)}</span>` : '—'}
         </div>
       </div>`;
     const totalHtml = `

@@ -118,7 +118,7 @@ def reset() -> dict:
 def record_paper_trades_from_signals(
     signals: list[dict] | list,
     *,
-    bankroll: float = DEFAULT_BANKROLL,
+    bankroll: float | None = None,
     risk_per_trade: float = DEFAULT_RISK_PER_TRADE,
     min_gap: float = DEFAULT_MIN_GAP,
 ) -> list[BtcArbPaperTrade]:
@@ -129,10 +129,18 @@ def record_paper_trades_from_signals(
     if ``gap < 0`` (NO looks cheap), buy NO at price ``1 - yes_price``.
 
     Sizing: notional capital = ``bankroll * risk_per_trade``.
-    Contract count = notional / fill_price.
+    Contract count = notional / fill_price. ``bankroll`` defaults to the live
+    account balance (mirrored) so paper sizing tracks the real account.
     """
     if not signals:
         return []
+
+    if bankroll is None:
+        try:
+            from lib.account_balance import live_account_balance
+            bankroll = live_account_balance()
+        except Exception:
+            bankroll = DEFAULT_BANKROLL
 
     existing = _load_all()
     # Dedup keys: open market_ids (no need to re-enter on a still-open trade)
