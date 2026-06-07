@@ -196,6 +196,63 @@ def _read_parquet_dir(path: Path, columns: list[str]) -> list[dict]:
     return pd.concat(frames, ignore_index=True).to_dict("records")
 
 
+def _iter_parquet_dir(path: Path, columns: list[str]):
+    """Stream row dicts from every .parquet under `path`, file-by-file in
+    batches — bounded memory even for tens of millions of rows. Pyarrow
+    preferred; falls back to materializing via _read_parquet_dir."""
+    files = sorted(path.rglob("*.parquet"))
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        for r in _read_parquet_dir(path, columns):
+            yield r
+        return
+    for fp in files:
+        try:
+            have = set(pq.ParquetFile(fp).schema.names)
+            cols = [c for c in columns if c in have] or None
+            for batch in pq.ParquetFile(fp).iter_batches(columns=cols, batch_size=65536):
+                for r in batch.to_pylist():
+                    yield r
+        except Exception as e:
+            print(f"  ! skip {fp.name}: {e}", file=sys.stderr)
+
+
+def fold_earliest(trade_iter, settled: dict) -> dict:
+    """Stream trades → keep only the EARLIEST priced trade per settled market
+    (becker_edge dedups to earliest anyway, so this collapses tens of millions
+    of trades to one row per market at bounded memory). Returns {ticker: row}.
+
+    `settled` maps ticker -> {result, is_weather, title, event_ticker, yes_sub_title}.
+    """
+    earliest: dict = {}
+    for t in trade_iter:
+        tk = t.get("ticker")
+        meta = settled.get(tk)
+        if not meta:
+            continue
+        try:
+            price = float(t.get("yes_price")) / 100.0
+        except (TypeError, ValueError):
+            continue
+        if not (0.0 < price < 1.0):
+            continue
+        sample_at = _iso(t.get("created_time"))
+        key = sample_at or "~"  # None sorts last (ASCII '~' > digits/'T')
+        cur = earliest.get(tk)
+        if cur is None or key < cur[0]:
+            earliest[tk] = (key, {
+                "market_ticker": tk,
+                "market_p_yes": round(price, 4),
+                "result": meta["result"],
+                "sample_at": sample_at,
+                "title": meta.get("title", ""),
+                "event_ticker": meta.get("event_ticker", ""),
+                "yes_sub_title": meta.get("yes_sub_title", ""),
+            })
+    return earliest
+
+
 def cmd_becker(args) -> None:
     repo = Path(args.becker_path).expanduser()
     kalshi_dir = repo / "data" / "kalshi"
@@ -208,15 +265,29 @@ def cmd_becker(args) -> None:
         print(f"(See {BECKER_REPO} for the full dataset / Polymarket too.)")
         print("Then re-run:  python scripts/fetch_backtest_data.py becker")
         return
-    print(f"Reading Becker parquet from {kalshi_dir} …")
-    markets = _read_parquet_dir(kalshi_dir / "markets",
-                                ["ticker", "result", "title", "event_ticker",
-                                 "yes_sub_title"])
-    trades = _read_parquet_dir(kalshi_dir / "trades",
-                               ["ticker", "yes_price", "created_time"])
-    print(f"  loaded {len(markets)} market rows, {len(trades)} trade rows")
-    all_rows = normalize_kalshi(trades, markets, weather_only=False)
-    wx_rows = normalize_kalshi(trades, markets, weather_only=True)
+    print(f"Indexing settled Kalshi markets from {kalshi_dir} …")
+    settled: dict = {}
+    for m in _iter_parquet_dir(kalshi_dir / "markets",
+                               ["ticker", "result", "title", "event_ticker",
+                                "yes_sub_title"]):
+        res = str(m.get("result", "") or "").lower()
+        tk = m.get("ticker")
+        if res not in ("yes", "no") or not tk:
+            continue
+        ev = m.get("event_ticker", "")
+        settled[tk] = {"result": res, "is_weather": _is_weather(tk, ev),
+                       "title": m.get("title", ""), "event_ticker": ev,
+                       "yes_sub_title": m.get("yes_sub_title", "")}
+    print(f"  {len(settled)} settled markets")
+
+    print("  streaming trades, keeping earliest priced trade per market …")
+    earliest = fold_earliest(
+        _iter_parquet_dir(kalshi_dir / "trades",
+                          ["ticker", "yes_price", "created_time"]),
+        settled)
+    all_rows = [row for _, row in earliest.values()]
+    wx_rows = [row for tk, (_, row) in earliest.items()
+               if settled[tk]["is_weather"]]
     _write_jsonl(OUT_DIR / "becker_kalshi_all.jsonl", all_rows)
     _write_jsonl(OUT_DIR / "becker_kalshi_weather.jsonl", wx_rows)
     print(f"  -> {len(all_rows)} rows  data/backtest/becker_kalshi_all.jsonl")
