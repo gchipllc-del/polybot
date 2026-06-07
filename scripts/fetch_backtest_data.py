@@ -93,10 +93,13 @@ def _cities() -> dict:
 
 
 def _is_weather(ticker: str, event: str = "") -> bool:
-    s = f"{ticker} {event}".upper()
-    if "MOV" in s:   # KXHIGHMOVKH / KXHIGHMOVDJT etc. — political, not weather
+    # Match the weather SERIES prefix across both ticker eras: current KX* form
+    # (KXHIGH/KXLOW/KXTEMP) and the older no-KX form (HIGH*/LOW*). Excludes the
+    # KXHIGHMOV* / HIGHMOV* political "highest-grossing" markets.
+    series = (ticker or "").split("-")[0].upper()
+    if "MOV" in series:
         return False
-    return any(p in s for p in WEATHER_PREFIXES)
+    return series.startswith(("KXHIGH", "KXLOW", "KXTEMP", "HIGH", "LOW"))
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:

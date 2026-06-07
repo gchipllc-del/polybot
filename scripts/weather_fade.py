@@ -129,13 +129,50 @@ WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN"
                   "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU"]
 
 
+def parse_orderbook(orderbook: dict) -> tuple:
+    """Derive (yes_price_mid, no_ask) in 0-1 from a Kalshi orderbook.
+
+    Kalshi books are two lists of resting BIDS, in cents:
+      orderbook["yes"] = bids to buy YES,  orderbook["no"] = bids to buy NO.
+    Lifting the other side gives the asks:
+      yes_ask = 100 − best_no_bid   (buy YES = sell NO to the top NO bid)
+      no_ask  = 100 − best_yes_bid  (buy NO  = sell YES to the top YES bid)
+    Returns (None, None) when a side is missing.
+    """
+    def _best(levels):
+        best = None
+        for lvl in levels or []:
+            try:
+                p = lvl[0] if isinstance(lvl, (list, tuple)) else lvl.get("price")
+            except Exception:
+                continue
+            if p is not None and (best is None or p > best):
+                best = p
+        return best
+    yes_bid_c = _best(orderbook.get("yes"))
+    no_bid_c = _best(orderbook.get("no"))
+    yb = yes_bid_c / 100.0 if yes_bid_c is not None else None
+    ya = (100 - no_bid_c) / 100.0 if no_bid_c is not None else None
+    no_ask = (100 - yes_bid_c) / 100.0 if yes_bid_c is not None else None
+    if yb is not None and ya is not None:
+        yes_price = (yb + ya) / 2.0
+    else:
+        yes_price = yb if yb is not None else ya
+    return (round(yes_price, 4) if yes_price is not None else None,
+            round(no_ask, 4) if no_ask is not None else None)
+
+
 def _open_weather_quotes(series_list) -> list[dict]:
-    """Pull OPEN weather markets and turn each into a quote dict. Reuses
-    fetch_backtest_data._kalshi_get (signed client → public fallback)."""
+    """Day-ahead OPEN weather markets with REAL order-book quotes. The /markets
+    snapshot returns null bid/ask for weather, so we list markets there but read
+    prices from the authoritative /markets/{ticker}/orderbook endpoint."""
+    import time
     sys.path.insert(0, str(ROOT / "scripts"))
     from fetch_backtest_data import _kalshi_get
     now = datetime.now(timezone.utc)
-    quotes = []
+
+    # 1) list open markets, keep only the day-ahead window (limits orderbook calls)
+    candidates = []
     for series in series_list:
         cursor = None
         for _ in range(20):
@@ -151,21 +188,24 @@ def _open_weather_quotes(series_list) -> list[dict]:
                         hrs = (datetime.fromisoformat(str(ct).replace("Z", "+00:00")) - now).total_seconds() / 3600.0
                     except Exception:
                         hrs = None
-                ya, na = m.get("yes_ask"), m.get("no_ask")
-                yb = m.get("yes_bid")
-                # market YES estimate = mid of yes bid/ask (cents → 0-1)
-                yp = None
-                if ya is not None and yb is not None:
-                    yp = ((ya + yb) / 2) / 100.0
-                quotes.append({
-                    "ticker": m.get("ticker"), "event_ticker": m.get("event_ticker", ""),
-                    "yes_price": yp,
-                    "no_ask": (na / 100.0) if na is not None else None,
-                    "close_ts": ct, "hours_to_close": hrs,
-                })
+                if hrs is not None and MIN_HOURS_TO_CLOSE <= hrs <= MAX_HOURS_TO_CLOSE:
+                    candidates.append({"ticker": m.get("ticker"),
+                                       "event_ticker": m.get("event_ticker", ""),
+                                       "close_ts": ct, "hours_to_close": hrs})
             cursor = data.get("cursor")
             if not cursor:
                 break
+
+    # 2) read the real book for each (rate-limited)
+    quotes = []
+    for c in candidates:
+        try:
+            ob = _kalshi_get(f"/markets/{c['ticker']}/orderbook", {}).get("orderbook") or {}
+        except Exception:
+            ob = {}
+        yp, na = parse_orderbook(ob)
+        quotes.append({**c, "yes_price": yp, "no_ask": na})
+        time.sleep(0.1)
     return quotes
 
 
