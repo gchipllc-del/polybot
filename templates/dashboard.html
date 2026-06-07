@@ -248,6 +248,9 @@ function setOpenTotalBadge(elId, trades, qtyField) {
 // Each renderXXX call pushes its slice via updateBankrollSlice; the
 // helper aggregates and updates both badges.
 const __bankroll = {live: null, btc_paper: null, weather_paper: null};
+// Mirrored live-account bankroll, replicated into each section's stat block.
+// Populated by renderKalshiPaperSummary each poll; {value, source} or null.
+let __paperBankroll = null;
 function updateBankrollSlice(slot, trades, qtyField) {
     __bankroll[slot] = {
         n: (trades || []).length,
@@ -695,6 +698,8 @@ function renderKalshiPaperSummary(d) {
     const bank = (t.bankroll != null) ? t.bankroll : null;
     const pv = (t.portfolio_value != null) ? t.portfolio_value : null;
     const src = t.bankroll_source;
+    // Share the mirrored bankroll with the per-section stat blocks (BTC/weather).
+    __paperBankroll = (bank != null) ? {value: bank, source: src} : null;
     const srcLabel = src === 'live' ? 'mirrors live account'
                    : src === 'config' ? 'mirrors live (config)'
                    : 'default';
@@ -734,6 +739,24 @@ function renderSectionStats(hostId, counts) {
     const roiPeak = counts.roi_peak_pct;
     const roiInv  = counts.roi_invested_pct;
     const wr = counts.wr_pct;
+    // Replicated bankroll tile: the live-mirrored account size, with this
+    // section's own portfolio value (bankroll + this sleeve's paper P&L).
+    let bankTile = '';
+    if (__paperBankroll && __paperBankroll.value != null) {
+        const b = __paperBankroll.value;
+        const sec_pv = b + (pnl || 0);
+        const srcLabel = __paperBankroll.source === 'live' ? 'mirrors live account'
+                       : __paperBankroll.source === 'config' ? 'mirrors live (config)'
+                       : 'default';
+        bankTile = `
+      <div class="stat" style="min-width:160px">
+        <div class="label">Bankroll</div>
+        <div class="value" style="font-size:1.6em">$${fmt(b)}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:2px">
+          ${srcLabel} · portfolio <span class="${pnlClass(sec_pv - b)}">$${fmt(sec_pv)}</span>
+        </div>
+      </div>`;
+    }
     host.innerHTML = `
       <div class="stat" style="min-width:160px">
         <div class="label">Paper P&L</div>
@@ -742,6 +765,7 @@ function renderSectionStats(hostId, counts) {
           ${counts.open} open · ${counts.closed_total} closed · ${counts.won}W/${counts.lost}L${wr != null ? ` (${wr.toFixed(0)}%)` : ''}
         </div>
       </div>
+      ${bankTile}
       <div class="stat" style="min-width:160px">
         <div class="label">Peak Capital at Risk</div>
         <div class="value" style="font-size:1.6em">$${fmt(counts.peak_capital)}</div>
