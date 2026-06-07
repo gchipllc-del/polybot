@@ -62,6 +62,19 @@ def _cities() -> dict:
             "lax":     {"series": "KXTEMPLAXH", "lat": 33.9425, "lon": -118.4081, "label": "LA (LAX)", "scope": "hourly"},
             "miami":   {"series": "KXTEMPMIAH", "lat": 25.7959, "lon": -80.2870, "label": "Miami (Intl)", "scope": "hourly"},
         })
+    # Historical Becker weather series (older KXHIGH* high-temp form, 8 cities).
+    # Keys match join_weather_trials.SERIES_CITY so the forecast-skill join lines
+    # up. Coords are the station Kalshi resolved each city on.
+    cities.update({
+        "aus_high":  {"series": "KXHIGHAUS",  "direction": "max", "lat": 30.3208, "lon": -97.7597, "label": "Austin Max", "scope": "daily"},
+        "chi_high":  {"series": "KXHIGHCHI",  "direction": "max", "lat": 41.9742, "lon": -87.9073, "label": "Chicago Max", "scope": "daily"},
+        "ny_high":   {"series": "KXHIGHNY",   "direction": "max", "lat": 40.7831, "lon": -73.9712, "label": "NYC Max", "scope": "daily"},
+        "den_high":  {"series": "KXHIGHDEN",  "direction": "max", "lat": 39.8561, "lon": -104.6737, "label": "Denver Max", "scope": "daily"},
+        "mia_high":  {"series": "KXHIGHMIA",  "direction": "max", "lat": 25.7959, "lon": -80.2870, "label": "Miami Max", "scope": "daily"},
+        "phil_high": {"series": "KXHIGHPHIL", "direction": "max", "lat": 39.8729, "lon": -75.2437, "label": "Philadelphia Max", "scope": "daily"},
+        "lax_high":  {"series": "KXHIGHLAX",  "direction": "max", "lat": 33.9425, "lon": -118.4081, "label": "LA Max", "scope": "daily"},
+        "hou_high":  {"series": "KXHIGHHOU",  "direction": "max", "lat": 29.9902, "lon": -95.3368, "label": "Houston Max", "scope": "daily"},
+    })
     try:
         from lib.weather_daily_signal import DAILY_CITIES as DAILY
         cities.update({k: {**v, "scope": "daily"} for k, v in DAILY.items()})
@@ -81,6 +94,8 @@ def _cities() -> dict:
 
 def _is_weather(ticker: str, event: str = "") -> bool:
     s = f"{ticker} {event}".upper()
+    if "MOV" in s:   # KXHIGHMOVKH / KXHIGHMOVDJT etc. — political, not weather
+        return False
     return any(p in s for p in WEATHER_PREFIXES)
 
 
@@ -218,14 +233,18 @@ def _iter_parquet_dir(path: Path, columns: list[str]):
             print(f"  ! skip {fp.name}: {e}", file=sys.stderr)
 
 
-def fold_earliest(trade_iter, settled: dict) -> dict:
-    """Stream trades → keep only the EARLIEST priced trade per settled market
-    (becker_edge dedups to earliest anyway, so this collapses tens of millions
-    of trades to one row per market at bounded memory). Returns {ticker: row}.
+def fold_trades(trade_iter, settled: dict, entry: str = "earliest") -> dict:
+    """Stream trades → keep the earliest and/or latest priced trade per settled
+    market (bounded memory). `entry` selects what's emitted:
+      earliest : first priced trade   (entry at market open)
+      latest   : last priced trade    (entry near settlement)
+      both     : both rows per market, so becker_edge --dedup earliest/latest
+                 actually differ — the entry-realism test.
+    Returns {ticker: [row, ...]}.
 
     `settled` maps ticker -> {result, is_weather, title, event_ticker, yes_sub_title}.
     """
-    earliest: dict = {}
+    acc: dict = {}  # ticker -> {"e": (key,row), "l": (key,row)}
     for t in trade_iter:
         tk = t.get("ticker")
         meta = settled.get(tk)
@@ -238,19 +257,43 @@ def fold_earliest(trade_iter, settled: dict) -> dict:
         if not (0.0 < price < 1.0):
             continue
         sample_at = _iso(t.get("created_time"))
-        key = sample_at or "~"  # None sorts last (ASCII '~' > digits/'T')
-        cur = earliest.get(tk)
-        if cur is None or key < cur[0]:
-            earliest[tk] = (key, {
-                "market_ticker": tk,
-                "market_p_yes": round(price, 4),
-                "result": meta["result"],
-                "sample_at": sample_at,
-                "title": meta.get("title", ""),
-                "event_ticker": meta.get("event_ticker", ""),
-                "yes_sub_title": meta.get("yes_sub_title", ""),
-            })
-    return earliest
+        ek = sample_at or "~"   # None sorts LAST  → loses "earliest"
+        lk = sample_at or ""    # None sorts FIRST → loses "latest"
+        row = {
+            "market_ticker": tk,
+            "market_p_yes": round(price, 4),
+            "result": meta["result"],
+            "sample_at": sample_at,
+            "title": meta.get("title", ""),
+            "event_ticker": meta.get("event_ticker", ""),
+            "yes_sub_title": meta.get("yes_sub_title", ""),
+        }
+        a = acc.get(tk)
+        if a is None:
+            acc[tk] = {"e": (ek, row), "l": (lk, row)}
+        else:
+            if ek < a["e"][0]:
+                a["e"] = (ek, row)
+            if lk > a["l"][0]:
+                a["l"] = (lk, row)
+    out: dict = {}
+    for tk, a in acc.items():
+        if entry == "latest":
+            out[tk] = [a["l"][1]]
+        elif entry == "both":
+            e_row, l_row = a["e"][1], a["l"][1]
+            out[tk] = [e_row] if e_row is l_row else [e_row, l_row]
+        else:  # earliest (default)
+            out[tk] = [a["e"][1]]
+    return out
+
+
+# Back-compat alias: earlier callers/tests used fold_earliest.
+def fold_earliest(trade_iter, settled: dict) -> dict:
+    return {tk: (rows[0]["sample_at"] or "~", rows[0])
+            for tk, rows in fold_trades(trade_iter, settled, "earliest").items()}
+
+
 
 
 def cmd_becker(args) -> None:
@@ -280,14 +323,15 @@ def cmd_becker(args) -> None:
                        "yes_sub_title": m.get("yes_sub_title", "")}
     print(f"  {len(settled)} settled markets")
 
-    print("  streaming trades, keeping earliest priced trade per market …")
-    earliest = fold_earliest(
+    entry = getattr(args, "entry", "earliest")
+    print(f"  streaming trades, keeping {entry} priced trade(s) per market …")
+    folded = fold_trades(
         _iter_parquet_dir(kalshi_dir / "trades",
                           ["ticker", "yes_price", "created_time"]),
-        settled)
-    all_rows = [row for _, row in earliest.values()]
-    wx_rows = [row for tk, (_, row) in earliest.items()
-               if settled[tk]["is_weather"]]
+        settled, entry=entry)
+    all_rows = [row for rows in folded.values() for row in rows]
+    wx_rows = [row for tk, rows in folded.items()
+               if settled[tk]["is_weather"] for row in rows]
     _write_jsonl(OUT_DIR / "becker_kalshi_all.jsonl", all_rows)
     _write_jsonl(OUT_DIR / "becker_kalshi_weather.jsonl", wx_rows)
     print(f"  -> {len(all_rows)} rows  data/backtest/becker_kalshi_all.jsonl")
@@ -504,9 +548,16 @@ def daily_extremes_from_hourly(hourly: dict, direction: str = "both") -> dict:
 
 def fetch_openmeteo(args) -> list[dict]:
     import requests
+    from datetime import date as _date
     cities = _cities()
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=args.days)
+    # Explicit --start/--end win (for matching historical Becker market dates);
+    # else fall back to the rolling --days window ending today.
+    if getattr(args, "start", None) and getattr(args, "end", None):
+        start = _date.fromisoformat(args.start)
+        end = _date.fromisoformat(args.end)
+    else:
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=args.days)
     rows = []
     for key, c in cities.items():
         common = {
@@ -566,6 +617,11 @@ def main() -> None:
     ap.add_argument("--becker-path", default="~/becker",
                     help="dir containing the extracted Becker data/kalshi/ "
                          "(default ~/becker)")
+    ap.add_argument("--entry", choices=["earliest", "latest", "both"],
+                    default="earliest",
+                    help="becker: which trade to keep per market — earliest "
+                         "(open), latest (near settlement), or both (so "
+                         "becker_edge --dedup earliest/latest test entry realism)")
     ap.add_argument("--series", default=None,
                     help="kalshi: limit to one series_ticker (e.g. KXHIGHTDAL)")
     ap.add_argument("--max-markets", type=int, default=5000,
@@ -577,7 +633,12 @@ def main() -> None:
     ap.add_argument("--rate-sleep", type=float, default=0.25,
                     help="kalshi-candles: seconds to sleep between API calls (default 0.25)")
     ap.add_argument("--days", type=int, default=120,
-                    help="openmeteo: lookback window in days (default 120)")
+                    help="openmeteo: rolling lookback window in days (default 120)")
+    ap.add_argument("--start", default=None,
+                    help="openmeteo: explicit start date YYYY-MM-DD (overrides --days; "
+                         "e.g. 2024-10-01 to match historical Becker markets)")
+    ap.add_argument("--end", default=None,
+                    help="openmeteo: explicit end date YYYY-MM-DD (use with --start)")
     args = ap.parse_args()
 
     if args.source in ("becker", "all"):

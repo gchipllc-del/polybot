@@ -48,6 +48,12 @@ SERIES_CITY = {
     "KXHIGHTATL": ("atl_high", "max"), "KXHIGHTSEA": ("sea_high", "max"),
     "KXLOWTCHI": ("chi_low", "min"), "KXLOWTDEN": ("den_low", "min"),
     "KXLOWTDC": ("dc_low", "min"), "KXLOWTLAX": ("lax_low", "min"),
+    # Historical Becker high-temp series (older KXHIGH* form, 8 cities). Keys
+    # match fetch_backtest_data._cities() so weather_truth lines up.
+    "KXHIGHAUS": ("aus_high", "max"), "KXHIGHCHI": ("chi_high", "max"),
+    "KXHIGHNY": ("ny_high", "max"), "KXHIGHDEN": ("den_high", "max"),
+    "KXHIGHMIA": ("mia_high", "max"), "KXHIGHPHIL": ("phil_high", "max"),
+    "KXHIGHLAX": ("lax_high", "max"), "KXHIGHHOU": ("hou_high", "max"),
 }
 
 
