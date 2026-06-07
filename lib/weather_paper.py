@@ -72,11 +72,16 @@ def reset_paper(log_path: Path | None = None) -> dict:
     cleared_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in paper)
     kept_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in live)
 
-    archive = None
-    if path.stat().st_size > 0:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        archive = path.with_name(f"{path.stem}.{stamp}.bak.jsonl")
-        path.replace(archive)
+    # Nothing to clear → no-op. Don't archive/rewrite (avoids piling up
+    # redundant .bak files on repeated runs of an already-clean ledger).
+    if not paper:
+        return {"cleared_paper_trades": 0, "cleared_paper_pnl": 0.0,
+                "kept_live_trades": len(live), "kept_live_pnl": round(kept_pnl, 2),
+                "archived_to": None, "ledger": str(path)}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = path.with_name(f"{path.stem}.{stamp}.bak.jsonl")
+    path.replace(archive)
 
     # Rewrite with ONLY the preserved live rows (empty file if there were none).
     tmp = path.with_suffix(".tmp")

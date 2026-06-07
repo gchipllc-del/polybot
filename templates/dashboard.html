@@ -690,6 +690,18 @@ function renderKalshiPaperSummary(d) {
     }).join('');
     const t = d.totals;
     const tWR = t.wr_pct != null ? `${t.wr_pct.toFixed(0)}%` : '—';
+    // Paper bankroll tile: the $233 base the paper sleeves size off, plus the
+    // portfolio value (bankroll + realized paper P&L) so you can see it move.
+    const bank = (t.bankroll != null) ? t.bankroll : null;
+    const pv = (t.portfolio_value != null) ? t.portfolio_value : null;
+    const bankHtml = (bank == null) ? '' : `
+      <div class="stat" style="min-width:170px;border-left:2px solid #30363d;padding-left:20px;margin-left:8px">
+        <div class="label">Paper Bankroll</div>
+        <div class="value" style="font-size:1.8em">$${fmt(bank)}</div>
+        <div style="font-size:11px;color:#8b949e;margin-top:2px">
+          portfolio ${pv != null ? `<span class="${pnlClass(pv - bank)}">$${fmt(pv)}</span>` : '—'}
+        </div>
+      </div>`;
     const totalHtml = `
       <div class="stat" style="min-width:200px;border-left:2px solid #30363d;padding-left:20px;margin-left:8px">
         <div class="label">All Kalshi Paper</div>
@@ -698,7 +710,7 @@ function renderKalshiPaperSummary(d) {
           ${t.total} total · ${t.open} open · ${t.won}W/${t.lost}L (${tWR})
         </div>
       </div>`;
-    host.innerHTML = stratHtml + totalHtml;
+    host.innerHTML = stratHtml + bankHtml + totalHtml;
 }
 
 function fmtSecsToHMS(s) {
