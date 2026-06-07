@@ -176,13 +176,16 @@ def _read_parquet_dir(path: Path, columns: list[str]) -> list[dict]:
 
 
 def cmd_becker(args) -> None:
-    repo = Path(args.becker_path).expanduser() if args.becker_path else (ROOT / "vendor" / "prediction-market-analysis")
+    repo = Path(args.becker_path).expanduser()
     kalshi_dir = repo / "data" / "kalshi"
     if not (kalshi_dir / "markets").exists() or not (kalshi_dir / "trades").exists():
-        print("Becker dataset not found. One-time download (run on your machine):\n")
-        print(f"  git clone {BECKER_REPO} {repo}")
-        print(f"  cd {repo} && uv sync && make setup    # ~36 GiB from s3.jbecker.dev\n")
-        print(f"Then re-run:  python scripts/fetch_backtest_data.py becker --becker-path {repo}")
+        print(f"Becker Kalshi data not found under {kalshi_dir}.")
+        print("One-time KALSHI-ONLY extract (downloads 33.5 GiB, writes only Kalshi):\n")
+        print(f"  brew install zstd")
+        print(f"  mkdir -p {repo} && cd {repo}")
+        print(f"  curl -L https://s3.jbecker.dev/data.tar.zst | zstd -dc --long=31 | tar -x 'data/kalshi/*'\n")
+        print(f"(See {BECKER_REPO} for the full dataset / Polymarket too.)")
+        print("Then re-run:  python scripts/fetch_backtest_data.py becker")
         return
     print(f"Reading Becker parquet from {kalshi_dir} …")
     markets = _read_parquet_dir(kalshi_dir / "markets",
@@ -348,8 +351,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("source", choices=["becker", "kalshi", "openmeteo", "all"])
-    ap.add_argument("--becker-path", default=None,
-                    help="path to a cloned jon-becker/prediction-market-analysis")
+    ap.add_argument("--becker-path", default="~/becker",
+                    help="dir containing the extracted Becker data/kalshi/ "
+                         "(default ~/becker)")
     ap.add_argument("--series", default=None,
                     help="kalshi: limit to one series_ticker (e.g. KXHIGHTDAL)")
     ap.add_argument("--max-markets", type=int, default=5000,
