@@ -17,7 +17,7 @@ composite has edge BEFORE Phase 3 risks real USDC.
 
 **No real orders. Pure measurement.**
 
-Risk controls (paper bankroll defaults to $1000):
+Risk controls (paper bankroll defaults to $143 — mirrors the live account):
   * Risk per trade: 1.0% of bankroll
   * Daily limit:    2.0% (recorded; doesn't halt — Phase 3 will halt)
   * Hard stop:      0.4%
@@ -42,7 +42,8 @@ from tradingcore.audit import log_event
 
 PAPER_PATH = Path(__file__).parent.parent / "data" / "btc_5min_paper.jsonl"
 
-DEFAULT_BANKROLL = 1000.0
+# Mirrors the live Kalshi account so paper sizing matches real-money sizing.
+DEFAULT_BANKROLL = 143.0
 DEFAULT_RISK_PER_TRADE = 0.01           # 1% — now used as soft-cap
                                         # input to Kelly, not flat
 DEFAULT_MIN_CONFIDENCE = 0.30           # |composite|/max ≥ 0.30
@@ -150,12 +151,43 @@ def _save_all(rows: list[dict]) -> None:
     tmp.replace(PAPER_PATH)
 
 
+def reset() -> dict:
+    """Zero the BTC 5-min paper ledger. The existing file is ARCHIVED to a
+    timestamped sibling first (reversible — nothing is destroyed), then the
+    live ledger is emptied so P&L / trade counts start fresh at zero.
+
+    Returns a summary of what was cleared. Does NOT touch any live position or
+    the btc_arb sleeve — only this paper ledger.
+    """
+    from datetime import datetime, timezone
+    rows = _load_all()
+    cleared = len(rows)
+    net = 0.0
+    for r in rows:
+        v = r.get("paper_pnl", r.get("net_profit"))
+        if isinstance(v, (int, float)):
+            net += float(v)
+    archive = None
+    if PAPER_PATH.exists() and PAPER_PATH.stat().st_size > 0:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive = PAPER_PATH.with_name(f"{PAPER_PATH.stem}.{stamp}.bak.jsonl")
+        PAPER_PATH.replace(archive)
+    # Recreate an empty ledger so downstream readers find a clean file.
+    _save_all([])
+    return {
+        "cleared_trades": cleared,
+        "cleared_net_pnl": round(net, 2),
+        "archived_to": str(archive) if archive else None,
+        "ledger": str(PAPER_PATH),
+    }
+
+
 # ── Recording ────────────────────────────────────────────────────────
 
 def record_paper_trades_from_samples(
     samples: list[dict] | list,
     *,
-    bankroll: float = DEFAULT_BANKROLL,
+    bankroll: float | None = None,
     risk_per_trade: float = DEFAULT_RISK_PER_TRADE,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     max_seconds_to_close: float = DEFAULT_MAX_SECONDS_TO_CLOSE,
@@ -169,9 +201,19 @@ def record_paper_trades_from_samples(
         already-resolved markets, and we wait until near close)
       * fill price inside extreme-price band
       * no existing open paper trade on the same market_id
+
+    ``bankroll`` defaults to the live account balance (mirrored via
+    account_balance.live_account_balance) so paper sizing tracks the real account.
     """
     if not samples:
         return []
+
+    if bankroll is None:
+        try:
+            from lib.account_balance import live_account_balance
+            bankroll = live_account_balance()
+        except Exception:
+            bankroll = DEFAULT_BANKROLL
 
     existing = _load_all()
     open_ids = {r.get("market_id") for r in existing

@@ -30,7 +30,8 @@ STRATEGY_PATH = Path(os.environ.get("WEATHER_STRATEGY_PATH") or (ROOT / "config"
 # what the global live config says. Default off → live sleeve unaffected.
 _PAPER_ONLY = os.environ.get("WEATHER_PAPER_ONLY") == "1"
 
-DEFAULT_BANKROLL = 1000.0
+# Mirrors the live Kalshi account so paper sizing matches real-money sizing.
+DEFAULT_BANKROLL = 143.0
 DEFAULT_MIN_TRADE_USD = 1.0
 DEFAULT_MAX_TRADE_USD = 5.0
 DEFAULT_KELLY_MULTIPLIER = 0.5
@@ -39,6 +40,75 @@ MAX_FILL_FOR_BUY = 0.45
 EXTREME_PRICE_FLOOR = 0.05
 EXTREME_PRICE_CEIL = 0.95
 KALSHI_PROFIT_FEE = 0.07
+
+def reset_paper(log_path: Path | None = None, include_live: bool = False) -> dict:
+    """Zero the weather paper ledger.
+
+    Default (``include_live=False``): clears only PAPER rows and PRESERVES the
+    real-money (is_live=true) rows that share this file — the dashboard paper
+    P&L drops to $0 while live history is untouched.
+
+    ``include_live=True``: clears EVERYTHING (paper + live) for a true clean
+    slate — e.g. to start a fresh model test from zero. The live rows are real
+    trade records, so this is opt-in only.
+
+    Either way the FULL current ledger is archived to a timestamped .bak.jsonl
+    first (reversible — nothing is destroyed).
+    """
+    path = Path(log_path) if log_path else PAPER_LOG
+    empty = {"cleared_paper_trades": 0, "cleared_paper_pnl": 0.0,
+             "cleared_live_trades": 0, "cleared_live_pnl": 0.0,
+             "kept_live_trades": 0, "kept_live_pnl": 0.0,
+             "archived_to": None, "ledger": str(path)}
+    if not path.exists():
+        return empty
+
+    rows: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    live = [r for r in rows if bool(r.get("is_live"))]
+    paper = [r for r in rows if not bool(r.get("is_live"))]
+    paper_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in paper)
+    live_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in live)
+
+    keep = [] if include_live else live
+    to_clear = rows if include_live else paper
+
+    # Nothing to clear → no-op. Don't archive/rewrite (avoids piling up
+    # redundant .bak files on repeated runs of an already-clean ledger).
+    if not to_clear:
+        return {**empty, "kept_live_trades": len(live),
+                "kept_live_pnl": round(live_pnl, 2), "ledger": str(path)}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = path.with_name(f"{path.stem}.{stamp}.bak.jsonl")
+    path.replace(archive)
+
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        for r in keep:
+            f.write(json.dumps(r) + "\n")
+    tmp.replace(path)
+
+    return {
+        "cleared_paper_trades": len(paper),
+        "cleared_paper_pnl": round(paper_pnl, 2),
+        "cleared_live_trades": len(live) if include_live else 0,
+        "cleared_live_pnl": round(live_pnl, 2) if include_live else 0.0,
+        "kept_live_trades": 0 if include_live else len(live),
+        "kept_live_pnl": 0.0 if include_live else round(live_pnl, 2),
+        "archived_to": str(archive),
+        "ledger": str(path),
+    }
+
 
 # ── LIVE-ONLY trend-aware veto (2026-06-02, the "cheap-NO gauge") ────────────
 # The bot's live weather entries are gated on the obs-anchored nws_p_yes, which
@@ -255,6 +325,13 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
     eff_max_fill = params["max_fill_for_buy"]
     eff_max_usd  = params["max_trade_usd"]
     eff_kelly    = params["kelly_multiplier"]
+    # Paper bankroll mirrors the live account (signed balance → config → default).
+    # Resolved once per cycle so paper sizing tracks the real account size.
+    try:
+        from lib.account_balance import live_account_balance
+        eff_bankroll = live_account_balance()
+    except Exception:
+        eff_bankroll = DEFAULT_BANKROLL
 
     # Running total of notional committed to live orders within this scan
     # cycle. Mirrors kalshi_daily_paper's balance-race fix — Kalshi balance
@@ -368,7 +445,7 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
         # only the losers. Leave sizing full; the realized-trend discriminator
         # (logged in the signal shadow) is the only path to a selective fix.
         notional, meta = _kelly_size(
-            p_win=p_win, fill=fill_paper, bankroll=DEFAULT_BANKROLL,
+            p_win=p_win, fill=fill_paper, bankroll=eff_bankroll,
             multiplier=eff_kelly,
             floor=DEFAULT_MIN_TRADE_USD, cap=eff_max_usd,
         )

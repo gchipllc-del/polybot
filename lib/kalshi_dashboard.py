@@ -235,24 +235,47 @@ def _paper_payload() -> dict:
     }
 
 
+def _balance_fallback() -> float | None:
+    """Operator-known live balance from config, used ONLY when the signed
+    balance call is unavailable so the dashboard shows the real account size
+    instead of a blank. Read live each call so editing settings.yaml takes
+    effect without a restart."""
+    try:
+        import yaml
+        cfg = yaml.safe_load((ROOT / "config" / "settings.yaml").read_text()) or {}
+        fb = (cfg.get("kalshi_daily_live", {}) or {}).get("account_balance_fallback")
+        return round(float(fb), 2) if fb is not None else None
+    except Exception:
+        return None
+
+
 def _account_payload() -> dict:
     """Kalshi balance + auth status. Public-facing; returns clean dict
-    even when auth isn't configured.
+    even when auth isn't configured. Prefers the live signed balance; falls
+    back to the operator-set config value (flagged) so the real account size
+    is always shown.
     """
     from lib.kalshi_auth import can_sign, signed_get, status as auth_status
 
-    base = {"auth": auth_status(), "balance_dollars": None, "error": None}
+    base = {"auth": auth_status(), "balance_dollars": None,
+            "balance_is_fallback": False, "error": None}
     if not can_sign():
         base["error"] = "auth not configured (run kalshi-auth-status)"
-        return base
-    try:
-        data = signed_get("/portfolio/balance")
-        # Kalshi returns cents; convert
-        cents = data.get("balance", 0)
-        base["balance_dollars"] = round(cents / 100.0, 2)
-        base["portfolio_value"] = data.get("portfolio_value")
-    except Exception as e:
-        base["error"] = str(e)[:200]
+    else:
+        try:
+            data = signed_get("/portfolio/balance")
+            # Kalshi returns cents; convert
+            cents = data.get("balance", 0)
+            base["balance_dollars"] = round(cents / 100.0, 2)
+            base["portfolio_value"] = data.get("portfolio_value")
+        except Exception as e:
+            base["error"] = str(e)[:200]
+    # Live read failed/unavailable → show the operator-known balance, flagged.
+    if base["balance_dollars"] is None:
+        fb = _balance_fallback()
+        if fb is not None:
+            base["balance_dollars"] = fb
+            base["balance_is_fallback"] = True
     return base
 
 
@@ -531,8 +554,10 @@ async function refresh() {
     // Account
     const acc = data.account || {};
     const bal = acc.balance_dollars;
+    const balLabel = acc.balance_is_fallback ? 'live account (config)' : 'live account balance';
     const accHtml = bal !== null && bal !== undefined
-      ? '<div class="bigstat"><span class="v">$' + bal.toFixed(2) + '</span><span class="k">balance</span></div>' +
+      ? '<div class="bigstat"><span class="v">$' + bal.toFixed(2) + '</span><span class="k">' + balLabel + '</span></div>' +
+        (acc.balance_is_fallback ? '<div class="yellow tiny">fallback: signed balance unavailable — showing config value</div>' : '') +
         (acc.error ? '<div class="red tiny">' + acc.error + '</div>' : '')
       : '<div class="red">' + (acc.error || 'no balance') + '</div>';
     document.getElementById('account').innerHTML = accHtml;

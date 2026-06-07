@@ -37,6 +37,9 @@ Usage:
     python main.py btc-5min-monitor       # Sample 5-min BTC UP/DOWN markets (Gravia-style)
     python main.py btc-5min-paper-settle  # Settle resolved 5-min paper trades
     python main.py btc-5min-paper-report  # Aggregate 5-min paper P&L + confidence-bucket WR
+    python main.py btc-paper-reset        # Zero ALL BTC paper ledgers (5min + arb; archives old)
+    python main.py weather-paper-reset    # Zero weather PAPER P&L (hourly+daily); keeps live rows
+    python main.py weather-paper-reset --all  # Clean slate: also clears live rows (archived)
     python main.py dataset-status         # Check Jon-Becker parquet dataset availability
     python main.py kalshi-auth-status     # Verify Kalshi RSA-PSS auth wiring
     python main.py kalshi-test-auth       # Make one signed call (/portfolio/balance) to prove it works
@@ -1356,6 +1359,59 @@ def cmd_btc_5min_paper_report():
             print(f"    {day}: ${s['per_day_pnl'][day]:+,.2f}")
 
 
+def cmd_btc_paper_reset():
+    """Reset ALL BTC paper ledgers to zero (5-min + arb) — fresh start.
+
+    Each ledger is archived to a timestamped .bak.jsonl first (reversible),
+    then emptied so P&L / trade counts begin again at zero. Does NOT touch any
+    live position.
+    """
+    from lib.btc_5min_paper import reset as reset_5min
+    from lib.btc_arb_paper import reset as reset_arb
+    print("=== BTC paper RESET (all sleeves) ===")
+    for label, fn in (("btc_5min", reset_5min), ("btc_arb", reset_arb)):
+        r = fn()
+        print(f"  [{label}] cleared {r['cleared_trades']} trades "
+              f"(net paper P&L was ${r['cleared_net_pnl']:+,.2f}).")
+        if r["archived_to"]:
+            print(f"           archived -> {r['archived_to']}")
+        else:
+            print("           nothing to archive (already empty).")
+        print(f"           zeroed: {r['ledger']}")
+
+
+def cmd_weather_paper_reset(include_live: bool = False):
+    """Reset weather paper P&L to zero (hourly + daily) — fresh start.
+
+    Default: the hourly ledger mixes paper at-bats with REAL live fills
+    (is_live=true) in the same file, so this preserves the live rows and clears
+    only the paper ones.
+
+    With ``--all``: also clears the live rows for a true clean slate (e.g. to
+    start a fresh model test from zero). Live rows are real trade records, so
+    this is opt-in. Either way the full ledger is archived first (reversible).
+    """
+    from lib.weather_paper import reset_paper as reset_hourly
+    from lib.weather_daily_paper import reset_paper as reset_daily
+    mode = "ALL rows incl. live" if include_live else "paper P&L only; live rows preserved"
+    print(f"=== Weather paper RESET ({mode}) ===")
+    for label, fn in (("weather_hourly", reset_hourly), ("weather_daily", reset_daily)):
+        r = fn(include_live=include_live)
+        print(f"  [{label}] cleared {r['cleared_paper_trades']} paper trades "
+              f"(paper P&L was ${r['cleared_paper_pnl']:+,.2f}).")
+        if include_live and r.get("cleared_live_trades"):
+            print(f"           CLEARED {r['cleared_live_trades']} live rows "
+                  f"(real P&L ${r['cleared_live_pnl']:+,.2f}) — archived, reversible.")
+        elif r["kept_live_trades"]:
+            print(f"           PRESERVED {r['kept_live_trades']} live rows "
+                  f"(real P&L ${r['kept_live_pnl']:+,.2f}) — untouched.")
+        if r["archived_to"]:
+            print(f"           archived -> {r['archived_to']}")
+        else:
+            print("           nothing to archive (already empty / missing).")
+        print(f"           ledger: {r['ledger']}")
+
+
 def cmd_btc_arb_paper_settle():
     """Phase 2 — settle open BTC arb paper trades against actual
     market outcomes. Run periodically (manually or cron) so the report
@@ -1875,6 +1931,11 @@ def main():
         cmd_btc_5min_paper_settle()
     elif command == "btc-5min-paper-report":
         cmd_btc_5min_paper_report()
+    elif command in ("btc-paper-reset", "btc-5min-paper-reset"):
+        cmd_btc_paper_reset()
+    elif command == "weather-paper-reset":
+        _wx_all = "--all" in sys.argv[2:] or "--include-live" in sys.argv[2:]
+        cmd_weather_paper_reset(include_live=_wx_all)
     elif command == "kalshi-15min-monitor":
         max_sec = 900
         for arg in sys.argv[2:]:

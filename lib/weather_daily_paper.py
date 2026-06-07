@@ -30,7 +30,8 @@ PAPER_LOG = ROOT / "data" / "weather_daily_paper.jsonl"
 STRATEGY_PATH = ROOT / "config" / "weather_daily_strategy.yaml"
 
 # ── Conservative defaults for the pilot ───────────────────────────────
-DEFAULT_BANKROLL = 1000.0
+# Mirrors the live Kalshi account so paper sizing matches real-money sizing.
+DEFAULT_BANKROLL = 143.0
 DEFAULT_MIN_TRADE_USD = 1.0
 DEFAULT_MAX_TRADE_USD = 5.0           # smaller than hourly ($7.5) — longer hold
 DEFAULT_KELLY_MULTIPLIER = 0.25       # quarter-Kelly
@@ -63,6 +64,67 @@ KALSHI_PROFIT_FEE = 0.07
 # Daily markets open ~24-30h pre-close, so this only blocks the closed/closing
 # tail — never the normal trading window (winners historically led 7-28h).
 MIN_SECONDS_TO_CLOSE = 600
+
+
+def reset_paper(log_path: Path | None = None, include_live: bool = False) -> dict:
+    """Zero the DAILY-weather paper ledger. This sleeve is paper-only, but the
+    reset is defensive and mirrors the hourly one:
+
+    Default (``include_live=False``): clears paper rows, preserves any
+    is_live=true rows (typically none). ``include_live=True`` clears everything
+    for a clean-slate model test. The full ledger is archived first (reversible).
+    """
+    path = Path(log_path) if log_path else PAPER_LOG
+    empty = {"cleared_paper_trades": 0, "cleared_paper_pnl": 0.0,
+             "cleared_live_trades": 0, "cleared_live_pnl": 0.0,
+             "kept_live_trades": 0, "kept_live_pnl": 0.0,
+             "archived_to": None, "ledger": str(path)}
+    if not path.exists():
+        return empty
+
+    rows: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    live = [r for r in rows if bool(r.get("is_live"))]
+    paper = [r for r in rows if not bool(r.get("is_live"))]
+    paper_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in paper)
+    live_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in live)
+
+    keep = [] if include_live else live
+    to_clear = rows if include_live else paper
+
+    if not to_clear:
+        return {**empty, "kept_live_trades": len(live),
+                "kept_live_pnl": round(live_pnl, 2), "ledger": str(path)}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = path.with_name(f"{path.stem}.{stamp}.bak.jsonl")
+    path.replace(archive)
+
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        for r in keep:
+            f.write(json.dumps(r) + "\n")
+    tmp.replace(path)
+
+    return {
+        "cleared_paper_trades": len(paper),
+        "cleared_paper_pnl": round(paper_pnl, 2),
+        "cleared_live_trades": len(live) if include_live else 0,
+        "cleared_live_pnl": round(live_pnl, 2) if include_live else 0.0,
+        "kept_live_trades": 0 if include_live else len(live),
+        "kept_live_pnl": 0.0 if include_live else round(live_pnl, 2),
+        "archived_to": str(archive),
+        "ledger": str(path),
+    }
 
 
 def _load_overrides() -> dict:
@@ -205,6 +267,13 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
     params = _effective_params()
     new_trades: list[DailyWeatherPaperTrade] = []
     skip_counts: dict[str, int] = {}
+    # Paper bankroll mirrors the live account (signed balance → config → default),
+    # resolved once per cycle so paper sizing tracks the real account size.
+    try:
+        from lib.account_balance import live_account_balance
+        eff_bankroll = live_account_balance()
+    except Exception:
+        eff_bankroll = DEFAULT_BANKROLL
     # Live execution per-cycle state (#160). committed_* stop over-deploy before
     # Kalshi's balance/positions lag catches up; balance is fetched at most once.
     committed_in_cycle = 0.0
@@ -310,7 +379,7 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[DailyWeatherPa
             continue
 
         notional, meta = _kelly_size(
-            p_win=p_win, fill=fill, bankroll=DEFAULT_BANKROLL,
+            p_win=p_win, fill=fill, bankroll=eff_bankroll,
             multiplier=params["kelly_multiplier"],
             floor=DEFAULT_MIN_TRADE_USD, cap=params["max_trade_usd"],
         )

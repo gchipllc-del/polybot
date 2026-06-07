@@ -17,7 +17,7 @@ Risk controls from Gravia (translated to our paper bankroll):
   * Min gap to fire: 3% (only trade when our model says
                           the quote is materially off)
 
-Paper bankroll defaults to \$1000 so the math is intuitive.
+Paper bankroll defaults to \$143 — mirrors the live Kalshi account.
 
 Dedup: at most ONE open paper trade per ``market_id`` at a time. The
 signal cycle can fire the same gap repeatedly; we only record once.
@@ -35,7 +35,8 @@ from tradingcore.audit import log_event
 PAPER_PATH = Path(__file__).parent.parent / "data" / "btc_arb_paper.jsonl"
 
 # Defaults — tuneable by callers / future Hermes pass.
-DEFAULT_BANKROLL = 1000.0
+# Mirrors the live Kalshi account so paper sizing matches real-money sizing.
+DEFAULT_BANKROLL = 143.0
 DEFAULT_RISK_PER_TRADE = 0.005      # 0.5%
 DEFAULT_DAILY_LIMIT = 0.02          # 2%
 DEFAULT_HARD_STOP = 0.004           # 0.4%
@@ -94,10 +95,30 @@ def _save_all(rows: list[dict]) -> None:
     tmp.replace(PAPER_PATH)
 
 
+def reset() -> dict:
+    """Zero the BTC arb paper ledger. Archives the current file to a timestamped
+    .bak.jsonl first (reversible), then empties it so P&L starts fresh at zero."""
+    rows = _load_all()
+    cleared = len(rows)
+    net = sum(float(r.get("paper_pnl", 0) or 0) for r in rows)
+    archive = None
+    if PAPER_PATH.exists() and PAPER_PATH.stat().st_size > 0:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive = PAPER_PATH.with_name(f"{PAPER_PATH.stem}.{stamp}.bak.jsonl")
+        PAPER_PATH.replace(archive)
+    _save_all([])
+    return {
+        "cleared_trades": cleared,
+        "cleared_net_pnl": round(net, 2),
+        "archived_to": str(archive) if archive else None,
+        "ledger": str(PAPER_PATH),
+    }
+
+
 def record_paper_trades_from_signals(
     signals: list[dict] | list,
     *,
-    bankroll: float = DEFAULT_BANKROLL,
+    bankroll: float | None = None,
     risk_per_trade: float = DEFAULT_RISK_PER_TRADE,
     min_gap: float = DEFAULT_MIN_GAP,
 ) -> list[BtcArbPaperTrade]:
@@ -108,10 +129,18 @@ def record_paper_trades_from_signals(
     if ``gap < 0`` (NO looks cheap), buy NO at price ``1 - yes_price``.
 
     Sizing: notional capital = ``bankroll * risk_per_trade``.
-    Contract count = notional / fill_price.
+    Contract count = notional / fill_price. ``bankroll`` defaults to the live
+    account balance (mirrored) so paper sizing tracks the real account.
     """
     if not signals:
         return []
+
+    if bankroll is None:
+        try:
+            from lib.account_balance import live_account_balance
+            bankroll = live_account_balance()
+        except Exception:
+            bankroll = DEFAULT_BANKROLL
 
     existing = _load_all()
     # Dedup keys: open market_ids (no need to re-enter on a still-open trade)

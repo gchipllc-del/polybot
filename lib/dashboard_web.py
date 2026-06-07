@@ -655,6 +655,19 @@ def api_kalshi_paper_summary():
                                   if totals["total_invested"] else None)
     totals["roi_peak_pct"] = (round(totals["net_pnl"] / totals["peak_capital"] * 100, 1)
                               if totals["peak_capital"] else None)
+
+    # Paper bankroll mirrors the LIVE Kalshi account: signed balance when
+    # available, else the operator-set config value, else a hard default.
+    # Portfolio value = bankroll + realized paper P&L, so the tile shows the
+    # mirrored base and how paper trading has moved it.
+    try:
+        from lib.account_balance import balance_with_source
+        paper_bankroll, bankroll_source = balance_with_source()
+    except Exception:
+        paper_bankroll, bankroll_source = 143.0, "default"
+    totals["bankroll"] = round(paper_bankroll, 2)
+    totals["bankroll_source"] = bankroll_source
+    totals["portfolio_value"] = round(paper_bankroll + totals["net_pnl"], 2)
     return jsonify({
         "as_of": datetime.now(timezone.utc).isoformat(),
         "strategies": strategies,
