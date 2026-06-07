@@ -201,6 +201,30 @@ def cmd_scan(args) -> None:
     # day-ahead window only (the edge is at open, not near close)
     day_ahead = [q for q in quotes if q.get("hours_to_close") is not None
                  and MIN_HOURS_TO_CLOSE <= q["hours_to_close"] <= MAX_HOURS_TO_CLOSE]
+
+    # Diagnostic: show the live edge for EVERY day-ahead market (not just
+    # qualifiers), so you can see the distribution and whether the calibration
+    # maps sanely onto live mid prices.
+    if getattr(args, "show", False):
+        rows = []
+        for q in day_ahead:
+            yp, na = q.get("yes_price"), q.get("no_ask")
+            if not isinstance(yp, (int, float)):
+                continue
+            fair = _fair(float(yp), centers, rates)
+            rows.append((fair - yp, yp, na, fair, q.get("ticker")))
+        rows.sort()  # most-overpriced YES (most negative edge) first
+        would = sum(1 for r in rows if r[0] <= -args.thr
+                    and isinstance(r[2], (int, float)) and FILL_FLOOR <= r[1] <= FILL_CEIL)
+        print(f"--- live edges, {len(rows)} day-ahead markets "
+              f"({would} clear thr {args.thr} in band {FILL_FLOOR}-{FILL_CEIL}) ---")
+        print(f"  {'ticker':26} {'yes':>5} {'no_ask':>6} {'fair':>5} {'edge':>7}")
+        for edge, yp, na, fair, tk in rows[:25]:
+            flag = "  FADE" if (edge <= -args.thr and isinstance(na, (int, float))
+                                and FILL_FLOOR <= yp <= FILL_CEIL) else ""
+            nas = f"{na:.2f}" if isinstance(na, (int, float)) else "  -"
+            print(f"  {str(tk)[:26]:26} {yp:>5.2f} {nas:>6} {fair:>5.2f} {edge:>+7.3f}{flag}")
+
     open_tickers = {r["ticker"] for r in _load_ledger() if r.get("status") == "open"}
     decisions = decide_batch(day_ahead, centers, rates, thr=args.thr,
                              bankroll=args.bankroll)
@@ -281,6 +305,9 @@ def main() -> None:
     ap.add_argument("--bins", type=int, default=20)
     ap.add_argument("--thr", type=float, default=DEFAULT_THR)
     ap.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL)
+    ap.add_argument("--show", action="store_true",
+                    help="scan: print the live edge for every day-ahead market "
+                         "(diagnose firing rate + calibration-vs-live mapping)")
     args = ap.parse_args()
     {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report}[args.cmd](args)
 
