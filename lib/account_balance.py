@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Final fallback if both the signed call and config are unavailable. Matches the
 # account size at the time the mirror was introduced.
-HARD_DEFAULT = 233.0
+HARD_DEFAULT = 143.0
 
 
 def config_balance() -> float | None:

@@ -17,7 +17,7 @@ Risk controls from Gravia (translated to our paper bankroll):
   * Min gap to fire: 3% (only trade when our model says
                           the quote is materially off)
 
-Paper bankroll defaults to \$233 — mirrors the live Kalshi account.
+Paper bankroll defaults to \$143 — mirrors the live Kalshi account.
 
 Dedup: at most ONE open paper trade per ``market_id`` at a time. The
 signal cycle can fire the same gap repeatedly; we only record once.
@@ -36,7 +36,7 @@ PAPER_PATH = Path(__file__).parent.parent / "data" / "btc_arb_paper.jsonl"
 
 # Defaults — tuneable by callers / future Hermes pass.
 # Mirrors the live Kalshi account so paper sizing matches real-money sizing.
-DEFAULT_BANKROLL = 233.0
+DEFAULT_BANKROLL = 143.0
 DEFAULT_RISK_PER_TRADE = 0.005      # 0.5%
 DEFAULT_DAILY_LIMIT = 0.02          # 2%
 DEFAULT_HARD_STOP = 0.004           # 0.4%

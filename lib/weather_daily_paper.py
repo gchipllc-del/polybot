@@ -31,7 +31,7 @@ STRATEGY_PATH = ROOT / "config" / "weather_daily_strategy.yaml"
 
 # ── Conservative defaults for the pilot ───────────────────────────────
 # Mirrors the live Kalshi account so paper sizing matches real-money sizing.
-DEFAULT_BANKROLL = 233.0
+DEFAULT_BANKROLL = 143.0
 DEFAULT_MIN_TRADE_USD = 1.0
 DEFAULT_MAX_TRADE_USD = 5.0           # smaller than hourly ($7.5) — longer hold
 DEFAULT_KELLY_MULTIPLIER = 0.25       # quarter-Kelly

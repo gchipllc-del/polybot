@@ -200,8 +200,8 @@ kalshi_daily_live:
   # live via the signed /portfolio/balance call; this value is only a labeled
   # FALLBACK shown when that call is unavailable (auth/network), so the
   # dashboard never displays a blank where the account size should be. Keep it
-  # roughly in sync with the real account. 2026-06-06: $233.
-  account_balance_fallback: 233.00
+  # roughly in sync with the real account. 2026-06-07: $143 (funds transferred out).
+  account_balance_fallback: 143.00
   cooldown_minutes: 30
   cooldown_loss_count: 3
   cooldown_window_min: 60

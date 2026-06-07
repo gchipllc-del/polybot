@@ -664,7 +664,7 @@ def api_kalshi_paper_summary():
         from lib.account_balance import balance_with_source
         paper_bankroll, bankroll_source = balance_with_source()
     except Exception:
-        paper_bankroll, bankroll_source = 233.0, "default"
+        paper_bankroll, bankroll_source = 143.0, "default"
     totals["bankroll"] = round(paper_bankroll, 2)
     totals["bankroll_source"] = bankroll_source
     totals["portfolio_value"] = round(paper_bankroll + totals["net_pnl"], 2)

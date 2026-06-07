@@ -17,7 +17,7 @@ composite has edge BEFORE Phase 3 risks real USDC.
 
 **No real orders. Pure measurement.**
 
-Risk controls (paper bankroll defaults to $233 — mirrors the live account):
+Risk controls (paper bankroll defaults to $143 — mirrors the live account):
   * Risk per trade: 1.0% of bankroll
   * Daily limit:    2.0% (recorded; doesn't halt — Phase 3 will halt)
   * Hard stop:      0.4%
@@ -43,7 +43,7 @@ from tradingcore.audit import log_event
 PAPER_PATH = Path(__file__).parent.parent / "data" / "btc_5min_paper.jsonl"
 
 # Mirrors the live Kalshi account so paper sizing matches real-money sizing.
-DEFAULT_BANKROLL = 233.0
+DEFAULT_BANKROLL = 143.0
 DEFAULT_RISK_PER_TRADE = 0.01           # 1% — now used as soft-cap
                                         # input to Kelly, not flat
 DEFAULT_MIN_CONFIDENCE = 0.30           # |composite|/max ≥ 0.30

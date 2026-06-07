@@ -31,7 +31,7 @@ STRATEGY_PATH = Path(os.environ.get("WEATHER_STRATEGY_PATH") or (ROOT / "config"
 _PAPER_ONLY = os.environ.get("WEATHER_PAPER_ONLY") == "1"
 
 # Mirrors the live Kalshi account so paper sizing matches real-money sizing.
-DEFAULT_BANKROLL = 233.0
+DEFAULT_BANKROLL = 143.0
 DEFAULT_MIN_TRADE_USD = 1.0
 DEFAULT_MAX_TRADE_USD = 5.0
 DEFAULT_KELLY_MULTIPLIER = 0.5
