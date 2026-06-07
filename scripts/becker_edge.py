@@ -244,6 +244,9 @@ def main() -> None:
     ap.add_argument("--thr", type=float, default=0.05)
     ap.add_argument("--fills", choices=("taker", "maker"), default="taker")
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--inspect", action="store_true",
+                    help="dump every OOS trade at --thr (market, price, fair, edge, side, won, pnl) "
+                         "to see if the edge is broad or carried by a few lucky markets")
     a = ap.parse_args()
 
     trade = load_rows(a.data, a.price_col, a.result_col, a.time_col, a.yes_bid_col, a.no_bid_col, a.market_col)
@@ -286,6 +289,24 @@ def main() -> None:
     print(f"  {'price':>6} {'realized':>9} {'gap':>8} {'n':>6}")
     for cc, rr, nn in zip(c, r, cnt):
         print(f"  {cc:>6.2f} {rr:>9.3f} {rr-cc:>+8.3f} {nn:>6}")
+
+    if a.inspect:
+        cen, rat, _ = fit_calibration([(x["price"], x["yes"]) for x in fit_rows], a.bins)
+        print(f"\ninspect — OOS trades at thr={a.thr}, fills={a.fills}:")
+        print(f"  {'market':30} {'price':>6} {'fair':>6} {'edge':>7} {'side':>4} "
+              f"{'won':>4} {'pnl':>8}")
+        tot, nt, wins = 0.0, 0, 0
+        for r_ in sorted(trade_rows, key=lambda z: (z["time"] is None, z["time"])):
+            f = fair_prob(r_["price"], cen, rat)
+            pnl, side = trade_pnl(r_, f, a.thr, a.fills)
+            if pnl is None:
+                continue
+            won = (side == "YES" and r_["yes"]) or (side == "NO" and not r_["yes"])
+            nt += 1; tot += pnl; wins += 1 if won else 0
+            print(f"  {str(r_.get('market'))[:30]:30} {r_['price']:>6.3f} {f:>6.3f} "
+                  f"{f - r_['price']:>+7.3f} {side:>4} {('Y' if won else 'N'):>4} {pnl:>+8.3f}")
+        print(f"  -> {nt} trades, {wins} won ({(wins/nt*100 if nt else 0):.1f}%), "
+              f"net ${tot:+.3f}, EV ${tot/nt if nt else 0:+.4f}/ct")
 
     print(f"\nOUT-OF-SAMPLE backtest  [{mode}]  fills={a.fills}")
     if a.sweep:
