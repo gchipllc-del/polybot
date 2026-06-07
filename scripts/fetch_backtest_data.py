@@ -110,7 +110,8 @@ def normalize_kalshi(trades_rows, markets_rows, weather_only=False) -> list[dict
         if res in ("yes", "no"):
             result_by[tk] = res
             meta_by[tk] = {"title": m.get("title", ""),
-                           "event_ticker": m.get("event_ticker", "")}
+                           "event_ticker": m.get("event_ticker", ""),
+                           "yes_sub_title": m.get("yes_sub_title", "")}
     out = []
     for t in trades_rows:
         tk = t.get("ticker")
@@ -132,6 +133,7 @@ def normalize_kalshi(trades_rows, markets_rows, weather_only=False) -> list[dict
             "sample_at": _iso(t.get("created_time")),
             "title": meta.get("title", ""),
             "event_ticker": meta.get("event_ticker", ""),
+            "yes_sub_title": meta.get("yes_sub_title", ""),
         })
     return out
 
@@ -189,7 +191,8 @@ def cmd_becker(args) -> None:
         return
     print(f"Reading Becker parquet from {kalshi_dir} …")
     markets = _read_parquet_dir(kalshi_dir / "markets",
-                                ["ticker", "result", "title", "event_ticker"])
+                                ["ticker", "result", "title", "event_ticker",
+                                 "yes_sub_title"])
     trades = _read_parquet_dir(kalshi_dir / "trades",
                                ["ticker", "yes_price", "created_time"])
     print(f"  loaded {len(markets)} market rows, {len(trades)} trade rows")
@@ -271,6 +274,124 @@ def cmd_kalshi(args) -> None:
     print(f"  -> {len(wx)} rows  data/backtest/kalshi_settled_weather.jsonl")
 
 
+# ── Kalshi candlestick top-up (recent settled markets the snapshot can't price) ─
+def _cs_close(candle: dict) -> float | None:
+    """Extract the close price (0-1) from one candlestick, handling both the
+    new `*_dollars` shape and the historical cents shape. Returns None if the
+    period had no trade (close absent)."""
+    price = candle.get("price") or {}
+    if price.get("close_dollars") is not None:
+        return float(price["close_dollars"])              # already dollars 0-1
+    if price.get("close") is not None:
+        return float(price["close"]) / 100.0              # cents -> dollars
+    # Fall back to the mid of yes_bid/yes_ask close if no trade printed.
+    yb = (candle.get("yes_bid") or {})
+    ya = (candle.get("yes_ask") or {})
+    b = yb.get("close_dollars", (yb.get("close") or 0) / 100.0 if yb.get("close") is not None else None)
+    a = ya.get("close_dollars", (ya.get("close") or 0) / 100.0 if ya.get("close") is not None else None)
+    if b is not None and a is not None:
+        return round((float(b) + float(a)) / 2.0, 4)
+    return None
+
+
+def parse_candlesticks(payload: dict, ticker: str, result: str,
+                       event_ticker: str = "") -> list[dict]:
+    """PURE: candlestick payload -> becker_edge rows (one per priced period).
+    Lets becker_edge --market-col earliest collapse to the entry price."""
+    out = []
+    for c in payload.get("candlesticks", []) or []:
+        close = _cs_close(c)
+        if close is None or not (0.0 < close < 1.0):
+            continue
+        ts = c.get("end_period_ts")
+        sample_at = (datetime.fromtimestamp(ts, timezone.utc).isoformat()
+                     if isinstance(ts, (int, float)) else None)
+        out.append({
+            "market_ticker": ticker,
+            "market_p_yes": round(close, 4),
+            "result": result,
+            "sample_at": sample_at,
+            "event_ticker": event_ticker,
+        })
+    return out
+
+
+def _list_settled_weather_markets(series: str, max_markets: int) -> list[dict]:
+    """Settled markets for one weather series, with the fields the candlestick
+    pull needs (ticker, result, open/close ts for the window)."""
+    rows, cursor, pulled = [], None, 0
+    while pulled < max_markets:
+        params = {"limit": 1000, "status": "settled", "series_ticker": series}
+        if cursor:
+            params["cursor"] = cursor
+        data = _kalshi_get("/markets", params)
+        markets = data.get("markets", []) or []
+        if not markets:
+            break
+        for m in markets:
+            res = str(m.get("result", "") or "").lower()
+            if res not in ("yes", "no"):
+                continue
+            rows.append({
+                "ticker": m.get("ticker", ""),
+                "result": res,
+                "event_ticker": m.get("event_ticker", ""),
+                "open_ts": m.get("open_time"),
+                "close_ts": m.get("close_time"),
+            })
+        pulled += len(markets)
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return rows
+
+
+def _to_epoch(v) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def cmd_kalshi_candles(args) -> None:
+    import time
+    print("Pulling per-market candlesticks for settled WEATHER markets …")
+    cities = _cities()
+    series_list = sorted({c["series"] for c in cities.values() if c.get("series")})
+    all_rows: list[dict] = []
+    for series in series_list:
+        try:
+            markets = _list_settled_weather_markets(series, args.max_per_series)
+        except Exception as e:
+            print(f"  ! {series}: list failed ({e}) — geo-blocked? run on home IP",
+                  file=sys.stderr)
+            continue
+        print(f"  {series}: {len(markets)} settled markets")
+        for m in markets:
+            start = _to_epoch(m.get("open_ts"))
+            end = _to_epoch(m.get("close_ts"))
+            params = {"period_interval": args.period}
+            if start:
+                params["start_ts"] = start
+            if end:
+                params["end_ts"] = end
+            try:
+                payload = _kalshi_get(
+                    f"/series/{series}/markets/{m['ticker']}/candlesticks", params)
+            except Exception as e:
+                print(f"    ! {m['ticker']}: {e}", file=sys.stderr)
+                continue
+            all_rows.extend(parse_candlesticks(payload, m["ticker"], m["result"],
+                                               m.get("event_ticker", "")))
+            time.sleep(args.rate_sleep)  # be polite to the API
+    _write_jsonl(OUT_DIR / "kalshi_candles_weather.jsonl", all_rows)
+    print(f"  -> {len(all_rows)} candle-rows  data/backtest/kalshi_candles_weather.jsonl")
+
+
 # ── Open-Meteo forecast + actuals (pure aggregation is testable) ───────────
 def daily_extremes_from_hourly(hourly: dict, direction: str = "both") -> dict:
     """Collapse an Open-Meteo hourly payload {time:[...], temperature_2m:[...]}
@@ -350,7 +471,8 @@ def cmd_openmeteo(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("source", choices=["becker", "kalshi", "openmeteo", "all"])
+    ap.add_argument("source",
+                    choices=["becker", "kalshi", "kalshi-candles", "openmeteo", "all"])
     ap.add_argument("--becker-path", default="~/becker",
                     help="dir containing the extracted Becker data/kalshi/ "
                          "(default ~/becker)")
@@ -358,6 +480,12 @@ def main() -> None:
                     help="kalshi: limit to one series_ticker (e.g. KXHIGHTDAL)")
     ap.add_argument("--max-markets", type=int, default=5000,
                     help="kalshi: cap markets pulled (default 5000)")
+    ap.add_argument("--max-per-series", type=int, default=400,
+                    help="kalshi-candles: cap settled markets per series (default 400)")
+    ap.add_argument("--period", type=int, default=60, choices=[1, 60, 1440],
+                    help="kalshi-candles: candle interval in minutes (default 60)")
+    ap.add_argument("--rate-sleep", type=float, default=0.25,
+                    help="kalshi-candles: seconds to sleep between API calls (default 0.25)")
     ap.add_argument("--days", type=int, default=120,
                     help="openmeteo: lookback window in days (default 120)")
     args = ap.parse_args()
@@ -366,6 +494,8 @@ def main() -> None:
         cmd_becker(args)
     if args.source in ("kalshi", "all"):
         cmd_kalshi(args)
+    if args.source in ("kalshi-candles", "all"):
+        cmd_kalshi_candles(args)
     if args.source in ("openmeteo", "all"):
         cmd_openmeteo(args)
 
