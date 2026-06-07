@@ -129,6 +129,19 @@ WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN"
                   "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU"]
 
 
+def _best_bid(levels) -> int | None:
+    """Highest bid price (cents) among orderbook levels ([price,size] or dicts)."""
+    best = None
+    for lvl in levels or []:
+        try:
+            p = lvl[0] if isinstance(lvl, (list, tuple)) else lvl.get("price")
+        except Exception:
+            continue
+        if p is not None and (best is None or p > best):
+            best = p
+    return best
+
+
 def parse_orderbook(orderbook: dict) -> tuple:
     """Derive (yes_price_mid, no_ask) in 0-1 from a Kalshi orderbook.
 
@@ -137,20 +150,10 @@ def parse_orderbook(orderbook: dict) -> tuple:
     Lifting the other side gives the asks:
       yes_ask = 100 − best_no_bid   (buy YES = sell NO to the top NO bid)
       no_ask  = 100 − best_yes_bid  (buy NO  = sell YES to the top YES bid)
-    Returns (None, None) when a side is missing.
+    no_ask is None when there's no YES bid to lift (you can't buy NO there).
     """
-    def _best(levels):
-        best = None
-        for lvl in levels or []:
-            try:
-                p = lvl[0] if isinstance(lvl, (list, tuple)) else lvl.get("price")
-            except Exception:
-                continue
-            if p is not None and (best is None or p > best):
-                best = p
-        return best
-    yes_bid_c = _best(orderbook.get("yes"))
-    no_bid_c = _best(orderbook.get("no"))
+    yes_bid_c = _best_bid(orderbook.get("yes"))
+    no_bid_c = _best_bid(orderbook.get("no"))
     yb = yes_bid_c / 100.0 if yes_bid_c is not None else None
     ya = (100 - no_bid_c) / 100.0 if no_bid_c is not None else None
     no_ask = (100 - yes_bid_c) / 100.0 if yes_bid_c is not None else None
@@ -204,7 +207,9 @@ def _open_weather_quotes(series_list) -> list[dict]:
         except Exception:
             ob = {}
         yp, na = parse_orderbook(ob)
-        quotes.append({**c, "yes_price": yp, "no_ask": na})
+        quotes.append({**c, "yes_price": yp, "no_ask": na,
+                       "yes_bid_c": _best_bid(ob.get("yes")),
+                       "no_bid_c": _best_bid(ob.get("no"))})
         time.sleep(0.1)
     return quotes
 
@@ -246,24 +251,36 @@ def cmd_scan(args) -> None:
     # qualifiers), so you can see the distribution and whether the calibration
     # maps sanely onto live mid prices.
     if getattr(args, "show", False):
+        # Dump EVERY day-ahead market with raw book + derived prices, so we can
+        # tell "genuinely unfillable/extreme" from "window/parse artifact".
+        n_empty = n_onesided = n_inband = n_oob = 0
         rows = []
         for q in day_ahead:
+            yb, nb = q.get("yes_bid_c"), q.get("no_bid_c")
             yp, na = q.get("yes_price"), q.get("no_ask")
-            if not isinstance(yp, (int, float)):
-                continue
-            fair = _fair(float(yp), centers, rates)
-            rows.append((fair - yp, yp, na, fair, q.get("ticker")))
-        rows.sort()  # most-overpriced YES (most negative edge) first
-        would = sum(1 for r in rows if r[0] <= -args.thr
-                    and isinstance(r[2], (int, float)) and FILL_FLOOR <= r[1] <= FILL_CEIL)
-        print(f"--- live edges, {len(rows)} day-ahead markets "
-              f"({would} clear thr {args.thr} in band {FILL_FLOOR}-{FILL_CEIL}) ---")
-        print(f"  {'ticker':26} {'yes':>5} {'no_ask':>6} {'fair':>5} {'edge':>7}")
-        for edge, yp, na, fair, tk in rows[:25]:
-            flag = "  FADE" if (edge <= -args.thr and isinstance(na, (int, float))
-                                and FILL_FLOOR <= yp <= FILL_CEIL) else ""
-            nas = f"{na:.2f}" if isinstance(na, (int, float)) else "  -"
-            print(f"  {str(tk)[:26]:26} {yp:>5.2f} {nas:>6} {fair:>5.2f} {edge:>+7.3f}{flag}")
+            if yb is None and nb is None:
+                n_empty += 1
+            elif na is None:
+                n_onesided += 1   # NO bids but no YES bid → can't buy NO
+            edge = (_fair(float(yp), centers, rates) - yp) if isinstance(yp, (int, float)) else None
+            in_band = (isinstance(yp, (int, float)) and isinstance(na, (int, float))
+                       and FILL_FLOOR <= yp <= FILL_CEIL)
+            if in_band:
+                n_inband += 1
+            elif isinstance(yp, (int, float)):
+                n_oob += 1
+            rows.append((edge if edge is not None else 0.0, yb, nb, yp, na, edge,
+                         in_band and edge is not None and edge <= -args.thr, q.get("ticker")))
+        rows.sort(key=lambda r: r[0])
+        print(f"--- {len(day_ahead)} day-ahead markets: {n_empty} empty book, "
+              f"{n_onesided} one-sided (no YES bid → can't buy NO), "
+              f"{n_inband} in-band {FILL_FLOOR}-{FILL_CEIL}, {n_oob} out-of-band ---")
+        print(f"  {'ticker':26} {'ybid':>4} {'nbid':>4} {'yes':>5} {'no_ask':>6} {'edge':>7}")
+        for _, yb, nb, yp, na, edge, fade, tk in rows[:30]:
+            f = lambda v, p=2: (f"{v:.{p}f}" if isinstance(v, (int, float)) else "  -")
+            print(f"  {str(tk)[:26]:26} {str(yb if yb is not None else '-'):>4} "
+                  f"{str(nb if nb is not None else '-'):>4} {f(yp):>5} {f(na):>6} "
+                  f"{(f'{edge:+.3f}' if edge is not None else '   -'):>7}{'  FADE' if fade else ''}")
 
     open_tickers = {r["ticker"] for r in _load_ledger() if r.get("status") == "open"}
     decisions = decide_batch(day_ahead, centers, rates, thr=args.thr,
