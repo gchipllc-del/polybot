@@ -30,7 +30,8 @@ STRATEGY_PATH = Path(os.environ.get("WEATHER_STRATEGY_PATH") or (ROOT / "config"
 # what the global live config says. Default off → live sleeve unaffected.
 _PAPER_ONLY = os.environ.get("WEATHER_PAPER_ONLY") == "1"
 
-DEFAULT_BANKROLL = 1000.0
+# Mirrors the live Kalshi account so paper sizing matches real-money sizing.
+DEFAULT_BANKROLL = 233.0
 DEFAULT_MIN_TRADE_USD = 1.0
 DEFAULT_MAX_TRADE_USD = 5.0
 DEFAULT_KELLY_MULTIPLIER = 0.5
@@ -39,6 +40,60 @@ MAX_FILL_FOR_BUY = 0.45
 EXTREME_PRICE_FLOOR = 0.05
 EXTREME_PRICE_CEIL = 0.95
 KALSHI_PROFIT_FEE = 0.07
+
+def reset_paper(log_path: Path | None = None) -> dict:
+    """Zero the PAPER weather P&L while PRESERVING real-money (is_live=true) rows.
+
+    The hourly ledger mixes paper at-bats with the real live fills that share
+    the same file. A blanket wipe would destroy live trade history, so this:
+      1. archives the FULL current ledger to a timestamped .bak.jsonl (reversible),
+      2. rewrites the ledger keeping ONLY is_live=true rows,
+    so the dashboard's paper P&L drops to $0 and the live cut is untouched.
+    """
+    path = Path(log_path) if log_path else PAPER_LOG
+    if not path.exists():
+        return {"cleared_paper_trades": 0, "cleared_paper_pnl": 0.0,
+                "kept_live_trades": 0, "kept_live_pnl": 0.0,
+                "archived_to": None, "ledger": str(path)}
+
+    rows: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    live = [r for r in rows if bool(r.get("is_live"))]
+    paper = [r for r in rows if not bool(r.get("is_live"))]
+    cleared_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in paper)
+    kept_pnl = sum(float(r.get("paper_pnl", 0) or 0) for r in live)
+
+    archive = None
+    if path.stat().st_size > 0:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive = path.with_name(f"{path.stem}.{stamp}.bak.jsonl")
+        path.replace(archive)
+
+    # Rewrite with ONLY the preserved live rows (empty file if there were none).
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        for r in live:
+            f.write(json.dumps(r) + "\n")
+    tmp.replace(path)
+
+    return {
+        "cleared_paper_trades": len(paper),
+        "cleared_paper_pnl": round(cleared_pnl, 2),
+        "kept_live_trades": len(live),
+        "kept_live_pnl": round(kept_pnl, 2),
+        "archived_to": str(archive) if archive else None,
+        "ledger": str(path),
+    }
+
 
 # ── LIVE-ONLY trend-aware veto (2026-06-02, the "cheap-NO gauge") ────────────
 # The bot's live weather entries are gated on the obs-anchored nws_p_yes, which

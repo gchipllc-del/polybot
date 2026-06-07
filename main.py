@@ -38,6 +38,7 @@ Usage:
     python main.py btc-5min-paper-settle  # Settle resolved 5-min paper trades
     python main.py btc-5min-paper-report  # Aggregate 5-min paper P&L + confidence-bucket WR
     python main.py btc-paper-reset        # Zero ALL BTC paper ledgers (5min + arb; archives old)
+    python main.py weather-paper-reset    # Zero weather PAPER P&L (hourly+daily); keeps live rows
     python main.py dataset-status         # Check Jon-Becker parquet dataset availability
     python main.py kalshi-auth-status     # Verify Kalshi RSA-PSS auth wiring
     python main.py kalshi-test-auth       # Make one signed call (/portfolio/balance) to prove it works
@@ -1378,6 +1379,31 @@ def cmd_btc_paper_reset():
         print(f"           zeroed: {r['ledger']}")
 
 
+def cmd_weather_paper_reset():
+    """Reset weather PAPER P&L to zero (hourly + daily) — fresh start.
+
+    The hourly ledger mixes paper at-bats with REAL live fills (is_live=true)
+    in the same file, so this preserves the live rows and clears only the paper
+    ones. Each ledger is archived to a timestamped .bak.jsonl first (reversible).
+    Does NOT touch any live position or live trade history.
+    """
+    from lib.weather_paper import reset_paper as reset_hourly
+    from lib.weather_daily_paper import reset_paper as reset_daily
+    print("=== Weather paper RESET (paper P&L only; live rows preserved) ===")
+    for label, fn in (("weather_hourly", reset_hourly), ("weather_daily", reset_daily)):
+        r = fn()
+        print(f"  [{label}] cleared {r['cleared_paper_trades']} paper trades "
+              f"(paper P&L was ${r['cleared_paper_pnl']:+,.2f}).")
+        if r["kept_live_trades"]:
+            print(f"           PRESERVED {r['kept_live_trades']} live rows "
+                  f"(real P&L ${r['kept_live_pnl']:+,.2f}) — untouched.")
+        if r["archived_to"]:
+            print(f"           archived -> {r['archived_to']}")
+        else:
+            print("           nothing to archive (already empty / missing).")
+        print(f"           ledger: {r['ledger']}")
+
+
 def cmd_btc_arb_paper_settle():
     """Phase 2 — settle open BTC arb paper trades against actual
     market outcomes. Run periodically (manually or cron) so the report
@@ -1899,6 +1925,8 @@ def main():
         cmd_btc_5min_paper_report()
     elif command in ("btc-paper-reset", "btc-5min-paper-reset"):
         cmd_btc_paper_reset()
+    elif command == "weather-paper-reset":
+        cmd_weather_paper_reset()
     elif command == "kalshi-15min-monitor":
         max_sec = 900
         for arg in sys.argv[2:]:
