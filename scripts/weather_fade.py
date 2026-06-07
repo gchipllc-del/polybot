@@ -142,21 +142,46 @@ def _best_bid(levels) -> int | None:
     return best
 
 
-def parse_orderbook(orderbook: dict) -> tuple:
-    """Derive (yes_price_mid, no_ask) in 0-1 from a Kalshi orderbook.
+def _ob_sides(resp: dict):
+    """Locate the (yes_levels, no_levels, scale) in a Kalshi orderbook response,
+    handling both the modern `orderbook_fp.{yes_dollars,no_dollars}` (prices in
+    DOLLARS 0-1) and the legacy `orderbook.{yes,no}` (CENTS) shapes — plus a
+    bare sub-dict (for tests). scale converts level prices to 0-1."""
+    r = resp or {}
+    for cont in (r.get("orderbook_fp") or {}, r.get("orderbook") or {}, r):
+        if not isinstance(cont, dict):
+            continue
+        if cont.get("yes_dollars") is not None or cont.get("no_dollars") is not None:
+            return cont.get("yes_dollars"), cont.get("no_dollars"), 1.0   # dollars
+    for cont in (r.get("orderbook") or {}, r.get("orderbook_fp") or {}, r):
+        if not isinstance(cont, dict):
+            continue
+        if cont.get("yes") is not None or cont.get("no") is not None:
+            return cont.get("yes"), cont.get("no"), 0.01                  # cents
+    return None, None, 1.0
 
-    Kalshi books are two lists of resting BIDS, in cents:
-      orderbook["yes"] = bids to buy YES,  orderbook["no"] = bids to buy NO.
-    Lifting the other side gives the asks:
-      yes_ask = 100 − best_no_bid   (buy YES = sell NO to the top NO bid)
-      no_ask  = 100 − best_yes_bid  (buy NO  = sell YES to the top YES bid)
-    no_ask is None when there's no YES bid to lift (you can't buy NO there).
+
+def orderbook_bests(resp: dict) -> tuple:
+    """(best_yes_bid, best_no_bid) in 0-1, or (None, None)."""
+    yl, nl, sc = _ob_sides(resp)
+    yb, nb = _best_bid(yl), _best_bid(nl)
+    return (round(yb * sc, 4) if yb is not None else None,
+            round(nb * sc, 4) if nb is not None else None)
+
+
+def parse_orderbook(resp: dict) -> tuple:
+    """Derive (yes_price_mid, no_ask) in 0-1 from a Kalshi orderbook response.
+
+    Resting BIDS only on each side; asks are the complement:
+      yes_ask = 1 − best_no_bid   (buy YES = sell NO to the top NO bid)
+      no_ask  = 1 − best_yes_bid  (buy NO  = sell YES to the top YES bid)
+    no_ask is None when there's no YES bid to lift (can't take NO there).
+    Accepts the full /orderbook response or a bare orderbook dict; handles both
+    the `orderbook_fp` (dollars) and legacy (cents) shapes.
     """
-    yes_bid_c = _best_bid(orderbook.get("yes"))
-    no_bid_c = _best_bid(orderbook.get("no"))
-    yb = yes_bid_c / 100.0 if yes_bid_c is not None else None
-    ya = (100 - no_bid_c) / 100.0 if no_bid_c is not None else None
-    no_ask = (100 - yes_bid_c) / 100.0 if yes_bid_c is not None else None
+    yb, nb = orderbook_bests(resp)
+    ya = (1.0 - nb) if nb is not None else None
+    no_ask = (1.0 - yb) if yb is not None else None
     if yb is not None and ya is not None:
         yes_price = (yb + ya) / 2.0
     else:
@@ -203,13 +228,13 @@ def _open_weather_quotes(series_list) -> list[dict]:
     quotes = []
     for c in candidates:
         try:
-            ob = _kalshi_get(f"/markets/{c['ticker']}/orderbook", {}).get("orderbook") or {}
+            resp = _kalshi_get(f"/markets/{c['ticker']}/orderbook", {})
         except Exception:
-            ob = {}
-        yp, na = parse_orderbook(ob)
+            resp = {}
+        yp, na = parse_orderbook(resp)
+        yb, nb = orderbook_bests(resp)
         quotes.append({**c, "yes_price": yp, "no_ask": na,
-                       "yes_bid_c": _best_bid(ob.get("yes")),
-                       "no_bid_c": _best_bid(ob.get("no"))})
+                       "yes_bid_c": yb, "no_bid_c": nb})   # now 0-1, not cents
         time.sleep(0.1)
     return quotes
 
@@ -353,10 +378,42 @@ def cmd_report(args) -> None:
     print("  ↑ judge the edge by THIS (real order-book fills), not the backtest.")
 
 
+def cmd_probe(args) -> None:
+    """Snapshot weather-book liquidity now and append to a probe log, so running
+    it on a short interval reveals WHEN these books are quoted/takeable. Cheap;
+    no calibration needed."""
+    try:
+        quotes = _open_weather_quotes(WEATHER_SERIES)
+    except Exception as e:
+        print(f"! probe failed ({e}) — run on home IP", file=sys.stderr)
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    log = ROOT / "data" / "weather_fade_book_probe.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    depth = takeable = 0
+    with open(log, "a") as f:
+        for q in quotes:
+            yb, nb, yp, na = (q.get("yes_bid_c"), q.get("no_bid_c"),
+                              q.get("yes_price"), q.get("no_ask"))
+            has_depth = (yb is not None) or (nb is not None)
+            tk_ok = (isinstance(na, (int, float)) and isinstance(yp, (int, float))
+                     and FILL_FLOOR <= yp <= FILL_CEIL)
+            depth += has_depth
+            takeable += tk_ok
+            f.write(json.dumps({"ts": now, "ticker": q.get("ticker"),
+                                "hours_to_close": q.get("hours_to_close"),
+                                "yes_bid": yb, "no_bid": nb, "yes_price": yp,
+                                "no_ask": na, "has_depth": has_depth,
+                                "takeable": tk_ok}) + "\n")
+    print(f"probe {now}: {len(quotes)} day-ahead markets, "
+          f"{depth} with depth, {takeable} takeable (in-band w/ no_ask) "
+          f"-> {log}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["scan", "settle", "report"])
+    ap.add_argument("cmd", choices=["scan", "settle", "report", "probe"])
     ap.add_argument("--calibration", default=str(CALIB_SRC),
                     help="historical weather jsonl to fit the calibration on")
     ap.add_argument("--bins", type=int, default=20)
@@ -366,7 +423,8 @@ def main() -> None:
                     help="scan: print the live edge for every day-ahead market "
                          "(diagnose firing rate + calibration-vs-live mapping)")
     args = ap.parse_args()
-    {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report}[args.cmd](args)
+    {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report,
+     "probe": cmd_probe}[args.cmd](args)
 
 
 if __name__ == "__main__":
