@@ -26,6 +26,7 @@ from weather_fade import (_load_ledger, _city_of, LEDGER, COLLECT_LEDGER,  # noq
                           VALIDATED_SERIES)
 
 PROBE_LOG = ROOT / "data" / "weather_fade_book_probe.jsonl"
+SCAN_STATUS = ROOT / "data" / "weather_fade_scan_status.json"
 
 
 def _read_jsonl(p: Path) -> list[dict]:
@@ -76,8 +77,26 @@ def build_summary() -> dict:
             byhr_tak[h] += 1 if r.get("takeable") else 0
     byhr = [{"hr": h, "tak": byhr_tak[h], "tot": byhr_tot[h]} for h in sorted(byhr_tot)]
 
+    # scan health: last run + how stale (stale ⇒ Mac asleep / agent not firing)
+    scan = {}
+    if SCAN_STATUS.exists():
+        try:
+            scan = json.loads(SCAN_STATUS.read_text())
+        except Exception:
+            scan = {}
+    age_min = None
+    if scan.get("ts"):
+        try:
+            age_min = int((datetime.now(timezone.utc)
+                           - datetime.fromisoformat(scan["ts"].replace("Z", "+00:00"))
+                           ).total_seconds() / 60)
+        except Exception:
+            age_min = None
+    scan["age_min"] = age_min
+
     return {
         "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+        "scan": scan,
         "open": len(openn), "closed": len(closed), "won": won, "lost": len(closed) - won,
         "wr": round(won / len(closed) * 100, 1) if closed else None,
         "net": round(net, 2), "invested": round(inv, 2),
@@ -95,6 +114,35 @@ def _cls(v):
         return "pos" if float(v) > 0 else ("neg" if float(v) < 0 else "")
     except (TypeError, ValueError):
         return ""
+
+
+def _scan_panel(sc: dict) -> str:
+    """Health banner: is the scan actually firing, and what is it finding?
+    A stale age or all-empty books explains an empty scorecard at a glance."""
+    if not sc:
+        return ("<div class=warn>⚠ scan hasn't run yet — start the scan agent "
+                "(no <code>weather_fade_scan_status.json</code> yet).</div>")
+    age = sc.get("age_min")
+    if age is None:
+        fresh, note = "dim", "age unknown"
+    elif age <= 45:
+        fresh, note = "pos", f"{age} min ago"
+    else:
+        fresh, note = "warn", (f"{age} min ago — STALE. The scan isn't firing "
+                               f"(Mac asleep during the liquid window?).")
+    booked = sc.get("booked", 0)
+    why = ""
+    if sc.get("day_ahead", 0) and not booked:
+        bits = []
+        if sc.get("empty_book"): bits.append(f"{sc['empty_book']} empty books")
+        if sc.get("one_sided"): bits.append(f"{sc['one_sided']} one-sided")
+        if not sc.get("in_band"): bits.append("0 in tradeable band")
+        elif not sc.get("qualified"): bits.append(f"{sc['in_band']} in-band but none overpriced enough")
+        why = " · booked 0 because: " + (", ".join(bits) if bits else "no qualifiers")
+    return (f"<div class={fresh}>⏱ last scan <b>{note}</b> · "
+            f"{sc.get('open_markets',0)} open mkts → {sc.get('day_ahead',0)} day-ahead → "
+            f"{sc.get('in_band',0)} in-band → <b>{booked} booked</b> "
+            f"(thr {sc.get('thr','?')}){why}</div>")
 
 
 def render_html(s: dict) -> str:
@@ -124,11 +172,13 @@ def render_html(s: dict) -> str:
 body{{background:#0d1117;color:#c9d1d9;font-family:Menlo,monospace;font-size:14px;max-width:980px;margin:0 auto;padding:20px}}
 h1{{color:#ffd700;font-size:20px}} h2{{color:#58a6ff;font-size:13px;text-transform:uppercase;margin-top:22px}}
 .big{{font-size:28px;font-weight:bold}} .pos{{color:#3fb950}} .neg{{color:#f85149}} .dim{{color:#8b949e}}
+.warn{{color:#d29922}} div.pos,div.warn,div.dim{{border:1px solid #30363d;border-radius:6px;padding:8px 12px;margin:10px 0;background:#161b22}}
 .new{{color:#d29922;font-size:11px}} .hr{{display:inline-block;margin:2px 10px 2px 0}}
 table{{width:100%;border-collapse:collapse;margin-top:6px}} td,th{{text-align:left;padding:5px 6px;border-bottom:1px solid #21262d}}
 th{{color:#8b949e;font-size:11px}} .stat{{display:inline-block;margin-right:32px}} .lbl{{color:#8b949e;font-size:12px}}
 </style></head><body>
 <h1>🌡️ weather-fade paper sleeve <span class=dim style=font-size:12px>as of {s['as_of']} · auto-refresh 30s</span></h1>
+{_scan_panel(s.get('scan') or {})}
 <div>
  <span class=stat><div class=lbl>Net P&amp;L (settled)</div><div class="big {_cls(s['net'])}">{money(s['net'])}</div></span>
  <span class=stat><div class=lbl>ROI</div><div class=big>{'—' if s['roi'] is None else f"{s['roi']:+.1f}%"}</div></span>

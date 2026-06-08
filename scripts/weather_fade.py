@@ -149,6 +149,7 @@ HOURLY_SERIES = ["KXTEMPNYCH", "KXTEMPCHIH", "KXTEMPDCH", "KXTEMPBOSH",
                  "KXTEMPLAXH", "KXTEMPMIAH"]
 HOURLY_MIN_H, HOURLY_MAX_H = 0.5, 12.0   # hourly markets close within hours
 COLLECT_LEDGER = ROOT / "data" / "hourly_weather_collect.jsonl"
+SCAN_STATUS = ROOT / "data" / "weather_fade_scan_status.json"   # last-run health
 
 
 def _best_bid(levels) -> float | None:
@@ -352,6 +353,29 @@ def cmd_scan(args) -> None:
         print(f"  NO {d['ticker']:24} yes={d['yes_price']:.2f} fair={d['fair_yes']:.2f} "
               f"edge={d['edge']:+.3f} fill={d['fill_price']:.2f} x{d['our_size']} "
               f"EV/ct {d['ev_per_contract']:+.3f}")
+
+    # Write run-health so the dashboard can show the scan is ALIVE and WHY it
+    # did/didn't book — even when 0 fades qualify (the common case).
+    n_empty = n_onesided = n_inband = 0
+    for q in day_ahead:
+        yb, nb, yp, na = (q.get("yes_bid_c"), q.get("no_bid_c"),
+                          q.get("yes_price"), q.get("no_ask"))
+        if yb is None and nb is None:
+            n_empty += 1
+        elif na is None:
+            n_onesided += 1
+        elif isinstance(yp, (int, float)) and FILL_FLOOR <= yp <= FILL_CEIL:
+            n_inband += 1
+    try:
+        SCAN_STATUS.parent.mkdir(parents=True, exist_ok=True)
+        SCAN_STATUS.write_text(json.dumps({
+            "ts": now_iso, "thr": args.thr, "bankroll": args.bankroll,
+            "open_markets": len(quotes), "day_ahead": len(day_ahead),
+            "empty_book": n_empty, "one_sided": n_onesided, "in_band": n_inband,
+            "qualified": len(decisions), "booked": len(new),
+        }))
+    except Exception:
+        pass
 
 
 def cmd_settle(args) -> None:
