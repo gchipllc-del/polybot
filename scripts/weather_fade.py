@@ -128,6 +128,13 @@ def decide_batch(quotes, centers, rates, **kw) -> list[dict]:
 WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN",
                   "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU"]
 
+# Hourly weather series (current temp). No Becker history exists for these, so we
+# COLLECT their price→outcome data forward to backtest the hourly edge later.
+HOURLY_SERIES = ["KXTEMPNYCH", "KXTEMPCHIH", "KXTEMPDCH", "KXTEMPBOSH",
+                 "KXTEMPLAXH", "KXTEMPMIAH"]
+HOURLY_MIN_H, HOURLY_MAX_H = 0.5, 12.0   # hourly markets close within hours
+COLLECT_LEDGER = ROOT / "data" / "hourly_weather_collect.jsonl"
+
 
 def _best_bid(levels) -> float | None:
     """Highest bid price among orderbook levels. Levels may be [price, size] or
@@ -193,10 +200,11 @@ def parse_orderbook(resp: dict) -> tuple:
             round(no_ask, 4) if no_ask is not None else None)
 
 
-def _open_weather_quotes(series_list) -> list[dict]:
-    """Day-ahead OPEN weather markets with REAL order-book quotes. The /markets
-    snapshot returns null bid/ask for weather, so we list markets there but read
-    prices from the authoritative /markets/{ticker}/orderbook endpoint."""
+def _open_weather_quotes(series_list, min_h: float = MIN_HOURS_TO_CLOSE,
+                         max_h: float = MAX_HOURS_TO_CLOSE) -> list[dict]:
+    """OPEN markets in the [min_h, max_h]-to-close window with REAL order-book
+    quotes. The /markets snapshot returns null bid/ask for weather, so we list
+    markets there but read prices from the /markets/{ticker}/orderbook endpoint."""
     import time
     sys.path.insert(0, str(ROOT / "scripts"))
     from fetch_backtest_data import _kalshi_get
@@ -219,7 +227,7 @@ def _open_weather_quotes(series_list) -> list[dict]:
                         hrs = (datetime.fromisoformat(str(ct).replace("Z", "+00:00")) - now).total_seconds() / 3600.0
                     except Exception:
                         hrs = None
-                if hrs is not None and MIN_HOURS_TO_CLOSE <= hrs <= MAX_HOURS_TO_CLOSE:
+                if hrs is not None and min_h <= hrs <= max_h:
                     candidates.append({"ticker": m.get("ticker"),
                                        "event_ticker": m.get("event_ticker", ""),
                                        "close_ts": ct, "hours_to_close": hrs})
@@ -413,10 +421,91 @@ def cmd_probe(args) -> None:
           f"-> {log}")
 
 
+def collect_new_rows(quotes, seen_tickers, now_iso) -> list[dict]:
+    """PURE: from current hourly quotes, return becker_edge-format rows for
+    markets we haven't recorded yet (one EARLIEST entry price per market).
+    Outcome is filled later by collect-settle."""
+    out = []
+    for q in quotes:
+        tk = q.get("ticker")
+        yp = q.get("yes_price")
+        if not tk or tk in seen_tickers or not isinstance(yp, (int, float)):
+            continue
+        if not (0.0 < yp < 1.0):
+            continue
+        out.append({"market_ticker": tk, "market_p_yes": round(float(yp), 4),
+                    "result": "", "sample_at": now_iso,
+                    "event_ticker": q.get("event_ticker", ""),
+                    "close_ts": q.get("close_ts"), "status": "open"})
+        seen_tickers.add(tk)
+    return out
+
+
+def cmd_collect(args) -> None:
+    """Forward-collect HOURLY weather price→outcome data (no Becker history
+    exists for KXTEMP*). Records each market's earliest entry price once; run it
+    hourly. After a few weeks, becker_edge on this file tests the hourly edge."""
+    try:
+        quotes = _open_weather_quotes(HOURLY_SERIES, HOURLY_MIN_H, HOURLY_MAX_H)
+    except Exception as e:
+        print(f"! collect failed ({e}) — run on home IP", file=sys.stderr)
+        return
+    existing = []
+    if COLLECT_LEDGER.exists():
+        with open(COLLECT_LEDGER) as f:
+            existing = [json.loads(l) for l in f if l.strip()]
+    seen = {r.get("market_ticker") for r in existing}
+    new = collect_new_rows(quotes, seen, datetime.now(timezone.utc).isoformat())
+    COLLECT_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with open(COLLECT_LEDGER, "a") as f:
+        for r in new:
+            f.write(json.dumps(r) + "\n")
+    n_open = sum(1 for r in existing if r.get("status") == "open") + len(new)
+    n_closed = sum(1 for r in existing if r.get("status") in ("won", "lost", "settled"))
+    print(f"collect: {len(quotes)} open hourly markets, {len(new)} new recorded "
+          f"-> {COLLECT_LEDGER} (total: {n_open} awaiting outcome, {n_closed} settled)")
+
+
+def cmd_collect_settle(args) -> None:
+    """Fill outcomes for collected hourly markets that have settled, so the file
+    becomes a becker_edge-ready (price, result) dataset."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from fetch_backtest_data import _kalshi_get
+    if not COLLECT_LEDGER.exists():
+        print("no collected hourly markets yet.")
+        return
+    with open(COLLECT_LEDGER) as f:
+        rows = [json.loads(l) for l in f if l.strip()]
+    changed = 0
+    for r in rows:
+        if r.get("status") != "open":
+            continue
+        try:
+            m = _kalshi_get(f"/markets/{r['market_ticker']}", {}).get("market", {})
+        except Exception:
+            continue
+        res = str(m.get("result", "") or "").lower()
+        if res in ("yes", "no"):
+            r["result"] = res
+            r["status"] = res  # 'yes'/'no' — becker_edge reads result directly
+            r["resolved_at"] = datetime.now(timezone.utc).isoformat()
+            changed += 1
+    if changed:
+        with open(COLLECT_LEDGER, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+    settled = sum(1 for r in rows if r.get("result") in ("yes", "no"))
+    print(f"collect-settle: resolved {changed} this run; {settled} total settled "
+          f"of {len(rows)}. Backtest when settled is large enough:")
+    print(f"  python scripts/becker_edge.py {COLLECT_LEDGER} --price-col market_p_yes "
+          f"--result-col result --time-col sample_at --market-col market_ticker --sweep")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["scan", "settle", "report", "probe"])
+    ap.add_argument("cmd", choices=["scan", "settle", "report", "probe",
+                                    "collect", "collect-settle"])
     ap.add_argument("--calibration", default=str(CALIB_SRC),
                     help="historical weather jsonl to fit the calibration on")
     ap.add_argument("--bins", type=int, default=20)
@@ -427,7 +516,8 @@ def main() -> None:
                          "(diagnose firing rate + calibration-vs-live mapping)")
     args = ap.parse_args()
     {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report,
-     "probe": cmd_probe}[args.cmd](args)
+     "probe": cmd_probe, "collect": cmd_collect,
+     "collect-settle": cmd_collect_settle}[args.cmd](args)
 
 
 if __name__ == "__main__":
