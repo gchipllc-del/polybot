@@ -125,8 +125,23 @@ def decide_batch(quotes, centers, rates, **kw) -> list[dict]:
 
 
 # ── Live scan (reuses the proven Kalshi client; needs home-IP / auth) ───────
-WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN",
-                  "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU"]
+# Daily HIGH-temp series. The original 8 (KXHIGH*, no T) are what the edge was
+# calibrated on; the KXHIGHT* set are additional cities from Kalshi's live
+# catalog (same daily-high market type → favorite-longshot bias should transfer;
+# the per-city report breakdown confirms each). Empty/closed series are harmless
+# (the scan just gets 0 markets). LOWS are deliberately excluded — never in the
+# calibration, so they're collected/validated separately, not traded.
+WEATHER_SERIES = [
+    # validated 8 (calibration set)
+    "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN",
+    "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU",
+    # additional live high-temp cities (same market type, per-city tracked)
+    "KXHIGHTATL", "KXHIGHTBOS", "KXHIGHTDAL", "KXHIGHTDC", "KXHIGHTLV",
+    "KXHIGHTMIN", "KXHIGHTNOLA", "KXHIGHTOKC", "KXHIGHTPHX", "KXHIGHTSATX",
+    "KXHIGHTSEA", "KXHIGHTSFO",
+]
+VALIDATED_SERIES = {"KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX",
+                    "KXHIGHDEN", "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU"}
 
 # Hourly weather series (current temp). No Becker history exists for these, so we
 # COLLECT their price→outcome data forward to backtest the hourly edge later.
@@ -374,6 +389,16 @@ def cmd_settle(args) -> None:
     print(f"settled {changed} trades, P&L this run ${pnl_now:+.2f}")
 
 
+def _city_of(ticker: str) -> str:
+    """City code from a weather ticker's series prefix (KXHIGHTATL→ATL,
+    KXHIGHNY→NY). Longer prefixes checked first so the 'T' isn't kept."""
+    s = (ticker or "").split("-")[0]
+    for p in ("KXHIGHT", "KXHIGH", "KXLOWT", "KXLOW", "KXTEMP"):
+        if s.startswith(p):
+            return s[len(p):] or s
+    return s
+
+
 def cmd_report(args) -> None:
     rows = _load_ledger()
     closed = [r for r in rows if r.get("status") in ("won", "lost")]
@@ -386,6 +411,23 @@ def cmd_report(args) -> None:
           f"WR {(won/len(closed)*100 if closed else 0):.1f}% ({won}W/{len(closed)-won}L)")
     print(f"  net paper P&L ${net:+.2f} on ${inv:.2f} invested "
           f"(ROI {(net/inv*100 if inv else 0):+.1f}%)")
+    # Per-city breakdown — essential now that the scan spans many cities, so a
+    # new city carrying or dragging the edge is visible (not hidden in the agg).
+    if closed:
+        by_city: dict = {}
+        for r in closed:
+            c = _city_of(r.get("market_ticker", ""))
+            b = by_city.setdefault(c, {"w": 0, "l": 0, "net": 0.0})
+            b["w" if r["status"] == "won" else "l"] += 1
+            b["net"] += float(r.get("paper_pnl", 0) or 0)
+        print("  per-city (closed):")
+        for c in sorted(by_city, key=lambda k: by_city[k]["net"]):
+            b = by_city[c]
+            n = b["w"] + b["l"]
+            tag = "" if c in {_city_of(s + "-x") for s in VALIDATED_SERIES} else " *new"
+            print(f"    {c:6} {b['w']}W/{b['l']}L  net ${b['net']:+.2f}  "
+                  f"({b['w']/n*100:.0f}% WR){tag}")
+        print("    (* = city outside the validated 8; watch these earn their place)")
     print("  ↑ judge the edge by THIS (real order-book fills), not the backtest.")
 
 
