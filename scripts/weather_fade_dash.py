@@ -212,7 +212,19 @@ def main() -> None:
 
     @app.route("/")
     def index():
-        return render_html(build_summary())
+        try:
+            return render_html(build_summary())
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            # Fail LOUD (localhost only) so a data edge-case shows the cause
+            # instead of a blank "Internal Server Error" page.
+            return ("<!doctype html><meta http-equiv=refresh content=15>"
+                    "<body style='background:#0d1117;color:#f85149;"
+                    "font-family:monospace;padding:20px'>"
+                    "<h2>weather-fade dashboard hit an error rendering</h2>"
+                    f"<pre style='color:#c9d1d9;white-space:pre-wrap'>{tb}</pre>"
+                    "</body>"), 200
 
     print(f"weather-fade dashboard → http://{args.host}:{args.port}  (Ctrl-C to stop)")
     app.run(host=args.host, port=args.port, debug=False)
