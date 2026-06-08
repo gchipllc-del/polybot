@@ -129,13 +129,16 @@ WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN"
                   "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU"]
 
 
-def _best_bid(levels) -> int | None:
-    """Highest bid price (cents) among orderbook levels ([price,size] or dicts)."""
+def _best_bid(levels) -> float | None:
+    """Highest bid price among orderbook levels. Levels may be [price, size] or
+    {"price":...}, and price may arrive as a string (orderbook_fp dollars come
+    as strings) — so cast to float and skip anything unparseable."""
     best = None
     for lvl in levels or []:
         try:
-            p = lvl[0] if isinstance(lvl, (list, tuple)) else lvl.get("price")
-        except Exception:
+            raw = lvl[0] if isinstance(lvl, (list, tuple)) else lvl.get("price")
+            p = float(raw) if raw is not None else None
+        except (TypeError, ValueError, AttributeError, IndexError):
             continue
         if p is not None and (best is None or p > best):
             best = p
