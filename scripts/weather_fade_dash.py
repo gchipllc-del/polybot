@@ -224,9 +224,32 @@ th{{color:#8b949e;font-size:11px}} .stat{{display:inline-block;margin-right:32px
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("mode", nargs="?", default="serve", choices=["serve", "render"],
+                    help="serve = Flask server (:5060); render = write the page to "
+                         "an HTML FILE you open directly (no server, no localhost/https)")
+    ap.add_argument("--out", default=str(ROOT / "data" / "weather_fade_dash.html"),
+                    help="render: output file path")
     ap.add_argument("--port", type=int, default=5060)
     ap.add_argument("--host", default="0.0.0.0")   # all interfaces: 127.0.0.1, localhost, LAN
     args = ap.parse_args()
+
+    # FILE mode: write the dashboard to disk and exit. Open it with file:// — no
+    # server, no port, no localhost/https/IPv6 — the bullet-proof path. Schedule
+    # this every few minutes (launchd) and the page's meta-refresh re-reads the
+    # regenerated file, so it stays live.
+    if args.mode == "render":
+        try:
+            html = render_html(build_summary())
+        except Exception:
+            import traceback
+            html = ("<!doctype html><body style='background:#0d1117;color:#f85149;"
+                    "font-family:monospace;padding:20px'><pre>"
+                    + traceback.format_exc() + "</pre></body>")
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(html)
+        print(f"wrote dashboard -> {args.out}\nopen it with:  open {args.out}")
+        return
+
     from flask import Flask
     app = Flask(__name__)
 
