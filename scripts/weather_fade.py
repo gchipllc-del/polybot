@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -423,6 +424,14 @@ def _city_of(ticker: str) -> str:
     return s
 
 
+def _event_date(ticker: str) -> str:
+    """Event date from a weather ticker, e.g. KXHIGHMIA-26JUN08-T90 -> 26JUN08.
+    This is the unit of independence — a day's city-fades share one weather
+    pattern, so judge the edge by DISTINCT DATES, not trade count."""
+    m = re.search(r"-(\d{2}[A-Z]{3}\d{2})", ticker or "")
+    return m.group(1) if m else "?"
+
+
 def cmd_report(args) -> None:
     rows = _load_ledger()
     closed = [r for r in rows if r.get("status") in ("won", "lost")]
@@ -435,6 +444,24 @@ def cmd_report(args) -> None:
           f"WR {(won/len(closed)*100 if closed else 0):.1f}% ({won}W/{len(closed)-won}L)")
     print(f"  net paper P&L ${net:+.2f} on ${inv:.2f} invested "
           f"(ROI {(net/inv*100 if inv else 0):+.1f}%)")
+    # PER-DAY is the unit that matters: a day's city-fades are one correlated
+    # weather bet, so the real sample size is the number of DISTINCT dates.
+    if closed:
+        by_day: dict = {}
+        for r in closed:
+            d = _event_date(r.get("ticker") or r.get("market_ticker") or "")
+            b = by_day.setdefault(d, {"w": 0, "l": 0, "net": 0.0})
+            b["w" if r["status"] == "won" else "l"] += 1
+            b["net"] += float(r.get("paper_pnl", 0) or 0)
+        day_wins = sum(1 for b in by_day.values() if b["net"] > 0)
+        print(f"  PER-DAY (the real sample): {len(by_day)} distinct day(s), "
+              f"{day_wins} green / {len(by_day)-day_wins} red")
+        for d in sorted(by_day):
+            b = by_day[d]
+            print(f"    {d:9} {b['w']}W/{b['l']}L  net ${b['net']:+.2f}")
+        if len(by_day) < 10:
+            print(f"    ⚠ only {len(by_day)} day(s) — NOT a verdict. Need ~20-30 "
+                  f"distinct days; one hot/cold day moves all city-fades together.")
     # Per-city breakdown — essential now that the scan spans many cities, so a
     # new city carrying or dragging the edge is visible (not hidden in the agg).
     if closed:
