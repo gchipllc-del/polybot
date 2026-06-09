@@ -225,7 +225,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=5060)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="0.0.0.0")   # all interfaces: 127.0.0.1, localhost, LAN
     args = ap.parse_args()
     from flask import Flask
     app = Flask(__name__)
