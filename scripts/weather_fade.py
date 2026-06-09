@@ -440,7 +440,7 @@ def cmd_report(args) -> None:
     if closed:
         by_city: dict = {}
         for r in closed:
-            c = _city_of(r.get("market_ticker", ""))
+            c = _city_of(r.get("ticker") or r.get("market_ticker") or "")
             b = by_city.setdefault(c, {"w": 0, "l": 0, "net": 0.0})
             b["w" if r["status"] == "won" else "l"] += 1
             b["net"] += float(r.get("paper_pnl", 0) or 0)

@@ -29,6 +29,11 @@ PROBE_LOG = ROOT / "data" / "weather_fade_book_probe.jsonl"
 SCAN_STATUS = ROOT / "data" / "weather_fade_scan_status.json"
 
 
+def _tk(r: dict) -> str:
+    """Ledger rows store the market id under 'ticker'; tolerate 'market_ticker'."""
+    return r.get("ticker") or r.get("market_ticker") or ""
+
+
 def _read_jsonl(p: Path) -> list[dict]:
     if not p.exists():
         return []
@@ -56,7 +61,7 @@ def build_summary() -> dict:
 
     by_city = {}
     for r in closed:
-        c = _city_of(r.get("market_ticker", ""))
+        c = _city_of(_tk(r))
         b = by_city.setdefault(c, {"w": 0, "l": 0, "net": 0.0})
         b["w" if r["status"] == "won" else "l"] += 1
         b["net"] += float(r.get("paper_pnl", 0) or 0)
@@ -94,9 +99,18 @@ def build_summary() -> dict:
             age_min = None
     scan["age_min"] = age_min
 
+    # bankroll the sleeve sizes off (scan records it; else module default)
+    try:
+        from weather_fade import DEFAULT_BANKROLL as _bk
+    except Exception:
+        _bk = 143.0
+    bankroll = float(scan.get("bankroll") or _bk)
+
     return {
         "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
         "scan": scan,
+        "bankroll": round(bankroll, 2),
+        "portfolio": round(bankroll + net, 2),
         "open": len(openn), "closed": len(closed), "won": won, "lost": len(closed) - won,
         "wr": round(won / len(closed) * 100, 1) if closed else None,
         "net": round(net, 2), "invested": round(inv, 2),
@@ -123,13 +137,18 @@ def _scan_panel(sc: dict) -> str:
         return ("<div class=warn>⚠ scan hasn't run yet — start the scan agent "
                 "(no <code>weather_fade_scan_status.json</code> yet).</div>")
     age = sc.get("age_min")
+    hr = datetime.now(timezone.utc).hour
+    dead_window = 4 <= hr <= 13   # mapped: no open weather markets overnight UTC
     if age is None:
         fresh, note = "dim", "age unknown"
-    elif age <= 45:
+    elif age <= 75:
         fresh, note = "pos", f"{age} min ago"
+    elif dead_window:
+        fresh, note = "dim", (f"{age} min ago — normal: it's the overnight DEAD "
+                              f"window (04–13 UTC), no markets to scan. Resumes ~14 UTC.")
     else:
-        fresh, note = "warn", (f"{age} min ago — STALE. The scan isn't firing "
-                               f"(Mac asleep during the liquid window?).")
+        fresh, note = "warn", (f"{age} min ago — STALE during a liquid window. "
+                               f"Scan may not be firing (Mac asleep?).")
     booked = sc.get("booked", 0)
     why = ""
     if sc.get("day_ahead", 0) and not booked:
@@ -154,12 +173,12 @@ def render_html(s: dict) -> str:
         f"<td class={_cls(c['net'])}>{c['net']:+.2f}</td></tr>"
         for c in s["per_city"]) or "<tr><td colspan=4 class=dim>no settled fades yet</td></tr>"
     open_html = "".join(
-        f"<tr><td>{r.get('market_ticker','')}</td><td>{r.get('fill_price','')}</td>"
+        f"<tr><td>{_tk(r)}</td><td>{r.get('fill_price','')}</td>"
         f"<td>{r.get('our_size','')}</td><td>{r.get('edge','')}</td>"
         f"<td class=dim>{str(r.get('opened_at',''))[:16]}</td></tr>"
         for r in s["open_fades"]) or "<tr><td colspan=5 class=dim>none open</td></tr>"
     settled_html = "".join(
-        f"<tr><td>{r.get('market_ticker','')}</td><td>{r.get('result','')}</td>"
+        f"<tr><td>{_tk(r)}</td><td>{r.get('result','')}</td>"
         f"<td class={_cls(r.get('paper_pnl'))}>{float(r.get('paper_pnl',0) or 0):+.2f}</td>"
         f"<td class=dim>{str(r.get('resolved_at',''))[:16]}</td></tr>"
         for r in s["recent_settled"]) or "<tr><td colspan=4 class=dim>none settled yet</td></tr>"
@@ -186,6 +205,7 @@ th{{color:#8b949e;font-size:11px}} .stat{{display:inline-block;margin-right:32px
  <span class=stat><div class=lbl>Settled</div><div class=big>{s['closed']}</div><div class=dim>{s['won']}W/{s['lost']}L</div></span>
  <span class=stat><div class=lbl>Open</div><div class=big>{s['open']}</div></span>
  <span class=stat><div class=lbl>Invested</div><div class=big>${s['invested']:,.2f}</div></span>
+ <span class=stat><div class=lbl>Bankroll (mirrors live)</div><div class=big>${s['bankroll']:,.2f}</div><div class=dim>portfolio ${s['portfolio']:,.2f}</div></span>
 </div>
 <p class=dim>↑ the real-fill verdict — judge the edge by this, not the backtest.</p>
 <h2>Per-city (settled) — *new = outside the validated 8</h2>
