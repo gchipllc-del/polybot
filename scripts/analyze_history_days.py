@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from becker_edge import fit_calibration, fair_prob          # noqa: E402
-from weather_fade import kalshi_fee, FILL_FLOOR, FILL_CEIL    # noqa: E402
+from weather_fade import FILL_FLOOR, FILL_CEIL                # noqa: E402
 
 import json  # noqa: E402
 
@@ -91,7 +91,9 @@ def reconstruct(markets, centers, rates, thr):
             continue
         fill = 1.0 - p                        # taker NO fill (historical proxy)
         won = (not yes)                       # NO wins when YES did not happen
-        fee = kalshi_fee(1.0, fill)           # 1 contract
+        # Per-contract fee, un-rounded: real orders are multi-contract so the
+        # ceil-to-cent amortizes away; ceiling a 1-lot would overstate ~30%.
+        fee = 0.07 * fill * (1.0 - fill)
         pnl = ((1.0 - fill) if won else -fill) - fee
         b = days.setdefault(date, {"net": 0.0, "n": 0, "yes": 0})
         b["net"] += pnl
@@ -119,7 +121,7 @@ def main() -> None:
     markets.sort(key=lambda m: (m[4] == "", m[4]))
     k = int(len(markets) * args.split)
     fit, trade = markets[:k], markets[k:]
-    centers, rates, _ = fit_calibration([(p, yes) for p, yes, *_ in fit], args.bins)
+    centers, cal_rates, _ = fit_calibration([(p, yes) for p, yes, *_ in fit], args.bins)
     n_days_total = len({m[3] for m in trade})
     print(f"=== historical per-day fade reconstruction (OOS) — {len(trade)} markets, "
           f"{n_days_total} distinct days ===")
@@ -129,19 +131,25 @@ def main() -> None:
     print(f"{'thr':>5} {'days':>5} {'green%':>7} {'trades':>7} {'net$':>9} "
           f"{'EV/ct':>7} {'corr(net,YESrate)':>18} {'hot-day net':>11} {'cool-day net':>12}")
     headline = None
+    prev_ntr = None
     for thr in (0.03, 0.05, 0.08, 0.10, 0.12):
-        days = reconstruct(trade, centers, rates, thr)
+        days = reconstruct(trade, centers, cal_rates, thr)
         if not days:
             continue
         nets = [d["net"] for d in days.values()]
-        rates = [d["yes"] / d["n"] for d in days.values()]
+        yes_rates = [d["yes"] / d["n"] for d in days.values()]
         ntr = sum(d["n"] for d in days.values())
+        # Sanity: a stricter threshold trades a SUBSET — trades must not grow.
+        if prev_ntr is not None and ntr > prev_ntr:
+            print(f"  !! internal error: trades grew {prev_ntr}->{ntr} at thr {thr} "
+                  f"(should be impossible) — do not trust this table")
+        prev_ntr = ntr
         net = sum(nets)
         green = sum(1 for x in nets if x > 0) / len(nets) * 100
-        corr = pearson(rates, nets)
-        med = sorted(rates)[len(rates) // 2]
-        hot = [d["net"] for d, r in zip(days.values(), rates) if r >= med]
-        cool = [d["net"] for d, r in zip(days.values(), rates) if r < med]
+        corr = pearson(yes_rates, nets)
+        med = sorted(yes_rates)[len(yes_rates) // 2]
+        hot = [d["net"] for d, r in zip(days.values(), yes_rates) if r >= med]
+        cool = [d["net"] for d, r in zip(days.values(), yes_rates) if r < med]
         hot_avg = sum(hot) / len(hot) if hot else 0
         cool_avg = sum(cool) / len(cool) if cool else 0
         corr_s = f"{corr:+.2f}" if corr is not None else "  n/a"
