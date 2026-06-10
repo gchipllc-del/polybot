@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from datetime import datetime, timezone
@@ -71,6 +72,15 @@ def _fair(price, centers, rates):
     return fair_prob(price, centers, rates)
 
 
+def kalshi_fee(size: float, price: float) -> float:
+    """Kalshi trading fee on a fill: ceil(0.07 · C · P · (1−P)), rounded up to
+    the cent, charged once at execution. Modeling it keeps the paper P&L an
+    HONEST real-fill test (the backtest applied a fee too)."""
+    if size <= 0 or not (0.0 < price < 1.0):
+        return 0.0
+    return math.ceil(0.07 * size * price * (1.0 - price) * 100) / 100.0
+
+
 # ── Decision engine (pure — fully testable) ─────────────────────────────────
 def fade_decision(quote: dict, centers, rates, *,
                   thr: float = DEFAULT_THR, bankroll: float = DEFAULT_BANKROLL,
@@ -100,8 +110,9 @@ def fade_decision(quote: dict, centers, rates, *,
     size = round(notional / no_ask, 2)
     if size <= 0:
         return None
-    # EV/contract of buying NO at no_ask under our fair model:
-    ev_ct = round((1.0 - fair) - no_ask, 4)
+    # EV of buying NO at no_ask under our fair model, NET of the Kalshi fee.
+    fee = kalshi_fee(size, float(no_ask))
+    ev_ct = round((1.0 - fair) - float(no_ask) - (fee / size if size else 0), 4)
     return {
         "ticker": quote.get("ticker"),
         "event_ticker": quote.get("event_ticker", ""),
@@ -112,6 +123,7 @@ def fade_decision(quote: dict, centers, rates, *,
         "fill_price": round(float(no_ask), 4),
         "our_size": size,
         "notional": round(size * float(no_ask), 2),
+        "fee": round(fee, 2),
         "ev_per_contract": ev_ct,
         "hours_to_close": quote.get("hours_to_close"),
     }
@@ -399,10 +411,14 @@ def cmd_settle(args) -> None:
         res = str(m.get("result", "") or "").lower()
         if res not in ("yes", "no"):
             continue
-        # We bought NO: win if market resolved NO.
+        # We bought NO: win if market resolved NO. Net the Kalshi fee (charged
+        # at entry) so the scorecard reflects real, after-fee fills.
         won = (res == "no")
         fill = float(r["fill_price"]); size = float(r["our_size"])
-        r["paper_pnl"] = round((size * (1.0 - fill)) if won else (-size * fill), 2)
+        fee = float(r.get("fee") or kalshi_fee(size, fill))
+        gross = (size * (1.0 - fill)) if won else (-size * fill)
+        r["fee"] = round(fee, 2)
+        r["paper_pnl"] = round(gross - fee, 2)
         r["status"] = "won" if won else "lost"
         r["result"] = res
         r["resolved_at"] = datetime.now(timezone.utc).isoformat()
