@@ -163,7 +163,41 @@ HOURLY_SERIES = ["KXTEMPNYCH", "KXTEMPCHIH", "KXTEMPDCH", "KXTEMPBOSH",
                  "KXTEMPLAXH", "KXTEMPMIAH"]
 HOURLY_MIN_H, HOURLY_MAX_H = 0.5, 12.0   # hourly markets close within hours
 COLLECT_LEDGER = ROOT / "data" / "hourly_weather_collect.jsonl"
+HOURLY_DISCOVERED = ROOT / "data" / "hourly_series_discovered.json"
 SCAN_STATUS = ROOT / "data" / "weather_fade_scan_status.json"   # last-run health
+
+
+def discover_hourly_series() -> list[str]:
+    """Find Kalshi's live hourly-temp series from the SERIES CATALOG instead of
+    trusting the hardcoded list. The collector has gathered 0 rows — if hourly
+    products list under tickers we don't watch, the static list would silently
+    collect nothing forever. Tries the catalog's weather categories; any
+    failure falls back to the static list (harmless: empty series yield 0
+    markets). Writes what it found to data/hourly_series_discovered.json."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from fetch_backtest_data import _kalshi_get
+    found = set()
+    for cat in ("Climate and Weather", "Weather"):
+        try:
+            data = _kalshi_get("/series", {"category": cat, "limit": 200})
+        except Exception:
+            continue
+        for s in (data.get("series") or []):
+            t = str(s.get("ticker") or "").upper()
+            # hourly temp products (current-temperature), not the daily HIGH/LOW
+            if "TEMP" in t and not t.startswith(("KXHIGH", "KXLOW", "HIGH", "LOW")):
+                found.add(t)
+    watching = sorted(set(HOURLY_SERIES) | found)
+    try:
+        HOURLY_DISCOVERED.parent.mkdir(parents=True, exist_ok=True)
+        HOURLY_DISCOVERED.write_text(json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "discovered": sorted(found),
+            "new_vs_static": sorted(found - set(HOURLY_SERIES)),
+            "watching": watching}))
+    except Exception:
+        pass
+    return watching
 
 
 def _best_bid(levels) -> float | None:
@@ -717,8 +751,13 @@ def cmd_collect(args) -> None:
     """Forward-collect HOURLY weather price→outcome data (no Becker history
     exists for KXTEMP*). Records each market's earliest entry price once; run it
     hourly. After a few weeks, becker_edge on this file tests the hourly edge."""
+    series = discover_hourly_series()
+    new_series = sorted(set(series) - set(HOURLY_SERIES))
+    if new_series:
+        print(f"collect: catalog discovery added {len(new_series)} hourly series "
+              f"beyond the static list: {', '.join(new_series[:10])}")
     try:
-        quotes = _open_weather_quotes(HOURLY_SERIES, HOURLY_MIN_H, HOURLY_MAX_H)
+        quotes = _open_weather_quotes(series, HOURLY_MIN_H, HOURLY_MAX_H)
     except Exception as e:
         print(f"! collect failed ({e}) — run on home IP", file=sys.stderr)
         return
@@ -734,7 +773,11 @@ def cmd_collect(args) -> None:
             f.write(json.dumps(r) + "\n")
     n_open = sum(1 for r in existing if r.get("status") == "open") + len(new)
     n_closed = sum(1 for r in existing if r.get("status") in ("won", "lost", "settled"))
-    print(f"collect: {len(quotes)} open hourly markets, {len(new)} new recorded "
+    # listed-vs-priced split: distinguishes "no hourly products exist" from
+    # "products list but their books are empty" — different problems.
+    n_priced = sum(1 for q in quotes if isinstance(q.get("yes_price"), (int, float)))
+    print(f"collect: watching {len(series)} series -> {len(quotes)} open hourly markets "
+          f"({n_priced} with a priced book), {len(new)} new recorded "
           f"-> {COLLECT_LEDGER} (total: {n_open} awaiting outcome, {n_closed} settled)")
 
 
