@@ -32,7 +32,8 @@ CALIB_SRC = ROOT / "data" / "backtest" / "becker_kalshi_weather.jsonl"
 # Day-ahead window: only enter markets this far from close (the edge is at open).
 MIN_HOURS_TO_CLOSE = 6.0
 MAX_HOURS_TO_CLOSE = 40.0
-DEFAULT_THR = 0.05            # require |fair − price| ≥ 5pp (best EV in backtest)
+DEFAULT_THR = 0.03            # data-gathering: looser net (still clearly +EV in
+                              # backtest; edge logged per-trade so you slice in analyze)
 DEFAULT_BANKROLL = 143.0
 DEFAULT_RISK_PCT = 0.02       # ~$2.86/trade at $143
 DEFAULT_MAX_TRADE_USD = 3.0
@@ -482,6 +483,81 @@ def cmd_report(args) -> None:
     print("  ↑ judge the edge by THIS (real order-book fills), not the backtest.")
 
 
+def _tkid(r: dict) -> str:
+    return r.get("ticker") or r.get("market_ticker") or ""
+
+
+def cmd_analyze(args) -> None:
+    """Slice settled fades to hunt the win/lose pattern: by conviction (edge),
+    by favorite price, by city, and by day (hot days = high YES-rate)."""
+    closed = [r for r in _load_ledger() if r.get("status") in ("won", "lost")]
+    if not closed:
+        print("no settled fades yet — nothing to analyze.")
+        return
+
+    def pnl(r):
+        return float(r.get("paper_pnl", 0) or 0)
+
+    def summarize(items):
+        w = sum(1 for r in items if r["status"] == "won")
+        net = sum(pnl(r) for r in items)
+        n = len(items)
+        return f"n={n:>4} {w}W/{n-w}L  WR {w/n*100:>5.1f}%  net ${net:>+8.2f}  EV ${net/n:>+6.3f}/trade"
+
+    def grp(items, keyfn, order=None):
+        g = {}
+        for r in items:
+            g.setdefault(keyfn(r), []).append(r)
+        keys = order or sorted(g)
+        return [(k, g[k]) for k in keys if k in g]
+
+    days = {_event_date(_tkid(r)) for r in closed}
+    wins = [r for r in closed if r["status"] == "won"]
+    losses = [r for r in closed if r["status"] == "lost"]
+    aw = sum(pnl(r) for r in wins) / len(wins) if wins else 0.0
+    al = -sum(pnl(r) for r in losses) / len(losses) if losses else 0.0
+    wr = len(wins) / len(closed) * 100
+    be = al / (aw + al) * 100 if (aw + al) else 0.0
+
+    print(f"=== weather-fade ANALYSIS — {len(closed)} settled across {len(days)} distinct day(s) ===")
+    if len(days) < 8:
+        print(f"  ⚠ only {len(days)} day(s) — patterns below are SUGGESTIVE, not conclusive.")
+    print(f"\nPAYOFF SHAPE: avg win +${aw:.2f}, avg loss -${al:.2f} → "
+          f"breakeven WR {be:.0f}% · actual WR {wr:.0f}%  "
+          f"({'+EV' if wr > be else 'UNDER breakeven'})")
+
+    print("\nBY CONVICTION (|edge| at entry — does a bigger edge win more?):")
+    def ebkt(r):
+        m = abs(float(r.get("edge", 0) or 0))
+        return ("0.03-0.05" if m < 0.05 else "0.05-0.08" if m < 0.08
+                else "0.08-0.12" if m < 0.12 else "0.12+")
+    for k, items in grp(closed, ebkt, ["0.03-0.05", "0.05-0.08", "0.08-0.12", "0.12+"]):
+        print(f"  edge {k:9} {summarize(items)}")
+
+    print("\nBY FAVORITE PRICE (market YES at entry — fade big vs small favorites?):")
+    def pbkt(r):
+        p = float(r.get("yes_price", 0) or 0)
+        return ("<0.60" if p < 0.60 else "0.60-0.70" if p < 0.70
+                else "0.70-0.80" if p < 0.80 else "0.80-0.90" if p < 0.90 else "0.90+")
+    for k, items in grp(closed, pbkt, ["<0.60", "0.60-0.70", "0.70-0.80", "0.80-0.90", "0.90+"]):
+        print(f"  YES {k:9} {summarize(items)}")
+
+    print("\nBY CITY (* = outside validated 8):")
+    val = {_city_of(s + "-x") for s in VALIDATED_SERIES}
+    for k, items in sorted(grp(closed, lambda r: _city_of(_tkid(r))),
+                           key=lambda kv: sum(pnl(r) for r in kv[1])):
+        tag = "" if k in val else " *new"
+        print(f"  {k:6}{tag:5} {summarize(items)}")
+
+    print("\nBY DAY (YES-rate = how 'hot' the day ran; fades lose when YES-rate high):")
+    for k, items in grp(closed, lambda r: _event_date(_tkid(r))):
+        yes_rate = sum(1 for r in items if str(r.get("result")) == "yes") / len(items) * 100
+        net = sum(pnl(r) for r in items)
+        print(f"  {k:9} {len(items):>3} mkts · YES-rate {yes_rate:>5.0f}% · net ${net:>+8.2f}")
+    print("\n  → The pattern to watch: does net P&L go red on high-YES-rate (hot) days and "
+          "green on low? If so, the edge is a directional weather bet, not a pricing edge.")
+
+
 def cmd_probe(args) -> None:
     """Snapshot weather-book liquidity now and append to a probe log, so running
     it on a short interval reveals WHEN these books are quoted/takeable. Cheap;
@@ -597,7 +673,7 @@ def cmd_collect_settle(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["scan", "settle", "report", "probe",
+    ap.add_argument("cmd", choices=["scan", "settle", "report", "analyze", "probe",
                                     "collect", "collect-settle"])
     ap.add_argument("--calibration", default=str(CALIB_SRC),
                     help="historical weather jsonl to fit the calibration on")
@@ -609,7 +685,7 @@ def main() -> None:
                          "(diagnose firing rate + calibration-vs-live mapping)")
     args = ap.parse_args()
     {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report,
-     "probe": cmd_probe, "collect": cmd_collect,
+     "analyze": cmd_analyze, "probe": cmd_probe, "collect": cmd_collect,
      "collect-settle": cmd_collect_settle}[args.cmd](args)
 
 
