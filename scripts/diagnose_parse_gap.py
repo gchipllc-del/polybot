@@ -25,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from join_weather_trials import (SERIES_CITY, parse_series, parse_event_date,  # noqa: E402
-                                 parse_strike, build_truth_index, _load_jsonl)
+                                 parse_strike2, build_truth_index, _load_jsonl)
 
 
 def classify(r, truth, truth_cities):
@@ -37,7 +37,7 @@ def classify(r, truth, truth_cities):
     date = parse_event_date(r.get("event_ticker", ""), tk)
     if date is None:
         return "no_date", series
-    strike = parse_strike(tk, r.get("yes_sub_title", ""))
+    kind, strike = parse_strike2(tk, r.get("yes_sub_title", ""))
     if strike is None:
         return "no_strike", series
     city = sc[0]
@@ -122,6 +122,45 @@ def main() -> None:
     if missing_truth:
         print(f"\n!! mapped cities with NO truth rows (fetch_backtest_data _cities gap): "
               f"{', '.join(missing_truth)}")
+
+    band_width_check(seen, truth)
+
+
+def band_width_check(seen, truth):
+    """Empirically verify the B<mid> band-width assumption against Kalshi's
+    own settlements: for joined band markets, does result==YES match
+    |actual − mid| ≤ 1.0 (two integer temps) better than ≤ 0.5 (one temp)?
+    Imperfect agreement is expected (Open-Meteo reanalysis vs NWS CLI), but
+    the right width should clearly dominate."""
+    n = 0
+    agree = {0.5: 0, 1.0: 0, 1.5: 0}
+    for tk, (r, _t) in seen.items():
+        kind, strike = parse_strike2(tk, r.get("yes_sub_title", ""))
+        if kind != "band" or strike is None:
+            continue
+        sc = SERIES_CITY.get(parse_series(tk))
+        date = parse_event_date(r.get("event_ticker", ""), tk)
+        if not sc or date is None:
+            continue
+        info = truth.get((sc[0], date))
+        if info is None or info.get("actual_temp") is None:
+            continue
+        actual = float(info["actual_temp"])
+        result_yes = str(r.get("result", "")).lower() == "yes"
+        n += 1
+        for hw in agree:
+            if (abs(actual - strike) <= hw) == result_yes:
+                agree[hw] += 1
+    if n < 50:
+        print(f"\n(band-width check: only {n} band markets joined — skipped)")
+        return
+    print(f"\n--- band-width check over {n} B-strike markets (vs Kalshi settlement) ---")
+    for hw in sorted(agree):
+        print(f"  |actual − mid| ≤ {hw}: agrees with result {agree[hw]/n*100:.1f}%")
+    best = max(agree, key=agree.get)
+    print(f"  -> best width: ±{best}"
+          + ("  (matches BAND_HALF_WIDTH — model OK)" if best == 1.0 else
+             f"  !! BAND_HALF_WIDTH is 1.0 — fix join_weather_trials before trusting band p_yes"))
 
 
 if __name__ == "__main__":

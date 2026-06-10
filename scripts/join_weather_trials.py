@@ -54,6 +54,11 @@ SERIES_CITY = {
     "KXHIGHNY": ("ny_high", "max"), "KXHIGHDEN": ("den_high", "max"),
     "KXHIGHMIA": ("mia_high", "max"), "KXHIGHPHIL": ("phil_high", "max"),
     "KXHIGHLAX": ("lax_high", "max"), "KXHIGHHOU": ("hou_high", "max"),
+    # Oldest pre-KX prefixes (2021–2024, ~13k markets — the 46% parse gap):
+    # same four cities, no "KX". HIGHNY0 is an early NY series variant.
+    "HIGHNY": ("ny_high", "max"), "HIGHCHI": ("chi_high", "max"),
+    "HIGHAUS": ("aus_high", "max"), "HIGHMIA": ("mia_high", "max"),
+    "HIGHNY0": ("ny_high", "max"),
 }
 
 
@@ -84,6 +89,20 @@ def parse_strike(ticker: str, yes_sub_title: str = "") -> float | None:
     return float(m.group(1)) if m else None
 
 
+def parse_strike2(ticker: str, yes_sub_title: str = "") -> tuple[str | None, float | None]:
+    """(kind, strike): 'above' for -T<n> thresholds, 'band' for -B<mid> bucket
+    markets (old HIGH* series: B48.5 settles YES on an integer temp of 48 or
+    49, i.e. mid ± 1°F continuous). Subtitle-number fallback is 'above'."""
+    m = re.search(r"T(-?\d+(?:\.\d+)?)$", ticker or "")
+    if m:
+        return "above", float(m.group(1))
+    m = re.search(r"B(-?\d+(?:\.\d+)?)$", ticker or "")
+    if m:
+        return "band", float(m.group(1))
+    m = re.search(r"(-?\d+(?:\.\d+)?)", yes_sub_title or "")
+    return ("above", float(m.group(1))) if m else (None, None)
+
+
 def p_above(forecast_f: float, strike_f: float, sigma_f: float) -> float:
     """P(actual ≥ strike | forecast) under a normal error model, clipped to
     [0.02, 0.98]. Same math as weather_signal._p_above_strike."""
@@ -92,6 +111,25 @@ def p_above(forecast_f: float, strike_f: float, sigma_f: float) -> float:
     z = (forecast_f - strike_f) / sigma_f
     p = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
     return max(0.02, min(0.98, p))
+
+
+BAND_HALF_WIDTH = 1.0   # B<mid> = two integer temps, e.g. [47.5, 49.5] around 48.5
+
+
+def forecast_p_yes(kind: str, strike_f: float, forecast_f: float,
+                   sigma_f: float) -> float:
+    """P(YES | forecast) for either market kind, clipped to [0.02, 0.98]."""
+    if kind == "band":
+        lo, hi = strike_f - BAND_HALF_WIDTH, strike_f + BAND_HALF_WIDTH
+        p = p_above(forecast_f, lo, sigma_f) - p_above(forecast_f, hi, sigma_f)
+        return max(0.02, min(0.98, p))
+    return p_above(forecast_f, strike_f, sigma_f)
+
+
+def actual_is_yes(kind: str, strike_f: float, actual_f: float) -> bool:
+    if kind == "band":
+        return abs(actual_f - strike_f) <= BAND_HALF_WIDTH
+    return actual_f >= strike_f
 
 
 def build_truth_index(truth_rows: list[dict]) -> dict:
@@ -123,7 +161,7 @@ def join_trials(market_rows: list[dict], truth_rows: list[dict],
         series = parse_series(tk)
         sc = SERIES_CITY.get(series)
         date = parse_event_date(r.get("event_ticker", ""), tk)
-        strike = parse_strike(tk, r.get("yes_sub_title", ""))
+        kind, strike = parse_strike2(tk, r.get("yes_sub_title", ""))
         if not sc or date is None or strike is None:
             stats["no_parse"] += 1
             continue
@@ -136,14 +174,14 @@ def join_trials(market_rows: list[dict], truth_rows: list[dict],
         if fc is None:
             stats["no_temp"] += 1
             continue
-        # These series are all "above the strike" YES markets.
-        fc_p = round(p_above(float(fc), strike, sigma), 4)
-        actual_yes = (1 if (ac is not None and float(ac) >= strike) else 0)
+        fc_p = round(forecast_p_yes(kind, strike, float(fc), sigma), 4)
+        actual_yes = (1 if (ac is not None
+                            and actual_is_yes(kind, strike, float(ac))) else 0)
         mkt = r.get("market_p_yes")
         stats["joined"] += 1
         out.append({
             "market_ticker": tk, "city": city, "date": date,
-            "direction": direction, "strike_f": strike,
+            "direction": direction, "strike_f": strike, "strike_kind": kind,
             "market_p_yes": mkt,
             "forecast_temp_f": fc, "actual_temp_f": ac,
             "forecast_p_yes": fc_p,

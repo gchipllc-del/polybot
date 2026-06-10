@@ -48,8 +48,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from becker_edge import fit_calibration, fair_prob                    # noqa: E402
 from weather_fade import FILL_FLOOR, FILL_CEIL                        # noqa: E402
 from join_weather_trials import (SERIES_CITY, parse_series,           # noqa: E402
-                                 parse_event_date, parse_strike,
-                                 p_above, build_truth_index, _load_jsonl)
+                                 parse_event_date, parse_strike2,
+                                 forecast_p_yes, build_truth_index, _load_jsonl)
 from analyze_history_days import pearson                              # noqa: E402
 
 THRESHOLDS = (0.03, 0.05, 0.08, 0.10, 0.12)
@@ -87,7 +87,7 @@ def load_joined_markets(markets_path: Path, truth_path: Path, sigma: float):
         stats["markets"] += 1
         sc = SERIES_CITY.get(parse_series(tk))
         date = parse_event_date(r.get("event_ticker", ""), tk)
-        strike = parse_strike(tk, r.get("yes_sub_title", ""))
+        kind, strike = parse_strike2(tk, r.get("yes_sub_title", ""))
         if not sc or date is None or strike is None:
             stats["no_parse"] += 1
             continue
@@ -95,7 +95,7 @@ def load_joined_markets(markets_path: Path, truth_path: Path, sigma: float):
         if info is None or info.get("forecast_temp") is None:
             stats["no_truth"] += 1
             continue
-        p_fc = p_above(float(info["forecast_temp"]), strike, sigma)
+        p_fc = forecast_p_yes(kind, strike, float(info["forecast_temp"]), sigma)
         stats["joined"] += 1
         rows.append((float(r["market_p_yes"]), p_fc,
                      str(r.get("result", "")).lower() == "yes", date, t))
