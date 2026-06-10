@@ -170,6 +170,46 @@ def print_table(name: str, rows, strategies):
     return headline
 
 
+def rank_skill_check(rows, nbins=10, min_side=20):
+    """Does the forecast carry information BEYOND the price level?
+
+    Within each market-price bin, split markets into forecast-cheap (p_fc > p)
+    vs forecast-rich (p_fc < p) and compare realized YES rates. The price level
+    is held fixed, so a positive lift (cheap resolves YES more often than rich
+    at the SAME price) can only come from the forecast — Brier-miscalibration
+    in level can't fake it. Returns the trade-weighted average lift."""
+    bins: dict = {}
+    for p, p_fc, yes, *_ in rows:
+        if not (FILL_FLOOR <= p <= FILL_CEIL):
+            continue
+        b = min(nbins - 1, int(p * nbins))
+        bins.setdefault(b, []).append((p_fc - p, 1.0 if yes else 0.0))
+    print(f"\n--- forecast rank-skill within price bins (lift = YES-rate of "
+          f"forecast-cheap − forecast-rich at the same price) ---")
+    print(f"{'price bin':>10} {'n_cheap':>8} {'n_rich':>7} {'yes%cheap':>10} "
+          f"{'yes%rich':>9} {'lift':>7}")
+    wsum = wn = 0.0
+    for b in sorted(bins):
+        items = bins[b]
+        cheap = [y for d, y in items if d > 0]
+        rich = [y for d, y in items if d < 0]
+        if len(cheap) < min_side or len(rich) < min_side:
+            continue
+        yc, yr = sum(cheap) / len(cheap), sum(rich) / len(rich)
+        n = len(cheap) + len(rich)
+        wsum += (yc - yr) * n
+        wn += n
+        print(f"{b/nbins:>5.2f}-{(b+1)/nbins:<4.2f} {len(cheap):>8} {len(rich):>7} "
+              f"{yc*100:>9.1f}% {yr*100:>8.1f}% {yc-yr:>+7.3f}")
+    if wn:
+        avg = wsum / wn
+        print(f"{'weighted avg lift':>43}: {avg:+.3f}  "
+              f"({'forecast HAS rank skill beyond price' if avg > 0.03 else 'forecast adds ~no information beyond price' if avg > -0.03 else 'forecast is ANTI-informative'})")
+        return avg
+    print("  (not enough data in any bin)")
+    return None
+
+
 # ---------------------------------------------------------------- strategies
 
 def strat_price_only(centers, cal_rates):
@@ -214,17 +254,16 @@ def strat_calib_two_sided(centers, cal_rates):
     return make
 
 
-def strat_random_two_sided(thr, seed=7):
-    """FLOOR reference: two-sided with sides chosen at random (forecast and
-    calibration both ignored). Should be ~breakeven-minus-fees and decorrelated
-    — it cannot harvest the bias because it doesn't know which side is rich.
-    Trades the same in-band markets at roughly the forecast version's rate."""
+def strat_fc_scrambled(thr, seed=7):
+    """FLOOR reference: trades the EXACT same markets as forecast two-sided
+    (same |forecast−market| ≥ thr gate, same volume) but the side is a coin
+    flip. Any net gap between the forecast version and this floor is purely
+    the value of KNOWING which side is rich — volume-matched by construction."""
     rng = random.Random(seed)
-    def decide(_p, _p_fc):
-        r = rng.random()
-        if r < thr * 4:            # match rough trade volume of the gated strats
-            return "no" if rng.random() < 0.5 else "yes"
-        return None
+    def decide(p, p_fc):
+        if abs(p_fc - p) < thr:
+            return None
+        return "no" if rng.random() < 0.5 else "yes"
     return decide
 
 
@@ -294,6 +333,20 @@ def selftest() -> int:
         print("  FAIL: with a truly skilled forecast, the forecast version should "
               "beat the price-only control")
         ok = False
+
+    # Volume-matched floor: same trade set as skilled 2-sided, coin-flip side.
+    # The skilled side-pick must be worth real EV/ct over the flip.
+    st_fl = day_stats(run_strategy(rows_skill, strat_fc_scrambled(0.05)))
+    ev_s, ev_fl = st_skill[4], st_fl[4]
+    print(f"  scrambled floor : {st_fl[2]} trades, net {st_fl[3]:+.2f}, "
+          f"EV/ct {ev_fl:+.3f} (skilled EV/ct {ev_s:+.3f})")
+    if st_fl[2] != ntr_s:
+        print(f"  FAIL: floor must trade the same volume as skilled "
+              f"({st_fl[2]} != {ntr_s})")
+        ok = False
+    if not (ev_s - ev_fl > 0.01):
+        print("  FAIL: skilled side-pick should be worth > +0.01/ct over a coin flip")
+        ok = False
     print("  PASS" if ok else "  *** SELFTEST FAILED ***")
     return 0 if ok else 1
 
@@ -349,6 +402,9 @@ def main() -> None:
                     for p, _fc, yes, *_ in trade) / len(trade)
     print(f"Brier (lower=better): forecast {brier_fc:.4f}  vs  market {brier_mkt:.4f}"
           f"  -> forecast {'HAS independent signal' if brier_fc < brier_mkt else 'is WORSE than the market price'}")
+    # Brier measures LEVEL calibration; a level-miscalibrated forecast can still
+    # rank same-priced markets correctly. This is the direct test of that:
+    rank_lift = rank_skill_check(trade)
 
     print_table("price-only fade (live rule, baseline on the joined subset)",
                 trade, strat_price_only(centers, cal_rates))
@@ -359,39 +415,37 @@ def main() -> None:
     # THE CONTROLS — decide cheap/rich WITHOUT any weather forecast.
     h_calib = print_table("CONTROL: calibration two-sided (price-only side pick, NO forecast)",
                           trade, strat_calib_two_sided(centers, cal_rates))
-    h_rand = print_table("FLOOR: random two-sided (sides coin-flipped — should be ~breakeven)",
-                         trade, lambda thr: strat_random_two_sided(thr))
+    h_scram = print_table("FLOOR: side-scrambled (SAME markets as forecast 2-sided, coin-flip side)",
+                          trade, lambda thr: strat_fc_scrambled(thr))
 
     print("\nHOW TO READ THIS — the forecast-attribution question:")
-    print("  • All three two-sided cuts cancel weather-direction exposure by")
-    print("    construction, so decorrelation alone proves nothing.")
-    print("  • CONTROL (calibration two-sided) is the discriminator: it picks the")
-    print("    SAME cheap/rich sides from the price curve with NO forecast.")
-    print("      – forecast two-sided ≈ CONTROL  → the forecast adds nothing; the")
-    print("        edge is direction-neutral favorite-longshot harvesting (no")
-    print("        weather pipeline needed — simpler and just as good).")
-    print("      – forecast two-sided clearly BEATS the CONTROL → the forecast")
-    print("        carries rank information despite its bad Brier → worth keeping.")
-    print("  • FLOOR (random sides) should be ~breakeven: confirms the profit comes")
-    print("    from KNOWING which side is rich, not from the two-sided structure.")
+    print("  • Two-sided cuts cancel weather-direction exposure by construction,")
+    print("    so decorrelation alone proves nothing about the forecast.")
+    print("  • FLOOR is the clean comparison: identical trade set and volume as")
+    print("    forecast two-sided, side coin-flipped. The per-contract gap between")
+    print("    them is exactly the value of the forecast's side-pick.")
+    print("  • CONTROL shows what the price curve alone offers two-sided (it mostly")
+    print("    finds NO-side trades, so compare it on EV/ct, not total net).")
+    print("  • The rank-skill table above is the model-free check: positive lift =")
+    print("    the forecast separates winners from losers AT THE SAME PRICE.")
 
-    def _net(h):
-        return h[3] if h else None
-    nf, nc = _net(h_2s), _net(h_calib)
-    if nf is not None and nc is not None:
-        gap = nf - nc
-        rel = gap / abs(nc) if nc else float("inf")
-        if abs(rel) < 0.15:
-            call = ("FORECAST ADDS NOTHING — calibration two-sided matches it. "
-                    "Trade the favorite-longshot bias both sides; drop the forecast.")
-        elif gap > 0:
-            call = ("FORECAST HELPS — it beats the price-only control by "
-                    f"${gap:+.2f} ({rel:+.0%}). Rank-informative despite bad Brier.")
+    if h_2s and h_scram:
+        ev_f, ev_s = h_2s[4], h_scram[4]
+        ev_c = h_calib[4] if h_calib else None
+        side_value = ev_f - ev_s
+        print(f"\n  @ thr 0.05 per-contract: forecast 2-sided {ev_f:+.3f}  vs  "
+              f"side-scrambled floor {ev_s:+.3f}  ->  side-pick worth {side_value:+.3f}/ct"
+              + (f"  (calibration control {ev_c:+.3f}/ct on its own, smaller book)"
+                 if ev_c is not None else ""))
+        if side_value > 0.015 and h_2s[3] > 0 and (rank_lift or 0) > 0.02:
+            call = ("FORECAST CARRIES REAL SIDE INFORMATION — beats its own "
+                    "volume-matched floor AND shows rank skill at fixed price.")
+        elif side_value <= 0.005 or (rank_lift is not None and rank_lift < 0.0):
+            call = ("FORECAST ADDS NOTHING — its side-pick is no better than a coin "
+                    "flip on the same markets. Drop the forecast.")
         else:
-            call = ("FORECAST HURTS — the price-only control is better by "
-                    f"${-gap:+.2f}. Definitely drop the forecast.")
-        print(f"\n  @ thr 0.05: forecast 2-sided ${nf:+.2f} vs calibration control "
-              f"${nc:+.2f} (random floor ${_net(h_rand) or 0:+.2f}) → {call}")
+            call = "MARGINAL — side value exists but is thin; needs more data."
+        print(f"  -> {call}")
 
 
 if __name__ == "__main__":
