@@ -487,6 +487,89 @@ def _tkid(r: dict) -> str:
     return r.get("ticker") or r.get("market_ticker") or ""
 
 
+def cmd_health(args) -> None:
+    """One-shot check that the whole paper-trading harness is alive: agents
+    loaded, Mac awake, scan firing, ledger growing, dashboard rendering."""
+    import subprocess
+    import time as _time
+    now = datetime.now(timezone.utc)
+    tick = lambda b: "OK " if b else "!! "
+    issues = []
+
+    # 1) launchd agents
+    want = ["scan", "probe", "collect", "collectsettle", "settle", "dashfile", "dash"]
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    present = sorted(w for w in want if f"weatherfade.{w}" in out)
+    print(f"[{tick(len(present) >= 5)}] agents loaded: {len(present)}/{len(want)}  "
+          f"({', '.join(present) or 'NONE'})")
+    missing = [w for w in want if w not in present]
+    if missing:
+        issues.append(f"missing agents: {', '.join(missing)} "
+                      f"(run scripts/launchd/install_weatherfade_agents.sh)")
+
+    # 2) Mac awake
+    try:
+        awake = subprocess.run(["pgrep", "-x", "caffeinate"],
+                               capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        awake = False
+    print(f"[{tick(awake)}] mac kept awake (caffeinate): {'yes' if awake else 'NO'}")
+    if not awake:
+        issues.append("caffeinate not running — overnight/evening scans may be skipped")
+
+    # 3) scan freshness (dead window 04-13 UTC is normal staleness)
+    age = None
+    if SCAN_STATUS.exists():
+        try:
+            st = json.loads(SCAN_STATUS.read_text())
+            age = (now - datetime.fromisoformat(st["ts"].replace("Z", "+00:00"))).total_seconds() / 60
+        except Exception:
+            pass
+    dead = 4 <= now.hour <= 13
+    if age is None:
+        print("[!! ] scan: has never recorded a run")
+        issues.append("scan never ran")
+    elif age <= 75 or dead:
+        tag = " (overnight dead window — normal)" if dead and age > 75 else ""
+        print(f"[OK ] scan: last ran {int(age)} min ago{tag}")
+    else:
+        print(f"[!! ] scan: last ran {int(age)} min ago — STALE during a liquid window")
+        issues.append("scan stale in a liquid window (Mac asleep / agent down?)")
+
+    # 4) ledger growth
+    rows = _load_ledger()
+    closed = [r for r in rows if r.get("status") in ("won", "lost")]
+    openn = [r for r in rows if r.get("status") == "open"]
+    days = {_event_date(_tkid(r)) for r in closed}
+    print(f"[{tick(bool(rows))}] ledger: {len(openn)} open · {len(closed)} settled "
+          f"across {len(days)} distinct day(s)")
+
+    # 5) dashboard file freshness
+    df = ROOT / "data" / "weather_fade_dash.html"
+    if df.exists():
+        dage = (_time.time() - df.stat().st_mtime) / 60
+        print(f"[{tick(dage <= 15)}] dashboard file: rendered {int(dage)} min ago  "
+              f"(open {df})")
+    else:
+        print("[!! ] dashboard file: not rendered yet")
+
+    # collect (hourly-weather forward data)
+    n_collect = sum(1 for _ in open(COLLECT_LEDGER)) if COLLECT_LEDGER.exists() else 0
+    print(f"[OK ] hourly-collect rows: {n_collect}")
+
+    print()
+    if not issues:
+        print("==> ALL PAPER-TRADING SYSTEMS RUNNING. Nothing to do but let days accumulate.")
+    else:
+        print("==> ISSUES:")
+        for i in issues:
+            print(f"    - {i}")
+
+
 def cmd_analyze(args) -> None:
     """Slice settled fades to hunt the win/lose pattern: by conviction (edge),
     by favorite price, by city, and by day (hot days = high YES-rate)."""
@@ -673,8 +756,8 @@ def cmd_collect_settle(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["scan", "settle", "report", "analyze", "probe",
-                                    "collect", "collect-settle"])
+    ap.add_argument("cmd", choices=["scan", "settle", "report", "analyze", "health",
+                                    "probe", "collect", "collect-settle"])
     ap.add_argument("--calibration", default=str(CALIB_SRC),
                     help="historical weather jsonl to fit the calibration on")
     ap.add_argument("--bins", type=int, default=20)
@@ -685,8 +768,8 @@ def main() -> None:
                          "(diagnose firing rate + calibration-vs-live mapping)")
     args = ap.parse_args()
     {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report,
-     "analyze": cmd_analyze, "probe": cmd_probe, "collect": cmd_collect,
-     "collect-settle": cmd_collect_settle}[args.cmd](args)
+     "analyze": cmd_analyze, "health": cmd_health, "probe": cmd_probe,
+     "collect": cmd_collect, "collect-settle": cmd_collect_settle}[args.cmd](args)
 
 
 if __name__ == "__main__":
