@@ -514,8 +514,10 @@ def cmd_health(args) -> None:
 
     # 1) launchd agents
     # The Flask :5060 server ("dash") is optional — the dashfile render replaced
-    # it — so only these six are required for the harness to be healthy.
-    want = ["scan", "probe", "collect", "collectsettle", "settle", "dashfile"]
+    # it — so only these eight are required for the harness to be healthy
+    # (incl. the fc2s forecast-two-sided sleeve's scan+settle).
+    want = ["scan", "probe", "collect", "collectsettle", "settle",
+            "fc2sscan", "fc2ssettle", "dashfile"]
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True,
                              text=True, timeout=10).stdout

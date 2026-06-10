@@ -12,16 +12,22 @@ caffeinate -dimsu &     # keep the Mac awake during the US-evening liquid window
 
 ## What runs
 
-| Agent (`com.jesse.polybot.weatherfade.*`) | Cadence | Does |
+| Agent (`com.jesse.polybot.weatherfade.*`) | Fires | Does |
 |---|---|---|
-| `scan`          | hourly        | book "fade overpriced YES" paper trades at the live book (`--thr 0.03`) |
-| `probe`         | hourly        | log book liquidity by hour (maps the live window) |
-| `collect`       | hourly        | forward-collect hourly-weather price→outcome data |
-| `collectsettle` | hourly        | fill outcomes for collected hourly markets |
-| `settle`        | hourly        | resolve booked fades → scorecard |
-| `fc2sscan`      | hourly        | book **forecast two-sided** paper trades (`--thr 0.05`) — the live execution test of the `forecast_skill_days` rank-skill edge |
-| `fc2ssettle`    | hourly        | resolve fc2s trades → scorecard |
+| `scan`          | hourly at :05 | book "fade overpriced YES" paper trades at the live book (`--thr 0.03`) |
+| `fc2ssettle`    | hourly at :12 | resolve fc2s trades → scorecard |
+| `fc2sscan`      | hourly at :20 | book **forecast two-sided** paper trades (`--thr 0.05`) — the live execution test of the `forecast_skill_days` rank-skill edge |
+| `settle`        | hourly at :32 | resolve booked fades → scorecard |
+| `probe`         | hourly at :38 | log book liquidity by hour (maps the live window) |
+| `collectsettle` | hourly at :44 | fill outcomes for collected hourly markets |
+| `collect`       | hourly at :50 | forward-collect hourly-weather price→outcome data |
 | `dashfile`      | every 5 min   | re-render the dashboard to `data/weather_fade_dash.html` (open via `file://`) |
+
+The hourly agents are **staggered by minute-of-hour** (StartCalendarInterval):
+seven agents sweeping the Kalshi API in the same second tripped 429 rate
+limits. The shared fetch path also retries 429/5xx with backoff, so a residual
+collision costs seconds, not the hour. Staggered agents do **not** fire at
+install — first runs happen within the following hour.
 
 > The live Flask server (`:5060`) is **not** installed by default — the file
 > render replaced it (localhost/https quirks made the server view unreliable).

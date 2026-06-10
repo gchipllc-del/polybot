@@ -342,19 +342,41 @@ def cmd_becker(args) -> None:
 
 
 # ── Live Kalshi settled-markets pull ───────────────────────────────────────
-def _kalshi_get(path: str, params: dict):
-    """Try the bot's signed client first, fall back to unauthenticated GET."""
-    try:
-        from lib.kalshi_auth import signed_get, can_sign
-        if can_sign():
-            return signed_get(path, params=params)
-    except Exception:
-        pass
-    import requests
-    base = "https://api.elections.kalshi.com/trade-api/v2"
-    r = requests.get(f"{base}{path}", params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+def _kalshi_get(path: str, params: dict, _tries: int = 4):
+    """Try the bot's signed client first, fall back to unauthenticated GET.
+    Retries 429/5xx with backoff (honors Retry-After): with several hourly
+    scanner agents sharing this path, a transient rate-limit should cost
+    seconds, not the whole hour's scan."""
+    import time
+    last_exc: Exception | None = None
+    for attempt in range(_tries):
+        try:
+            from lib.kalshi_auth import signed_get, can_sign
+            if can_sign():
+                return signed_get(path, params=params)
+        except Exception:
+            pass
+        import requests
+        base = "https://api.elections.kalshi.com/trade-api/v2"
+        try:
+            r = requests.get(f"{base}{path}", params=params, timeout=20)
+            if r.status_code == 429 or r.status_code >= 500:
+                if attempt < _tries - 1:
+                    try:
+                        wait = float(r.headers.get("Retry-After") or 0)
+                    except (TypeError, ValueError):
+                        wait = 0.0
+                    time.sleep(max(wait, 2.0 * (attempt + 1)))
+                    continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < _tries - 1:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            raise
+    raise last_exc if last_exc else RuntimeError("kalshi GET failed")
 
 
 def fetch_kalshi_settled(series: str | None = None, max_markets: int = 5000) -> list[dict]:
