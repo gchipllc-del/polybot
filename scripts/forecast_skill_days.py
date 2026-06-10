@@ -197,6 +197,37 @@ def strat_fc_two_sided(thr):
     return decide
 
 
+def strat_calib_two_sided(centers, cal_rates):
+    """THE CONTROL: two-sided, but cheap/rich is decided by the price→outcome
+    calibration curve alone — NO weather forecast. If this decorrelates and
+    profits as well as the forecast version, the forecast adds nothing and the
+    edge is just direction-neutral favorite-longshot harvesting."""
+    def make(thr):
+        def decide(p, _p_fc):
+            d = fair_prob(p, centers, cal_rates) - p
+            if d <= -thr:
+                return "no"
+            if d >= thr:
+                return "yes"
+            return None
+        return decide
+    return make
+
+
+def strat_random_two_sided(thr, seed=7):
+    """FLOOR reference: two-sided with sides chosen at random (forecast and
+    calibration both ignored). Should be ~breakeven-minus-fees and decorrelated
+    — it cannot harvest the bias because it doesn't know which side is rich.
+    Trades the same in-band markets at roughly the forecast version's rate."""
+    rng = random.Random(seed)
+    def decide(_p, _p_fc):
+        r = rng.random()
+        if r < thr * 4:            # match rough trade volume of the gated strats
+            return "no" if rng.random() < 0.5 else "yes"
+        return None
+    return decide
+
+
 # ---------------------------------------------------------------- self-test
 
 def selftest() -> int:
@@ -247,6 +278,21 @@ def selftest() -> int:
         ok = False
     if not (net_s - net_n > 0.2 * abs(net_s)):
         print("  FAIL: skilled forecast should clearly beat a noise forecast")
+        ok = False
+
+    # Control discriminator: fit a price calibration on the skill rows and run
+    # the calibration two-sided control. With a genuinely skilled forecast, the
+    # forecast version should BEAT the price-only control; if the control alone
+    # already captured everything, the real test couldn't tell them apart.
+    centers, cal_rates, _ = fit_calibration(
+        [(p, yes) for p, _fc, yes, *_ in rows_skill], 20)
+    st_ctrl = day_stats(run_strategy(rows_skill,
+                                     strat_calib_two_sided(centers, cal_rates)(0.05)))
+    net_c = st_ctrl[3]
+    print(f"  calib control   : {st_ctrl[2]} trades, net {net_c:+.2f}, corr {st_ctrl[5]:+.2f}")
+    if not (net_s - net_c > 0.15 * abs(net_s)):
+        print("  FAIL: with a truly skilled forecast, the forecast version should "
+              "beat the price-only control")
         ok = False
     print("  PASS" if ok else "  *** SELFTEST FAILED ***")
     return 0 if ok else 1
@@ -310,24 +356,42 @@ def main() -> None:
                          trade, lambda thr: strat_fc_fade(thr))
     h_2s = print_table("forecast two-sided (NO when rich, YES when cheap — direction-neutral)",
                        trade, lambda thr: strat_fc_two_sided(thr))
+    # THE CONTROLS — decide cheap/rich WITHOUT any weather forecast.
+    h_calib = print_table("CONTROL: calibration two-sided (price-only side pick, NO forecast)",
+                          trade, strat_calib_two_sided(centers, cal_rates))
+    h_rand = print_table("FLOOR: random two-sided (sides coin-flipped — should be ~breakeven)",
+                         trade, lambda thr: strat_random_two_sided(thr))
 
-    print("\nHOW TO READ THIS:")
-    print("  • The baseline should reproduce the known result: +net but corr ≈ −0.8")
-    print("    (directional short-heat exposure).")
-    print("  • If the forecast gate keeps net > 0 and green% > 55 while corr rises")
-    print("    toward 0 (≳ −0.2), the forecast carries real, weather-neutral")
-    print("    information → worth sizing (with the per-day cap).")
-    print("  • If corr stays ≲ −0.5 in all three tables, every cut of this book is")
-    print("    the same short-vol weather bet → close the weather book.")
-    for label, h in (("forecast-gated fade", h_fade), ("two-sided", h_2s)):
-        if h and h[5] is not None:
-            ndays, green, ntr, net, _ev, corr, _h, _c = h
-            verdict = ("DECORRELATED EDGE — the forecast adds real information"
-                       if (corr > -0.2 and net > 0 and green > 55)
-                       else "still a DIRECTIONAL WEATHER BET" if corr < -0.4
-                       else "mixed — read the table")
-            print(f"\n  @ thr 0.05 {label}: {ndays} days, green {green:.0f}%, "
-                  f"net ${net:+.2f}, corr {corr:+.2f} → {verdict}")
+    print("\nHOW TO READ THIS — the forecast-attribution question:")
+    print("  • All three two-sided cuts cancel weather-direction exposure by")
+    print("    construction, so decorrelation alone proves nothing.")
+    print("  • CONTROL (calibration two-sided) is the discriminator: it picks the")
+    print("    SAME cheap/rich sides from the price curve with NO forecast.")
+    print("      – forecast two-sided ≈ CONTROL  → the forecast adds nothing; the")
+    print("        edge is direction-neutral favorite-longshot harvesting (no")
+    print("        weather pipeline needed — simpler and just as good).")
+    print("      – forecast two-sided clearly BEATS the CONTROL → the forecast")
+    print("        carries rank information despite its bad Brier → worth keeping.")
+    print("  • FLOOR (random sides) should be ~breakeven: confirms the profit comes")
+    print("    from KNOWING which side is rich, not from the two-sided structure.")
+
+    def _net(h):
+        return h[3] if h else None
+    nf, nc = _net(h_2s), _net(h_calib)
+    if nf is not None and nc is not None:
+        gap = nf - nc
+        rel = gap / abs(nc) if nc else float("inf")
+        if abs(rel) < 0.15:
+            call = ("FORECAST ADDS NOTHING — calibration two-sided matches it. "
+                    "Trade the favorite-longshot bias both sides; drop the forecast.")
+        elif gap > 0:
+            call = ("FORECAST HELPS — it beats the price-only control by "
+                    f"${gap:+.2f} ({rel:+.0%}). Rank-informative despite bad Brier.")
+        else:
+            call = ("FORECAST HURTS — the price-only control is better by "
+                    f"${-gap:+.2f}. Definitely drop the forecast.")
+        print(f"\n  @ thr 0.05: forecast 2-sided ${nf:+.2f} vs calibration control "
+              f"${nc:+.2f} (random floor ${_net(h_rand) or 0:+.2f}) → {call}")
 
 
 if __name__ == "__main__":
