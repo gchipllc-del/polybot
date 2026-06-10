@@ -19,6 +19,8 @@ caffeinate -dimsu &     # keep the Mac awake during the US-evening liquid window
 | `collect`       | hourly        | forward-collect hourly-weather price→outcome data |
 | `collectsettle` | hourly        | fill outcomes for collected hourly markets |
 | `settle`        | hourly        | resolve booked fades → scorecard |
+| `fc2sscan`      | hourly        | book **forecast two-sided** paper trades (`--thr 0.05`) — the live execution test of the `forecast_skill_days` rank-skill edge |
+| `fc2ssettle`    | hourly        | resolve fc2s trades → scorecard |
 | `dashfile`      | every 5 min   | re-render the dashboard to `data/weather_fade_dash.html` (open via `file://`) |
 
 > The live Flask server (`:5060`) is **not** installed by default — the file
@@ -27,8 +29,19 @@ caffeinate -dimsu &     # keep the Mac awake during the US-evening liquid window
 
 ## View it
 - **Dashboard (reliable):** `open data/weather_fade_dash.html` — bookmark the `file://` URL.
-- **Scorecard:** `python scripts/weather_fade.py report`
+- **Scorecard (price-only fade):** `python scripts/weather_fade.py report`
+- **Scorecard (forecast two-sided):** `python scripts/fc_two_sided.py report`
 - **Pattern analysis:** `python scripts/weather_fade.py analyze`
+
+## Why two sleeves
+`weather_fade` is the price-only fade — the backtest showed it's +EV but
+directional (corr(net, YES-rate) ≈ −0.8: a short-heat bet). `fc2s` is the
+forecast two-sided rule that the controls validated (rank-skill lift +0.15 at
+fixed price; beats its own side-scrambled floor by +0.05/ct over 285 OOS days).
+They run in parallel so the live scorecards answer the only question the
+backtest can't: does the thin +0.04/ct survive real fills on flickering books?
+fc2s carries a per-event-date risk cap (`DAY_RISK_CAP_USD`) because the
+residual corr −0.37 means one hot day still hits several cities at once.
 
 ## Liquidity / sleep note
 Weather books are only live ~14:00–03:00 UTC (US daytime/evening); 04:00–13:00 UTC

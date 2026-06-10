@@ -13,9 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN="$PROJECT_ROOT/scripts/launchd/run_weather_fade.sh"
 RUN_DASH="$PROJECT_ROOT/scripts/launchd/run_weather_fade_dash.sh"
+RUN_FC2S="$PROJECT_ROOT/scripts/launchd/run_fc2s.sh"
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS"
-chmod +x "$RUN" "$RUN_DASH" 2>/dev/null || true
+chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" 2>/dev/null || true
 
 # write_agent LABEL  INTERVAL_OR_KEEPALIVE  RUNNER  [args...]
 #   INTERVAL: a number = StartInterval seconds; "keepalive" = KeepAlive long-run
@@ -58,6 +59,10 @@ write_agent "$P.probe"         3600 "$RUN" probe
 write_agent "$P.collect"       3600 "$RUN" collect
 write_agent "$P.collectsettle" 3600 "$RUN" collect-settle
 write_agent "$P.settle"        3600 "$RUN" settle
+# fc2s — the forecast two-sided sleeve (parallel paper experiment; the live
+# execution test of the forecast_skill_days backtest verdict)
+write_agent "$P.fc2sscan"      3600 "$RUN_FC2S" scan --thr 0.05
+write_agent "$P.fc2ssettle"    3600 "$RUN_FC2S" settle
 # dashboard — file render every 5 min (the reliable view: open the HTML file,
 # no server/localhost/https). The live Flask :5060 server is intentionally NOT
 # installed (it flapped and the file view replaced it); start it manually with
