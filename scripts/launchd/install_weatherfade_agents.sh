@@ -58,9 +58,11 @@ write_agent "$P.probe"         3600 "$RUN" probe
 write_agent "$P.collect"       3600 "$RUN" collect
 write_agent "$P.collectsettle" 3600 "$RUN" collect-settle
 write_agent "$P.settle"        3600 "$RUN" settle
-# dashboard — file render every 5 min (the reliable view), + live Flask server
+# dashboard — file render every 5 min (the reliable view: open the HTML file,
+# no server/localhost/https). The live Flask :5060 server is intentionally NOT
+# installed (it flapped and the file view replaced it); start it manually with
+# `python scripts/weather_fade_dash.py serve` only if you want the live URL.
 write_agent "$P.dashfile"       300 "$RUN_DASH" render
-write_agent "$P.dash"      keepalive "$RUN_DASH"
 
 echo ""
 echo "Done. Roster:"

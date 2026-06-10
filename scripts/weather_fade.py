@@ -513,14 +513,16 @@ def cmd_health(args) -> None:
     issues = []
 
     # 1) launchd agents
-    want = ["scan", "probe", "collect", "collectsettle", "settle", "dashfile", "dash"]
+    # The Flask :5060 server ("dash") is optional — the dashfile render replaced
+    # it — so only these six are required for the harness to be healthy.
+    want = ["scan", "probe", "collect", "collectsettle", "settle", "dashfile"]
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True,
                              text=True, timeout=10).stdout
     except Exception:
         out = ""
     present = sorted(w for w in want if f"weatherfade.{w}" in out)
-    print(f"[{tick(len(present) >= 5)}] agents loaded: {len(present)}/{len(want)}  "
+    print(f"[{tick(len(present) == len(want))}] agents loaded: {len(present)}/{len(want)}  "
           f"({', '.join(present) or 'NONE'})")
     missing = [w for w in want if w not in present]
     if missing:

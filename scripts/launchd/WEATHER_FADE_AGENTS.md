@@ -19,8 +19,11 @@ caffeinate -dimsu &     # keep the Mac awake during the US-evening liquid window
 | `collect`       | hourly        | forward-collect hourly-weather price→outcome data |
 | `collectsettle` | hourly        | fill outcomes for collected hourly markets |
 | `settle`        | hourly        | resolve booked fades → scorecard |
-| `dashfile`      | every 5 min   | re-render the dashboard to `data/weather_fade_dash.html` |
-| `dash`          | KeepAlive     | live Flask dashboard on :5060 (file view is the reliable one) |
+| `dashfile`      | every 5 min   | re-render the dashboard to `data/weather_fade_dash.html` (open via `file://`) |
+
+> The live Flask server (`:5060`) is **not** installed by default — the file
+> render replaced it (localhost/https quirks made the server view unreliable).
+> Run it manually only if you want the live URL: `python scripts/weather_fade_dash.py serve`.
 
 ## View it
 - **Dashboard (reliable):** `open data/weather_fade_dash.html` — bookmark the `file://` URL.
