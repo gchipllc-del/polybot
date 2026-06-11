@@ -185,8 +185,20 @@ def discover_hourly_series() -> list[str]:
         for s in (data.get("series") or []):
             t = str(s.get("ticker") or "").upper()
             # hourly temp products (current-temperature), not the daily HIGH/LOW
-            if "TEMP" in t and not t.startswith(("KXHIGH", "KXLOW", "HIGH", "LOW")):
-                found.add(t)
+            # nor the aggregate/period series (AVG/MAX/MIN monthly/annual/global,
+            # MICH novelty, bare TEMP). Prefer the catalog's own frequency field
+            # when present; else fall back to a name blocklist.
+            if "TEMP" not in t or t.startswith(("KXHIGH", "KXLOW", "HIGH", "LOW")):
+                continue
+            freq = str(s.get("frequency") or s.get("settlement_frequency") or "").lower()
+            if freq and freq not in ("hourly", "intraday", "daily"):
+                continue                      # monthly/annual/etc per the catalog
+            if any(tok in t for tok in ("AVG", "MAX", "MIN", "MON", "ANNUAL",
+                                        "YEAR", "GTEMP", "MICH")):
+                continue
+            if t in ("TEMP", "KXTEMP"):       # bare aggregate roots
+                continue
+            found.add(t)
     watching = sorted(set(HOURLY_SERIES) | found)
     try:
         HOURLY_DISCOVERED.parent.mkdir(parents=True, exist_ok=True)

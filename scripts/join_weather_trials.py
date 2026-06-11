@@ -113,7 +113,11 @@ def p_above(forecast_f: float, strike_f: float, sigma_f: float) -> float:
     return max(0.02, min(0.98, p))
 
 
-BAND_HALF_WIDTH = 1.0   # B<mid> = two integer temps, e.g. [47.5, 49.5] around 48.5
+# B<mid> is a 1°F-wide bucket, e.g. B90.5 = "90-91°" → [90.0, 91.0] around the
+# .5 midpoint, so the HALF-width is 0.5. Verified empirically against Kalshi's
+# own settlements (diagnose_parse_gap band-width check): ±0.5 agreed 71.4% of
+# 19,340 B-markets vs 66.2% at ±1.0 vs 61.3% at ±1.5 — monotone, narrower wins.
+BAND_HALF_WIDTH = 0.5
 
 
 def forecast_p_yes(kind: str, strike_f: float, forecast_f: float,
