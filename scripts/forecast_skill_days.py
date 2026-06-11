@@ -210,6 +210,88 @@ def rank_skill_check(rows, nbins=10, min_side=20):
     return None
 
 
+def _weighted_lift(bins, min_side=20):
+    """Trade-weighted within-bin lift from prebuilt {bin: [(signed_gap, y)]}."""
+    wsum = wn = 0.0
+    for items in bins.values():
+        cheap = [y for d, y in items if d > 0]
+        rich = [y for d, y in items if d < 0]
+        if len(cheap) < min_side or len(rich) < min_side:
+            continue
+        n = len(cheap) + len(rich)
+        wsum += (sum(cheap) / len(cheap) - sum(rich) / len(rich)) * n
+        wn += n
+    return (wsum / wn) if wn else None
+
+
+def lift_significance(rows, nbins=10, min_side=20, n_perm=2000, n_boot=2000,
+                      seed=0):
+    """Is the within-bin rank lift real, or noise that more data would wash out?
+
+    Two model-free tests on the SAME OOS data (no new history exists — the
+    universe is already fully recovered):
+      • permutation p-value: shuffle the forecast's cheap/rich SIGN within each
+        price bin (kills any forecast↔outcome link, keeps the marginals) and
+        recompute the lift n_perm times. p = P(random forecast ≥ observed). The
+        scrambled-floor control is one draw of this; this is the full null.
+      • bootstrap 95% CI: resample markets with replacement n_boot times. If the
+        CI straddles 0, the lift is not distinguishable from zero.
+    """
+    rng = random.Random(seed)
+    base: dict = {}
+    for p, p_fc, yes, *_ in rows:
+        if FILL_FLOOR <= p <= FILL_CEIL:
+            base.setdefault(min(nbins - 1, int(p * nbins)), []).append(
+                (p_fc - p, 1.0 if yes else 0.0))
+    obs = _weighted_lift(base, min_side)
+    if obs is None:
+        print("\n(significance: not enough data)")
+        return None
+
+    # Permutation null: re-pair each bin's signed gaps with shuffled outcomes.
+    ge = 0
+    for _ in range(n_perm):
+        perm = {}
+        for b, items in base.items():
+            ys = [y for _d, y in items]
+            rng.shuffle(ys)
+            perm[b] = [(d, ys[i]) for i, (d, _y) in enumerate(items)]
+        L = _weighted_lift(perm, min_side)
+        if L is not None and L >= obs:
+            ge += 1
+    p_perm = (ge + 1) / (n_perm + 1)
+
+    # Bootstrap CI: resample markets with replacement.
+    allrows = [(b, d, y) for b, items in base.items() for d, y in items]
+    boots = []
+    for _ in range(n_boot):
+        samp: dict = {}
+        for _ in range(len(allrows)):
+            b, d, y = allrows[rng.randrange(len(allrows))]
+            samp.setdefault(b, []).append((d, y))
+        L = _weighted_lift(samp, min_side)
+        if L is not None:
+            boots.append(L)
+    boots.sort()
+    lo = boots[int(0.025 * len(boots))] if boots else float("nan")
+    hi = boots[int(0.975 * len(boots))] if boots else float("nan")
+
+    print(f"\n--- significance of the rank-skill lift (model-free, on the existing "
+          f"{len(allrows)} OOS markets) ---")
+    print(f"  observed weighted lift : {obs:+.3f}")
+    print(f"  permutation p-value     : {p_perm:.4f}   "
+          f"(P[random forecast ≥ observed]; {n_perm} shuffles)")
+    print(f"  bootstrap 95% CI        : [{lo:+.3f}, {hi:+.3f}]   ({len(boots)} resamples)")
+    real = p_perm < 0.05 and lo > 0
+    verdict = ("REAL signal (p<0.05 AND CI excludes 0) — small but not noise"
+               if real else
+               "NOISE — indistinguishable from a random forecast at this sample size"
+               if (p_perm >= 0.10 or lo <= 0 <= hi) else
+               "BORDERLINE — leans real but not conclusive")
+    print(f"  -> {verdict}")
+    return {"obs": obs, "p_perm": p_perm, "ci": (lo, hi), "real": real}
+
+
 # ---------------------------------------------------------------- strategies
 
 def strat_price_only(centers, cal_rates):
@@ -347,6 +429,16 @@ def selftest() -> int:
     if not (ev_s - ev_fl > 0.01):
         print("  FAIL: skilled side-pick should be worth > +0.01/ct over a coin flip")
         ok = False
+
+    # Significance harness must call a skilled forecast REAL and a noise one NOISE.
+    sig_s = lift_significance(rows_skill, n_perm=300, n_boot=300, seed=1)
+    sig_n = lift_significance(rows_noise, n_perm=300, n_boot=300, seed=1)
+    if not (sig_s and sig_s["real"]):
+        print("  FAIL: significance should call the skilled forecast REAL")
+        ok = False
+    if not (sig_n and not sig_n["real"]):
+        print("  FAIL: significance should NOT call a noise forecast real")
+        ok = False
     print("  PASS" if ok else "  *** SELFTEST FAILED ***")
     return 0 if ok else 1
 
@@ -367,6 +459,9 @@ def main() -> None:
     ap.add_argument("--bins", type=int, default=20)
     ap.add_argument("--selftest", action="store_true",
                     help="run the synthetic skill-vs-noise harness check and exit")
+    ap.add_argument("--significance", action="store_true",
+                    help="permutation p-value + bootstrap CI on the rank-skill lift "
+                         "(is the residual real or noise?)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -405,6 +500,8 @@ def main() -> None:
     # Brier measures LEVEL calibration; a level-miscalibrated forecast can still
     # rank same-priced markets correctly. This is the direct test of that:
     rank_lift = rank_skill_check(trade)
+    if args.significance:
+        lift_significance(trade)
 
     print_table("price-only fade (live rule, baseline on the joined subset)",
                 trade, strat_price_only(centers, cal_rates))

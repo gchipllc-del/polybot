@@ -128,12 +128,14 @@ def main() -> None:
 
 def band_width_check(seen, truth):
     """Empirically verify the B<mid> band-width assumption against Kalshi's
-    own settlements: for joined band markets, does result==YES match
-    |actual − mid| ≤ 1.0 (two integer temps) better than ≤ 0.5 (one temp)?
-    Imperfect agreement is expected (Open-Meteo reanalysis vs NWS CLI), but
-    the right width should clearly dominate."""
+    own settlements: for joined band markets, which half-width makes
+    |actual − mid| ≤ hw best agree with result==YES? Imperfect agreement is
+    expected (Open-Meteo reanalysis vs NWS CLI), but the right width should
+    dominate. Always tests the configured BAND_HALF_WIDTH so the verdict
+    reflects the live constant, not a hardcoded value."""
+    from join_weather_trials import BAND_HALF_WIDTH
     n = 0
-    agree = {0.5: 0, 1.0: 0, 1.5: 0}
+    agree = {hw: 0 for hw in sorted({0.5, 1.0, 1.5, BAND_HALF_WIDTH})}
     for tk, (r, _t) in seen.items():
         kind, strike = parse_strike2(tk, r.get("yes_sub_title", ""))
         if kind != "band" or strike is None:
@@ -158,9 +160,10 @@ def band_width_check(seen, truth):
     for hw in sorted(agree):
         print(f"  |actual − mid| ≤ {hw}: agrees with result {agree[hw]/n*100:.1f}%")
     best = max(agree, key=agree.get)
-    print(f"  -> best width: ±{best}"
-          + ("  (matches BAND_HALF_WIDTH — model OK)" if best == 1.0 else
-             f"  !! BAND_HALF_WIDTH is 1.0 — fix join_weather_trials before trusting band p_yes"))
+    ok = abs(best - BAND_HALF_WIDTH) < 1e-9
+    print(f"  -> best width: ±{best}  (configured BAND_HALF_WIDTH = ±{BAND_HALF_WIDTH})"
+          + ("  — model OK" if ok else
+             f"  !! MISMATCH — set BAND_HALF_WIDTH = {best} in join_weather_trials"))
 
 
 if __name__ == "__main__":
