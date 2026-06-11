@@ -1,8 +1,8 @@
 #!/bin/bash
-# weather-fade dashboard runner — long-running Flask server on :5060.
-# Called by com.jesse.polybot.weatherfade.dash (KeepAlive + RunAtLoad), so it
-# auto-starts and respawns like the main poly dashboard. Self-locating: resolves
-# the repo from this script's own path (works from the backtest clone).
+# weather-fade dashboard runner. Forwards args to weather_fade_dash.py, so it
+# drives either mode: `render` (dashfile agent, every 5 min → HTML file) or
+# `serve --port 5052` (dashserve KeepAlive agent → live auto-refreshing link).
+# Self-locating: resolves the repo from this script's own path.
 set -euo pipefail
 
 export PATH="/Users/jesse/anaconda3/bin:$PATH"

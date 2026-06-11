@@ -22,6 +22,7 @@ caffeinate -dimsu &     # keep the Mac awake during the US-evening liquid window
 | `collectsettle` | hourly at :44 | fill outcomes for collected hourly markets |
 | `collect`       | hourly at :50 | forward-collect hourly-weather price→outcome data |
 | `dashfile`      | every 5 min   | re-render the dashboard to `data/weather_fade_dash.html` (open via `file://`) |
+| `dashserve`     | KeepAlive     | live auto-refreshing link at **http://127.0.0.1:5052** (stdlib server, no Flask) |
 
 The hourly agents are **staggered by minute-of-hour** (StartCalendarInterval):
 seven agents sweeping the Kalshi API in the same second tripped 429 rate
@@ -29,12 +30,16 @@ limits. The shared fetch path also retries 429/5xx with backoff, so a residual
 collision costs seconds, not the hour. Staggered agents do **not** fire at
 install — first runs happen within the following hour.
 
-> The live Flask server (`:5060`) is **not** installed by default — the file
-> render replaced it (localhost/https quirks made the server view unreliable).
-> Run it manually only if you want the live URL: `python scripts/weather_fade_dash.py serve`.
+> The dashboard now has **two** views, both installed: the live link
+> (`dashserve`, http://127.0.0.1:5052) and the file render (`dashfile`). The
+> live server was rewritten on the Python stdlib (no Flask), bound to IPv4
+> `127.0.0.1`, with `Cache-Control: no-store` — fixing the localhost→IPv6 +
+> HSTS-https-upgrade blanking that made the old Flask `:5060` server unreliable.
+> Always use **http://** (not https) and the `127.0.0.1` address (not `localhost`).
 
 ## View it
-- **Dashboard (reliable):** `open data/weather_fade_dash.html` — bookmark the `file://` URL.
+- **Dashboard (live link):** http://127.0.0.1:5052 — auto-refreshes every 30s, live data each load.
+- **Dashboard (file backup):** `open data/weather_fade_dash.html` — bookmark the `file://` URL.
 - **Scorecard (price-only fade):** `python scripts/weather_fade.py report`
 - **Scorecard (forecast two-sided):** `python scripts/fc_two_sided.py report`
 - **Pattern analysis:** `python scripts/weather_fade.py analyze`

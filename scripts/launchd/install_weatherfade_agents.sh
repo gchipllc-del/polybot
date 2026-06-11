@@ -76,12 +76,16 @@ write_agent "$P.collect"       cal:50 "$RUN" collect
 # installed (it flapped and the file view replaced it); start it manually with
 # `python scripts/weather_fade_dash.py serve` only if you want the live URL.
 write_agent "$P.dashfile"       300 "$RUN_DASH" render
+# live auto-refreshing link: stdlib server (no Flask) on 127.0.0.1:5052,
+# KeepAlive so it's always up. Open http://127.0.0.1:5052 (http, not https).
+write_agent "$P.dashserve" keepalive "$RUN_DASH" serve --port 5052 --host 127.0.0.1
 
 echo ""
 echo "Done. Roster:"
 launchctl list 2>/dev/null | grep weatherfade || echo "  (none listed — check Console for load errors)"
 echo ""
-echo "Dashboard:  open $PROJECT_ROOT/data/weather_fade_dash.html"
+echo "Dashboard (live link):  http://127.0.0.1:5052   (http, not https)"
+echo "Dashboard (file backup): open $PROJECT_ROOT/data/weather_fade_dash.html"
 echo "Scorecards: python scripts/weather_fade.py report   |   python scripts/fc_two_sided.py report"
 echo "NOTE: staggered agents fire at their minute-of-hour (scan :05, fc2s :20, probe :38,"
 echo "      collect :50) — first runs happen within the next hour, NOT at install."

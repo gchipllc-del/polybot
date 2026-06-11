@@ -49,6 +49,29 @@ def _read_jsonl(p: Path) -> list[dict]:
     return out
 
 
+def build_fc2s() -> dict | None:
+    """Compact fc2s (forecast two-sided) scorecard for the dashboard. Defensive:
+    any read error returns None so the main page never blanks because of it."""
+    try:
+        import fc_two_sided as fc
+        rows = fc._load_ledger()
+    except Exception:
+        return None
+    settled = [r for r in rows if r.get("status") in ("won", "lost")]
+    openn = [r for r in rows if r.get("status") == "open"]
+    won = sum(1 for r in settled if r["status"] == "won")
+    net = sum(float(r.get("paper_pnl", 0) or 0) for r in settled)
+    sides = {}
+    for side in ("YES", "NO"):
+        ss = [r for r in settled if r.get("side") == side]
+        if ss:
+            sides[side] = {"n": len(ss),
+                           "w": sum(1 for r in ss if r["status"] == "won"),
+                           "net": round(sum(float(r.get("paper_pnl", 0) or 0) for r in ss), 2)}
+    return {"settled": len(settled), "won": won, "lost": len(settled) - won,
+            "net": round(net, 2), "open": len(openn), "sides": sides}
+
+
 def build_summary() -> dict:
     """All weather_fade metrics in one dict — pure, testable."""
     rows = _load_ledger()
@@ -120,6 +143,7 @@ def build_summary() -> dict:
         "per_city": city_rows,
         "by_hour": byhr,
         "hourly_collected": len(_read_jsonl(COLLECT_LEDGER)),
+        "fc2s": build_fc2s(),
     }
 
 
@@ -162,6 +186,26 @@ def _scan_panel(sc: dict) -> str:
             f"{sc.get('open_markets',0)} open mkts → {sc.get('day_ahead',0)} day-ahead → "
             f"{sc.get('in_band',0)} in-band → <b>{booked} booked</b> "
             f"(thr {sc.get('thr','?')}){why}</div>")
+
+
+def _fc2s_panel(f: dict | None) -> str:
+    """Compact second-sleeve panel: the forecast two-sided live execution test."""
+    if not f:
+        return ""
+    if not f["settled"] and not f["open"]:
+        body = "<span class=dim>no trades booked yet — fires at :20 past the hour in the live window.</span>"
+    else:
+        sides = " · ".join(
+            f"{sd} {v['w']}/{v['n']} <span class={_cls(v['net'])}>{v['net']:+.2f}</span>"
+            for sd, v in f["sides"].items()) or "<span class=dim>—</span>"
+        body = (f"settled <b>{f['settled']}</b> ({f['won']}W/{f['lost']}L) · "
+                f"net <span class=\"big {_cls(f['net'])}\">${f['net']:+.2f}</span> · "
+                f"open <b>{f['open']}</b><br><span class=dim>by side:</span> {sides}")
+    return (f"<h2>fc2s — forecast two-sided (live execution test)</h2>"
+            f"<div class=dim style='border:1px solid #30363d;border-radius:6px;"
+            f"padding:8px 12px;background:#161b22;color:#c9d1d9'>{body}"
+            f"<br><span class=dim>backtest says ~+0.01/ct (below friction) — watching whether "
+            f"real fills beat that. <code>python scripts/fc_two_sided.py report</code></span></div>")
 
 
 def render_html(s: dict) -> str:
@@ -208,6 +252,7 @@ th{{color:#8b949e;font-size:11px}} .stat{{display:inline-block;margin-right:32px
  <span class=stat><div class=lbl>Bankroll (mirrors live)</div><div class=big>${s['bankroll']:,.2f}</div><div class=dim>portfolio ${s['portfolio']:,.2f}</div></span>
 </div>
 <p class=dim>↑ the real-fill verdict — judge the edge by this, not the backtest.</p>
+{_fc2s_panel(s.get('fc2s'))}
 <h2>Per-city (settled) — *new = outside the validated 8</h2>
 <table><tr><th>City</th><th>W/L</th><th>WR</th><th>Net $</th></tr>{city_html}</table>
 <h2>Open fades ({s['open']})</h2>
@@ -225,12 +270,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", nargs="?", default="serve", choices=["serve", "render"],
-                    help="serve = Flask server (:5060); render = write the page to "
-                         "an HTML FILE you open directly (no server, no localhost/https)")
+                    help="serve = live auto-refreshing link (stdlib server, no Flask); "
+                         "render = write the page to an HTML FILE you open directly")
     ap.add_argument("--out", default=str(ROOT / "data" / "weather_fade_dash.html"),
                     help="render: output file path")
-    ap.add_argument("--port", type=int, default=5060)
-    ap.add_argument("--host", default="0.0.0.0")   # all interfaces: 127.0.0.1, localhost, LAN
+    ap.add_argument("--port", type=int, default=5052)
+    ap.add_argument("--host", default="127.0.0.1")  # IPv4 loopback — avoids the
+    # localhost→IPv6 + HSTS-https-upgrade blanking that sank the old Flask serve
     args = ap.parse_args()
 
     # FILE mode: write the dashboard to disk and exit. Open it with file:// — no
@@ -250,27 +296,49 @@ def main() -> None:
         print(f"wrote dashboard -> {args.out}\nopen it with:  open {args.out}")
         return
 
-    from flask import Flask
-    app = Flask(__name__)
+    # SERVE mode: a dependency-free stdlib server (no Flask), bound to IPv4
+    # loopback, rendering LIVE data on every request. Cache-Control: no-store so
+    # the browser can't cache a transient blank. Open it at the printed
+    # http://127.0.0.1:PORT — the page meta-refreshes every 30s on its own.
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    @app.route("/")
-    def index():
+    def _page() -> bytes:
         try:
-            return render_html(build_summary())
+            return render_html(build_summary()).encode("utf-8")
         except Exception:
             import traceback
-            tb = traceback.format_exc()
-            # Fail LOUD (localhost only) so a data edge-case shows the cause
-            # instead of a blank "Internal Server Error" page.
             return ("<!doctype html><meta http-equiv=refresh content=15>"
                     "<body style='background:#0d1117;color:#f85149;"
                     "font-family:monospace;padding:20px'>"
                     "<h2>weather-fade dashboard hit an error rendering</h2>"
-                    f"<pre style='color:#c9d1d9;white-space:pre-wrap'>{tb}</pre>"
-                    "</body>"), 200
+                    f"<pre style='color:#c9d1d9;white-space:pre-wrap'>"
+                    f"{traceback.format_exc()}</pre></body>").encode("utf-8")
 
-    print(f"weather-fade dashboard → http://{args.host}:{args.port}  (Ctrl-C to stop)")
-    app.run(host=args.host, port=args.port, debug=False)
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+                return
+            body = _page()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):   # keep the console quiet
+            pass
+
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    url = f"http://{args.host}:{args.port}"
+    print(f"weather-fade dashboard → {url}  (open this exact URL — http, not https; "
+          f"Ctrl-C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        srv.shutdown()
 
 
 if __name__ == "__main__":
