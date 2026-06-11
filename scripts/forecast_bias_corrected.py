@@ -79,7 +79,8 @@ def load_rich(markets_path: Path, truth_path: Path):
         if info is None or info.get("forecast_temp") is None:
             continue
         rows.append({"p_market": float(r["market_p_yes"]),
-                     "yes": res == "yes", "city": sc[0], "date": date, "t": t,
+                     "yes": str(r.get("result", "")).lower() == "yes",
+                     "city": sc[0], "date": date, "t": t,
                      "kind": kind, "strike": float(strike),
                      "fc_temp": float(info["forecast_temp"]),
                      "ac_temp": (None if info.get("actual_temp") is None
@@ -182,6 +183,12 @@ def main() -> None:
             raise SystemExit(f"not found: {p} — run fetch_backtest_data.py {hint} first")
 
     rows = load_rich(args.markets, args.truth)
+    # Tripwire for load bugs (a stale-variable bug here once made every market
+    # read as "no"): real settled weather data is always a mix of outcomes.
+    n_yes = sum(1 for r in rows if r["yes"])
+    if rows and (n_yes == 0 or n_yes == len(rows)):
+        raise SystemExit(f"!! all {len(rows)} markets loaded with the same outcome "
+                         f"(yes={n_yes}) — load_rich is broken, do not trust output")
     rows.sort(key=lambda r: (r["t"] == "", r["t"]))
     k = int(len(rows) * args.split)
     fit, trade = rows[:k], rows[k:]
