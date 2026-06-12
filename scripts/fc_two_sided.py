@@ -331,6 +331,72 @@ def cmd_report(args) -> None:
             print(f"  {c:>6}: {b['n']:>3} trades {b['w']:>3}W  net ${b['net']:+.2f}")
 
 
+def cmd_status(args) -> None:
+    """Is this sleeve actually scanning + booking? One-glance liveness check:
+    last scan age, what it saw/booked, ledger growth, and whether right now is
+    even a live window (weather books are dead ~04–13 UTC)."""
+    now = datetime.now(timezone.utc)
+    tick = lambda b: "OK " if b else "!! "
+    issues = []
+
+    st = {}
+    if SCAN_STATUS.exists():
+        try:
+            st = json.loads(SCAN_STATUS.read_text())
+        except Exception:
+            st = {}
+    age = None
+    if st.get("last_scan"):
+        try:
+            age = (now - datetime.fromisoformat(
+                st["last_scan"].replace("Z", "+00:00"))).total_seconds() / 60
+        except Exception:
+            age = None
+    dead = 4 <= now.hour <= 13   # mapped overnight dead window (no open markets)
+    if age is None:
+        print(f"[!! ] fc2s scan has NEVER run (no {SCAN_STATUS.name}). "
+              f"Install the agents + wait for :20 past the hour in a live window.")
+        issues.append("scan never ran")
+    elif age <= 75:
+        print(f"[OK ] last fc2s scan {age:.0f} min ago — saw {st.get('markets_seen',0)} "
+              f"markets, booked {st.get('booked',0)} "
+              f"(skipped {st.get('skipped_day_cap',0)} day-cap, "
+              f"{st.get('no_forecast_or_strike',0)} no-forecast)")
+    elif dead:
+        print(f"[OK ] last fc2s scan {age:.0f} min ago — normal: overnight DEAD window "
+              f"(04–13 UTC), no markets to scan. Resumes ~14 UTC.")
+    else:
+        print(f"[!! ] last fc2s scan {age:.0f} min ago — STALE in a live window "
+              f"(Mac asleep / agent not firing?).")
+        issues.append("scan stale")
+
+    rows = _load_ledger()
+    settled = [r for r in rows if r.get("status") in ("won", "lost")]
+    openn = [r for r in rows if r.get("status") == "open"]
+    ndays = len({_iso_event_date(r.get("ticker", "")) for r in settled})
+    print(f"[{tick(bool(rows))}] ledger: {len(openn)} open · {len(settled)} settled "
+          f"across {ndays} distinct days "
+          f"(${sum(float(r.get('notional') or 0) for r in openn):.2f} at risk)")
+    if not rows:
+        if dead:
+            print("      (empty is expected right now — dead window. Check again ~14–03 UTC.)")
+        else:
+            print("      no trades booked yet. Force one now:  "
+                  "python scripts/fc_two_sided.py scan --show")
+
+    booked = st.get("booked", 0)
+    if age is not None and not dead and st.get("markets_seen", 0) and not booked and not openn:
+        why = []
+        if st.get("no_forecast_or_strike"): why.append(f"{st['no_forecast_or_strike']} no forecast/strike")
+        if st.get("skipped_day_cap"): why.append(f"{st['skipped_day_cap']} hit day-cap")
+        print("[!! ] saw markets but booked 0" + (": " + ", ".join(why) if why else
+              " — likely all inside the gate or spread too wide (MAX_SLIP)."))
+        issues.append("scanning but not booking")
+
+    print("==> fc2s " + ("LIVE & BOOKING." if not issues else
+                          "needs attention: " + "; ".join(issues)))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -344,6 +410,8 @@ def main() -> None:
     p.set_defaults(fn=cmd_settle)
     p = sub.add_parser("report", help="scorecard: totals, per-side, per-day, per-city")
     p.set_defaults(fn=cmd_report)
+    p = sub.add_parser("status", help="liveness check: is it scanning + booking right now?")
+    p.set_defaults(fn=cmd_status)
     args = ap.parse_args()
     args.fn(args)
 
