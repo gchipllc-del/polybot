@@ -17,8 +17,9 @@ Rules (mirrors the backtest exactly, plus live-only guards):
   * fill     taker on the chosen side, from the REAL order book
   * band     0.10 ≤ market YES ≤ 0.90, sane fill, ≤ MAX_SLIP from the signal price
   * fee      Kalshi fee modeled at entry (honest after-fee scorecard)
-  * cap      per-event-date risk cap — the residual corr −0.37 means one hot
-             day still hits multiple cities; the cap bounds that drawdown
+  * cap      per-event-date risk cap ($20 paper / ~$6 live) — the residual corr
+             −0.37 means one hot day still hits multiple cities; the cap bounds
+             that drawdown without freezing the paper sample (--day-cap to tune)
   * forecast Open-Meteo LIVE forecast (same source the backtest validated),
              p_yes via the same σ=3°F normal model, band-aware (B-strikes)
 
@@ -53,7 +54,13 @@ SCAN_STATUS = ROOT / "data" / "fc2s_scan_status.json"
 DEFAULT_THR = 0.05            # the backtest's headline cell
 SIGMA_F = 3.0                 # forecast-error °F — same σ the backtest validated
 MAX_SLIP = 0.05               # taker fill may cost ≤ 5¢ over the bid-implied price
-DAY_RISK_CAP_USD = 6.0        # max total notional per event DATE (heat-beta guard)
+# Max total notional per event DATE — the correlated-heat-beta guard. Set to
+# $20 for the PAPER data-gathering phase (~7 trades/date): at $6 a date filled
+# after only 2 trades and clustered weather dates froze the whole sleeve to
+# ~2-4 trades/day, far too thin to ever test a +0.014/ct-floor edge. This is a
+# PAPER cap — a real-money deployment would re-tighten it (≈$6, ~4% of a $143
+# bankroll/date). Override per-run with `scan --day-cap N`.
+DAY_RISK_CAP_USD = 20.0
 
 # series → (lat, lon) of the settlement station, for the live forecast pull.
 # First 12 come from fetch_backtest_data._cities(); the rest are the standard
@@ -217,7 +224,7 @@ def cmd_scan(args) -> None:
         d = two_sided_decision(q, p_fc, thr=args.thr, bankroll=args.bankroll)
         if d is None:
             continue
-        if day_risk.get(date, 0.0) + d["notional"] > DAY_RISK_CAP_USD:
+        if day_risk.get(date, 0.0) + d["notional"] > args.day_cap:
             skipped_cap += 1
             continue
         day_risk[date] = day_risk.get(date, 0.0) + d["notional"]
@@ -236,7 +243,7 @@ def cmd_scan(args) -> None:
     SCAN_STATUS.write_text(json.dumps({
         "last_scan": now_iso, "markets_seen": len(quotes), "booked": len(booked),
         "skipped_day_cap": skipped_cap, "no_forecast_or_strike": no_fc,
-        "thr": args.thr, "bankroll": args.bankroll}))
+        "thr": args.thr, "bankroll": args.bankroll, "day_cap": args.day_cap}))
     print(f"fc2s scan: {len(quotes)} day-ahead markets, booked {len(booked)} "
           f"({sum(1 for b in booked if b['side']=='YES')} YES / "
           f"{sum(1 for b in booked if b['side']=='NO')} NO), "
@@ -404,6 +411,9 @@ def main() -> None:
     p = sub.add_parser("scan", help="book two-sided paper trades at the live book")
     p.add_argument("--thr", type=float, default=DEFAULT_THR)
     p.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL)
+    p.add_argument("--day-cap", type=float, default=DAY_RISK_CAP_USD, dest="day_cap",
+                   help="max total notional per event DATE (paper default $20; "
+                        "real-money would use ~$6)")
     p.add_argument("--show", action="store_true")
     p.set_defaults(fn=cmd_scan)
     p = sub.add_parser("settle", help="resolve booked trades → scorecard")
