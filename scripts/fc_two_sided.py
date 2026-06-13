@@ -13,6 +13,11 @@ This sleeve answers that — on paper, next to (not replacing) the weather_fade
 sleeve, so the two rules accumulate live scorecards side by side.
 
 Rules (mirrors the backtest exactly, plus live-only guards):
+  * day-ahead ONLY — skip markets whose event day has already begun at the
+             city: by afternoon the high is realized, the market knows it, and
+             a day-ahead forecast model fading those prices is pure adverse
+             selection (the backtest entered at the earliest/open sample, and
+             entry-realism showed the edge gone near close)
   * gate     |p_forecast − market_yes| ≥ thr (default 0.05, the headline cell)
   * fill     taker on the chosen side, from the REAL order book
   * band     0.10 ≤ market YES ≤ 0.90, sane fill, ≤ MAX_SLIP from the signal price
@@ -188,6 +193,16 @@ def _load_ledger() -> list[dict]:
     return rows
 
 
+def _city_local_date(series: str, now_utc: datetime, geo: dict) -> str:
+    """Approximate local calendar date at the series' settlement station, from
+    its longitude (15°/hour). Off by ≤1h vs civil DST time — irrelevant for a
+    day-boundary check anchored at local afternoon."""
+    ll = geo.get(series)
+    offset_h = (ll[1] / 15.0) if ll else -6.0     # default: US central-ish
+    from datetime import timedelta
+    return (now_utc + timedelta(hours=offset_h)).date().isoformat()
+
+
 def cmd_scan(args) -> None:
     try:
         quotes = _open_weather_quotes(WEATHER_SERIES)
@@ -207,14 +222,24 @@ def cmd_scan(args) -> None:
             d = _iso_event_date(r.get("ticker", ""))
             day_risk[d] = day_risk.get(d, 0.0) + float(r.get("notional") or 0.0)
 
-    booked, skipped_cap, no_fc = [], 0, 0
-    now_iso = datetime.now(timezone.utc).isoformat()
+    booked, skipped_cap, no_fc, skipped_same_day = [], 0, 0, 0
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    geo = series_geo()
     for q in quotes:
         tk = q.get("ticker") or ""
         if tk in seen:
             continue
         series = tk.split("-")[0]
         date = _iso_event_date(tk)
+        # DAY-AHEAD ONLY: if the event day has already begun at the city, its
+        # high may already be realized — the market knows, our day-ahead
+        # forecast doesn't (the backtest edge was at the OPEN; entry-realism
+        # showed it gone near close). Fading informed same-day prices is pure
+        # adverse selection, so skip them regardless of hours-to-close.
+        if date <= _city_local_date(series, now_utc, geo):
+            skipped_same_day += 1
+            continue
         kind, strike = parse_strike2(tk)
         high = fc.get((series, date))
         if high is None or strike is None:
@@ -243,10 +268,12 @@ def cmd_scan(args) -> None:
     SCAN_STATUS.write_text(json.dumps({
         "last_scan": now_iso, "markets_seen": len(quotes), "booked": len(booked),
         "skipped_day_cap": skipped_cap, "no_forecast_or_strike": no_fc,
+        "skipped_same_day": skipped_same_day,
         "thr": args.thr, "bankroll": args.bankroll, "day_cap": args.day_cap}))
-    print(f"fc2s scan: {len(quotes)} day-ahead markets, booked {len(booked)} "
+    print(f"fc2s scan: {len(quotes)} open markets, booked {len(booked)} "
           f"({sum(1 for b in booked if b['side']=='YES')} YES / "
           f"{sum(1 for b in booked if b['side']=='NO')} NO), "
+          f"{skipped_same_day} same-day (event already underway — adverse selection), "
           f"{skipped_cap} skipped by day-cap, {no_fc} no forecast/strike")
     if getattr(args, "show", False) and booked:
         for b in booked:
@@ -301,6 +328,26 @@ def cmd_report(args) -> None:
     print(f"=== fc2s (forecast two-sided) paper scorecard ===")
     print(f"settled {len(settled)} ({w}W/{len(settled)-w}L), net ${net:+.2f} after fees; "
           f"{len(open_)} open (${sum(float(r.get('notional') or 0) for r in open_):.2f} at risk)")
+    # Quarantine pre-fix SAME-DAY entries (event day already underway at the
+    # city when opened — adverse selection, not the strategy). The rule is what
+    # the day-ahead cohort says; the same-day cohort just shows the damage.
+    geo = series_geo()
+    def _same_day(r):
+        try:
+            opened = datetime.fromisoformat(str(r.get("opened_at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        tk = r.get("ticker", "")
+        return _iso_event_date(tk) <= _city_local_date(tk.split("-")[0], opened, geo)
+    tainted = [r for r in settled if _same_day(r)]
+    if tainted:
+        tnet = sum(float(r.get("paper_pnl") or 0) for r in tainted)
+        clean = [r for r in settled if not _same_day(r)]
+        cnet = sum(float(r.get("paper_pnl") or 0) for r in clean)
+        cw = sum(1 for r in clean if r["status"] == "won")
+        print(f"  !! cohorts: DAY-AHEAD (the strategy) {len(clean)} settled "
+              f"({cw}W/{len(clean)-cw}L) net ${cnet:+.2f}  ·  "
+              f"SAME-DAY (pre-fix adverse selection) {len(tainted)} settled net ${tnet:+.2f}")
     for side in ("YES", "NO"):
         ss = [r for r in settled if r.get("side") == side]
         if ss:
