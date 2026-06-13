@@ -107,12 +107,20 @@ def fade_decision(quote: dict, centers, rates, *,
     if edge > -thr:                              # not overpriced enough
         return None
     notional = min(max_trade_usd, bankroll * risk_pct)
-    size = round(notional / no_ask, 2)
-    if size <= 0:
+    # WHOLE contracts only (Kalshi can't fill 3.36 of a contract) — paper must
+    # match what a real order could actually do.
+    size = float(int(notional / no_ask))
+    if size < 1:
         return None
     # EV of buying NO at no_ask under our fair model, NET of the Kalshi fee.
     fee = kalshi_fee(size, float(no_ask))
     ev_ct = round((1.0 - fair) - float(no_ask) - (fee / size if size else 0), 4)
+    # The backtest's fill assumption was no_ask == 1 - yes_price (no spread).
+    # Live, a wide book can put no_ask far above that, eating the entire edge:
+    # the calibration says YES is rich, but the price we'd PAY isn't the price
+    # the signal measured. Only book when the EV survives at the actual fill.
+    if ev_ct <= 0:
+        return None
     return {
         "ticker": quote.get("ticker"),
         "event_ticker": quote.get("event_ticker", ""),
@@ -358,6 +366,25 @@ def cmd_scan(args) -> None:
     # day-ahead window only (the edge is at open, not near close)
     day_ahead = [q for q in quotes if q.get("hours_to_close") is not None
                  and MIN_HOURS_TO_CLOSE <= q["hours_to_close"] <= MAX_HOURS_TO_CLOSE]
+    # TRUE day-ahead: also drop markets whose event day has already begun at
+    # the city — by local afternoon the high is realized and the market is
+    # pricing an OBSERVATION; fading it is adverse selection, not the edge
+    # (hours-to-close can't catch this: a same-day market can sit 6h from its
+    # midnight close with its weather fully decided). Same fix fc2s got; the
+    # backtest only ever entered at the earliest/open sample.
+    from fc_two_sided import series_geo, _city_local_date
+    from join_weather_trials import parse_event_date
+    geo = series_geo()
+    _now = datetime.now(timezone.utc)
+    def _is_day_ahead(q):
+        tk = q.get("ticker") or ""
+        ev = parse_event_date("", tk)
+        if ev is None:
+            return True            # unparseable → don't silently drop
+        return ev > _city_local_date(tk.split("-")[0], _now, geo)
+    pre = len(day_ahead)
+    day_ahead = [q for q in day_ahead if _is_day_ahead(q)]
+    n_same_day = pre - len(day_ahead)
 
     # Diagnostic: show the live edge for EVERY day-ahead market (not just
     # qualifiers), so you can see the distribution and whether the calibration
@@ -406,7 +433,8 @@ def cmd_scan(args) -> None:
                   "resolved_at": "", "paper_pnl": 0.0, "is_live": False})
         new.append(d)
     _append_ledger(new)
-    print(f"scan: {len(quotes)} open markets, {len(day_ahead)} day-ahead, "
+    print(f"scan: {len(quotes)} open markets, {n_same_day} same-day dropped "
+          f"(event underway — adverse selection), {len(day_ahead)} day-ahead, "
           f"{len(decisions)} qualify, {len(new)} new paper fades booked "
           f"(bankroll ${args.bankroll:.0f}, thr {args.thr}).")
     for d in new[:20]:
@@ -431,6 +459,7 @@ def cmd_scan(args) -> None:
         SCAN_STATUS.write_text(json.dumps({
             "ts": now_iso, "thr": args.thr, "bankroll": args.bankroll,
             "open_markets": len(quotes), "day_ahead": len(day_ahead),
+            "same_day_dropped": n_same_day,
             "empty_book": n_empty, "one_sided": n_onesided, "in_band": n_inband,
             "qualified": len(decisions), "booked": len(new),
         }))
@@ -507,6 +536,36 @@ def cmd_report(args) -> None:
           f"WR {(won/len(closed)*100 if closed else 0):.1f}% ({won}W/{len(closed)-won}L)")
     print(f"  net paper P&L ${net:+.2f} on ${inv:.2f} invested "
           f"(ROI {(net/inv*100 if inv else 0):+.1f}%)")
+    # Quarantine pre-fix SAME-DAY entries (event day already underway at the
+    # city when booked → the market was pricing an observation; that's adverse
+    # selection, not the strategy). Judge the edge by the DAY-AHEAD cohort.
+    if closed:
+        try:
+            from fc_two_sided import series_geo, _city_local_date
+            from join_weather_trials import parse_event_date
+            geo = series_geo()
+            def _same_day(r):
+                tk = r.get("ticker") or r.get("market_ticker") or ""
+                ev = parse_event_date("", tk)
+                try:
+                    opened = datetime.fromisoformat(
+                        str(r.get("opened_at", "")).replace("Z", "+00:00"))
+                except ValueError:
+                    return False
+                return ev is not None and ev <= _city_local_date(
+                    tk.split("-")[0], opened, geo)
+            tainted = [r for r in closed if _same_day(r)]
+            if tainted:
+                clean = [r for r in closed if not _same_day(r)]
+                cw = sum(1 for r in clean if r["status"] == "won")
+                cnet = sum(float(r.get("paper_pnl", 0) or 0) for r in clean)
+                tnet = sum(float(r.get("paper_pnl", 0) or 0) for r in tainted)
+                print(f"  !! cohorts: DAY-AHEAD (the strategy) {len(clean)} closed "
+                      f"({cw}W/{len(clean)-cw}L) net ${cnet:+.2f}  ·  "
+                      f"SAME-DAY (pre-fix adverse selection) {len(tainted)} closed "
+                      f"net ${tnet:+.2f}")
+        except Exception:
+            pass
     # PER-DAY is the unit that matters: a day's city-fades are one correlated
     # weather bet, so the real sample size is the number of DISTINCT dates.
     if closed:
@@ -563,7 +622,7 @@ def cmd_health(args) -> None:
     # it — so only these eight are required for the harness to be healthy
     # (incl. the fc2s forecast-two-sided sleeve's scan+settle).
     want = ["scan", "probe", "collect", "collectsettle", "settle",
-            "fc2sscan", "fc2ssettle", "dashfile"]
+            "fc2sscan", "fc2ssettle", "dashfile", "dashserve"]
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True,
                              text=True, timeout=10).stdout

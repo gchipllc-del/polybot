@@ -151,8 +151,9 @@ def two_sided_decision(quote: dict, p_fc: float, *, thr: float = DEFAULT_THR,
     if fill - ref > max_slip:                # spread too wide to cross honestly
         return None
     notional = min(max_trade_usd, bankroll * risk_pct)
-    size = round(notional / fill, 2)
-    if size <= 0:
+    # WHOLE contracts only — a real Kalshi order can't fill 12.4 contracts.
+    size = float(int(notional / fill))
+    if size < 1:
         return None
     fee = kalshi_fee(size, fill)
     # EV per contract vs the MARKET price (the forecast is rank-only — never
@@ -226,6 +227,8 @@ def cmd_scan(args) -> None:
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()
     geo = series_geo()
+    # Pass 1: decide every market (no booking yet).
+    candidates = []
     for q in quotes:
         tk = q.get("ticker") or ""
         if tk in seen:
@@ -247,8 +250,14 @@ def cmd_scan(args) -> None:
             continue
         p_fc = forecast_p_yes(kind, strike, high, SIGMA_F)
         d = two_sided_decision(q, p_fc, thr=args.thr, bankroll=args.bankroll)
-        if d is None:
-            continue
+        if d is not None:
+            candidates.append((date, high, strike, kind, d))
+    # Pass 2: book BIGGEST |gap| first, so when the day-cap binds it keeps the
+    # strongest forecast-vs-market disagreements instead of whatever the API
+    # happened to list first. (Within a date the trades are correlated anyway —
+    # if we can only take ~7, take the 7 best.)
+    candidates.sort(key=lambda c: -abs(c[4]["gap"]))
+    for date, high, strike, kind, d in candidates:
         if day_risk.get(date, 0.0) + d["notional"] > args.day_cap:
             skipped_cap += 1
             continue
@@ -257,7 +266,7 @@ def cmd_scan(args) -> None:
                   "status": "open", "opened_at": now_iso, "result": "",
                   "resolved_at": "", "paper_pnl": 0.0, "is_live": False})
         booked.append(d)
-        seen.add(tk)
+        seen.add(d["ticker"])
 
     if booked:
         LEDGER.parent.mkdir(parents=True, exist_ok=True)
