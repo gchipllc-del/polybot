@@ -165,10 +165,14 @@ WEATHER_SERIES = [
 VALIDATED_SERIES = {"KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX",
                     "KXHIGHDEN", "KXHIGHAUS", "KXHIGHPHIL", "KXHIGHHOU"}
 
-# Hourly weather series (current temp). No Becker history exists for these, so we
-# COLLECT their price→outcome data forward to backtest the hourly edge later.
-HOURLY_SERIES = ["KXTEMPNYCH", "KXTEMPCHIH", "KXTEMPDCH", "KXTEMPBOSH",
-                 "KXTEMPLAXH", "KXTEMPMIAH"]
+# Hourly weather series (current temp). Kalshi DELISTED the multi-city hourly
+# temp products ~Apr 2026 — KXTEMP{CHI,DC,BOS,LAX,MIA}H last traded in April;
+# only KXTEMPNYCH still lists, and only intermittently. We keep NYC and rely on
+# catalog discovery (discover_hourly_series) to auto-re-add any city that
+# relists. The hourly-edge backtest needs cross-city breadth (the rank-skill
+# test compares markets at the same price), so with one sporadic city it's
+# effectively PARKED until/unless Kalshi brings the products back.
+HOURLY_SERIES = ["KXTEMPNYCH"]
 HOURLY_MIN_H, HOURLY_MAX_H = 0.5, 12.0   # hourly markets close within hours
 COLLECT_LEDGER = ROOT / "data" / "hourly_weather_collect.jsonl"
 HOURLY_DISCOVERED = ROOT / "data" / "hourly_series_discovered.json"
@@ -682,9 +686,21 @@ def cmd_health(args) -> None:
     else:
         print("[!! ] dashboard file: not rendered yet")
 
-    # collect (hourly-weather forward data)
+    # collect (hourly-weather forward data) — OPTIONAL feed, and currently
+    # dormant: Kalshi delisted the multi-city hourly temp products (~Apr 2026),
+    # so 0 rows is EXPECTED, not a healthy OK. Surface it honestly without
+    # failing the harness — the daily sleeves don't depend on it.
     n_collect = sum(1 for _ in open(COLLECT_LEDGER)) if COLLECT_LEDGER.exists() else 0
-    print(f"[OK ] hourly-collect rows: {n_collect}")
+    if n_collect > 0:
+        print(f"[OK ] hourly-collect rows: {n_collect}")
+    else:
+        cage_h = ((_time.time() - COLLECT_LEDGER.stat().st_mtime) / 3600
+                  if COLLECT_LEDGER.exists() else None)
+        stale = cage_h is not None and cage_h > 24
+        mark = "⚠  " if stale else "-- "
+        print(f"[{mark}] hourly-collect rows: 0 — feed DORMANT "
+              f"(Kalshi delisted multi-city hourly temp products; only NYC lists "
+              f"sporadically). Parked, not used by the daily sleeves.")
 
     print()
     if not issues:
