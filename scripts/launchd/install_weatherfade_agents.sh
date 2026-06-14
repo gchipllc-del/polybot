@@ -14,9 +14,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN="$PROJECT_ROOT/scripts/launchd/run_weather_fade.sh"
 RUN_DASH="$PROJECT_ROOT/scripts/launchd/run_weather_fade_dash.sh"
 RUN_FC2S="$PROJECT_ROOT/scripts/launchd/run_fc2s.sh"
+RUN_ENS="$PROJECT_ROOT/scripts/launchd/run_ensemble.sh"
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS"
-chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" 2>/dev/null || true
+chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" "$RUN_ENS" 2>/dev/null || true
 
 # write_agent LABEL  CADENCE  RUNNER  [args...]
 #   CADENCE: a number    = StartInterval seconds (fires at load too)
@@ -67,10 +68,12 @@ echo "Installing weather-fade agents (PROJECT_ROOT=$PROJECT_ROOT) ..."
 write_agent "$P.scan"          cal:05 "$RUN" scan --thr 0.03
 write_agent "$P.fc2ssettle"    cal:12 "$RUN_FC2S" settle
 write_agent "$P.fc2sscan"      cal:20 "$RUN_FC2S" scan --thr 0.05
+write_agent "$P.enscollect"    cal:26 "$RUN_ENS" collect
 write_agent "$P.settle"        cal:32 "$RUN" settle
 write_agent "$P.probe"         cal:38 "$RUN" probe
 write_agent "$P.collectsettle" cal:44 "$RUN" collect-settle
 write_agent "$P.collect"       cal:50 "$RUN" collect
+write_agent "$P.enssettle"     cal:56 "$RUN_ENS" settle
 # dashboard — file render every 5 min (the reliable view: open the HTML file,
 # no server/localhost/https). The live Flask :5060 server is intentionally NOT
 # installed (it flapped and the file view replaced it); start it manually with

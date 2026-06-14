@@ -626,7 +626,8 @@ def cmd_health(args) -> None:
     # it — so only these eight are required for the harness to be healthy
     # (incl. the fc2s forecast-two-sided sleeve's scan+settle).
     want = ["scan", "probe", "collect", "collectsettle", "settle",
-            "fc2sscan", "fc2ssettle", "dashfile", "dashserve"]
+            "fc2sscan", "fc2ssettle", "enscollect", "enssettle",
+            "dashfile", "dashserve"]
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True,
                              text=True, timeout=10).stdout
