@@ -82,6 +82,13 @@ write_agent "$P.dashfile"       300 "$RUN_DASH" render
 # live auto-refreshing link: stdlib server (no Flask) on 127.0.0.1:5052,
 # KeepAlive so it's always up. Open http://127.0.0.1:5052 (http, not https).
 write_agent "$P.dashserve" keepalive "$RUN_DASH" serve --port 5052 --host 127.0.0.1
+# keep the Mac awake — MANAGED, not manual. caffeinate was the harness's single
+# point of failure (a reboot/closed-terminal/-u-timeout killed it silently and
+# every agent then stalled on sleep). As a KeepAlive agent it auto-starts at
+# login and respawns if it dies. -dims (no -u, so no 5s self-timeout) prevents
+# display/idle/disk/system sleep until you unload it. To let the Mac sleep
+# again: launchctl unload ~/Library/LaunchAgents/$P.caffeinate.plist
+write_agent "$P.caffeinate" keepalive /usr/bin/caffeinate -dims
 
 echo ""
 echo "Done. Roster:"
@@ -90,6 +97,8 @@ echo ""
 echo "Dashboard (live link):  http://127.0.0.1:5052   (http, not https)"
 echo "Dashboard (file backup): open $PROJECT_ROOT/data/weather_fade_dash.html"
 echo "Scorecards: python scripts/weather_fade.py report   |   python scripts/fc_two_sided.py report"
-echo "NOTE: staggered agents fire at their minute-of-hour (scan :05, fc2s :20, probe :38,"
-echo "      collect :50) — first runs happen within the next hour, NOT at install."
-echo "NOTE: also keep the Mac awake during the US-evening liquid window (caffeinate -dimsu &)."
+echo "NOTE: staggered agents fire at their minute-of-hour (scan :05, fc2s :20, ens :26,"
+echo "      probe :38, collect :50) — first runs happen within the next hour, NOT at install."
+echo "NOTE: caffeinate is now a MANAGED KeepAlive agent (auto-starts at login, respawns if"
+echo "      it dies) — no manual 'caffeinate &' needed. To let the Mac sleep again:"
+echo "      launchctl unload ~/Library/LaunchAgents/$P.caffeinate.plist"
