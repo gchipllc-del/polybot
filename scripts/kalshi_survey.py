@@ -170,23 +170,38 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--deep", action="store_true",
-                    help="also sample per-series open-market volume (more API calls)")
+                    help="also sample per-series open-market volume. Only samples "
+                         "families that could have an edge (skips EFFICIENT/THIN, "
+                         "which are floored regardless) so it stays fast.")
+    ap.add_argument("--deep-cap", type=int, default=60,
+                    help="max series per category to sample liquidity for (default 60)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
         raise SystemExit(selftest())
 
-    rows = []
+    rows, sampled = [], 0
     for cat in CATEGORIES:
         series = fetch_series(cat)
+        cap = args.deep_cap
         for s in series:
             rec = {"category": cat, "title": s.get("title", ""),
                    "ticker": s.get("ticker", ""), "frequency": s.get("frequency", "")}
-            if args.deep:
-                n, v = sample_liquidity(s.get("ticker", ""))
+            # Only spend API calls on families where liquidity can move the rank.
+            # EFFICIENT (crypto) / THIN (entertainment…) are floored either way.
+            _, verdict, _ = classify(cat, rec["title"], rec["ticker"])
+            if args.deep and verdict not in ("EFFICIENT", "THIN") and cap > 0:
+                n, v = sample_liquidity(rec["ticker"])
                 rec["open_markets"], rec["volume"] = n, v
+                cap -= 1
+                sampled += 1
             rows.append(rec)
-        print(f"  {cat}: {len(series)} series", file=sys.stderr)
+        print(f"  {cat}: {len(series)} series"
+              f"{' (liq-sampled '+str(args.deep_cap-cap)+')' if args.deep else ''}",
+              file=sys.stderr)
+    if args.deep:
+        print(f"  liquidity sampled on {sampled} edge-candidate series total",
+              file=sys.stderr)
     if not rows:
         print("no series returned — run on home IP with Kalshi auth.")
         return
