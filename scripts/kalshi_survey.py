@@ -45,26 +45,38 @@ CATEGORIES = ["Climate and Weather", "Economics", "Financials", "Crypto",
 #   CANDIDATE — public data predicts it; worth collecting + testing
 #   SHARP     — public data exists but pros arb it hard; low odds
 #   THIN      — no clean gatherable predictor → skip
-EDGE_RULES = [
-    (("high", "low", "temp", "weather", "rain", "snow", "climate"),
-     "NWS / Open-Meteo forecasts", "PROVEN", 0.80),
-    (("bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "doge"),
-     "spot price feed", "EFFICIENT", 0.05),
-    (("cpi", "inflation", "pce", "jobs", "payroll", "unemployment", "gdp",
-      "fed", "rate", "jobless", "ppi", "retail sales"),
-     "consensus + released gov data", "CANDIDATE", 0.55),
-    (("nfl", "nba", "mlb", "nhl", "soccer", "tennis", "ufc", "golf", "game",
-      "match", "win", "playoff"),
-     "sports models / market odds", "SHARP", 0.30),
-    (("election", "president", "senate", "house", "governor", "poll", "primary",
-      "approval", "nominee"),
-     "polling aggregates", "SHARP", 0.25),
-    (("earnings", "revenue", "stock", "ipo", "company", "ceo"),
-     "analyst estimates / filings", "CANDIDATE", 0.45),
-    (("gas", "oil", "gasoline", "egg", "price of"),
-     "commodity / price series", "CANDIDATE", 0.50),
-]
+# Classification is CATEGORY-FIRST: Kalshi already labels each series with a
+# category, so that's the authoritative signal — far more reliable than scanning
+# free-text titles, where generic words ("high", "low", "win") bleed across every
+# category. Each Kalshi category maps to a (data_source, verdict, base).
+CATEGORY_RULES = {
+    "Climate and Weather":     ("NWS / Open-Meteo forecasts", "PROVEN", 0.80),
+    "Economics":               ("consensus + released gov data", "CANDIDATE", 0.55),
+    "Companies":               ("analyst estimates / filings", "CANDIDATE", 0.45),
+    "Transportation":          ("ops data (FAA delays / fuel)", "CANDIDATE", 0.40),
+    "Financials":              ("index price feed", "EFFICIENT", 0.05),
+    "Crypto":                  ("spot price feed", "EFFICIENT", 0.05),
+    "Sports":                  ("sports models / market odds", "SHARP", 0.30),
+    "Politics":                ("polling aggregates", "SHARP", 0.25),
+    "Science and Technology":  ("no clean public predictor", "THIN", 0.10),
+    "Health":                  ("no clean public predictor", "THIN", 0.10),
+    "Entertainment":           ("no clean public predictor", "THIN", 0.10),
+    "World":                   ("no clean public predictor", "THIN", 0.10),
+}
 DATA_THIN = ("no clean public predictor", "THIN", 0.10)
+
+# SPECIFIC keyword overrides — only used to RE-classify a series whose title makes
+# its true type unambiguous despite its filed category (e.g. a Bitcoin market that
+# lives under "Financials", or a Fed-rate market under "Financials"). Tokens here
+# must be specific enough that they can't appear in an unrelated market's title.
+# NO generic words ("high", "low", "win", "up", "above") — that was the old bug.
+KEYWORD_OVERRIDES = [
+    (("bitcoin", "ethereum", "solana", "dogecoin", "litecoin", " btc ", " eth "),
+     ("spot price feed", "EFFICIENT", 0.05)),
+    (("cpi ", "inflation", "nonfarm", "payroll", "unemployment", "jobless",
+      "fed funds", "interest rate", "gdp ", "ppi "),
+     ("consensus + released gov data", "CANDIDATE", 0.55)),
+]
 
 # How often the family resolves → how fast you can gather a sample.
 CADENCE_SCORE = {"hourly": 1.0, "daily": 0.9, "weekly": 0.6, "monthly": 0.35,
@@ -72,12 +84,14 @@ CADENCE_SCORE = {"hourly": 1.0, "daily": 0.9, "weekly": 0.6, "monthly": 0.35,
 
 
 def classify(category: str, title: str, ticker: str):
-    """Return (data_source, verdict, base_score) for a series."""
-    hay = f"{category} {title} {ticker}".lower()
-    for keys, src, verdict, base in EDGE_RULES:
+    """Return (data_source, verdict, base_score). Category-first; specific-keyword
+    overrides only reclassify when a title is unambiguous. Pad the haystack with
+    spaces so token boundaries (" btc ", "cpi ") match at the ends too."""
+    hay = f" {title} {ticker} ".lower()
+    for keys, res in KEYWORD_OVERRIDES:
         if any(k in hay for k in keys):
-            return src, verdict, base
-    return DATA_THIN
+            return res
+    return CATEGORY_RULES.get(category, DATA_THIN)
 
 
 def cadence_score(frequency: str) -> float:
@@ -138,8 +152,8 @@ def aggregate(series_rows: list, deep: bool):
     """series_rows: list of dicts with category/title/ticker/frequency
     (+ open_markets/volume if deep). Returns ranked family summaries."""
     fams = defaultdict(lambda: {"n_series": 0, "open": 0, "vol": 0.0,
-                                "verdict": None, "src": None, "base": 0.0,
-                                "cadence": 0.0, "examples": []})
+                                "votes": defaultdict(int), "cadence": 0.0,
+                                "examples": []})
     for s in series_rows:
         cat = s.get("category", "")
         src, verdict, base = classify(cat, s.get("title", ""), s.get("ticker", ""))
@@ -148,19 +162,20 @@ def aggregate(series_rows: list, deep: bool):
         f["open"] += int(s.get("open_markets", 0) or 0)
         f["vol"] += float(s.get("volume", 0) or 0)
         f["cadence"] = max(f["cadence"], cadence_score(s.get("frequency", "")))
-        # keep the most promising verdict/src seen in the family
-        if base > f["base"]:
-            f["base"], f["verdict"], f["src"] = base, verdict, src
+        # Tally each series' verdict; the FAMILY verdict is the modal one, so a
+        # single stray title can't promote the whole category (the old argmax bug).
+        f["votes"][(src, verdict, base)] += 1
         if len(f["examples"]) < 3:
             f["examples"].append(s.get("ticker", ""))
     out = []
     for cat, f in fams.items():
+        (src, verdict, base), _ = max(f["votes"].items(), key=lambda kv: kv[1])
         liq = liquidity_score(f["open"], f["vol"]) if deep else 0.5
         out.append({
             "category": cat, "n_series": f["n_series"], "open": f["open"],
-            "volume": int(f["vol"]), "verdict": f["verdict"], "data": f["src"],
+            "volume": int(f["vol"]), "verdict": verdict, "data": src,
             "cadence": round(f["cadence"], 2), "liq": liq,
-            "priority": priority(f["base"], f["cadence"], liq, f["verdict"]),
+            "priority": priority(base, f["cadence"], liq, verdict),
             "examples": f["examples"]})
     out.sort(key=lambda r: -r["priority"])
     return out
@@ -229,13 +244,23 @@ def main() -> None:
 
 def selftest() -> int:
     ok = True
-    # classify routing
+    # classify routing — category-first
     assert classify("Climate and Weather", "NY High Temp", "KXHIGHNY")[1] == "PROVEN"
     assert classify("Crypto", "Bitcoin above", "KXBTC")[1] == "EFFICIENT"
     assert classify("Economics", "CPI year-over-year", "KXCPI")[1] == "CANDIDATE"
     assert classify("Sports", "NFL game winner", "KXNFL")[1] == "SHARP"
     assert classify("Entertainment", "Oscar best picture", "KXOSCAR")[1] == "THIN"
     print("classify routing OK")
+    # REGRESSION: generic "high"/"low"/"win" must NOT pull non-weather into PROVEN
+    # (the bug — these titles all contain weather-rule trigger words).
+    assert classify("Politics", "Lowest approval rating", "KXAPPROVE")[1] == "SHARP"
+    assert classify("Financials", "S&P 500 new all-time high", "KXSPX")[1] == "EFFICIENT"
+    assert classify("Sports", "Will the home team win big", "KXWIN")[1] == "SHARP"
+    assert classify("Entertainment", "Highest-grossing film", "KXFILM")[1] == "THIN"
+    # specific overrides DO reclassify mis-filed series (crypto/econ under Financials)
+    assert classify("Financials", "Bitcoin above 100k", "KXBTCHIGH")[1] == "EFFICIENT"
+    assert classify("Financials", "Fed funds rate cut", "KXFED")[1] == "CANDIDATE"
+    print("cross-category bleed regression OK")
     # cadence
     assert cadence_score("hourly") > cadence_score("daily") > cadence_score("yearly")
     assert cadence_score("") == 0.3 and cadence_score(None) == 0.3
@@ -259,6 +284,16 @@ def selftest() -> int:
     assert ranked[0]["category"] == "Climate and Weather", [r["category"] for r in ranked]
     assert ranked[-1]["category"] == "Crypto", ranked   # efficient sinks despite volume
     print("aggregate ranking OK (weather top, crypto bottom despite high volume)")
+    # REGRESSION: a single stray Bitcoin series in Politics must NOT promote the
+    # whole Politics family — modal verdict stays SHARP, not EFFICIENT/PROVEN.
+    pol = [{"category": "Politics", "title": f"Senate race {i}", "ticker": f"KXSEN{i}",
+            "frequency": "yearly", "open_markets": 5, "volume": 100} for i in range(6)]
+    pol.append({"category": "Politics", "title": "Bitcoin mentioned in debate",
+                "ticker": "KXBTCDEBATE", "frequency": "yearly",
+                "open_markets": 1, "volume": 1})
+    pol_row = aggregate(pol, deep=True)[0]
+    assert pol_row["verdict"] == "SHARP", pol_row   # modal, not stray-promoted
+    print("modal-verdict aggregation OK (stray series can't promote a family)")
     print("PASS" if ok else "*** FAIL ***")
     return 0 if ok else 1
 
