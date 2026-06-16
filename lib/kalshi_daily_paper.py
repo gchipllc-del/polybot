@@ -177,6 +177,24 @@ def record_paper_trades_from_samples(
     eff_kelly    = params["kelly_multiplier"]
     eff_min_sigmas = params["min_strike_distance_sigmas"]
 
+    # 2026-06-15 (ported from traderbot): evidence-gated bet sizing. The
+    # Kelly multiplier is capped by what the Kalshi sleeve's OWN resolved
+    # record statistically supports (lib/psr_gate) — monotone, can only
+    # shrink. SHADOW by default: with kalshi_daily_psr_gate_enabled unset
+    # we log what it WOULD cap to but don't apply it (live bot — operator
+    # opts in). With 0 resolved Kalshi trades today it reads
+    # 'no_measured_edge' → would cap the multiplier to 0.25.
+    try:
+        from lib.psr_gate import gated_kelly_multiplier
+        _gated, _gmeta = gated_kelly_multiplier(eff_kelly, platform="kalshi")
+        _gate_on = bool(_load_overrides().get("kalshi_daily_psr_gate_enabled", False))
+        _gmeta["enforced"] = _gate_on
+        log_event("kalshi_daily", "psr_sizing_gate", _gmeta)
+        if _gate_on:
+            eff_kelly = _gated
+    except Exception as _e:
+        log_event("kalshi_daily", "psr_gate_error", {"error": str(_e)[:200]})
+
     existing = _load_all()
     open_tickers = {r["market_ticker"] for r in existing if r.get("status") == "open"}
 

@@ -28,6 +28,9 @@ No I/O, no global state — just math, so it is trivially safe to import anywher
 from __future__ import annotations
 
 import math
+from statistics import NormalDist
+
+_N = NormalDist()
 
 # Sample size at which a recommendation earns its FULL stated confidence.
 # Below this, confidence is scaled down linearly. 30 is the usual rule-of-thumb
@@ -59,6 +62,60 @@ def wilson_bounds(wins: int, n: int, z: float = _Z95) -> tuple[float, float]:
     lo = max(0.0, center - half)
     hi = min(1.0, center + half)
     return lo, hi
+
+
+def _moments(xs: list[float]) -> tuple[float, float, float, float]:
+    """mean, sample stdev, skew, NON-excess kurtosis (normal = 3)."""
+    n = len(xs)
+    mean = sum(xs) / n
+    var = sum((x - mean) ** 2 for x in xs) / (n - 1) if n > 1 else 0.0
+    sd = math.sqrt(var)
+    if sd == 0:
+        return mean, 0.0, 0.0, 3.0
+    skew = (sum((x - mean) ** 3 for x in xs) / n) / sd ** 3
+    kurt = (sum((x - mean) ** 4 for x in xs) / n) / sd ** 4
+    return mean, sd, skew, kurt
+
+
+def probabilistic_sharpe_ratio(returns: list[float],
+                               sr_benchmark: float = 0.0) -> float | None:
+    """PSR: P(true Sharpe > sr_benchmark) given the observed per-trade
+    return series, skew/kurtosis-adjusted (Bailey & Lopez de Prado).
+
+    Ported from traderbot lib/track_record (2026-06-15) — the prediction-
+    market analogue of "is this edge real": for Kalshi/Manifold the
+    return series is per-resolution net_profit / capital-deployed. None
+    when n<5 or the series has no variance.
+    """
+    n = len(returns)
+    if n < 5:
+        return None
+    mean, sd, skew, kurt = _moments(returns)
+    if sd == 0:
+        return None
+    sr = mean / sd
+    denom = math.sqrt(max(1e-12, 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr))
+    return _N.cdf((sr - sr_benchmark) * math.sqrt(n - 1) / denom)
+
+
+def min_track_record_length(returns: list[float],
+                            sr_benchmark: float = 0.0,
+                            confidence: float = 0.95) -> float | None:
+    """How many trades before the observed Sharpe is distinguishable from
+    the benchmark at `confidence`. inf when the edge is non-positive (no
+    sample size rescues a losing strategy). None when n<5."""
+    n = len(returns)
+    if n < 5:
+        return None
+    mean, sd, skew, kurt = _moments(returns)
+    if sd == 0:
+        return None
+    sr = mean / sd
+    if sr <= sr_benchmark:
+        return float("inf")
+    z = _N.inv_cdf(confidence)
+    return 1.0 + (1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr) \
+        * (z / (sr - sr_benchmark)) ** 2
 
 
 def sample_factor(n: int, full_n: int = FULL_CONFIDENCE_N) -> float:
