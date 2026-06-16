@@ -15,9 +15,10 @@ RUN="$PROJECT_ROOT/scripts/launchd/run_weather_fade.sh"
 RUN_DASH="$PROJECT_ROOT/scripts/launchd/run_weather_fade_dash.sh"
 RUN_FC2S="$PROJECT_ROOT/scripts/launchd/run_fc2s.sh"
 RUN_ENS="$PROJECT_ROOT/scripts/launchd/run_ensemble.sh"
+RUN_BARB="$PROJECT_ROOT/scripts/launchd/run_bucket_arb.sh"
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS"
-chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" "$RUN_ENS" 2>/dev/null || true
+chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" "$RUN_ENS" "$RUN_BARB" 2>/dev/null || true
 
 # write_agent LABEL  CADENCE  RUNNER  [args...]
 #   CADENCE: a number    = StartInterval seconds (fires at load too)
@@ -74,6 +75,10 @@ write_agent "$P.probe"         cal:38 "$RUN" probe
 write_agent "$P.collectsettle" cal:44 "$RUN" collect-settle
 write_agent "$P.collect"       cal:50 "$RUN" collect
 write_agent "$P.enssettle"     cal:56 "$RUN_ENS" settle
+# bucket-arb: scan mutually-exclusive ladders for structural locks AND log every
+# ladder's near-miss margin (--collect) to build the distribution. Slots at :15,
+# between scan(:05) and fc2sscan(:20). Read-only — places nothing.
+write_agent "$P.bucketarb"     cal:15 "$RUN_BARB" --collect
 # dashboard — file render every 5 min (the reliable view: open the HTML file,
 # no server/localhost/https). The live Flask :5060 server is intentionally NOT
 # installed (it flapped and the file view replaced it); start it manually with
@@ -97,8 +102,8 @@ echo ""
 echo "Dashboard (live link):  http://127.0.0.1:5052   (http, not https)"
 echo "Dashboard (file backup): open $PROJECT_ROOT/data/weather_fade_dash.html"
 echo "Scorecards: python scripts/weather_fade.py report   |   python scripts/fc_two_sided.py report"
-echo "NOTE: staggered agents fire at their minute-of-hour (scan :05, fc2s :20, ens :26,"
-echo "      probe :38, collect :50) — first runs happen within the next hour, NOT at install."
+echo "NOTE: staggered agents fire at their minute-of-hour (scan :05, bucketarb :15, fc2s :20,"
+echo "      ens :26, probe :38, collect :50) — first runs happen within the next hour, NOT at install."
 echo "NOTE: caffeinate is now a MANAGED KeepAlive agent (auto-starts at login, respawns if"
 echo "      it dies) — no manual 'caffeinate &' needed. To let the Mac sleep again:"
 echo "      launchctl unload ~/Library/LaunchAgents/$P.caffeinate.plist"

@@ -42,7 +42,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-LOG = ROOT / "data" / "bucket_arb_scan.jsonl"
+LOG = ROOT / "data" / "bucket_arb_scan.jsonl"          # locked arbs only
+COLLECT_LOG = ROOT / "data" / "bucket_arb_collect.jsonl"  # every event's margin
 
 # S&P-500 / Nasdaq-100 ladders get the discounted fee coefficient.
 DISCOUNTED_PREFIXES = ("INX", "KXINX", "NASDAQ100", "KXNASDAQ100", "KXNDQ")
@@ -73,38 +74,59 @@ def _leg_quotes(m: dict) -> tuple[int, int]:
     return yes_ask, no_ask
 
 
-def scan_event(event_ticker: str, markets: list, mutually_exclusive: bool,
-               coef: float) -> list:
-    """Return locked-arb opportunities for one event's bucket ladder. Empty if
-    none, or if the event isn't mutually exclusive (no structural guarantee)."""
-    if not mutually_exclusive or len(markets) < 2:
-        return []
-    n = len(markets)
+def _ladder_calc(markets: list, coef: float) -> dict:
+    """Cost + per-leg fees for sweeping a ladder's YES side and NO side, plus
+    whether each side is fully executable (every leg quoted)."""
     yes_asks = [_leg_quotes(m)[0] for m in markets]
     no_asks = [_leg_quotes(m)[1] for m in markets]
+    return {
+        "n": len(markets),
+        "yes_cost": sum(yes_asks), "yes_exec": all(0 < a < 100 for a in yes_asks),
+        "yes_fee": sum(fee_cents(a, coef) for a in yes_asks),
+        "no_cost": sum(no_asks), "no_exec": all(0 < a < 100 for a in no_asks),
+        "no_fee": sum(fee_cents(a, coef) for a in no_asks),
+    }
+
+
+def event_margins(event_ticker: str, markets: list, mutually_exclusive: bool,
+                  coef: float) -> dict | None:
+    """Per-event sweep margins in cents (POSITIVE = locked profit, negative = how
+    far from profitable). None if the event has no structural guarantee. This is
+    what `collect` logs every run, so a week of scans yields the distribution of
+    how close ladders actually get — the thing that tells us if the lane is real,
+    not just whether a perfect lock happened to exist this second."""
+    if not mutually_exclusive or len(markets) < 2:
+        return None
+    c = _ladder_calc(markets, coef)
+    n = c["n"]
+    return {
+        "event": event_ticker, "legs": n,
+        "no_margin_cents": ((n - 1) * 100 - c["no_cost"] - c["no_fee"]
+                            if c["no_exec"] else None),
+        "yes_margin_cents": (100 - c["yes_cost"] - c["yes_fee"]
+                             if c["yes_exec"] else None),
+        "no_cost_cents": c["no_cost"], "no_fee_cents": c["no_fee"],
+        "yes_cost_cents": c["yes_cost"], "yes_fee_cents": c["yes_fee"],
+    }
+
+
+def scan_event(event_ticker: str, markets: list, mutually_exclusive: bool,
+               coef: float) -> list:
+    """Return locked-arb opportunities (margin > 0) for one event's ladder."""
+    em = event_margins(event_ticker, markets, mutually_exclusive, coef)
+    if em is None:
+        return []
     out = []
-
-    # NO-SWEEP — robust (needs only mutual exclusivity). Every leg must be buyable.
-    if all(0 < a < 100 for a in no_asks):
-        cost = sum(no_asks)
-        fees = sum(fee_cents(a, coef) for a in no_asks)
-        profit = (n - 1) * 100 - cost - fees
-        if profit > 0:
-            out.append({"event": event_ticker, "type": "NO_SWEEP", "legs": n,
-                        "cost_cents": cost, "fee_cents": fees,
-                        "profit_cents": profit, "guarantee": "mutual-exclusivity",
-                        "assumes_exhaustive": False})
-
-    # YES-SWEEP — needs exhaustiveness too; flag but mark the assumption.
-    if all(0 < a < 100 for a in yes_asks):
-        cost = sum(yes_asks)
-        fees = sum(fee_cents(a, coef) for a in yes_asks)
-        profit = 100 - cost - fees
-        if profit > 0:
-            out.append({"event": event_ticker, "type": "YES_SWEEP", "legs": n,
-                        "cost_cents": cost, "fee_cents": fees,
-                        "profit_cents": profit, "guarantee": "needs-exhaustive-ladder",
-                        "assumes_exhaustive": True})
+    if em["no_margin_cents"] is not None and em["no_margin_cents"] > 0:
+        out.append({"event": event_ticker, "type": "NO_SWEEP", "legs": em["legs"],
+                    "cost_cents": em["no_cost_cents"], "fee_cents": em["no_fee_cents"],
+                    "profit_cents": em["no_margin_cents"],
+                    "guarantee": "mutual-exclusivity", "assumes_exhaustive": False})
+    if em["yes_margin_cents"] is not None and em["yes_margin_cents"] > 0:
+        out.append({"event": event_ticker, "type": "YES_SWEEP", "legs": em["legs"],
+                    "cost_cents": em["yes_cost_cents"], "fee_cents": em["yes_fee_cents"],
+                    "profit_cents": em["yes_margin_cents"],
+                    "guarantee": "needs-exhaustive-ladder", "assumes_exhaustive": True})
     return out
 
 
@@ -151,17 +173,108 @@ def series_in_category(category: str, cap: int) -> list:
     return [s for s in out if s][:cap]
 
 
-def scan_series(series_ticker: str) -> list:
+def scan_series(series_ticker: str) -> tuple[list, list]:
+    """One fetch per series → (locked arbs, per-event margins). The margins feed
+    `collect`; the arbs feed the live display + the locked-arb log."""
     coef = fee_coef(series_ticker)
-    hits = []
+    hits, margins = [], []
     for ev in fetch_open_events(series_ticker):
         ms = ev.get("markets", []) or []
         me = bool(ev.get("mutually_exclusive"))
-        for opp in scan_event(ev.get("event_ticker", ""), ms, me, coef):
-            opp["series"] = series_ticker
-            opp["coef"] = coef
-            hits.append(opp)
-    return hits
+        et = ev.get("event_ticker", "")
+        em = event_margins(et, ms, me, coef)
+        if em is not None:
+            margins.append({**em, "series": series_ticker, "coef": coef})
+        for opp in scan_event(et, ms, me, coef):
+            hits.append({**opp, "series": series_ticker, "coef": coef})
+    return hits, margins
+
+
+def eval_collected() -> int:
+    """Summarize the accumulated near-miss distribution: have ladders ever come
+    close to a locked arb, how close, and how often executable?"""
+    if not COLLECT_LOG.exists():
+        print("no collection yet — run `bucket_arb.py --collect` on a schedule first.")
+        return 0
+    rows = [json.loads(l) for l in COLLECT_LOG.read_text().splitlines() if l.strip()]
+    no = [r["no_margin_cents"] for r in rows if r.get("no_margin_cents") is not None]
+    yes = [r["yes_margin_cents"] for r in rows if r.get("yes_margin_cents") is not None]
+    print(f"=== bucket-arb collection — {len(rows)} event-observations ===")
+    print(f"  NO-sweep executable on {len(no)}/{len(rows)} obs, "
+          f"YES-sweep on {len(yes)}/{len(rows)}")
+    for name, xs in (("NO_SWEEP (robust)", no), ("YES_SWEEP (needs-exhaustive)", yes)):
+        if not xs:
+            print(f"  {name}: never executable in sample")
+            continue
+        pos = sum(1 for x in xs if x > 0)
+        near = sum(1 for x in xs if -5 <= x <= 0)
+        print(f"  {name}: best {max(xs):+d}¢ · median {sorted(xs)[len(xs)//2]:+d}¢ · "
+              f"locked(>0) {pos} · within 5¢ of lock {near}")
+    print("\nREAD: a healthy efficient market sits a few ¢ negative (fees). If best "
+          "stays well below 0 over many days, the lane is dead — walk away. If it "
+          "repeatedly pokes >0 AND fills, it's real.")
+    return 0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--series", help="comma-separated series tickers to scan")
+    ap.add_argument("--category", help="scan all series in a Kalshi category")
+    ap.add_argument("--max-series", type=int, default=40,
+                    help="cap series scanned in --category mode (default 40)")
+    ap.add_argument("--min-profit", type=int, default=1,
+                    help="only report opportunities with >= this profit in cents")
+    ap.add_argument("--collect", action="store_true",
+                    help="log every event's sweep margin (not just locks) to build "
+                         "the distribution — what scheduled runs should do")
+    ap.add_argument("--eval", action="store_true", help="summarize collected margins")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+    if args.selftest:
+        raise SystemExit(selftest())
+    if args.eval:
+        raise SystemExit(eval_collected())
+
+    if args.series:
+        targets = [s.strip() for s in args.series.split(",") if s.strip()]
+    elif args.category:
+        targets = series_in_category(args.category, args.max_series)
+    else:
+        # default: the proven, clean-ladder family
+        targets = series_in_category("Climate and Weather", args.max_series)
+    if not targets:
+        print("no series to scan — run on home IP with Kalshi auth.")
+        return
+
+    all_hits, all_margins, scanned = [], [], 0
+    for s in targets:
+        hits, margins = scan_series(s)
+        all_hits.extend(h for h in hits if h["profit_cents"] >= args.min_profit)
+        all_margins.extend(margins)
+        scanned += 1
+        if hits:
+            print(f"  {s}: {len(hits)} opportunity(ies)", file=sys.stderr)
+    print(f"scanned {scanned} series, {len(all_margins)} mutually-exclusive events",
+          file=sys.stderr)
+
+    ts = datetime.now(timezone.utc).isoformat()
+    if all_hits:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a") as fh:
+            for h in all_hits:
+                fh.write(json.dumps({"ts": ts, **h}) + "\n")
+    if args.collect and all_margins:
+        COLLECT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with COLLECT_LOG.open("a") as fh:
+            for m in all_margins:
+                fh.write(json.dumps({"ts": ts, **m}) + "\n")
+        best = max((m["no_margin_cents"] for m in all_margins
+                    if m.get("no_margin_cents") is not None), default=None)
+        print(f"  collected {len(all_margins)} margins "
+              f"(best NO-sweep this run: {best:+d}¢)" if best is not None
+              else f"  collected {len(all_margins)} margins", file=sys.stderr)
+    all_hits.sort(key=lambda h: -h["profit_cents"])
 
 
 def main() -> None:
@@ -265,6 +378,17 @@ def selftest() -> int:
     gap = [{"no_ask": 0, "yes_ask": 45}, {"no_ask": 60, "yes_ask": 45}]
     assert all(r["type"] != "NO_SWEEP" for r in scan_event("GAP", gap, me, 0.07))
     print("guards OK (non-exclusive skipped, unquoted leg not swept)")
+
+    # event_margins: the efficient ladder is a NEAR-MISS — margin slightly
+    # negative (eaten by fees), NOT None, so `collect` records the distribution.
+    em = event_margins("EFF", eff, me, 0.07)
+    assert em is not None and em["no_margin_cents"] < 0, em
+    assert event_margins("NX", eff, False, 0.07) is None      # no guarantee → skip
+    # an unquoted NO leg → no_margin is None (not executable) but YES side can
+    # still report; the dict is still produced for collection
+    em2 = event_margins("GAP", gap, me, 0.07)
+    assert em2 is not None and em2["no_margin_cents"] is None, em2
+    print(f"event_margins OK (efficient ladder near-miss {em['no_margin_cents']:+d}¢)")
     print("PASS")
     return 0
 
