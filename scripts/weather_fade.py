@@ -782,6 +782,65 @@ def cmd_analyze(args) -> None:
     print("\n  → The pattern to watch: does net P&L go red on high-YES-rate (hot) days and "
           "green on low? If so, the edge is a directional weather bet, not a pricing edge.")
 
+    if getattr(args, "psr", False):
+        _psr_significance(closed)
+
+
+def _psr_significance(closed: list) -> None:
+    """Read-only significance read-out on settled fades (Bailey & López de Prado).
+
+    The per-DAY series is the HONEST independent sample: a day's city-fades share
+    one weather pattern, so the 187 trades are really ~9 correlated clusters.
+    The per-TRADE series is shown only to expose how much that correlation
+    inflates an unclustered read. PSR = P(true edge > 0); MinTRL = sample size
+    needed to call the Sharpe distinguishable from zero."""
+    sys.path.insert(0, str(ROOT))
+    try:
+        from lib.hermes_significance import (probabilistic_sharpe_ratio,
+                                             min_track_record_length)
+    except Exception as e:
+        print(f"\n[PSR] significance lib unavailable ({e}) — needs "
+              "lib/hermes_significance.py (sync the branch).")
+        return
+
+    def _ret(r):
+        cap = float(r.get("notional", 0) or 0)
+        return (float(r.get("paper_pnl", 0) or 0) / cap) if cap > 0 else None
+
+    per_trade = [x for x in (_ret(r) for r in closed) if x is not None]
+    byday: dict = {}
+    for r in closed:
+        b = byday.setdefault(_event_date(_tkid(r)), [0.0, 0.0])
+        b[0] += float(r.get("paper_pnl", 0) or 0)
+        b[1] += float(r.get("notional", 0) or 0)
+    per_day = [pnl / cap for pnl, cap in byday.values() if cap > 0]
+
+    def _tier(psr):
+        if psr is None:
+            return "no edge (n<5)"
+        return ("NO MEASURED EDGE" if psr < 0.50 else
+                "provisional" if psr < 0.95 else "EVIDENCE-BACKED")
+
+    def _mintrl(m):
+        return "n<5" if m is None else ("∞" if m == float("inf") else str(int(m)))
+
+    print("\n=== SIGNIFICANCE — PSR / MinTRL (return = net P&L / capital deployed) ===")
+    for label, xs, unit, note in (
+        ("per-TRADE", per_trade, "trades",
+         "treats correlated trades as independent → OPTIMISTIC"),
+        ("per-DAY  ", per_day, "days",
+         "a day's fades share one weather pattern → the HONEST sample"),
+    ):
+        psr = probabilistic_sharpe_ratio(xs)
+        psr_s = "n<5 " if psr is None else f"{psr:.2f}"
+        print(f"  {label}  n={len(xs):<4} PSR(edge>0)={psr_s}  "
+              f"MinTRL={_mintrl(min_track_record_length(xs)):>4} {unit:<6} "
+              f"[{_tier(psr)}]  · {note}")
+    print("  READ: PSR is P(true edge>0). <0.50 = not even probably positive · "
+          "0.50–0.95 = provisional · ≥0.95 = evidence-backed. MinTRL ∞ = the edge "
+          "is non-positive, so no amount of data rescues it. Judge by the per-DAY "
+          "line; the per-trade PSR is inflated by within-day correlation.")
+
 
 def cmd_probe(args) -> None:
     """Snapshot weather-book liquidity now and append to a probe log, so running
@@ -917,6 +976,9 @@ def main() -> None:
     ap.add_argument("--show", action="store_true",
                     help="scan: print the live edge for every day-ahead market "
                          "(diagnose firing rate + calibration-vs-live mapping)")
+    ap.add_argument("--psr", action="store_true",
+                    help="analyze: append Bailey & López de Prado PSR + MinTRL "
+                         "significance (per-trade AND per-day/clustered). Read-only.")
     args = ap.parse_args()
     {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report,
      "analyze": cmd_analyze, "health": cmd_health, "probe": cmd_probe,
