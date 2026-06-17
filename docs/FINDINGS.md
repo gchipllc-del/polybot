@@ -31,9 +31,34 @@ settle. Validated in backtest (`becker_edge.py`): 13 months, 8 cities, OOS
 **Disposition:** code retained as a documented negative result; do not feed it
 capital. Reproduce with `weather_fade.py analyze --validated-only --psr`.
 
-### BTC short-horizon (earlier)
-**Verdict: efficient market, no edge.** Tested and ruled out — the market prices
-the available data. The disciplined "don't build for a phantom edge" outcome.
+### BTC SHORT-horizon (5-min / hourly) — earlier
+**Verdict: efficient market, no edge.** Tested and ruled out — at minute/hour
+horizons the market prices the available data. NOTE: this is the *short* horizon
+only; BTC *daily* is a different animal — see PROVISIONAL below.
+
+---
+
+## 🟡 PROVISIONAL — positive central tendency, not yet proven
+
+### live BTC-DAILY (kalshi_daily) — REAL account (2026-06-17)
+**What it is:** the `kalshi_daily` strategy (daily BTC price contracts, `KXBTCD-*`),
+run on the **live account** — this is what actually produced the "$50→$280"-type
+run, NOT weather. Distinct from BTC short-horizon (above): the 1-day horizon has
+far better signal-to-noise.
+
+**Verdict: PROVISIONAL edge — keep, but do NOT scale up.** Measured on real
+settled positions via `kalshi_live_psr.py`:
+- 68 settled positions, 10 days (2026-05-24 → 06-06), realized **+$84.94**, 21W/47L (31% WR).
+- **per-day PSR 0.64** (above the 0.50 "probably positive" bar, below 0.95 "evidence-backed").
+- **MinTRL 196 days** — *finite*, so the central tendency is POSITIVE (unlike weather-fade's ∞). But with 10 days collected you're ~5% of the way to statistical certainty.
+- Cheap-longshot shape (31% WR, result carried by a few big winners) — at n=10, real edge and lucky streak look identical.
+
+**Disposition:** the most promising signal found so far. It's been OFF since ~06-06
+(broken `kalshi_daily` agent, exit 127). To resolve edge-vs-luck it must keep
+running — but at **psr_gate-governed fractional size** (PSR 0.50–0.95 → "provisional"
+tier → ~0.40 Kelly cap), NOT scaled up on 10 days. Re-run `kalshi_live_psr.py psr`
+periodically; watch per-day PSR move toward 0.95 (real) or back below 0.50 (variance).
+Reconcile: settled P&L +$84.94 vs the remembered ~+$230 (deposits / open positions?).
 
 ---
 
