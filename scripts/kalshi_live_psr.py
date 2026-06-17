@@ -115,16 +115,21 @@ def build_returns(settlements: list) -> tuple[list, dict]:
     _num() parses both numbers and dollar-strings like '0.5600'."""
     rows, skipped = [], 0
     for s in settlements:
-        cost = _num(s.get("yes_total_cost_dollars")) + _num(s.get("no_total_cost_dollars"))
+        yc = _num(s.get("yes_total_cost_dollars"))
+        nc = _num(s.get("no_total_cost_dollars"))
+        cost = yc + nc
         if cost <= 0:                       # never opened a paid position here → skip
             skipped += 1
             continue
+        # which side did we BUY? discriminates weather-fade (NO) from a directional
+        # YES strategy — the key to identifying which strategy made the money.
+        side = "NO" if nc > yc else "YES"
         payout = _num(s.get("revenue")) / 100.0     # revenue is in cents
         fee = _num(s.get("fee_cost"))
         net = payout - cost - fee
         day = str(s.get("settled_time") or "")[:10] or "?"
         rows.append({"date": day, "ticker": s.get("ticker", ""),
-                     "result": s.get("market_result", ""),
+                     "result": s.get("market_result", ""), "side": side,
                      "cost": cost, "net": net, "ret": net / cost})
     return rows, {"settlements": len(settlements), "matched": len(rows),
                   "skipped": skipped}
@@ -214,20 +219,25 @@ def cmd_breakdown(args) -> None:
     """Split realized P&L by strategy family (BTC / WEATHER / ETH / …) AND show a
     chronological per-day timeline. Answers 'was it BTC or weather (or both) that
     made money?' and 'was the recent tail losing before it stopped?'"""
+    from collections import Counter
     rows, meta = build_returns(fetch_settlements())
     if args.since:
         rows = [r for r in rows if r["date"] >= args.since]
+    if args.family:
+        rows = [r for r in rows if _family(r["ticker"]) == args.family.upper()]
     if not rows:
-        print(f"no matched settled positions ({meta}).")
+        print(f"no matched settled positions ({meta}; filters since={args.since} "
+              f"family={args.family}).")
         return
 
     fam = defaultdict(list)
     for r in rows:
         fam[_family(r["ticker"])].append(r)
     print(f"=== LIVE account by family — {len(rows)} positions, "
-          f"matched {meta['matched']}/{meta['settlements']} ===")
+          f"matched {meta['matched']}/{meta['settlements']} "
+          f"(since={args.since or 'all'}) ===")
     print(f"{'family':10} {'pos':>4} {'days':>4} {'net$':>9} {'WR':>4} "
-          f"{'PSR/day':>8} {'MinTRL':>7}")
+          f"{'side(Y/N)':>9} {'PSR/day':>8} {'MinTRL':>7}")
     for f, rs in sorted(fam.items(), key=lambda kv: -sum(x["net"] for x in kv[1])):
         days = defaultdict(lambda: [0.0, 0.0])
         for r in rs:
@@ -236,11 +246,13 @@ def cmd_breakdown(args) -> None:
         per_day = [n / c for n, c in days.values() if c > 0]
         net = sum(r["net"] for r in rs)
         wins = sum(1 for r in rs if r["net"] > 0)
+        sd = Counter(r["side"] for r in rs)
         psr_s, mt_s = _psr_pair(per_day)
         print(f"{f[:10]:10} {len(rs):>4} {len(days):>4} {net:>+9.2f} "
-              f"{wins/len(rs)*100:>3.0f}% {psr_s:>8} {mt_s:>7}")
+              f"{wins/len(rs)*100:>3.0f}% {str(sd['YES'])+'/'+str(sd['NO']):>9} "
+              f"{psr_s:>8} {mt_s:>7}")
 
-    print("\n=== per-day timeline (all families) — is the recent tail losing? ===")
+    print("\n=== per-day timeline — is the recent tail losing? ===")
     byday = defaultdict(float)
     for r in rows:
         byday[r["date"]] += r["net"]
@@ -248,8 +260,17 @@ def cmd_breakdown(args) -> None:
     for d in sorted(byday):
         run += byday[d]
         print(f"  {d}  net {byday[d]:>+8.2f}   running {run:>+8.2f}")
-    print("  READ: a positive full-window total with a negative last-few-days tail "
-          "explains 'it wasn't making money when I stopped' — recency, not the whole story.")
+
+    # With a single --family selected, dump per-position detail so we can SEE
+    # exactly what the strategy traded (tickers + side) and identify it.
+    if args.family:
+        print(f"\n=== {args.family.upper()} positions (side: which side we bought) ===")
+        for r in sorted(rows, key=lambda r: (r["date"], -r["net"])):
+            print(f"  {r['date']}  {str(r['ticker'])[:30]:30} {r['side']:>3} "
+                  f"→{r['result']:>3}  net {r['net']:>+7.2f}")
+    print("\n  READ: side Y/N tells you the strategy. Mostly-NO weather = the "
+          "weather-FADE family we ruled out on 187 paper trades (so a winning live "
+          "window is suspect); mostly-YES = a different, directional strategy.")
 
 
 def cmd_psr(args) -> None:
@@ -305,6 +326,8 @@ def main() -> None:
     ap.add_argument("mode", nargs="?", default="probe",
                     choices=["probe", "psr", "account", "breakdown"])
     ap.add_argument("--since", help="only positions settled on/after YYYY-MM-DD")
+    ap.add_argument("--family", help="breakdown: filter to one family (BTC/WEATHER/ETH) "
+                    "+ dump per-position detail")
     args = ap.parse_args()
     _load_dotenv()
     {"probe": cmd_probe, "psr": cmd_psr, "account": cmd_account,

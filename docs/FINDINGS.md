@@ -38,27 +38,38 @@ only; BTC *daily* is a different animal — see PROVISIONAL below.
 
 ---
 
-## 🟡 PROVISIONAL — positive central tendency, not yet proven
+### live BTC-DAILY (kalshi_daily, KXBTCD) — REAL account (2026-06-17)
+**Verdict: RULED OUT — losing.** The earlier "+$84.94 / PSR 0.64" was a *combined*
+account figure and was a **Simpson's paradox** — averaging a winning weather family
+with a losing BTC family. Split by family (`kalshi_live_psr breakdown`): BTC-daily is
+**−$91.05, 18% WR, per-day PSR 0.02, MinTRL ∞** — a structural loser, same verdict as
+weather-fade. The `kalshi_daily`/`kalshi_daily_hermes` agents staying paused is CORRECT;
+do NOT resume BTC. (Balance gap to ~$280 = user-confirmed withdrawals, not drawdown.)
 
-### live BTC-DAILY (kalshi_daily) — REAL account (2026-06-17)
-**What it is:** the `kalshi_daily` strategy (daily BTC price contracts, `KXBTCD-*`),
-run on the **live account** — this is what actually produced the "$50→$280"-type
-run, NOT weather. Distinct from BTC short-horizon (above): the 1-day horizon has
-far better signal-to-noise.
+---
 
-**Verdict: PROVISIONAL edge — keep, but do NOT scale up.** Measured on real
-settled positions via `kalshi_live_psr.py`:
-- 68 settled positions, 10 days (2026-05-24 → 06-06), realized **+$84.94**, 21W/47L (31% WR).
-- **per-day PSR 0.64** (above the 0.50 "probably positive" bar, below 0.95 "evidence-backed").
-- **MinTRL 196 days** — *finite*, so the central tendency is POSITIVE (unlike weather-fade's ∞). But with 10 days collected you're ~5% of the way to statistical certainty.
-- Cheap-longshot shape (31% WR, result carried by a few big winners) — at n=10, real edge and lucky streak look identical.
+## 🟡 PROVISIONAL — positive but not yet proven (needs stress-testing)
 
-**Disposition:** the most promising signal found so far. It's been OFF since ~06-06
-(broken `kalshi_daily` agent, exit 127). To resolve edge-vs-luck it must keep
-running — but at **psr_gate-governed fractional size** (PSR 0.50–0.95 → "provisional"
-tier → ~0.40 Kelly cap), NOT scaled up on 10 days. Re-run `kalshi_live_psr.py psr`
-periodically; watch per-day PSR move toward 0.95 (real) or back below 0.50 (variance).
-Reconcile: settled P&L +$84.94 vs the remembered ~+$230 (deposits / open positions?).
+### live WEATHER — REAL account (2026-06-17)
+**What it is:** the live weather family (`KXHIGH*`/`KXLOW*`) on the real account — the
+strategy that ACTUALLY made the live money (user recalled this correctly). NOTE: NOT
+necessarily the same as the paper `weather-fade` we ruled out — must identify it.
+
+**Verdict: PROMISING but UNCONFIRMED — do not crown or scale yet.**
+- 33 settled positions, 8 days, realized **+$186.06**, 45% WR, **per-day PSR 0.97**, MinTRL 6.
+- ⚠ **Concentrated:** +$154 of the +$186 came from a 3-day run (May 28–30). PSR 0.97 on
+  8 days carried by 3 is the same "one hot run" shape that fooled us on weather-fade —
+  MinTRL 6 is deceptively low (it assumes the lucky Sharpe is the true Sharpe).
+- ⚠ **Strategy not yet identified.** If these were mostly **NO-side** buys it's the
+  weather-FADE family we ruled out on 187 paper trades (→ the larger sample wins, this
+  is a lucky window). If mostly **YES-side**, it's a different, directional strategy
+  (genuinely untested). Resolve with `kalshi_live_psr breakdown --family WEATHER`
+  (side Y/N + per-position tickers) and `--since 2026-05-31` (does it survive without
+  the 3-day run?).
+
+**Disposition:** the best live lead, but treat exactly like weather-fade until proven —
+identify the strategy, check concentration, then judge by per-day PSR on the un-lucky
+subset. Do NOT scale on 8 concentrated days.
 
 ---
 
