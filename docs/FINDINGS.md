@@ -85,12 +85,14 @@ Reconcile: settled P&L +$84.94 vs the remembered ~+$230 (deposits / open positio
   terminal/Claude **Full Disk Access**; otherwise diagnose live issues in a
   native Terminal. `~/polybot-backtest` is the **readable analysis/data mirror**
   (now also has a read-only Kalshi key in its `.env` for `kalshi_live_psr`).
-- **OPEN QUESTION — live BTC-daily stopped settling ~2026-06-06.** Cause NOT yet
-  confirmed. Candidates: the order-placing agent broke (a missing local launcher
-  `run_kalshi_daily.sh` — never in git — breaks `kalshi_daily`/`_conservative`
-  with exit 127), OR `kalshi_daily_hermes` is in `review` (shadow) mode, OR
-  capital is tied up in open positions. Check with `kalshi_live_psr.py account`
-  (balance/positions, server-side, no TCC) + the Desktop logs (native terminal).
+- **CONFIRMED PAUSED — live BTC-daily stopped trading ~2026-06-06.** `account`
+  check (server-side, TCC-free) shows **$63.33 cash, 0 open positions** — so it's
+  not "holding," it simply stopped placing trades. WHY is still open (bug vs
+  `review`/shadow mode vs a deliberate risk-off) — needs the Desktop logs via a
+  native terminal. Also note the balance arithmetic: $63.33 cash vs +$84.94
+  realized (and a remembered ~$280 peak) ⇒ **withdrawals and/or a post-06-06
+  drawdown** — reconcile before re-enabling, as a drawdown would be the
+  longshot-risk materializing.
 - **DO NOT unload the exit-127 agents** (`kalshi_daily`, `kalshi_daily_conservative`,
   `trade`, `monitor`, `harvester`, `weather_daily`) until the above is resolved —
   one of them may be the *broken live trader*, not a harmless orphan. Removing it
