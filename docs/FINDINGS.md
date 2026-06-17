@@ -89,10 +89,13 @@ Reconcile: settled P&L +$84.94 vs the remembered ~+$230 (deposits / open positio
   check (server-side, TCC-free) shows **$63.33 cash, 0 open positions** — so it's
   not "holding," it simply stopped placing trades. WHY is still open (bug vs
   `review`/shadow mode vs a deliberate risk-off) — needs the Desktop logs via a
-  native terminal. Also note the balance arithmetic: $63.33 cash vs +$84.94
-  realized (and a remembered ~$280 peak) ⇒ **withdrawals and/or a post-06-06
-  drawdown** — reconcile before re-enabling, as a drawdown would be the
-  longshot-risk materializing.
+  native terminal. Balance reconciled: the $63.33 vs +$84.94 gap is
+  **user-confirmed WITHDRAWALS**, not a drawdown — so the measured edge stands.
+- **OPEN — was it BTC or WEATHER (or both) that made the live money?** User recalls
+  *both* weather and BTC were profitable live, and that BTC "wasn't making money"
+  right before the stop. The +$84.94/PSR-0.64 figure is COMBINED and the sample
+  looked BTC-only — split it with `kalshi_live_psr.py breakdown` (per-family P&L +
+  per-day PSR + daily timeline) before crediting either strategy.
 - **DO NOT unload the exit-127 agents** (`kalshi_daily`, `kalshi_daily_conservative`,
   `trade`, `monitor`, `harvester`, `weather_daily`) until the above is resolved —
   one of them may be the *broken live trader*, not a harmless orphan. Removing it

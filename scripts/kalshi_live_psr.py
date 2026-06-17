@@ -11,6 +11,7 @@ modifies an order. Needs your signed Kalshi client (lib/kalshi_auth: KALSHI_API_
   python scripts/kalshi_live_psr.py probe    # RUN FIRST — dump raw sample + counts
   python scripts/kalshi_live_psr.py psr       # per-day PSR on settled positions
   python scripts/kalshi_live_psr.py account   # balance + open positions (paused vs holding?)
+  python scripts/kalshi_live_psr.py breakdown # P&L by family (BTC/WEATHER/…) + daily timeline
   python scripts/kalshi_live_psr.py psr --since 2026-06-01
 
 Why probe first: Kalshi's settlement/fill field names aren't visible from the
@@ -162,6 +163,71 @@ def cmd_probe(_args) -> None:
               f"{len(days)} days ({days[0]}…{days[-1]}).")
 
 
+def _family(ticker: str) -> str:
+    """Group a ticker into a strategy family so we can see WHICH one made money."""
+    t = (ticker or "").upper()
+    if t.startswith("KXBTC"):
+        return "BTC"
+    if t.startswith("KXETH"):
+        return "ETH"
+    if t.startswith(("KXHIGH", "KXLOW", "KXTEMP")):
+        return "WEATHER"
+    return t.split("-")[0] or "?"
+
+
+def _psr_pair(per_day: list):
+    """(psr_str, mintrl_str) for a per-day return series."""
+    from lib.hermes_significance import (probabilistic_sharpe_ratio,
+                                         min_track_record_length)
+    psr = probabilistic_sharpe_ratio(per_day)
+    mt = min_track_record_length(per_day)
+    psr_s = "n<5" if psr is None else f"{psr:.2f}"
+    mt_s = "n<5" if mt is None else ("∞" if mt == float("inf") else str(int(mt)))
+    return psr_s, mt_s
+
+
+def cmd_breakdown(args) -> None:
+    """Split realized P&L by strategy family (BTC / WEATHER / ETH / …) AND show a
+    chronological per-day timeline. Answers 'was it BTC or weather (or both) that
+    made money?' and 'was the recent tail losing before it stopped?'"""
+    rows, meta = build_returns(fetch_settlements())
+    if args.since:
+        rows = [r for r in rows if r["date"] >= args.since]
+    if not rows:
+        print(f"no matched settled positions ({meta}).")
+        return
+
+    fam = defaultdict(list)
+    for r in rows:
+        fam[_family(r["ticker"])].append(r)
+    print(f"=== LIVE account by family — {len(rows)} positions, "
+          f"matched {meta['matched']}/{meta['settlements']} ===")
+    print(f"{'family':10} {'pos':>4} {'days':>4} {'net$':>9} {'WR':>4} "
+          f"{'PSR/day':>8} {'MinTRL':>7}")
+    for f, rs in sorted(fam.items(), key=lambda kv: -sum(x["net"] for x in kv[1])):
+        days = defaultdict(lambda: [0.0, 0.0])
+        for r in rs:
+            days[r["date"]][0] += r["net"]
+            days[r["date"]][1] += r["cost"]
+        per_day = [n / c for n, c in days.values() if c > 0]
+        net = sum(r["net"] for r in rs)
+        wins = sum(1 for r in rs if r["net"] > 0)
+        psr_s, mt_s = _psr_pair(per_day)
+        print(f"{f[:10]:10} {len(rs):>4} {len(days):>4} {net:>+9.2f} "
+              f"{wins/len(rs)*100:>3.0f}% {psr_s:>8} {mt_s:>7}")
+
+    print("\n=== per-day timeline (all families) — is the recent tail losing? ===")
+    byday = defaultdict(float)
+    for r in rows:
+        byday[r["date"]] += r["net"]
+    run = 0.0
+    for d in sorted(byday):
+        run += byday[d]
+        print(f"  {d}  net {byday[d]:>+8.2f}   running {run:>+8.2f}")
+    print("  READ: a positive full-window total with a negative last-few-days tail "
+          "explains 'it wasn't making money when I stopped' — recency, not the whole story.")
+
+
 def cmd_psr(args) -> None:
     from lib.hermes_significance import (probabilistic_sharpe_ratio,
                                          min_track_record_length)
@@ -213,11 +279,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", nargs="?", default="probe",
-                    choices=["probe", "psr", "account"])
+                    choices=["probe", "psr", "account", "breakdown"])
     ap.add_argument("--since", help="only positions settled on/after YYYY-MM-DD")
     args = ap.parse_args()
     _load_dotenv()
-    {"probe": cmd_probe, "psr": cmd_psr, "account": cmd_account}[args.mode](args)
+    {"probe": cmd_probe, "psr": cmd_psr, "account": cmd_account,
+     "breakdown": cmd_breakdown}[args.mode](args)
 
 
 if __name__ == "__main__":
