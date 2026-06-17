@@ -101,6 +101,10 @@ def fetch_positions() -> list:
     return _page("/portfolio/positions", "market_positions")
 
 
+def fetch_orders() -> list:
+    return _page("/portfolio/orders", "orders")
+
+
 def build_returns(settlements: list) -> tuple[list, dict]:
     """Per-settlement net P&L + return from the settlement's OWN fields (no fills
     join needed — confirmed against Kalshi's settlements schema):
@@ -144,6 +148,26 @@ def cmd_account(_args) -> None:
     else:
         print("    → capital is deployed; recent lack of settlements may just be "
               "open positions not yet resolved, not a pause.")
+
+    # Order history narrows WHY it paused, without needing the Desktop logs:
+    # last-order date ≈ when it last even TRIED to trade.
+    try:
+        orders = fetch_orders()
+    except SystemExit:
+        orders = []
+    if orders:
+        from collections import Counter
+        dates = sorted(str(o.get("created_time") or "")[:10] for o in orders
+                       if o.get("created_time"))
+        statuses = Counter(o.get("status", "?") for o in orders[:60])
+        print(f"  orders on record: {len(orders)} · last order placed: "
+              f"{dates[-1] if dates else '?'}")
+        print(f"  recent order statuses: {dict(statuses)}")
+        print("  READ: if 'last order placed' ≈ the last settlement date, it stopped "
+              "TRYING (review-mode/disabled/crashed-pre-order), not 'trying but not "
+              "filling'. That points the Desktop check straight at the mode/gate.")
+    else:
+        print("  no orders on record (or endpoint empty) — consistent with a long pause.")
 
 
 def cmd_probe(_args) -> None:
