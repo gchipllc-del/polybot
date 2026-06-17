@@ -720,6 +720,17 @@ def cmd_analyze(args) -> None:
         print("no settled fades yet — nothing to analyze.")
         return
 
+    if getattr(args, "validated_only", False):
+        valc = {_city_of(s + "-x") for s in VALIDATED_SERIES}
+        before = len(closed)
+        closed = [r for r in closed if _city_of(_tkid(r)) in valc]
+        print(f"[validated-only] {len(closed)}/{before} settled fades are in the 8 "
+              f"PRE-VALIDATED cities ({', '.join(sorted(valc))}) — the scope becker_edge "
+              f"actually proved, decided before this live data (not a post-hoc slice).")
+        if not closed:
+            print("  none in validated cities — nothing to analyze.")
+            return
+
     def pnl(r):
         return float(r.get("paper_pnl", 0) or 0)
 
@@ -979,6 +990,9 @@ def main() -> None:
     ap.add_argument("--psr", action="store_true",
                     help="analyze: append Bailey & López de Prado PSR + MinTRL "
                          "significance (per-trade AND per-day/clustered). Read-only.")
+    ap.add_argument("--validated-only", action="store_true",
+                    help="analyze: restrict to the 8 PRE-VALIDATED cities (the scope "
+                         "becker_edge proved) — principled, not a post-hoc slice.")
     args = ap.parse_args()
     {"scan": cmd_scan, "settle": cmd_settle, "report": cmd_report,
      "analyze": cmd_analyze, "health": cmd_health, "probe": cmd_probe,
