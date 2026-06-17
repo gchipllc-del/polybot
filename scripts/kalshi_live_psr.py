@@ -52,7 +52,17 @@ def _signed_get(path: str, params: dict):
     if not can_sign():
         raise SystemExit("can't sign Kalshi requests — set KALSHI_API_KEY and "
                          "KALSHI_PRIVATE_KEY_PATH in .env on the machine with your keys.")
-    return signed_get(path, params=params)
+    try:
+        return signed_get(path, params=params)
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "Unauthorized" in msg.lower():
+            raise SystemExit(
+                "Kalshi returned 401 Unauthorized. Your .pem signed fine, so the "
+                "KALSHI_API_KEY (Key ID) is wrong — it must be the Key ID that "
+                "PAIRS with that .pem (Kalshi → Settings → API), not a placeholder "
+                "or a different key. Fix .env and re-run.")
+        raise SystemExit(f"Kalshi request to {path} failed: {msg[:200]}")
 
 
 def _page(path: str, key: str, limit: int = 200, max_pages: int = 50) -> list:
