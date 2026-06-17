@@ -91,65 +91,43 @@ def fetch_settlements() -> list:
     return _page("/portfolio/settlements", "settlements")
 
 
-def fetch_fills() -> list:
-    return _page("/portfolio/fills", "fills")
-
-
-def _cost_by_ticker(fills: list) -> dict:
-    """Entry cost in cents per ticker = Σ count × price over BUY fills. Kalshi
-    fill prices are in cents (1–99). Defensive about field names."""
-    cost = defaultdict(float)
-    for f in fills:
-        tk = f.get("ticker") or f.get("market_ticker") or ""
-        cnt = _num(f.get("count") or f.get("quantity"))
-        # price field varies; try the common ones, all in cents
-        px = _num(f.get("yes_price") if (f.get("side") == "yes") else f.get("no_price"))
-        if px == 0:
-            px = _num(f.get("price"))
-        action = (f.get("action") or f.get("side_action") or "buy").lower()
-        if tk and cnt and px and action != "sell":
-            cost[tk] += cnt * px
-    return cost
-
-
-def build_returns(settlements: list, fills: list) -> tuple[list, dict]:
-    """Per-settlement return = (revenue − entry_cost) / entry_cost, in P&L terms.
-    Returns (rows, meta) where rows = [{date, ret, net_cents, cost_cents, ticker}]."""
-    cost = _cost_by_ticker(fills)
+def build_returns(settlements: list) -> tuple[list, dict]:
+    """Per-settlement net P&L + return from the settlement's OWN fields (no fills
+    join needed — confirmed against Kalshi's settlements schema):
+      cost  = yes_total_cost_dollars + no_total_cost_dollars   (DOLLARS, strings)
+      payout = revenue                                          (CENTS → /100)
+      fee   = fee_cost                                          (DOLLARS, string)
+      net = payout − cost − fee ; return = net / cost.
+    _num() parses both numbers and dollar-strings like '0.5600'."""
     rows, skipped = [], 0
     for s in settlements:
-        tk = s.get("ticker") or s.get("market_ticker") or ""
-        rev = _num(s.get("revenue"))                       # gross payout, cents
-        c = cost.get(tk, 0.0)
-        if c <= 0:                                          # no matched cost → can't return
+        cost = _num(s.get("yes_total_cost_dollars")) + _num(s.get("no_total_cost_dollars"))
+        if cost <= 0:                       # never opened a paid position here → skip
             skipped += 1
             continue
-        net = rev - c
-        when = (s.get("settled_time") or s.get("settled_ts") or
-                s.get("determination_time") or "")
-        day = str(when)[:10] or "?"
-        rows.append({"date": day, "ticker": tk, "cost_cents": c,
-                     "net_cents": net, "ret": net / c})
-    return rows, {"settlements": len(settlements), "fills": len(fills),
-                  "matched": len(rows), "unmatched": skipped}
+        payout = _num(s.get("revenue")) / 100.0     # revenue is in cents
+        fee = _num(s.get("fee_cost"))
+        net = payout - cost - fee
+        day = str(s.get("settled_time") or "")[:10] or "?"
+        rows.append({"date": day, "ticker": s.get("ticker", ""),
+                     "result": s.get("market_result", ""),
+                     "cost": cost, "net": net, "ret": net / cost})
+    return rows, {"settlements": len(settlements), "matched": len(rows),
+                  "skipped": skipped}
 
 
 def cmd_probe(_args) -> None:
     settlements = fetch_settlements()
-    fills = fetch_fills()
-    print(f"=== PROBE — {len(settlements)} settlements, {len(fills)} fills ===")
+    print(f"=== PROBE — {len(settlements)} settlements ===")
     if settlements:
         print("\nraw settlement[0]:")
         print(json.dumps(settlements[0], indent=2)[:1200])
-    if fills:
-        print("\nraw fill[0]:")
-        print(json.dumps(fills[0], indent=2)[:1200])
-    rows, meta = build_returns(settlements, fills)
+    rows, meta = build_returns(settlements)
     print(f"\nmatched {meta['matched']} settlements to a cost basis "
-          f"({meta['unmatched']} unmatched). If matched is ~0, the field names "
-          f"above differ from my guesses — paste this output and I'll fix the mapping.")
+          f"({meta['skipped']} skipped, cost≤0). If matched is ~0, the field names "
+          f"above differ from the schema — paste this output and I'll fix the mapping.")
     if rows:
-        net = sum(r["net_cents"] for r in rows) / 100.0
+        net = sum(r["net"] for r in rows)
         days = sorted({r["date"] for r in rows})
         print(f"preview: net ${net:+.2f} across {len(rows)} settled positions, "
               f"{len(days)} days ({days[0]}…{days[-1]}).")
@@ -158,7 +136,7 @@ def cmd_probe(_args) -> None:
 def cmd_psr(args) -> None:
     from lib.hermes_significance import (probabilistic_sharpe_ratio,
                                          min_track_record_length)
-    rows, meta = build_returns(fetch_settlements(), fetch_fills())
+    rows, meta = build_returns(fetch_settlements())
     if args.since:
         rows = [r for r in rows if r["date"] >= args.since]
     if not rows:
@@ -169,12 +147,12 @@ def cmd_psr(args) -> None:
     per_trade = [r["ret"] for r in rows]
     byday = defaultdict(lambda: [0.0, 0.0])
     for r in rows:
-        byday[r["date"]][0] += r["net_cents"]
-        byday[r["date"]][1] += r["cost_cents"]
+        byday[r["date"]][0] += r["net"]
+        byday[r["date"]][1] += r["cost"]
     per_day = [net / cost for net, cost in byday.values() if cost > 0]
 
-    net = sum(r["net_cents"] for r in rows) / 100.0
-    wins = sum(1 for r in rows if r["net_cents"] > 0)
+    net = sum(r["net"] for r in rows)
+    wins = sum(1 for r in rows if r["net"] > 0)
     print(f"=== LIVE Kalshi account — {len(rows)} settled positions across "
           f"{len(byday)} days ===")
     print(f"  realized P&L ${net:+.2f} · {wins}W/{len(rows)-wins}L "
