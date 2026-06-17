@@ -76,6 +76,28 @@ Reconcile: settled P&L +$84.94 vs the remembered ~+$230 (deposits / open positio
 
 ---
 
+## 🗺️ OPERATIONAL MAP (read before debugging agents)
+
+- **Two checkouts.** `~/Desktop/projects/polybot` is the **LIVE** tree — it holds
+  the `.env` with Kalshi creds and the running launchd agents. It is
+  **TCC-protected**: a sandboxed assistant shell gets "Operation not permitted"
+  reading it (only `ls` metadata works). To let the assistant read it, grant the
+  terminal/Claude **Full Disk Access**; otherwise diagnose live issues in a
+  native Terminal. `~/polybot-backtest` is the **readable analysis/data mirror**
+  (now also has a read-only Kalshi key in its `.env` for `kalshi_live_psr`).
+- **OPEN QUESTION — live BTC-daily stopped settling ~2026-06-06.** Cause NOT yet
+  confirmed. Candidates: the order-placing agent broke (a missing local launcher
+  `run_kalshi_daily.sh` — never in git — breaks `kalshi_daily`/`_conservative`
+  with exit 127), OR `kalshi_daily_hermes` is in `review` (shadow) mode, OR
+  capital is tied up in open positions. Check with `kalshi_live_psr.py account`
+  (balance/positions, server-side, no TCC) + the Desktop logs (native terminal).
+- **DO NOT unload the exit-127 agents** (`kalshi_daily`, `kalshi_daily_conservative`,
+  `trade`, `monitor`, `harvester`, `weather_daily`) until the above is resolved —
+  one of them may be the *broken live trader*, not a harmless orphan. Removing it
+  would delete a fixable earner. Cleanup is cosmetic; correctness first.
+
+---
+
 ## 🔭 SURVEYED, NOT YET TESTED
 
 `kalshi_survey.py` ranks catalog families by where a data-processing edge is

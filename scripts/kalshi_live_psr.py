@@ -10,7 +10,8 @@ modifies an order. Needs your signed Kalshi client (lib/kalshi_auth: KALSHI_API_
 
   python scripts/kalshi_live_psr.py probe    # RUN FIRST — dump raw sample + counts
   python scripts/kalshi_live_psr.py psr       # per-day PSR on settled positions
-  python scripts/kalshi_live_psr.py psr --since 26MAY01
+  python scripts/kalshi_live_psr.py account   # balance + open positions (paused vs holding?)
+  python scripts/kalshi_live_psr.py psr --since 2026-06-01
 
 Why probe first: Kalshi's settlement/fill field names aren't visible from the
 dev box this was written on. `probe` prints one raw settlement + one raw fill so
@@ -91,6 +92,14 @@ def fetch_settlements() -> list:
     return _page("/portfolio/settlements", "settlements")
 
 
+def fetch_balance() -> dict:
+    return _signed_get("/portfolio/balance", {})
+
+
+def fetch_positions() -> list:
+    return _page("/portfolio/positions", "market_positions")
+
+
 def build_returns(settlements: list) -> tuple[list, dict]:
     """Per-settlement net P&L + return from the settlement's OWN fields (no fills
     join needed — confirmed against Kalshi's settlements schema):
@@ -114,6 +123,26 @@ def build_returns(settlements: list) -> tuple[list, dict]:
                      "cost": cost, "net": net, "ret": net / cost})
     return rows, {"settlements": len(settlements), "matched": len(rows),
                   "skipped": skipped}
+
+
+def cmd_account(_args) -> None:
+    """Live account state — balance + open positions. Answers 'is the strategy
+    PAUSED or just HOLDING?' without needing the TCC-blocked Desktop checkout,
+    since this is all server-side. Read-only."""
+    bal = _num(fetch_balance().get("balance")) / 100.0
+    print(f"=== LIVE account ===\n  balance: ${bal:,.2f}")
+    pos = fetch_positions()
+    openp = [p for p in pos if _num(p.get("position")) != 0]
+    print(f"  open market positions: {len(openp)}")
+    for p in openp[:40]:
+        q = _num(p.get("position"))
+        exp = _num(p.get("market_exposure")) / 100.0
+        print(f"    {str(p.get('ticker',''))[:34]:34} pos {q:+.0f}  exposure ${exp:,.2f}")
+    if not openp:
+        print("    none — no capital deployed → the strategy is PAUSED, not holding.")
+    else:
+        print("    → capital is deployed; recent lack of settlements may just be "
+              "open positions not yet resolved, not a pause.")
 
 
 def cmd_probe(_args) -> None:
@@ -183,11 +212,12 @@ def cmd_psr(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", nargs="?", default="probe", choices=["probe", "psr"])
+    ap.add_argument("mode", nargs="?", default="probe",
+                    choices=["probe", "psr", "account"])
     ap.add_argument("--since", help="only positions settled on/after YYYY-MM-DD")
     args = ap.parse_args()
     _load_dotenv()
-    {"probe": cmd_probe, "psr": cmd_psr}[args.mode](args)
+    {"probe": cmd_probe, "psr": cmd_psr, "account": cmd_account}[args.mode](args)
 
 
 if __name__ == "__main__":
