@@ -29,6 +29,24 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from the repo-root .env into os.environ (without
+    overriding already-set vars), so a manual `python scripts/...` run picks up
+    Kalshi creds the same way the launchd runners do when they `source .env`."""
+    import os
+    for envp in (ROOT / ".env", Path.cwd() / ".env"):
+        if not envp.exists():
+            continue
+        for line in envp.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
 def _signed_get(path: str, params: dict):
     from lib.kalshi_auth import signed_get, can_sign
     if not can_sign():
@@ -180,6 +198,7 @@ def main() -> None:
     ap.add_argument("mode", nargs="?", default="probe", choices=["probe", "psr"])
     ap.add_argument("--since", help="only positions settled on/after YYYY-MM-DD")
     args = ap.parse_args()
+    _load_dotenv()
     {"probe": cmd_probe, "psr": cmd_psr}[args.mode](args)
 
 
