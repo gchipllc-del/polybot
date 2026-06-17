@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""kalshi_live_psr — pull your REAL Kalshi settled trades and run the SAME
+per-day PSR / MinTRL we use on the paper sleeves, so a live result (e.g. the
+$50→$280 run) can be judged as edge vs. a lucky streak on the dataset that
+actually matters: your account.
+
+READ-ONLY. Only issues GET /portfolio/* requests — it never places, cancels, or
+modifies an order. Needs your signed Kalshi client (lib/kalshi_auth: KALSHI_API_KEY
++ KALSHI_PRIVATE_KEY_PATH in .env), so run it on the machine that holds the keys.
+
+  python scripts/kalshi_live_psr.py probe    # RUN FIRST — dump raw sample + counts
+  python scripts/kalshi_live_psr.py psr       # per-day PSR on settled positions
+  python scripts/kalshi_live_psr.py psr --since 26MAY01
+
+Why probe first: Kalshi's settlement/fill field names aren't visible from the
+dev box this was written on. `probe` prints one raw settlement + one raw fill so
+we confirm the schema; if `psr` then misreads a field, the fix is obvious.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+def _signed_get(path: str, params: dict):
+    from lib.kalshi_auth import signed_get, can_sign
+    if not can_sign():
+        raise SystemExit("can't sign Kalshi requests — set KALSHI_API_KEY and "
+                         "KALSHI_PRIVATE_KEY_PATH in .env on the machine with your keys.")
+    return signed_get(path, params=params)
+
+
+def _page(path: str, key: str, limit: int = 200, max_pages: int = 50) -> list:
+    """Pull every page of a /portfolio list endpoint (cursor-paginated)."""
+    out, cursor = [], None
+    for _ in range(max_pages):
+        params = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        data = _signed_get(path, params)
+        out.extend(data.get(key, []) or [])
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return out
+
+
+def _num(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fetch_settlements() -> list:
+    return _page("/portfolio/settlements", "settlements")
+
+
+def fetch_fills() -> list:
+    return _page("/portfolio/fills", "fills")
+
+
+def _cost_by_ticker(fills: list) -> dict:
+    """Entry cost in cents per ticker = Σ count × price over BUY fills. Kalshi
+    fill prices are in cents (1–99). Defensive about field names."""
+    cost = defaultdict(float)
+    for f in fills:
+        tk = f.get("ticker") or f.get("market_ticker") or ""
+        cnt = _num(f.get("count") or f.get("quantity"))
+        # price field varies; try the common ones, all in cents
+        px = _num(f.get("yes_price") if (f.get("side") == "yes") else f.get("no_price"))
+        if px == 0:
+            px = _num(f.get("price"))
+        action = (f.get("action") or f.get("side_action") or "buy").lower()
+        if tk and cnt and px and action != "sell":
+            cost[tk] += cnt * px
+    return cost
+
+
+def build_returns(settlements: list, fills: list) -> tuple[list, dict]:
+    """Per-settlement return = (revenue − entry_cost) / entry_cost, in P&L terms.
+    Returns (rows, meta) where rows = [{date, ret, net_cents, cost_cents, ticker}]."""
+    cost = _cost_by_ticker(fills)
+    rows, skipped = [], 0
+    for s in settlements:
+        tk = s.get("ticker") or s.get("market_ticker") or ""
+        rev = _num(s.get("revenue"))                       # gross payout, cents
+        c = cost.get(tk, 0.0)
+        if c <= 0:                                          # no matched cost → can't return
+            skipped += 1
+            continue
+        net = rev - c
+        when = (s.get("settled_time") or s.get("settled_ts") or
+                s.get("determination_time") or "")
+        day = str(when)[:10] or "?"
+        rows.append({"date": day, "ticker": tk, "cost_cents": c,
+                     "net_cents": net, "ret": net / c})
+    return rows, {"settlements": len(settlements), "fills": len(fills),
+                  "matched": len(rows), "unmatched": skipped}
+
+
+def cmd_probe(_args) -> None:
+    settlements = fetch_settlements()
+    fills = fetch_fills()
+    print(f"=== PROBE — {len(settlements)} settlements, {len(fills)} fills ===")
+    if settlements:
+        print("\nraw settlement[0]:")
+        print(json.dumps(settlements[0], indent=2)[:1200])
+    if fills:
+        print("\nraw fill[0]:")
+        print(json.dumps(fills[0], indent=2)[:1200])
+    rows, meta = build_returns(settlements, fills)
+    print(f"\nmatched {meta['matched']} settlements to a cost basis "
+          f"({meta['unmatched']} unmatched). If matched is ~0, the field names "
+          f"above differ from my guesses — paste this output and I'll fix the mapping.")
+    if rows:
+        net = sum(r["net_cents"] for r in rows) / 100.0
+        days = sorted({r["date"] for r in rows})
+        print(f"preview: net ${net:+.2f} across {len(rows)} settled positions, "
+              f"{len(days)} days ({days[0]}…{days[-1]}).")
+
+
+def cmd_psr(args) -> None:
+    from lib.hermes_significance import (probabilistic_sharpe_ratio,
+                                         min_track_record_length)
+    rows, meta = build_returns(fetch_settlements(), fetch_fills())
+    if args.since:
+        rows = [r for r in rows if r["date"] >= args.since]
+    if not rows:
+        print(f"no matched settled positions ({meta}). Run `probe` first to check "
+              f"the schema.")
+        return
+
+    per_trade = [r["ret"] for r in rows]
+    byday = defaultdict(lambda: [0.0, 0.0])
+    for r in rows:
+        byday[r["date"]][0] += r["net_cents"]
+        byday[r["date"]][1] += r["cost_cents"]
+    per_day = [net / cost for net, cost in byday.values() if cost > 0]
+
+    net = sum(r["net_cents"] for r in rows) / 100.0
+    wins = sum(1 for r in rows if r["net_cents"] > 0)
+    print(f"=== LIVE Kalshi account — {len(rows)} settled positions across "
+          f"{len(byday)} days ===")
+    print(f"  realized P&L ${net:+.2f} · {wins}W/{len(rows)-wins}L "
+          f"({wins/len(rows)*100:.0f}% WR) · matched {meta['matched']}/"
+          f"{meta['settlements']} settlements")
+
+    def tier(p):
+        return ("n<5" if p is None else "NO MEASURED EDGE" if p < 0.50
+                else "provisional" if p < 0.95 else "EVIDENCE-BACKED")
+
+    def mtrl(m):
+        return "n<5" if m is None else ("∞" if m == float("inf") else str(int(m)))
+
+    print("\n=== SIGNIFICANCE — PSR / MinTRL (return = net P&L / cost) ===")
+    for label, xs, unit, note in (
+        ("per-TRADE", per_trade, "trades", "each position independent → optimistic"),
+        ("per-DAY  ", per_day, "days", "correlated within a day → the honest sample"),
+    ):
+        p = probabilistic_sharpe_ratio(xs)
+        ps = "n<5 " if p is None else f"{p:.2f}"
+        print(f"  {label}  n={len(xs):<4} PSR(edge>0)={ps}  "
+              f"MinTRL={mtrl(min_track_record_length(xs)):>4} {unit:<6} [{tier(p)}]  · {note}")
+    print("  READ: judge by per-DAY. PSR<0.50 = not even probably positive; the "
+          "$50→$280 run is edge only if this clears it. MinTRL ∞ = non-positive "
+          "central tendency, a lucky streak rather than a repeatable edge.")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("mode", nargs="?", default="probe", choices=["probe", "psr"])
+    ap.add_argument("--since", help="only positions settled on/after YYYY-MM-DD")
+    args = ap.parse_args()
+    {"probe": cmd_probe, "psr": cmd_psr}[args.mode](args)
+
+
+if __name__ == "__main__":
+    main()
