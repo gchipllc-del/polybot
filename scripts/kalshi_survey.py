@@ -181,6 +181,40 @@ def aggregate(series_rows: list, deep: bool):
     return out
 
 
+def drill_category(category: str, deep: bool, cap: int) -> int:
+    """List every series in ONE category — cadence, liquidity, verdict, title —
+    sorted by cadence then liquidity, so we can see what's actually tradeable and
+    how often it resolves before committing a forward-collector to it."""
+    series = fetch_series(category)
+    if not series:
+        print(f"no series for '{category}' — run on home IP with Kalshi auth, and "
+              f"check the exact category name (e.g. 'Economics', 'Transportation').")
+        return 1
+    rows, sampled = [], 0
+    for s in series:
+        tk, title, freq = s.get("ticker", ""), s.get("title", ""), s.get("frequency", "")
+        _, verdict, _ = classify(category, title, tk)
+        open_n = vol = 0
+        if deep and sampled < cap:
+            open_n, vol = sample_liquidity(tk)
+            sampled += 1
+        rows.append({"ticker": tk, "title": title, "freq": freq,
+                     "cad": cadence_score(freq), "verdict": verdict,
+                     "open": open_n, "vol": vol})
+    rows.sort(key=lambda r: (-r["cad"], -r["open"]))
+    print(f"=== DRILL: {category} — {len(rows)} series (sorted by cadence, then liquidity) ===")
+    print(f"{'cadence':>7} {'freq':>9} {'open':>5} {'vol':>8} {'verdict':>10}  ticker  ·  title")
+    for r in rows[:60]:
+        print(f"{r['cad']:>7.2f} {str(r['freq'])[:9]:>9} {r['open']:>5} {int(r['vol']):>8} "
+              f"{r['verdict']:>10}  {r['ticker'][:18]:18} {r['title'][:42]}")
+    fast = sum(1 for r in rows if r["cad"] >= 0.6)   # weekly-or-faster
+    print(f"\n  {fast}/{len(rows)} series resolve WEEKLY-OR-FASTER (cadence ≥ 0.6) — only "
+          f"these can reach PSR significance in a practical window.")
+    print("  CADENCE IS THE GATE: a monthly/yearly family can't be validated in "
+          "reasonable time even if a real edge exists. Favor the fast resolvers.")
+    return 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -190,10 +224,14 @@ def main() -> None:
                          "which are floored regardless) so it stays fast.")
     ap.add_argument("--deep-cap", type=int, default=60,
                     help="max series per category to sample liquidity for (default 60)")
+    ap.add_argument("--drill", help="list every series in ONE category (cadence, "
+                    "liquidity, verdict, title) instead of the cross-category survey")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
         raise SystemExit(selftest())
+    if args.drill:
+        raise SystemExit(drill_category(args.drill, args.deep, args.deep_cap))
 
     rows, sampled = [], 0
     for cat in CATEGORIES:
