@@ -27,6 +27,7 @@ settle. Validated in backtest (`becker_edge.py`): 13 months, 8 cities, OOS
 - The apparent "+EV" in the full run was **unvalidated cities running lucky** (SFO/MIN/DC/ATL, all outside the proven 8). No reason unproven cities should out-earn proven ones except noise.
 - **Conviction inverted** vs the backtest: bigger calibration edge did *worse* live (0.08–0.12 bucket at 20% WR), the opposite of the backtest's monotone-in-threshold. Strong sign the backtested edge wasn't real on live fills.
 - **Directional, not a pricing edge:** loses on high-YES-rate (hot) days, wins on cool days — the P&L tracks the temperature regime, not mispricing.
+- **Confirmed dead LIVE too (2026-06-17):** the live account's apparent weather win (+$186 / "PSR 0.97" over 8 days) was THIS strategy — **30/33 positions were NO-side buys = weather-fade.** It was ~4 longshot wins in `KXTEMPNYCH` (NYC hourly temp, since **DELISTED** by Kalshi); `breakdown --since 2026-05-31` strips them → **+$8.26, n<5, no measurable edge.** 33 lucky live trades can't override 187 paper trades — larger sample wins, and the profitable venue no longer exists.
 
 **Disposition:** code retained as a documented negative result; do not feed it
 capital. Reproduce with `weather_fade.py analyze --validated-only --psr`.
@@ -34,7 +35,7 @@ capital. Reproduce with `weather_fade.py analyze --validated-only --psr`.
 ### BTC SHORT-horizon (5-min / hourly) — earlier
 **Verdict: efficient market, no edge.** Tested and ruled out — at minute/hour
 horizons the market prices the available data. NOTE: this is the *short* horizon
-only; BTC *daily* is a different animal — see PROVISIONAL below.
+only; BTC *daily* (KXBTCD) was tested live and is **also ruled out** — see below.
 
 ---
 
@@ -48,28 +49,14 @@ do NOT resume BTC. (Balance gap to ~$280 = user-confirmed withdrawals, not drawd
 
 ---
 
-## 🟡 PROVISIONAL — positive but not yet proven (needs stress-testing)
+## 🟡 PROVISIONAL — none
 
-### live WEATHER — REAL account (2026-06-17)
-**What it is:** the live weather family (`KXHIGH*`/`KXLOW*`) on the real account — the
-strategy that ACTUALLY made the live money (user recalled this correctly). NOTE: NOT
-necessarily the same as the paper `weather-fade` we ruled out — must identify it.
-
-**Verdict: PROMISING but UNCONFIRMED — do not crown or scale yet.**
-- 33 settled positions, 8 days, realized **+$186.06**, 45% WR, **per-day PSR 0.97**, MinTRL 6.
-- ⚠ **Concentrated:** +$154 of the +$186 came from a 3-day run (May 28–30). PSR 0.97 on
-  8 days carried by 3 is the same "one hot run" shape that fooled us on weather-fade —
-  MinTRL 6 is deceptively low (it assumes the lucky Sharpe is the true Sharpe).
-- ⚠ **Strategy not yet identified.** If these were mostly **NO-side** buys it's the
-  weather-FADE family we ruled out on 187 paper trades (→ the larger sample wins, this
-  is a lucky window). If mostly **YES-side**, it's a different, directional strategy
-  (genuinely untested). Resolve with `kalshi_live_psr breakdown --family WEATHER`
-  (side Y/N + per-position tickers) and `--since 2026-05-31` (does it survive without
-  the 3-day run?).
-
-**Disposition:** the best live lead, but treat exactly like weather-fade until proven —
-identify the strategy, check concentration, then judge by per-day PSR on the un-lucky
-subset. Do NOT scale on 8 concentrated days.
+The live "WEATHER PSR 0.97" lead was investigated and **collapsed** (it was
+weather-fade catching a lucky window in a now-delisted market — see weather-fade
+above). After this session, **nothing on the live account is a proven or even
+provisional edge.** The entire +$84.94 realized was a handful of weather-fade
+longshot wins a larger sample says won't repeat; pausing on 2026-06-06 was, in
+hindsight, the right outcome. Do not un-pause anything.
 
 ---
 
