@@ -167,6 +167,10 @@ def _scan_panel(sc: dict) -> str:
         fresh, note = "dim", "age unknown"
     elif age <= 75:
         fresh, note = "pos", f"{age} min ago"
+    elif age > 360:
+        fresh, note = "warn", (f"{age} min ago — scan agent appears STOPPED "
+                               f"(weather-fade was RETIRED / its scan unloaded). The "
+                               f"figures below are HISTORICAL, not a live sleeve.")
     elif dead_window:
         fresh, note = "dim", (f"{age} min ago — normal: it's the overnight DEAD "
                               f"window (04–13 UTC), no markets to scan. Resumes ~14 UTC.")
@@ -229,6 +233,25 @@ def render_html(s: dict) -> str:
     hr_html = "".join(
         f"<span class=hr>{h['hr']}:00 <b>{h['tak']}</b>/{h['tot']}</span>"
         for h in s["by_hour"]) or "<span class=dim>no probe data yet</span>"
+    # Flag opens that have outlived their resolution: if the settle agent is
+    # unloaded they're orphaned, so the P&L above EXCLUDES them and is stale.
+    now = datetime.now(timezone.utc)
+    stale_open = 0
+    for r in s["open_fades"]:
+        try:
+            t = datetime.fromisoformat(str(r.get("opened_at", "")).replace("Z", "+00:00"))
+            if t.tzinfo is None:                       # ledger stamps are naive UTC
+                t = t.replace(tzinfo=timezone.utc)
+            if (now - t).total_seconds() > 18 * 3600:
+                stale_open += 1
+        except (ValueError, TypeError):
+            pass
+    open_warn = ("" if not stale_open else
+                 f"<div class=warn>⚠ {stale_open} open fade(s) opened &gt;18h ago and "
+                 f"should have resolved — the <b>settle agent is stopped</b>, so these are "
+                 f"orphaned and the Net P&amp;L above EXCLUDES them. Run "
+                 f"<code>python scripts/weather_fade.py settle</code> once (after the "
+                 f"morning CLI) to finalize them.</div>")
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv=refresh content=30>
 <title>weather-fade</title><style>
@@ -256,6 +279,7 @@ th{{color:#8b949e;font-size:11px}} .stat{{display:inline-block;margin-right:32px
 <h2>Per-city (settled) — *new = outside the validated 8</h2>
 <table><tr><th>City</th><th>W/L</th><th>WR</th><th>Net $</th></tr>{city_html}</table>
 <h2>Open fades ({s['open']})</h2>
+{open_warn}
 <table><tr><th>Ticker</th><th>Fill</th><th>Size</th><th>Edge</th><th>Opened</th></tr>{open_html}</table>
 <h2>Recently settled</h2>
 <table><tr><th>Ticker</th><th>Result</th><th>P&amp;L</th><th>Settled</th></tr>{settled_html}</table>
