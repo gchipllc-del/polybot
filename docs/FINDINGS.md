@@ -124,3 +124,55 @@ motion without progress.
 **If hunting continues, the liquidity is in Sports/Politics** (survey: SHARP — pros arb
 them) — a different, harder game we have not attempted.
 
+---
+
+## 🔬 DEEP RESEARCH (2026-06-18) — where consistent edge actually is
+
+5-angle multi-source research (BTC short-horizon, weather, academic FLB/efficiency,
+Kalshi market-making, practitioner reports). Strong cross-validated convergence on
+ONE theme:
+
+**The consistent edge is MAKER-SIDE / variance harvesting — NOT prediction.**
+- Kalshi favorite-longshot "behavioral surplus": takers buy YES ~61% of the time but
+  YES wins only ~32%; **makers earn ~2× per contract net of adverse selection**
+  (Bartlett & O'Hara, 41.6M trades, SSRN 6615739). Maker fee ≈ ¼ taker (often 0% on
+  standard series); resting/cancelling is free.
+- Direction-forecasting is efficient or a latency war *everywhere we looked*: BTC
+  final-second BRTI settlement = HFT; weather forecast-bots overfit (86%→60% live).
+
+**BTC-15min:** no documented consistent post-fee retail edge. Reliable money (final-
+second settlement, cross-exchange basis) is HFT, not retail. Only retail-plausible
+angles: take *near-decided* contracts at low-fee **price extremes** (fee→0 as P→0/1)
+via your own running 60-s BRTI average; and volatility-reversion (fade intra-window
+panic). Thin, crowded. Maker-ing BTC = worst HFT adverse selection. → not where to focus.
+
+**Weather — the one NEW documented idea: sell over-priced UNCERTAINTY.** Kalshi temp
+ladders price ~**1.27× more uncertainty than forecasts actually carry** (Oalkhadra,
+1,911 city-dates, Diebold-Mariano p=0.006) → fade the over-wide tails (variance harvest,
+NOT direction — *different* from the ruled-out calibration fade). Plus intraday
+"bucket-lock" (buy the near-certain bucket after the afternoon high physically realizes,
+until the 11:59pm ET cutoff; structurally real but unmeasured + CLI determination risk).
+Only ~4 liquid cities (NYC/CHI/MIA/AUS), $10K–500K/day.
+
+**Universal caveats (cross-validated, high confidence):** the ~7% taker fee
+`ceil(0.07·C·P·(1-P))` brutally taxes *low-priced* contracts (one trader went 0/32 and
+quit over it) — so any play must avoid cheap contracts / be maker-side; **overfitting is
+THE retail failure** (Sharpe 2.0→0.5 backtest-to-live — validates our PSR/DSR discipline);
+adverse selection from bots (~89 trades/day vs human ~2.2) picks off slow manual quotes;
+**no audited retail Sharpe exists** for any of these (all bot READMEs are illustrative);
+sports ≈ 80% of Kalshi volume, the data-niches are a rounding error.
+
+**Skeptic flags:** treat the one repo's Sharpe 4.9 / 49.8% as **unbankable** ($1 sizing,
+$0.02 assumed spread, self-reported, thin books) — the *idea* (1.27× over-pricing) is more
+credible than the *P&L*. Maker rebate program (~1%, ~$7k/wk) needs application/approval.
+
+**Recommendation:** the single new, documented, discipline-fitting hypothesis is the
+**weather uncertainty/tail-fade on the 3-4 liquid cities** — forward-test paper-only,
+judge by per-day PSR **and DSR**, expect it likely washes out (base rate = 0 so far).
+Maker-ing proper is the academically strongest edge but needs automation + inventory
+control + a volume-earned rate-tier — a bigger, riskier build, dubious on a $63 account.
+
+Sources: Bartlett & O'Hara SSRN 6615739; Whelan "Makers and Takers" (Kalshi); Snowberg &
+Wolfers (FLB); Oalkhadra GitHub (uncertainty 1.27×, DM p=0.006); Kalshi NHIGH.pdf (CLI
+settlement); Turbine (overfitting + 1000-strategy backtest); kalshibacktest.com (BRTI).
+
