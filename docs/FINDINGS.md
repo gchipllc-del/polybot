@@ -176,3 +176,49 @@ Sources: Bartlett & O'Hara SSRN 6615739; Whelan "Makers and Takers" (Kalshi); Sn
 Wolfers (FLB); Oalkhadra GitHub (uncertainty 1.27×, DM p=0.006); Kalshi NHIGH.pdf (CLI
 settlement); Turbine (overfitting + 1000-strategy backtest); kalshibacktest.com (BRTI).
 
+
+---
+
+## 🔬 DEEP RESEARCH ROUND 2 (2026-06-18) — Kalshi SPORTS (the liquid frontier)
+
+5-angle research into whether sports (the liquid, retail-heavy ~80% of Kalshi volume)
+offers a retail-*makeable* edge. Verdict: **no free strategy; only structural edges,
+none accessible to a small/manual account.**
+
+- **Fade-the-public is a myth** (Winkelmann 2024: biases non-persistent; Levitt: books
+  already shade lines to price the public side worse). The only surviving signal is
+  **closing-line value (CLV)** — thin (~+3-4% over 20k+ bets) and requires genuine
+  handicapping skill.
+- **Sports are well-calibrated at game time** (292M-trade calibration study, arXiv
+  2602.19520: slopes 0.90-1.10, 0-48h pre-resolution). Underconfidence only in
+  long-horizon futures.
+- **The favorite-longshot behavioral surplus is real but already harvested by ~2,000+
+  bots/makers** (~95% of fills); it's strongest in POLITICS, not sports. Average taker
+  loses ~32%; only ~5-13% of participants are net profitable (matches the <5% who beat
+  the close in sports betting).
+- **Market-making sports is NOT retail-feasible**: needs full automation + news/vol
+  kill-switch + low-to-mid 4-figure capital + a volume-earned API tier; Kalshi's order
+  book never pauses for in-game events (worse than Betfair's protective delay), and
+  ~95% of Betfair sports traders lose.
+- **The genuine structural advantages** — Kalshi's ~3-pt-lower cost (~0.85-1.5% vs
+  ~4.5% sportsbook vig) and **no winner-limiting/banning** — only AMPLIFY a pre-existing
+  edge (handicapping or making); they don't create one. "Low vig ≠ +EV."
+- **Extra retail risks**: settlement at "last fair price" not void (one trader lost
+  ~$30k), and regulatory void risk (state injunctions).
+
+**The ONE cheap, falsifiable, in-our-wheelhouse residual:** an analyst claim that Kalshi
+sports are efficient at 95-99% but **miscalibrated in the 90-93% favorite band** (public
+overpays for blue-blood/favorite certainty → fade). Calibration-shaped → testable on
+historical sports settlements with becker_edge / series_collect + PSR/DSR, no capital or
+automation. Most likely already arbed; cheap to check.
+
+## 🧭 OVERALL VERDICT (both research rounds + the whole empirical session)
+
+There is **no free, retail-feasible, small-account edge** anywhere we looked — weather,
+BTC (short & daily), gas, transportation, sports. Durable edges are **structural**:
+(1) maker-side liquidity provision (needs automation + 4-figure capital), (2) genuine
+CLV handicapping (needs skill most lack; Kalshi's low fee/no-limits amplifies it), or
+(3) speed/data latency (HFT/bot). For a ~$63 manual account, **Kalshi is "efficient-
+with-fees."** The value produced this project: a rigorous survey→collect→PSR/DSR toolkit
+that reliably tells edge from luck, and a cheap ruling-out of every mirage (which already
+saved us from scaling a +$84.94 weather "winner" that was 4 lucky longshots).
