@@ -87,13 +87,12 @@ hindsight, the right outcome. Do not un-pause anything.
   check (server-side, TCC-free) shows **$63.33 cash, 0 open positions** — so it's
   not "holding," it simply stopped placing trades. WHY is still open (bug vs
   `review`/shadow mode vs a deliberate risk-off) — needs the Desktop logs via a
-  native terminal. Balance reconciled: the $63.33 vs +$84.94 gap is
-  **user-confirmed WITHDRAWALS**, not a drawdown — so the measured edge stands.
-- **OPEN — was it BTC or WEATHER (or both) that made the live money?** User recalls
-  *both* weather and BTC were profitable live, and that BTC "wasn't making money"
-  right before the stop. The +$84.94/PSR-0.64 figure is COMBINED and the sample
-  looked BTC-only — split it with `kalshi_live_psr.py breakdown` (per-family P&L +
-  per-day PSR + daily timeline) before crediting either strategy.
+  native terminal (TCC blocks the assistant). Balance reconciled: the $63.33 vs
+  +$84.94 gap is **user-confirmed WITHDRAWALS**, not a drawdown.
+- **RESOLVED — it was WEATHER that made the live money, not BTC.** `breakdown`
+  split it: WEATHER +$186 (weather-fade longshots, now-delisted KXTEMPNYCH),
+  BTC-daily −$91, ETH ~0. Both correctly ruled out (see above) — so the *why it
+  paused* question is now moot for action: there's nothing here worth resuming.
 - **DO NOT unload the exit-127 agents** (`kalshi_daily`, `kalshi_daily_conservative`,
   `trade`, `monitor`, `harvester`, `weather_daily`) until the above is resolved —
   one of them may be the *broken live trader*, not a harmless orphan. Removing it
