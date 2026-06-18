@@ -73,9 +73,11 @@ for s in $SERIES; do
   write_agent "$BASE.$tag.collect" 10800 "$RUN" collect "$s"   # every 3h
   write_agent "$BASE.$tag.settle"  cal:20 "$RUN" settle "$s"    # hourly at :20
 done
-# shared dashboard (aggregates all collected series) — file render + live link :5054
-write_agent "$BASE.dash"  300       "$RUN_DASH" render
-write_agent "$BASE.serve" keepalive "$RUN_DASH" serve --port 5054 --host 127.0.0.1
+# dashboard scoped to THIS sleeve's series (so a sports sleeve's binary-game
+# calibration isn't muddied by e.g. gas's price-ladder buckets) — file render + :5054
+SERIES_CSV="$(echo "$SERIES" | tr ' ' ',')"
+write_agent "$BASE.dash"  300       "$RUN_DASH" render --series "$SERIES_CSV"
+write_agent "$BASE.serve" keepalive "$RUN_DASH" serve --series "$SERIES_CSV" --port 5054 --host 127.0.0.1
 echo ""
 echo "Done. Dashboard: http://127.0.0.1:5054   (own paper bankroll; http not https)"
 echo "Status:   for s in $SERIES; do python scripts/series_collect.py status \$s; done"
