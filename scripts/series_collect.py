@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 DATA = ROOT / "data"
+DEFAULT_BANKROLL = 100.0   # this sleeve's own paper bankroll (separate from all others)
 
 
 def _ledger(series: str) -> Path:
@@ -103,6 +104,29 @@ def fade_returns(rows: list):
         byday[d][1] += cost
     per_day = [n / c for n, c in byday.values() if c > 0]
     return per_trade, per_day
+
+
+def band_fade_returns(rows: list, lo: float = 0.90, hi: float = 0.93):
+    """The PRE-REGISTERED test: in the [lo,hi] favorite band, FADE the favorite
+    (buy NO at 1-p). Returns (per_trade, per_day, daily_chrono, n, realized_yes):
+    daily_chrono = [(date, net_per_$1_cost)] for a bankroll curve; realized_yes =
+    actual YES-rate in the band (the claim: realized < priced ⇒ favorites overpriced)."""
+    band = [r for r in rows if r.get("outcome") in (0, 1)
+            and r.get("entry_p") is not None and lo <= r["entry_p"] <= hi]
+    per_trade, byday = [], defaultdict(lambda: [0.0, 0.0])
+    for r in band:
+        p, o = r["entry_p"], r["outcome"]
+        cost, won = 1.0 - p, (o == 0)        # buy NO
+        if cost <= 0:
+            continue
+        per_trade.append(((1.0 - cost) if won else -cost) / cost)
+        d = str(r.get("settled_at") or r.get("ts") or "")[:10]
+        byday[d][0] += (1.0 - cost) if won else -cost
+        byday[d][1] += cost
+    per_day = [n / c for n, c in byday.values() if c > 0]
+    daily = [(d, byday[d][0]) for d in sorted(byday)]
+    realized_yes = (sum(r["outcome"] for r in band) / len(band)) if band else None
+    return per_trade, per_day, daily, len(band), realized_yes
 
 
 # ── live (Kalshi API) ───────────────────────────────────────────────────────
@@ -195,13 +219,29 @@ def cmd_eval(args) -> None:
     for lo, hi, n, mkt, real in calibration(settled):
         print(f"  {f'{lo:.2f}-{hi:.2f}':>12} {n:>4} {mkt:>6.2f} {real:>9.2f} "
               f"{real-mkt:>+7.2f}")
-    pt, pd = fade_returns(settled)
-    psr_s, mt_s = _psr(pd)
-    net = sum(r for r in pt)
-    print(f"\nNAÏVE fade-probe (no predictor): {len(pt)} trades, "
-          f"per-day PSR {psr_s}, MinTRL {mt_s}, sum-return {net:+.2f}")
-    print("  READ: flat calibration gaps + PSR<0.5 ⇒ efficient, drop it. A "
-          "consistent gap ⇒ worth a real predictor + bankroll/dash sleeve.")
+    # PRE-REGISTERED band-fade test (the documented 90–93% favorite-overpricing claim)
+    lo, hi = getattr(args, "band_lo", 0.90), getattr(args, "band_hi", 0.93)
+    trials = getattr(args, "trials", 1)
+    bpt, bpd, _daily, bn, real_yes = band_fade_returns(settled, lo, hi)
+    print(f"\nPRE-REGISTERED FADE TEST — band [{lo:.2f}, {hi:.2f}] (buy NO):")
+    if bn == 0:
+        print(f"  no settled markets in band yet — keep collecting.")
+    else:
+        priced = (lo + hi) / 2
+        print(f"  n={bn} · market priced ~{priced:.0%} YES · realized YES {real_yes:.0%} "
+              f"→ fade edge {(1-real_yes)-(1-priced):+.0%} (positive = favorites overpriced)")
+        psr_s, mt_s = _psr(bpd)
+        try:
+            from lib.hermes_significance import deflated_sharpe_ratio
+            dsr = deflated_sharpe_ratio(bpd, n_trials=trials)
+            dsr_s = "n<5" if dsr is None else f"{dsr:.2f}"
+        except Exception:
+            dsr_s = "n/a"
+        print(f"  per-day PSR {psr_s} · DSR(@{trials} trials) {dsr_s} · MinTRL {mt_s} · "
+              f"sum-return {sum(bpt):+.2f} over {len(bpd)} days")
+        print(f"  READ: edge>0 AND DSR≥0.95 ⇒ real & survives the search. Edge≤0 or "
+              f"DSR<0.5 ⇒ band is efficient, drop it. (DSR uses n_trials to deflate "
+              f"for how many bands/configs you tested — keep it honest.)")
 
 
 def cmd_status(args) -> None:
@@ -233,6 +273,13 @@ def selftest() -> int:
     pt, pd = fade_returns(over)
     assert pt and sum(pt) > 0, (pt, pd)
     print(f"fade-probe OK (overpriced favorites → fade nets +, sum {sum(pt):.2f})")
+    # band-fade: favorites at 0.91 that always lose → fading nets +, realized YES 0
+    bover = [{"entry_p": 0.91, "outcome": 0, "settled_at": f"2026-06-{d:02d}"} for d in range(1, 9)]
+    bpt, bpd, daily, bn, ry = band_fade_returns(bover, 0.90, 0.93)
+    assert bn == 8 and ry == 0.0 and sum(bpt) > 0, (bn, ry, sum(bpt))
+    assert band_fade_returns([{"entry_p": 0.80, "outcome": 0, "settled_at": "2026-06-01"}],
+                             0.90, 0.93)[3] == 0   # out-of-band excluded
+    print(f"band-fade OK (n={bn}, realized {ry:.0%}, fade sum {sum(bpt):+.2f})")
     print("PASS")
     return 0
 
@@ -242,6 +289,13 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["collect", "settle", "eval", "status", "selftest"])
     ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXAAAGASD")
+    ap.add_argument("--band-lo", type=float, default=0.90, dest="band_lo",
+                    help="eval: low edge of the pre-registered fade band (default 0.90)")
+    ap.add_argument("--band-hi", type=float, default=0.93, dest="band_hi",
+                    help="eval: high edge of the fade band (default 0.93)")
+    ap.add_argument("--trials", type=int, default=1,
+                    help="eval: how many bands/configs you tested, for DSR deflation "
+                         "(keep at 1 if testing only the pre-registered band)")
     args = ap.parse_args()
     if args.mode == "selftest":
         raise SystemExit(selftest())

@@ -1,47 +1,51 @@
 #!/bin/bash
-# OPT-IN installer for forward price→outcome collection on candidate series.
+# OPT-IN installer for forward price→outcome collection sleeves + their dashboard.
 # Separate from every other harness. Paper/data only — places NO orders.
 #
-# Default target: KXAAAGASD (daily gas) — the one survey candidate with both fast
-# cadence and listed strikes. Collects every 3h (to catch any quote window, since
-# the book is currently unquoted) and settles daily after the 03:59Z close.
+# SERIES is a space-separated list. Each gets a collect (every 3h) + settle (hourly)
+# agent; one shared dashboard (render every 5 min + live link on :5054) aggregates them.
 #
-#   bash scripts/launchd/install_series_collect_agents.sh            # install (gas)
+#   bash scripts/launchd/install_series_collect_agents.sh                      # default: gas
+#   SERIES="KXNFLGAME KXNBA" bash scripts/launchd/install_series_collect_agents.sh   # sports sleeve
 #   bash scripts/launchd/install_series_collect_agents.sh --uninstall
 #
-# To collect a different/extra series, edit SERIES below. Idempotent.
+# Idempotent. Find liquid sports tickers first with: python scripts/kalshi_survey.py --drill "Sports"
 set -euo pipefail
 
 SERIES="${SERIES:-KXAAAGASD}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN="$PROJECT_ROOT/scripts/launchd/run_series_collect.sh"
+RUN_DASH="$PROJECT_ROOT/scripts/launchd/run_series_collect_dash.sh"
 AGENTS="$HOME/Library/LaunchAgents"
-P="com.jesse.polybot.seriescollect.$(echo "$SERIES" | tr '[:upper:]' '[:lower:]')"
+BASE="com.jesse.polybot.seriescollect"
 mkdir -p "$AGENTS"
-chmod +x "$RUN" 2>/dev/null || true
+chmod +x "$RUN" "$RUN_DASH" 2>/dev/null || true
 
 if [ "${1:-}" = "--uninstall" ]; then
-  for suffix in collect settle; do
-    plist="$AGENTS/$P.$suffix.plist"
+  for plist in "$AGENTS/$BASE."*.plist; do
+    [ -e "$plist" ] || continue
     launchctl unload "$plist" 2>/dev/null || true
     rm -f "$plist"
-    echo "  removed $P.$suffix"
+    echo "  removed $(basename "$plist" .plist)"
   done
+  echo "series-collect sleeve uninstalled."
   exit 0
 fi
 
+# write_agent LABEL CADENCE RUNNER [args...]   (cadence: seconds | cal:MM | keepalive)
 write_agent() {
-  local label="$1"; local cadence="$2"; shift 2
-  local plist="$AGENTS/$label.plist"
-  local argxml=""
+  local label="$1"; local cadence="$2"; local runner="$3"; shift 3
+  local plist="$AGENTS/$label.plist"; local argxml=""
   for a in "$@"; do argxml+="    <string>$a</string>
 "; done
   local cadence_xml
-  if [[ "$cadence" == cal:* ]]; then
-    local minute="${cadence#cal:}"
+  if [ "$cadence" = "keepalive" ]; then
+    cadence_xml="  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>"
+  elif [[ "$cadence" == cal:* ]]; then
     cadence_xml="  <key>StartCalendarInterval</key>
-  <dict><key>Minute</key><integer>$minute</integer></dict>"
+  <dict><key>Minute</key><integer>${cadence#cal:}</integer></dict>"
   else
     cadence_xml="  <key>StartInterval</key><integer>$cadence</integer>
   <key>RunAtLoad</key><true/>"
@@ -53,7 +57,7 @@ write_agent() {
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$RUN</string>
+    <string>$runner</string>
 $argxml  </array>
 $cadence_xml
 </dict></plist>
@@ -63,10 +67,17 @@ EOF
   echo "  installed $label"
 }
 
-echo "Installing series-collect agents for $SERIES (paper/data only) ..."
-write_agent "$P.collect" 10800 collect "$SERIES"   # every 3h: catch any quote window
-write_agent "$P.settle"  cal:20 settle "$SERIES"    # hourly at :20 — resolves after close
+echo "Installing series-collect sleeve for: $SERIES (paper/data only) ..."
+for s in $SERIES; do
+  tag="$(echo "$s" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+  write_agent "$BASE.$tag.collect" 10800 "$RUN" collect "$s"   # every 3h
+  write_agent "$BASE.$tag.settle"  cal:20 "$RUN" settle "$s"    # hourly at :20
+done
+# shared dashboard (aggregates all collected series) — file render + live link :5054
+write_agent "$BASE.dash"  300       "$RUN_DASH" render
+write_agent "$BASE.serve" keepalive "$RUN_DASH" serve --port 5054 --host 127.0.0.1
 echo ""
-echo "Done. Check:  python scripts/series_collect.py status $SERIES"
-echo "Eval later:   python scripts/series_collect.py eval $SERIES   (after ~2 weeks of days)"
-echo "Uninstall:    bash scripts/launchd/install_series_collect_agents.sh --uninstall"
+echo "Done. Dashboard: http://127.0.0.1:5054   (own paper bankroll; http not https)"
+echo "Status:   for s in $SERIES; do python scripts/series_collect.py status \$s; done"
+echo "Eval:     python scripts/series_collect.py eval <SERIES>   (after ~2 weeks of days)"
+echo "Uninstall: bash scripts/launchd/install_series_collect_agents.sh --uninstall"
