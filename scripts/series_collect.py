@@ -119,21 +119,33 @@ def cmd_collect(args) -> None:
         return
     ms = data.get("markets", []) or []
     ts = datetime.now(timezone.utc).isoformat()
-    added = 0
+    by_ticker = {r["ticker"]: r for r in rows}
+    added = upgraded = 0
     for m in ms:
         tk = m.get("ticker", "")
-        if not tk or tk in seen:
+        if not tk:
             continue
-        rows.append({"ts": ts, "ticker": tk,
-                     "entry_p": _mid(m.get("yes_bid"), m.get("yes_ask")),
+        mid = _mid(m.get("yes_bid"), m.get("yes_ask"))
+        if tk in by_ticker:
+            # already recorded — but if we logged it UNQUOTED and a real quote has
+            # since appeared, capture the first real price (answers 'does liquidity
+            # ever show up?' without losing the earliest genuine quote).
+            r = by_ticker[tk]
+            if r.get("entry_p") is None and mid is not None and r.get("outcome") is None:
+                r.update(entry_p=mid, yes_bid=m.get("yes_bid"),
+                         yes_ask=m.get("yes_ask"), quote_seen_at=ts)
+                upgraded += 1
+            continue
+        rows.append({"ts": ts, "ticker": tk, "entry_p": mid,
                      "yes_bid": m.get("yes_bid"), "yes_ask": m.get("yes_ask"),
                      "close_time": m.get("close_time", ""), "status": "open",
                      "outcome": None})
-        seen.add(tk)
+        by_ticker[tk] = rows[-1]
         added += 1
     _save(args.series, rows)
-    print(f"{args.series}: saw {len(ms)} open, recorded {added} new "
-          f"(total {len(rows)}).")
+    quoted = sum(1 for r in rows if r.get("entry_p") is not None)
+    print(f"{args.series}: saw {len(ms)} open, +{added} new, +{upgraded} now-quoted "
+          f"(total {len(rows)}, {quoted} ever-quoted).")
 
 
 def cmd_settle(args) -> None:
