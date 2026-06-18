@@ -100,9 +100,27 @@ hindsight, the right outcome. Do not un-pause anything.
 
 ---
 
-## 🔭 SURVEYED, NOT YET TESTED
+## 🔭 SURVEYED → BLOCKED ON LIQUIDITY
 
-`kalshi_survey.py` ranks catalog families by where a data-processing edge is
-*possible*. Top untested CANDIDATEs (frequent + data-predictable + not already
-efficient): **Economics**, **Companies**, **Transportation**. EFFICIENT (Crypto,
-Financials) and THIN (Entertainment, etc.) families are not worth forward-collecting.
+`kalshi_survey.py` ranked the candidate families; drilling into them (`--drill`,
+`--markets`) revealed the binding constraint is **liquidity, not predictability**:
+- **Transportation** — right cadence (flight delays daily) but **open=0/vol=0**, untradeable.
+- **Companies** — structurally one-off events (single resolution → PSR can't accumulate).
+- **Economics** — richest + only family with *listed* daily markets. The lead,
+  **KXAAAGASD** (daily gas, forecastable AAA underlying), has 15 listed strikes but
+  **every one is unquoted (ybid/yask=None, vol=0)** — listed ≠ tradeable.
+
+**The pattern across the whole search: liquid Kalshi markets are efficient (weather,
+BTC-daily had fills, no edge); forecastable ones are illiquid (gas, transport).** That's
+a fundamental constraint, not a tooling gap — consistent with sports being ~80% of
+Kalshi volume and these niches a rounding error.
+
+**Parked (free probe):** `series_collect KXAAAGASD` runs every 3h to answer two questions
+over time — does a quote *ever* appear, and does AAA settle predictably within the strike
+grid? Not a found edge; a long-shot "does liquidity show up" watch. Do NOT spin up parallel
+collectors on the open=0 families — collecting price→outcome where there are no prices is
+motion without progress.
+
+**If hunting continues, the liquidity is in Sports/Politics** (survey: SHARP — pros arb
+them) — a different, harder game we have not attempted.
+
