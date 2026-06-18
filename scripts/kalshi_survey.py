@@ -181,6 +181,44 @@ def aggregate(series_rows: list, deep: bool):
     return out
 
 
+def inspect_markets(series_ticker: str) -> int:
+    """Show the OPEN market ladder for one series — strike, live yes/no quotes,
+    volume, close — so we can see whether there's a tradeable, mispriceable
+    structure before building a forward-collector for it."""
+    from fetch_backtest_data import _kalshi_get
+    try:
+        data = _kalshi_get("/markets", {"series_ticker": series_ticker,
+                                        "status": "open", "limit": 200})
+    except Exception as e:
+        print(f"! {series_ticker}: {e}", file=sys.stderr)
+        return 1
+    ms = data.get("markets", []) or []
+    if not ms:
+        print(f"no OPEN markets for {series_ticker} (closed window now? wrong ticker?).")
+        return 1
+    print(f"=== {series_ticker}: {len(ms)} open markets ===")
+    print(f"{'ticker':30} {'strike':>16} {'ybid':>5} {'yask':>5} {'vol':>6}  close")
+    for m in sorted(ms, key=lambda x: (x.get("close_time", ""),
+                                       _safe_float(x.get("floor_strike")))):
+        sub = m.get("subtitle") or m.get("yes_sub_title") or ""
+        fl, cp = m.get("floor_strike"), m.get("cap_strike")
+        strike = sub or (f"{fl}–{cp}" if (fl is not None or cp is not None) else "?")
+        print(f"{str(m.get('ticker',''))[:30]:30} {str(strike)[:16]:>16} "
+              f"{str(m.get('yes_bid')):>5} {str(m.get('yes_ask')):>5} "
+              f"{str(m.get('volume') or 0):>6}  {str(m.get('close_time',''))[:16]}")
+    print("\n  READ: a wide ladder with two-sided quotes + a slow, forecastable "
+          "underlying = the setup for a data-edge collector. All-or-nothing extreme "
+          "prices (0.01/0.99) leave no room after fees.")
+    return 0
+
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def drill_category(category: str, deep: bool, cap: int) -> int:
     """List every series in ONE category — cadence, liquidity, verdict, title —
     sorted by cadence then liquidity, so we can see what's actually tradeable and
@@ -226,10 +264,14 @@ def main() -> None:
                     help="max series per category to sample liquidity for (default 60)")
     ap.add_argument("--drill", help="list every series in ONE category (cadence, "
                     "liquidity, verdict, title) instead of the cross-category survey")
+    ap.add_argument("--markets", help="show the OPEN market ladder (strikes + live "
+                    "quotes) for ONE series ticker, e.g. KXAAAGASD")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
         raise SystemExit(selftest())
+    if args.markets:
+        raise SystemExit(inspect_markets(args.markets))
     if args.drill:
         raise SystemExit(drill_category(args.drill, args.deep, args.deep_cap))
 
