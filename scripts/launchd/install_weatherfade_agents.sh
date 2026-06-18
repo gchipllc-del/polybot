@@ -61,44 +61,34 @@ EOF
 }
 
 P=com.jesse.polybot.weatherfade
-echo "Installing weather-fade agents (PROJECT_ROOT=$PROJECT_ROOT) ..."
-# Hourly API agents, STAGGERED across the hour (cal:MM = hourly at minute MM).
-# The heavy market sweeps (scan/fc2sscan/probe/collect) are spaced 12-18 min
-# apart; settles slot between them. All-at-once firing tripped Kalshi 429s.
-write_agent "$P.scan"          cal:05 "$RUN" scan --thr 0.03
+echo "Installing weather sleeve agents (PROJECT_ROOT=$PROJECT_ROOT) ..."
+# NOTE: the price-fade weather-fade strategy is RETIRED (ruled out — see
+# docs/FINDINGS.md: per-day PSR 0.24, failed OOS). Its scan/settle/collect/
+# collectsettle/probe agents are intentionally NOT installed here anymore. What
+# remains are the still-in-flight hypotheses (fc2s forecast, ensemble A/B) plus
+# the dashboard file-render and the shared caffeinate keep-awake.
+# Staggered cal:MM (hourly at minute MM) so they don't all hit Kalshi at once.
 write_agent "$P.fc2ssettle"    cal:12 "$RUN_FC2S" settle
 write_agent "$P.fc2sscan"      cal:20 "$RUN_FC2S" scan --thr 0.05
 write_agent "$P.enscollect"    cal:26 "$RUN_ENS" collect
-write_agent "$P.settle"        cal:32 "$RUN" settle
-write_agent "$P.probe"         cal:38 "$RUN" probe
-write_agent "$P.collectsettle" cal:44 "$RUN" collect-settle
-write_agent "$P.collect"       cal:50 "$RUN" collect
 write_agent "$P.enssettle"     cal:56 "$RUN_ENS" settle
-# dashboard — file render every 5 min (the reliable view: open the HTML file,
-# no server/localhost/https). The live Flask :5060 server is intentionally NOT
-# installed (it flapped and the file view replaced it); start it manually with
-# `python scripts/weather_fade_dash.py serve` only if you want the live URL.
+# dashboard — file render every 5 min (the reliable view: open the HTML file).
+# Now shows honest "retired/stale" banners; still renders the fc2s + ensemble panels.
 write_agent "$P.dashfile"       300 "$RUN_DASH" render
-# live auto-refreshing link: stdlib server (no Flask) on 127.0.0.1:5052,
-# KeepAlive so it's always up. Open http://127.0.0.1:5052 (http, not https).
-write_agent "$P.dashserve" keepalive "$RUN_DASH" serve --port 5052 --host 127.0.0.1
-# keep the Mac awake — MANAGED, not manual. caffeinate was the harness's single
-# point of failure (a reboot/closed-terminal/-u-timeout killed it silently and
-# every agent then stalled on sleep). As a KeepAlive agent it auto-starts at
-# login and respawns if it dies. -dims (no -u, so no 5s self-timeout) prevents
-# display/idle/disk/system sleep until you unload it. To let the Mac sleep
-# again: launchctl unload ~/Library/LaunchAgents/$P.caffeinate.plist
+# keep the Mac awake — MANAGED, shared infra for ALL sleeves (fc2s, ensemble,
+# bucket-arb, series-collect). Without it the Mac sleeps and every scheduled agent
+# stalls. Auto-starts at login, respawns if it dies. To let the Mac sleep again:
+# launchctl unload ~/Library/LaunchAgents/$P.caffeinate.plist
 write_agent "$P.caffeinate" keepalive /usr/bin/caffeinate -dims
 
 echo ""
 echo "Done. Roster:"
 launchctl list 2>/dev/null | grep weatherfade || echo "  (none listed — check Console for load errors)"
 echo ""
-echo "Dashboard (live link):  http://127.0.0.1:5052   (http, not https)"
-echo "Dashboard (file backup): open $PROJECT_ROOT/data/weather_fade_dash.html"
-echo "Scorecards: python scripts/weather_fade.py report   |   python scripts/fc_two_sided.py report"
-echo "NOTE: staggered agents fire at their minute-of-hour (scan :05, fc2s :20, ens :26,"
-echo "      probe :38, collect :50) — first runs happen within the next hour, NOT at install."
+echo "Dashboard (file): open $PROJECT_ROOT/data/weather_fade_dash.html"
+echo "Scorecards: python scripts/fc_two_sided.py report   |   python scripts/ensemble_collect.py status"
+echo "NOTE: staggered agents fire at their minute-of-hour (fc2ssettle :12, fc2sscan :20,"
+echo "      enscollect :26, enssettle :56) — first runs happen within the next hour, NOT at install."
 echo "NOTE: caffeinate is now a MANAGED KeepAlive agent (auto-starts at login, respawns if"
 echo "      it dies) — no manual 'caffeinate &' needed. To let the Mac sleep again:"
 echo "      launchctl unload ~/Library/LaunchAgents/$P.caffeinate.plist"
