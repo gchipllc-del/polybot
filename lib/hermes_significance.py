@@ -118,6 +118,52 @@ def min_track_record_length(returns: list[float],
         * (z / (sr - sr_benchmark)) ** 2
 
 
+_EULER_MASCHERONI = 0.5772156649015329
+
+
+def expected_max_sharpe(n_trials: int, sharpe_std: float) -> float:
+    """E[max Sharpe] across `n_trials` strategies whose true edge is ZERO but whose
+    Sharpe *estimates* scatter ~N(0, sharpe_std²). Bailey & López de Prado: the more
+    configs you try, the higher the best one looks by luck alone. This is the bar a
+    real edge must clear — and it RISES with the number of things you tried."""
+    if n_trials < 2 or sharpe_std <= 0:
+        return 0.0
+    g = _EULER_MASCHERONI
+    z1 = _N.inv_cdf(1.0 - 1.0 / n_trials)
+    z2 = _N.inv_cdf(1.0 - 1.0 / (n_trials * math.e))
+    return sharpe_std * ((1.0 - g) * z1 + g * z2)
+
+
+def deflated_sharpe_ratio(returns: list[float], n_trials: int,
+                          trial_sharpes: "list[float] | None" = None) -> "float | None":
+    """Deflated Sharpe Ratio — the antidote to tuning gates on the scoreboard.
+
+    DSR = P(true Sharpe > expected-best-of-`n_trials`), skew/kurtosis adjusted.
+    Unlike PSR (benchmark 0), DSR raises the benchmark to what the BEST of n_trials
+    configs would score by pure luck — so optimizing over many gate settings makes
+    the bar HARDER, not easier. >0.95 = the result survives the search; if you tried
+    50 configs and the winner's DSR is <0.95, you found noise, not edge. None when n<5.
+
+    If you have each trial's Sharpe, pass them (variance is measured from them — the
+    honest input); else a conservative single-sample estimator variance is used."""
+    n = len(returns)
+    if n < 5:
+        return None
+    mean, sd, skew, kurt = _moments(returns)
+    if sd == 0:
+        return None
+    sr = mean / sd
+    adj = max(1e-12, 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr)
+    if trial_sharpes and len(trial_sharpes) > 1:
+        m = sum(trial_sharpes) / len(trial_sharpes)
+        sharpe_std = math.sqrt(sum((x - m) ** 2 for x in trial_sharpes)
+                               / (len(trial_sharpes) - 1))
+    else:
+        sharpe_std = math.sqrt(adj / (n - 1))   # variance of this Sharpe estimator
+    sr0 = expected_max_sharpe(n_trials, sharpe_std)
+    return _N.cdf((sr - sr0) * math.sqrt(n - 1) / math.sqrt(adj))
+
+
 def sample_factor(n: int, full_n: int = FULL_CONFIDENCE_N) -> float:
     """Shrink factor in [0,1] for a recommendation's confidence given sample n.
 
