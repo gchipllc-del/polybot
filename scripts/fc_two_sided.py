@@ -58,6 +58,13 @@ LEDGER = ROOT / "data" / "fc2s_paper.jsonl"
 SCAN_STATUS = ROOT / "data" / "fc2s_scan_status.json"
 DEFAULT_THR = 0.05            # the backtest's headline cell
 SIGMA_F = 3.0                 # forecast-error °F — same σ the backtest validated
+# ABOVE-strike (tail) entries are VETOED: live data showed the σ=3 model claims
+# ~73% exceedance and realizes ~18% (2W/9L, -$10.53) — overconfident on the tail
+# because σ=3 is too tight there AND max(hourly) high-biases the forecast. Fire
+# hardest exactly where we're most wrong = adverse selection. Re-enable only after
+# recalibrating σ/bias from MEASURED forecast error (not a guess on n=11). Band
+# strikes (the NO sleeve) are unaffected. Flip to True after recalibration.
+TRADE_ABOVE_STRIKES = False
 MAX_SLIP = 0.05               # taker fill may cost ≤ 5¢ over the bid-implied price
 # Max total notional per event DATE — the correlated-heat-beta guard. Set to
 # $20 for the PAPER data-gathering phase (~7 trades/date): at $6 a date filled
@@ -223,7 +230,7 @@ def cmd_scan(args) -> None:
             d = _iso_event_date(r.get("ticker", ""))
             day_risk[d] = day_risk.get(d, 0.0) + float(r.get("notional") or 0.0)
 
-    booked, skipped_cap, no_fc, skipped_same_day = [], 0, 0, 0
+    booked, skipped_cap, no_fc, skipped_same_day, skipped_above = [], 0, 0, 0, 0
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()
     geo = series_geo()
@@ -247,6 +254,9 @@ def cmd_scan(args) -> None:
         high = fc.get((series, date))
         if high is None or strike is None:
             no_fc += 1
+            continue
+        if kind == "above" and not TRADE_ABOVE_STRIKES:   # vetoed: tail overconfidence
+            skipped_above += 1
             continue
         p_fc = forecast_p_yes(kind, strike, high, SIGMA_F)
         d = two_sided_decision(q, p_fc, thr=args.thr, bankroll=args.bankroll)
@@ -277,12 +287,13 @@ def cmd_scan(args) -> None:
     SCAN_STATUS.write_text(json.dumps({
         "last_scan": now_iso, "markets_seen": len(quotes), "booked": len(booked),
         "skipped_day_cap": skipped_cap, "no_forecast_or_strike": no_fc,
-        "skipped_same_day": skipped_same_day,
+        "skipped_same_day": skipped_same_day, "skipped_above_strike": skipped_above,
         "thr": args.thr, "bankroll": args.bankroll, "day_cap": args.day_cap}))
     print(f"fc2s scan: {len(quotes)} open markets, booked {len(booked)} "
           f"({sum(1 for b in booked if b['side']=='YES')} YES / "
           f"{sum(1 for b in booked if b['side']=='NO')} NO), "
-          f"{skipped_same_day} same-day (event already underway — adverse selection), "
+          f"{skipped_same_day} same-day (adverse selection), "
+          f"{skipped_above} above-strike (VETOED — tail overconfidence), "
           f"{skipped_cap} skipped by day-cap, {no_fc} no forecast/strike")
     if getattr(args, "show", False) and booked:
         for b in booked:
