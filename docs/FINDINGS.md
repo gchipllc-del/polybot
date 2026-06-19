@@ -71,6 +71,16 @@ hindsight, the right outcome. Do not un-pause anything.
   mutually-exclusive ladders. Opt-in; collects the near-miss margin distribution.
   Real locks are expected to be rare; the question is whether they ever appear
   *and* fill. (Scans Kalshi ladders only — NOT perpetuals.)
+- **devig_check** (NEW) — the second sports edge, runs ALONGSIDE the lock: strip the
+  vig off a sharp book's (Pinnacle) 2-way moneyline → fair prob, flag when Kalshi's YES
+  diverges by ≥ `MIN_EDGE` (net of the taker fee). Devig four ways
+  (multiplicative/additive/power/Shin) for a robustness BAND — skip when the methods
+  disagree (`band > MAX_BAND`). Works the *whole game* (not just garbage time) and
+  doubles as a second opinion on lock signals. Odds via The Odds API (`ODDS_API_KEY`,
+  free tier); Kalshi ladder + team-match reused from `sports_lock`. **Unproven** — the
+  edge assumes Kalshi is wrong *relative to the sharp book*, which it may not be; that's
+  why it's paired with pypbo/netcal (validate by per-day PSR on `data/devig_check.jsonl`
+  before real money). selftest green. Paper only.
 - **sports_lock** (NEW) — the sports sibling of `asos_tracker`: a live-score LOCK,
   not a forecast. Late in a game a lead becomes mathematically near-safe
   (`P = Φ(margin / (σ_league·√time_left))`) well before the moneyline crawls to 99¢;
