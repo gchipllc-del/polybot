@@ -19,12 +19,15 @@ near-certainty is robust, like requiring 'evening + clearly off the peak' for we
 READ-ONLY / paper. Logs lock signals for forward-collection; places NO orders.
 Free data via ESPN's public scoreboard JSON (no key). Kalshi via the repo's client.
 
-  python scripts/sports_lock.py probe nba KXNBAGAME   # RUN FIRST: ESPN games + Kalshi ladder, VERIFY mapping
-  python scripts/sports_lock.py scan  nba KXNBAGAME    # flag near-locked, mispriced moneylines
+  python scripts/sports_lock.py probe nba KXNBAGAME          # RUN FIRST: ESPN + 2nd feed + ladder, VERIFY mapping
+  python scripts/sports_lock.py scan  nba KXNBAGAME          # flag near-locked, mispriced moneylines
+  python scripts/sports_lock.py scan  nba KXNBAGAME --confirm  # only fire if an independent feed agrees
   python scripts/sports_lock.py selftest
 
 ⚠ VERIFY two things with `probe` before trusting a signal: (1) the ESPN league matches
   the Kalshi series, and (2) team names line up so the right side is being priced.
+The lock's worst failure is acting on one bad live number, so `--confirm` gates each
+lock on a SECOND, independent-origin feed (NBA.com CDN / NHLE) agreeing on score+clock.
 """
 from __future__ import annotations
 
@@ -56,6 +59,7 @@ LOCK_MAX_FRAC = 0.18    # only consider a lock once ≤ this fraction of game ti
 LOCK_MIN_MARGIN = 6.0   # and the lead is at least this many points (sanity floor vs tiny σ)
 BOUNDARY_PROB = 0.04    # don't trust a "lock" whose win-prob is within this of 1.0's complement
 NEAR_CERTAIN = 0.98     # prob we assign a locked outcome (not 1.0 — injuries, scoring runs, OT)
+CLOCK_TOL_SEC = 40      # two feeds may differ by a possession; agree within this on the clock
 
 
 # ── pure logic (testable, no network) ────────────────────────────────────────
@@ -135,6 +139,43 @@ def match_team(name: str, candidates: list) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def _same_team(a: str, b: str) -> bool:
+    na, nb = _norm(a), _norm(b)
+    return bool(na and nb and (na in nb or nb in na))
+
+
+def _same_game(p: dict, s: dict) -> bool:
+    """Two source records describe the same matchup (home↔home, away↔away)."""
+    return (_same_team(p.get("home"), s.get("home"))
+            and _same_team(p.get("away"), s.get("away")))
+
+
+def reconcile(primary: list, secondary: list, clock_tol: float = CLOCK_TOL_SEC) -> list:
+    """Two-source confirmation gate: return the PRIMARY game dicts (we keep the primary
+    feed's shape downstream) for in-progress games where an independent SECONDARY feed
+    agrees on the matchup, the exact score, the period, and the clock (within clock_tol
+    seconds). A game seen by only one feed, or where the feeds disagree, is DROPPED —
+    so a single glitchy live number can never fire a lock. Pure; no network."""
+    kept = []
+    for p in primary:
+        if p.get("state") != "in":
+            continue
+        ps, pa, pp, pc = (p.get("home_score"), p.get("away_score"),
+                          p.get("period"), p.get("clock_sec"))
+        if None in (ps, pa, pp, pc):
+            continue
+        for s in secondary:
+            if s.get("state") != "in" or not _same_game(p, s):
+                continue
+            if (s.get("home_score") == ps and s.get("away_score") == pa
+                    and s.get("period") is not None and int(s["period"]) == int(pp)
+                    and s.get("clock_sec") is not None
+                    and abs(float(s["clock_sec"]) - float(pc)) <= clock_tol):
+                kept.append(p)
+            break                                            # matched the game (agree or not)
+    return kept
+
+
 # ── live fetch (needs network) ───────────────────────────────────────────────
 
 def fetch_espn_games(cfg: dict) -> list:
@@ -171,6 +212,76 @@ def fetch_espn_games(cfg: dict) -> list:
                 "period": period, "clock_sec": cs, "state": state,
             })
     return out
+
+
+def _iso_clock_to_sec(s: str):
+    """NBA gameClock 'PT05M21.00S' → 321.0 seconds. None if unparseable."""
+    try:
+        body = str(s).upper().split("PT", 1)[1]
+        mins = float(body.split("M", 1)[0]) if "M" in body else 0.0
+        secs = float(body.split("M", 1)[1].rstrip("S")) if "M" in body else float(body.rstrip("S"))
+        return mins * 60.0 + secs
+    except (IndexError, ValueError, AttributeError):
+        return None
+
+
+def fetch_nba_cdn_games(cfg: dict):
+    """SECONDARY (NBA only): NBA.com's live CDN scoreboard — a DIFFERENT origin from
+    ESPN, so it's a real independent confirmation. No key. Returns the normalized game
+    shape, or None if unavailable (so --confirm can tell 'no second opinion' apart from
+    'no agreement'). ⚠ verify locally: this sandbox blocks the network."""
+    import requests
+    try:
+        r = requests.get("https://cdn.nba.com/static/json/liveData/scoreboard/"
+                         "todaysScoreboard_00.json", timeout=20)
+        r.raise_for_status()
+        games = (r.json().get("scoreboard") or {}).get("games") or []
+    except Exception:
+        return None
+    out = []
+    for g in games:
+        st = {1: "pre", 2: "in", 3: "post"}.get(g.get("gameStatus"))
+        h, a = g.get("homeTeam") or {}, g.get("awayTeam") or {}
+        out.append({
+            "home": h.get("teamName"), "away": a.get("teamName"),
+            "home_score": float(h.get("score")) if h.get("score") is not None else None,
+            "away_score": float(a.get("score")) if a.get("score") is not None else None,
+            "period": g.get("period"), "clock_sec": _iso_clock_to_sec(g.get("gameClock")),
+            "state": st,
+        })
+    return out
+
+
+def fetch_nhl_api_games(cfg: dict):
+    """SECONDARY (NHL only): NHLE's public score feed (api-web.nhle.com) — independent
+    of ESPN. No key. Returns the normalized shape or None if unavailable.
+    ⚠ verify locally: this sandbox blocks the network."""
+    import requests
+    try:
+        r = requests.get("https://api-web.nhle.com/v1/score/now", timeout=20)
+        r.raise_for_status()
+        games = r.json().get("games") or []
+    except Exception:
+        return None
+    out = []
+    for g in games:
+        gs = g.get("gameState")
+        st = "in" if gs in ("LIVE", "CRIT") else ("post" if gs in ("FINAL", "OFF") else "pre")
+        h, a = g.get("homeTeam") or {}, g.get("awayTeam") or {}
+        clk = (g.get("clock") or {}).get("secondsRemaining")
+        out.append({
+            "home": (h.get("name") or {}).get("default") or h.get("abbrev"),
+            "away": (a.get("name") or {}).get("default") or a.get("abbrev"),
+            "home_score": float(h.get("score")) if h.get("score") is not None else None,
+            "away_score": float(a.get("score")) if a.get("score") is not None else None,
+            "period": g.get("period"), "clock_sec": float(clk) if clk is not None else None,
+            "state": st,
+        })
+    return out
+
+
+# leagues with an independent second feed available for the --confirm gate
+SECONDARY = {"nba": fetch_nba_cdn_games, "nhl": fetch_nhl_api_games}
 
 
 def fetch_market_ladder(series: str) -> list:
@@ -231,6 +342,16 @@ def cmd_probe(args) -> None:
             tag = f"  [{leader} +{m:.0f}, {tf*100:.0f}% left, P={p:.2f}{' LOCKED' if locked else ''}]"
         print(f"  {g['state']:>4} {g['away']} @ {g['home']}  "
               f"{g['away_score']}-{g['home_score']} Q{g['period']}{tag}")
+    sec = SECONDARY.get(args.league)
+    if sec is not None:
+        s = sec(cfg)
+        n = sum(1 for g in (s or []) if g.get("state") == "in")
+        print(f"\nSecondary feed ({args.league}): "
+              + (f"available, {n} in-progress — scan --confirm will gate on it"
+                 if s is not None else "UNAVAILABLE here (network) — verify locally"))
+    else:
+        print(f"\nSecondary feed: none for {args.league} (only {', '.join(SECONDARY)} "
+              "are confirmable; scan --confirm would suppress this league).")
     ladder = fetch_market_ladder(args.series)
     print(f"\nKalshi ladder ({len(ladder)} markets):")
     for tk, title, sub, yes_p in ladder[:12]:
@@ -251,6 +372,23 @@ def cmd_scan(args) -> None:
     except Exception as e:
         print(f"! ESPN {args.league}: {e}", file=sys.stderr)
         return
+    if getattr(args, "confirm", False):
+        fetcher = SECONDARY.get(args.league)
+        if fetcher is None:
+            print(f"  --confirm: no independent second feed for {args.league}; "
+                  f"suppressing locks (only {', '.join(SECONDARY)} are confirmable).")
+            games = []
+        else:
+            secondary = fetcher(cfg)
+            if secondary is None:
+                print("  --confirm: second feed unavailable (network/parse) — "
+                      "suppressing locks rather than trusting one source.")
+                games = []
+            else:
+                before = sum(1 for g in games if g.get("state") == "in")
+                games = reconcile(games, secondary)
+                print(f"  --confirm: {len(games)}/{before} in-progress games agree "
+                      f"across ESPN + the second feed.")
     ladder = fetch_market_ladder(args.series)
     hits = []
     locked_games = 0
@@ -339,6 +477,24 @@ def selftest() -> int:
     assert match_team("Lakers", ["Los Angeles Lakers", "Los Angeles Clippers"]) == "Los Angeles Lakers"
     assert match_team("Foo", ["Bar", "Baz"]) is None
     print("match_team OK")
+    # reconcile: agree → kept; score mismatch / clock drift / unseen → dropped
+    prim = [{"home": "Los Angeles Lakers", "away": "Boston Celtics", "home_score": 99.0,
+             "away_score": 90.0, "period": 4, "clock_sec": 30.0, "state": "in"}]
+    agree = [{"home": "Lakers", "away": "Celtics", "home_score": 99.0, "away_score": 90.0,
+              "period": 4, "clock_sec": 45.0, "state": "in"}]              # 15s drift < tol
+    assert reconcile(prim, agree) == prim, "agreeing feeds should keep the game"
+    bad_score = [dict(agree[0], home_score=98.0)]
+    assert reconcile(prim, bad_score) == [], "score disagreement must drop the game"
+    bad_clock = [dict(agree[0], clock_sec=300.0)]                          # 270s drift > tol
+    assert reconcile(prim, bad_clock) == [], "clock disagreement must drop the game"
+    assert reconcile(prim, []) == [], "a game the second feed can't see is dropped"
+    assert reconcile(prim, [dict(agree[0], state="post")]) == [], "non-live second drop"
+    print("reconcile OK")
+    # iso clock parse
+    assert abs(_iso_clock_to_sec("PT05M21.00S") - 321.0) < 1e-6
+    assert abs(_iso_clock_to_sec("PT00M30.0S") - 30.0) < 1e-6
+    assert _iso_clock_to_sec("garbage") is None
+    print("_iso_clock_to_sec OK")
     print("PASS")
     return 0
 
@@ -349,6 +505,9 @@ def main() -> None:
     ap.add_argument("mode", choices=["probe", "scan", "selftest"])
     ap.add_argument("league", nargs="?", help=f"one of: {', '.join(LEAGUES)}")
     ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXNBAGAME")
+    ap.add_argument("--confirm", action="store_true",
+                    help="require an independent second feed to agree on score+clock "
+                         f"before a lock fires (available: {', '.join(SECONDARY)})")
     args = ap.parse_args()
     if args.mode == "selftest":
         raise SystemExit(selftest())

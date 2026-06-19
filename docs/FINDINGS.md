@@ -88,6 +88,14 @@ hindsight, the right outcome. Do not un-pause anything.
   edge assumes Kalshi is wrong *relative to the sharp book*, which it may not be; that's
   why it's paired with pypbo/netcal (validate by per-day PSR on `data/devig_check.jsonl`
   before real money). selftest green. Paper only.
+- **sports_lock — two-source confirmation gate** (NEW): `scan --confirm` only fires a
+  lock when an INDEPENDENT-origin feed (NBA.com CDN / NHLE, different servers from ESPN,
+  no new deps) agrees on score + period + clock (within `CLOCK_TOL_SEC`). Kills the
+  lock's worst failure — acting on one glitchy live number. Default behavior unchanged
+  (opt-in). `reconcile()`/`_iso_clock_to_sec()` are pure and selftested; the live
+  secondaries need local verification (sandbox blocks network). Deliberately did NOT
+  swap to sportsdataverse-py: it wraps the *same* ESPN endpoint we already poll, so it
+  adds a dependency with zero independence gain — an independent origin is the real win.
 - **sports_lock** (NEW) — the sports sibling of `asos_tracker`: a live-score LOCK,
   not a forecast. Late in a game a lead becomes mathematically near-safe
   (`P = Φ(margin / (σ_league·√time_left))`) well before the moneyline crawls to 99¢;
