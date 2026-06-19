@@ -137,6 +137,7 @@ def build_summary() -> dict:
         "open": len(openn), "closed": len(closed), "won": won, "lost": len(closed) - won,
         "wr": round(won / len(closed) * 100, 1) if closed else None,
         "net": round(net, 2), "invested": round(inv, 2),
+        "deployed_now": round(sum(float(r.get("notional", 0) or 0) for r in openn), 2),
         "roi": round(net / inv * 100, 1) if inv else None,
         "open_fades": sorted(openn, key=lambda r: r.get("opened_at", ""), reverse=True)[:25],
         "recent_settled": sorted(closed, key=lambda r: r.get("resolved_at", ""), reverse=True)[:15],
@@ -270,9 +271,9 @@ th{{color:#8b949e;font-size:11px}} .stat{{display:inline-block;margin-right:32px
  <span class=stat><div class=lbl>ROI</div><div class=big>{'—' if s['roi'] is None else f"{s['roi']:+.1f}%"}</div></span>
  <span class=stat><div class=lbl>Win rate</div><div class=big>{'—' if s['wr'] is None else f"{s['wr']:.0f}%"}</div></span>
  <span class=stat><div class=lbl>Settled</div><div class=big>{s['closed']}</div><div class=dim>{s['won']}W/{s['lost']}L</div></span>
- <span class=stat><div class=lbl>Open</div><div class=big>{s['open']}</div></span>
- <span class=stat><div class=lbl>Invested</div><div class=big>${s['invested']:,.2f}</div></span>
- <span class=stat><div class=lbl>Bankroll (mirrors live)</div><div class=big>${s['bankroll']:,.2f}</div><div class=dim>portfolio ${s['portfolio']:,.2f}</div></span>
+ <span class=stat><div class=lbl>Open</div><div class=big>{s['open']}</div><div class=dim>${s['deployed_now']:,.2f} deployed now</div></span>
+ <span class=stat><div class=lbl>Cumulative traded</div><div class=big>${s['invested']:,.2f}</div><div class=dim>all {s['closed']} settled, lifetime — NOT current exposure</div></span>
+ <span class=stat><div class=lbl>Bankroll (paper)</div><div class=big>${s['bankroll']:,.2f}</div><div class=dim>portfolio ${s['portfolio']:,.2f}</div></span>
 </div>
 <p class=dim>↑ the real-fill verdict — judge the edge by this, not the backtest.</p>
 {_fc2s_panel(s.get('fc2s'))}
