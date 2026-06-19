@@ -71,6 +71,13 @@ hindsight, the right outcome. Do not un-pause anything.
   mutually-exclusive ladders. Opt-in; collects the near-miss margin distribution.
   Real locks are expected to be rare; the question is whether they ever appear
   *and* fill. (Scans Kalshi ladders only — NOT perpetuals.)
+- **sports_eval** (NEW) — the shared scorer for BOTH sports sleeves. Dedupes each
+  signal log to one paper position per market, settles via Kalshi market result
+  (cached in `data/sports_eval_resolutions.json`), then reports per-day PSR / DSR /
+  MinTRL (lib/hermes_significance) and win-prob calibration (Brier + reliability
+  table), gross and net of the taker fee. `python scripts/sports_eval.py eval`.
+  selftest green; confirms a coin-flip is NOT significant and a 98%-calibrated edge
+  is. The honest gate before any real money — collect signals, then judge.
 - **devig_check** (NEW) — the second sports edge, runs ALONGSIDE the lock: strip the
   vig off a sharp book's (Pinnacle) 2-way moneyline → fair prob, flag when Kalshi's YES
   diverges by ≥ `MIN_EDGE` (net of the taker fee). Devig four ways
