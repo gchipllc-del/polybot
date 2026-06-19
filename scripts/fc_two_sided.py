@@ -393,6 +393,35 @@ def cmd_report(args) -> None:
             b = by_city[c]
             print(f"  {c:>6}: {b['n']:>3} trades {b['w']:>3}W  net ${b['net']:+.2f}")
 
+    # Per-day SIGNIFICANCE — the SAME bar that ruled out weather-fade. A win/loss
+    # "pattern" is only real edge if it clears this; the eye can't tell skill from a
+    # streak. This is the gate before any real money goes in.
+    sys.path.insert(0, str(ROOT))
+    try:
+        from lib.hermes_significance import (probabilistic_sharpe_ratio,
+                                             min_track_record_length,
+                                             deflated_sharpe_ratio)
+        day_ret = []
+        for d in sorted(by_day):
+            cost = sum(float(r.get("notional") or 0) for r in settled
+                       if _iso_event_date(r.get("ticker", "")) == d)
+            if cost > 0:
+                day_ret.append(by_day[d]["net"] / cost)
+
+        def _f(x):
+            return "n<5" if x is None else f"{x:.2f}"
+        psr = probabilistic_sharpe_ratio(day_ret)
+        dsr = deflated_sharpe_ratio(day_ret, n_trials=1)
+        mt = min_track_record_length(day_ret)
+        mts = "n<5" if mt is None else ("∞" if mt == float("inf") else f"{int(mt)} days")
+        print(f"\nSIGNIFICANCE (per-day, n={len(day_ret)} days): "
+              f"PSR(edge>0)={_f(psr)} · DSR={_f(dsr)} · MinTRL={mts}")
+        print("  READ: PSR ≥ 0.95 = real skill (deploy real money) · 0.50–0.95 = "
+              "provisional, keep collecting · < 0.50 = the W/L 'pattern' is noise or "
+              "too-early. THIS is the gate, not the eyeballed win streak.")
+    except Exception as e:
+        print(f"\n[psr] significance unavailable: {e}")
+
 
 def cmd_status(args) -> None:
     """Is this sleeve actually scanning + booking? One-glance liveness check:
