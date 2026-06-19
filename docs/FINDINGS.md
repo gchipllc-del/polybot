@@ -71,6 +71,15 @@ hindsight, the right outcome. Do not un-pause anything.
   mutually-exclusive ladders. Opt-in; collects the near-miss margin distribution.
   Real locks are expected to be rare; the question is whether they ever appear
   *and* fill. (Scans Kalshi ladders only — NOT perpetuals.)
+- **sports_lock** (NEW) — the sports sibling of `asos_tracker`: a live-score LOCK,
+  not a forecast. Late in a game a lead becomes mathematically near-safe
+  (`P = Φ(margin / (σ_league·√time_left))`) well before the moneyline crawls to 99¢;
+  log when a *near-locked* winner is still mispriced. This is the user's "sports
+  market determined by stats and numbers." Free data via ESPN's public scoreboard
+  JSON (no key); Kalshi side via the repo client. **Unproven** — same bucket-lock
+  open question as weather: does the gap *fill* before settlement, net of fees, and
+  is the ESPN↔Kalshi team mapping right (run `probe` first)? Judge by per-day PSR on
+  `data/sports_lock.jsonl` once forward-collected. Paper only.
 
 ---
 
