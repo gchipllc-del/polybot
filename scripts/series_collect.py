@@ -64,6 +64,25 @@ def _mid(yes_bid, yes_ask):
     return (yb + ya) / 200.0
 
 
+def _entry_prob(m: dict):
+    """Best available entry probability for a market. Kalshi books are
+    quote-on-demand (often NO resting bid/ask even where the market trades), so
+    fall back to last_price — the last traded price IS a valid probability estimate
+    when there's no resting quote. Returns (prob, source) or (None, None)."""
+    mid = _mid(m.get("yes_bid"), m.get("yes_ask"))
+    if mid is not None:
+        return mid, "mid"
+    for f in ("last_price", "yes_price", "previous_price"):
+        v = m.get(f)
+        try:
+            p = float(v)
+        except (TypeError, ValueError):
+            continue
+        if 0 < p < 100:                 # cents
+            return p / 100.0, f
+    return None, None
+
+
 # ── pure analysis (testable) ────────────────────────────────────────────────
 
 def calibration(rows: list, bins: int = 5) -> list:
@@ -149,27 +168,30 @@ def cmd_collect(args) -> None:
         tk = m.get("ticker", "")
         if not tk:
             continue
-        mid = _mid(m.get("yes_bid"), m.get("yes_ask"))
+        prob, src = _entry_prob(m)          # mid if quoted, else last_price (quote-on-demand)
         if tk in by_ticker:
-            # already recorded — but if we logged it UNQUOTED and a real quote has
-            # since appeared, capture the first real price (answers 'does liquidity
-            # ever show up?' without losing the earliest genuine quote).
+            # already recorded — but if we logged it with NO price and one has since
+            # appeared (a quote or a trade), capture the first real price.
             r = by_ticker[tk]
-            if r.get("entry_p") is None and mid is not None and r.get("outcome") is None:
-                r.update(entry_p=mid, yes_bid=m.get("yes_bid"),
-                         yes_ask=m.get("yes_ask"), quote_seen_at=ts)
+            if r.get("entry_p") is None and prob is not None and r.get("outcome") is None:
+                r.update(entry_p=prob, entry_src=src, yes_bid=m.get("yes_bid"),
+                         yes_ask=m.get("yes_ask"), last_price=m.get("last_price"),
+                         quote_seen_at=ts)
                 upgraded += 1
             continue
-        rows.append({"ts": ts, "ticker": tk, "entry_p": mid,
+        rows.append({"ts": ts, "ticker": tk, "entry_p": prob, "entry_src": src,
                      "yes_bid": m.get("yes_bid"), "yes_ask": m.get("yes_ask"),
+                     "last_price": m.get("last_price"), "volume": m.get("volume"),
+                     "open_interest": m.get("open_interest"),
                      "close_time": m.get("close_time", ""), "status": "open",
                      "outcome": None})
         by_ticker[tk] = rows[-1]
         added += 1
     _save(args.series, rows)
-    quoted = sum(1 for r in rows if r.get("entry_p") is not None)
-    print(f"{args.series}: saw {len(ms)} open, +{added} new, +{upgraded} now-quoted "
-          f"(total {len(rows)}, {quoted} ever-quoted).")
+    priced = sum(1 for r in rows if r.get("entry_p") is not None)
+    via_last = sum(1 for r in rows if r.get("entry_src") in ("last_price", "yes_price", "previous_price"))
+    print(f"{args.series}: saw {len(ms)} open, +{added} new, +{upgraded} now-priced "
+          f"(total {len(rows)}, {priced} ever-priced, {via_last} via last-trade not resting book).")
 
 
 def cmd_settle(args) -> None:

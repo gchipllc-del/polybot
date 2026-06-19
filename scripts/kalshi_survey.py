@@ -196,19 +196,35 @@ def inspect_markets(series_ticker: str) -> int:
     if not ms:
         print(f"no OPEN markets for {series_ticker} (closed window now? wrong ticker?).")
         return 1
+    # RAW dump of one market so we can confirm Kalshi's field names (resting book is
+    # often empty; trades-based fields tell the real tradability story).
     print(f"=== {series_ticker}: {len(ms)} open markets ===")
-    print(f"{'ticker':30} {'strike':>16} {'ybid':>5} {'yask':>5} {'vol':>6}  close")
-    for m in sorted(ms, key=lambda x: (x.get("close_time", ""),
-                                       _safe_float(x.get("floor_strike")))):
-        sub = m.get("subtitle") or m.get("yes_sub_title") or ""
-        fl, cp = m.get("floor_strike"), m.get("cap_strike")
-        strike = sub or (f"{fl}–{cp}" if (fl is not None or cp is not None) else "?")
-        print(f"{str(m.get('ticker',''))[:30]:30} {str(strike)[:16]:>16} "
-              f"{str(m.get('yes_bid')):>5} {str(m.get('yes_ask')):>5} "
-              f"{str(m.get('volume') or 0):>6}  {str(m.get('close_time',''))[:16]}")
-    print("\n  READ: a wide ladder with two-sided quotes + a slow, forecastable "
-          "underlying = the setup for a data-edge collector. All-or-nothing extreme "
-          "prices (0.01/0.99) leave no room after fees.")
+    print("raw market[0] (confirm field names):")
+    print("  " + json.dumps({k: ms[0].get(k) for k in
+          ("ticker", "yes_bid", "yes_ask", "last_price", "volume", "volume_24h",
+           "open_interest", "liquidity", "previous_price", "close_time")}))
+    # trades-based view: last_price / volume_24h / open_interest reveal whether a
+    # market actually TRADES even when the resting bid/ask is empty (quote-on-demand).
+    print(f"\n{'ticker':28} {'ybid':>5} {'yask':>5} {'last':>5} {'vol':>7} "
+          f"{'v24h':>7} {'OI':>7}  close")
+    n_resting = n_traded = 0
+    for m in sorted(ms, key=lambda x: -_safe_float(x.get("open_interest"))):
+        yb, ya = m.get("yes_bid"), m.get("yes_ask")
+        last = m.get("last_price")
+        vol = _safe_float(m.get("volume")); v24 = _safe_float(m.get("volume_24h"))
+        oi = _safe_float(m.get("open_interest"))
+        if (yb or 0) and (ya or 0):
+            n_resting += 1
+        if vol or v24 or oi or last:
+            n_traded += 1
+        print(f"{str(m.get('ticker',''))[:28]:28} {str(yb):>5} {str(ya):>5} "
+              f"{str(last):>5} {vol:>7.0f} {v24:>7.0f} {oi:>7.0f}  "
+              f"{str(m.get('close_time',''))[:16]}")
+    print(f"\n  {n_resting}/{len(ms)} have a two-sided RESTING quote · "
+          f"{n_traded}/{len(ms)} show ANY trade signal (last/vol/OI).")
+    print("  READ: resting book empty but last/vol/OI > 0 = market is QUOTE-ON-DEMAND "
+          "(trades, just no resting quotes) — tradable for a single order, NOT for a "
+          "multi-leg sweep. All columns 0 = genuinely untraded/dead.")
     return 0
 
 
