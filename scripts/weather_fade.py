@@ -35,8 +35,8 @@ MIN_HOURS_TO_CLOSE = 6.0
 MAX_HOURS_TO_CLOSE = 40.0
 DEFAULT_THR = 0.03            # data-gathering: looser net (still clearly +EV in
                               # backtest; edge logged per-trade so you slice in analyze)
-DEFAULT_BANKROLL = 143.0
-DEFAULT_RISK_PCT = 0.02       # ~$2.86/trade at $143
+DEFAULT_BANKROLL = 63.0   # matches the live account balance (paper mirrors real)
+DEFAULT_RISK_PCT = 0.02       # ~$1.26/trade at $63
 DEFAULT_MAX_TRADE_USD = 3.0
 FILL_FLOOR, FILL_CEIL = 0.10, 0.90   # liquid band the edge was validated on
 

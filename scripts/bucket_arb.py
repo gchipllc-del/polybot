@@ -52,7 +52,7 @@ LEDGER = ROOT / "data" / "bucket_arb_paper.jsonl"      # paper baskets (own bank
 # Bucket-arb's OWN paper bankroll — deliberately separate from the weather
 # sleeve so the two edges' P&L never get confused. Structural arb is a different
 # animal from forecast-fade and deserves its own scoreboard.
-DEFAULT_BANKROLL = 100.0
+DEFAULT_BANKROLL = 63.0
 
 # S&P-500 / Nasdaq-100 ladders get the discounted fee coefficient.
 DISCOUNTED_PREFIXES = ("INX", "KXINX", "NASDAQ100", "KXNASDAQ100", "KXNDQ")

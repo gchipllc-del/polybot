@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 DATA = ROOT / "data"
-DEFAULT_BANKROLL = 100.0   # this sleeve's own paper bankroll (separate from all others)
+DEFAULT_BANKROLL = 63.0   # this sleeve's own paper bankroll = live account balance
 
 
 def _ledger(series: str) -> Path:
