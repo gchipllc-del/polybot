@@ -48,7 +48,10 @@ write_agent() {
   for a in "$@"; do argxml+="    <string>$a</string>
 "; done
   local cadence_xml
-  if [[ "$cadence" == cal:* ]]; then
+  if [ "$cadence" = "keepalive" ]; then
+    cadence_xml="  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>"
+  elif [[ "$cadence" == cal:* ]]; then
     cadence_xml="  <key>StartCalendarInterval</key>
   <dict><key>Minute</key><integer>${cadence#cal:}</integer></dict>"
   else
@@ -76,10 +79,13 @@ echo "Installing ALL-SPORTS sweep (paper/data only) ..."
 write_agent "$BASE.lock"  "$LOCK_INTERVAL"  "$RUN" sports_lock scan --confirm   # every 15 min, all live series
 write_agent "$BASE.devig" "$DEVIG_INTERVAL" "$RUN" devig_check scan             # every 6 h, all live series
 write_agent "$BASE.eval"  cal:40            "$RUN" sports_eval eval             # hourly resolve + score
+write_agent "$BASE.dashfile"  300       "$RUN" sports_dash render                # re-render HTML every 5 min
+write_agent "$BASE.dashserve" keepalive "$RUN" sports_dash serve --port 5056 --host 127.0.0.1
 
 echo ""
 echo "Done. Sweeps EVERY live per-game series automatically — no ticker config."
 echo "  lock  every ${LOCK_INTERVAL}s   devig every ${DEVIG_INTERVAL}s   eval hourly :40"
+echo "Dashboard: http://127.0.0.1:5056   (http not https; file backup: data/sports_dash.html)"
 echo "Tail:   tail -f logs/sports.log"
 echo "Score:  python scripts/sports_eval.py eval"
 echo "Reqs:   devig needs ODDS_API_KEY in .env (the-odds-api.com); sweep costs ~1 credit/live-league/run"

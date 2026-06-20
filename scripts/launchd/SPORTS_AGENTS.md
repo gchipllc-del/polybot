@@ -22,6 +22,8 @@ Tune cadences: `LOCK_INTERVAL=600 DEVIG_INTERVAL=14400 bash .../install_sports_a
 | `lock`  | every 15 min (`LOCK_INTERVAL`) | `sports_lock scan --confirm` — sweeps **all** live series; `--confirm` gates nba/nhl on an independent 2nd feed, others run single-source |
 | `devig` | every 6 h (`DEVIG_INTERVAL`) | `devig_check scan` — sweeps **all** live series; Pinnacle-devig vs Kalshi YES |
 | `eval`  | hourly :40 | `sports_eval eval` — resolve settled games → per-day PSR/DSR + calibration across **both** logs |
+| `dashfile`  | every 5 min | `sports_dash render` → `data/sports_dash.html` (file backup) |
+| `dashserve` | KeepAlive | live scorecard at **http://127.0.0.1:5056** (stdlib server, http not https) |
 
 Leagues covered: discovery maps each Kalshi series to a league via `infer_league`.
 `sports_lock` covers nba/wnba/ncaab/nfl/ncaaf/nhl (clock model); `devig_check`
