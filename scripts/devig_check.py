@@ -16,8 +16,10 @@ only exists if Kalshi is mispriced *relative to that*, net of fees.
 READ-ONLY / paper. Logs signals for forward-collection; places NO orders.
 Odds via The Odds API (free key in env ODDS_API_KEY); Kalshi via the repo client.
 
-  python scripts/devig_check.py probe nba KXNBAGAMES   # RUN FIRST: odds + devig + Kalshi ladder, VERIFY mapping
-  python scripts/devig_check.py scan  nba KXNBAGAMES   # flag Kalshi YES mispriced vs sharp fair prob
+  python scripts/devig_check.py scan                  # ALL live sports series (auto-discovered) — the default sweep
+  python scripts/devig_check.py probe                 # list every live per-game sports series on Kalshi
+  python scripts/devig_check.py probe nba KXNBAGAMES  # one league: odds + devig + Kalshi ladder, VERIFY mapping
+  python scripts/devig_check.py scan  nba KXNBAGAMES  # one league only
   python scripts/devig_check.py selftest
 
 ⚠ Edge here depends on Kalshi being inefficient *relative to the sharp book* — it may
@@ -47,6 +49,7 @@ SPORTS = {
     "nfl":   "americanfootball_nfl",
     "ncaaf": "americanfootball_ncaaf",
     "nhl":   "icehockey_nhl",
+    "mlb":   "baseball_mlb",
 }
 SHARP_BOOK = "pinnacle"     # the sharpest 2-way moneyline; fall back to consensus if absent
 MIN_EDGE = 0.03             # require fair − market ≥ this (prob units) before flagging
@@ -256,22 +259,18 @@ def cmd_probe(args) -> None:
           "the devigged p_home sane (favorite > 0.5)? If yes, trust scan.")
 
 
-def cmd_scan(args) -> None:
+def _scan_one(league: str, series: str, key: str, ts: str):
+    """Scan ONE league/series → (hits, matched, n_markets)."""
     from sports_lock import fetch_market_ladder, _norm
-    sk = SPORTS.get(args.league)
+    sk = SPORTS.get(league)
     if not sk:
-        print(f"unknown league {args.league}; known: {', '.join(SPORTS)}")
-        return
-    key = _api_key()
-    if not key:
-        return
-    ts = datetime.now(timezone.utc).isoformat()
+        return [], 0, 0
     try:
         evs = fetch_odds(sk, key)
     except Exception as e:
-        print(f"! Odds API {args.league}: {e}", file=sys.stderr)
-        return
-    ladder = fetch_market_ladder(args.series)
+        print(f"! Odds API {league}: {e}", file=sys.stderr)
+        return [], 0, 0
+    ladder = fetch_market_ladder(series)
     hits, matched = [], 0
     for tk, title, sub, yes_p in ladder:
         if yes_p is None:
@@ -297,25 +296,85 @@ def cmd_scan(args) -> None:
         if sig is None:
             continue
         s_side, our_p, gross, net = sig
-        rec = {"ts": ts, "league": args.league, "series": args.series, "ticker": tk,
-               "game": f"{ev_used['away']} @ {ev_used['home']}", "yes_team_side": side_team,
-               "fair_yes": round(fair_yes, 4), "kalshi_yes": yes_p, "band": band,
-               "side": s_side, "gross_edge": gross, "net_edge": net}
-        hits.append(rec)
+        hits.append({"ts": ts, "league": league, "series": series, "ticker": tk,
+                     "game": f"{ev_used['away']} @ {ev_used['home']}", "yes_team_side": side_team,
+                     "fair_yes": round(fair_yes, 4), "kalshi_yes": yes_p, "band": band,
+                     "side": s_side, "gross_edge": gross, "net_edge": net})
+    return hits, matched, len(ladder)
+
+
+def _write_hits(hits: list) -> None:
     if hits:
         LOG.parent.mkdir(parents=True, exist_ok=True)
         with LOG.open("a") as f:
             for h in hits:
                 f.write(json.dumps(h) + "\n")
+
+
+def _print_summary(label: str, n_markets: int, matched: int, hits: list) -> None:
     flagged = [h for h in hits if h["net_edge"] is not None and h["net_edge"] > 0]
-    print(f"=== devig scan {args.league}/{args.series} — {len(ladder)} markets, "
-          f"{matched} matched to odds, {len(flagged)} mispriced (net edge>0 after fee) ===")
+    print(f"=== devig scan {label} — {n_markets} markets, {matched} matched to odds, "
+          f"{len(flagged)} mispriced (net edge>0 after fee) ===")
     for h in sorted(flagged, key=lambda x: -x["net_edge"])[:20]:
         print(f"  {h['ticker'][:30]:30} {h['side']:>3} fair {h['fair_yes']:.2f} "
               f"vs kalshi {h['kalshi_yes']:.2f}  gross {h['gross_edge']:+.2f} "
               f"net {h['net_edge']:+.2f} (band {h['band']})")
+
+
+def cmd_scan(args) -> None:
+    if not SPORTS.get(args.league):
+        print(f"unknown league {args.league}; known: {', '.join(SPORTS)}")
+        return
+    key = _api_key()
+    if not key:
+        return
+    ts = datetime.now(timezone.utc).isoformat()
+    hits, matched, nm = _scan_one(args.league, args.series, key, ts)
+    _write_hits(hits)
+    _print_summary(f"{args.league}/{args.series}", nm, matched, hits)
     print("\n  Logged to data/devig_check.jsonl. NOTE: assumes the sharp book is right and "
           "Kalshi is wrong — VALIDATE by per-day PSR before trusting. Paper only.")
+
+
+def cmd_scan_all(args) -> None:
+    """Auto-discover every live per-game sports series and devig-scan them all."""
+    from sports_lock import discover_game_series
+    key = _api_key()
+    if not key:
+        return
+    ts = datetime.now(timezone.utc).isoformat()
+    series = discover_game_series()
+    modeled = [(lg, tk, ti) for lg, tk, ti in series if lg in SPORTS]
+    skipped = sorted({lg for lg, _, _ in series if lg not in SPORTS})
+    covered = ", ".join(sorted({lg for lg, _, _ in modeled})) or "none live"
+    print(f"=== devig scan ALL — {len(modeled)} live per-game series ({covered}) ===")
+    if skipped:
+        print(f"  (skipped {', '.join(skipped)}: no Odds API mapping)")
+    all_hits, tot_matched = [], 0
+    for lg, tk, ti in modeled:
+        hits, matched, nm = _scan_one(lg, tk, key, ts)
+        tot_matched += matched
+        all_hits += hits
+        if hits or matched:
+            _print_summary(f"{lg}/{tk}", nm, matched, hits)
+    _write_hits(all_hits)
+    flagged = [h for h in all_hits if h["net_edge"] is not None and h["net_edge"] > 0]
+    print(f"\nTOTAL across all live series: {tot_matched} matched, {len(flagged)} mispriced "
+          f"(net>0). Logged to data/devig_check.jsonl. Paper only.")
+
+
+def cmd_probe_all(args) -> None:
+    """List every live per-game sports series Kalshi exposes (the universe scan sweeps)."""
+    from sports_lock import discover_game_series, fetch_market_ladder
+    series = discover_game_series()
+    print(f"=== devig PROBE ALL — {len(series)} per-game sports series on Kalshi ===")
+    if not series:
+        print("  none discovered (off-season, or run on your home IP with Kalshi auth).")
+        return
+    for lg, tk, ti in series:
+        cover = "devig" if lg in SPORTS else "no-odds-map"
+        print(f"  {lg:6} {tk:22} {len(fetch_market_ladder(tk)):>3} open  [{cover}]  «{ti}»")
+    print("\nThen: `scan` sweeps all (needs ODDS_API_KEY).")
 
 
 def selftest() -> int:
@@ -362,14 +421,21 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["probe", "scan", "selftest"])
-    ap.add_argument("league", nargs="?", help=f"one of: {', '.join(SPORTS)}")
+    ap.add_argument("league", nargs="?",
+                    help=f"one of: {', '.join(SPORTS)} — omit (or 'all') to sweep every live series")
     ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXNBAGAMES")
     args = ap.parse_args()
     if args.mode == "selftest":
         raise SystemExit(selftest())
-    if not args.league or not args.series:
-        ap.error(f"{args.mode} needs a league and a Kalshi series, e.g. {args.mode} nba KXNBAGAMES")
-    (cmd_probe if args.mode == "probe" else cmd_scan)(args)
+    all_mode = args.league is None or args.league.lower() == "all"
+    if args.mode == "probe":
+        cmd_probe_all(args) if all_mode else cmd_probe(args)
+    elif all_mode:
+        cmd_scan_all(args)
+    elif not args.series:
+        ap.error("scan needs a series (e.g. scan nba KXNBAGAMES) — or omit league to sweep ALL")
+    else:
+        cmd_scan(args)
 
 
 if __name__ == "__main__":

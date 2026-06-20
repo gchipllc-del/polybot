@@ -1,30 +1,27 @@
 #!/bin/bash
-# OPT-IN installer for the SPORTS sleeves (sports_lock + devig_check) and their
-# shared scorer (sports_eval). Paper/data only — places NO orders. Separate from
-# every other harness, idempotent, with --uninstall.
+# OPT-IN installer for the SPORTS sleeves — now an ALL-SPORTS SWEEP (no per-league
+# config, no hardcoded tickers). Each scan auto-discovers every live per-game series
+# on Kalshi and scans them. Paper/data only — places NO orders. Idempotent; --uninstall.
 #
-# PAIRS is space-separated league:kalshiseries items. Each pair gets:
-#   • a sports_lock scan every 15 min (free ESPN feed; --confirm added automatically
-#     for confirmable leagues so a lock needs a 2nd independent feed to agree)
-#   • a devig_check scan every 2 h (Pinnacle-devig vs Kalshi; INFREQUENT on purpose —
-#     The Odds API free tier is ~500 req/month ≈ 16/day, one request per scan-league)
-# Plus ONE shared sports_eval agent hourly at :40 (resolve settled games → PSR/DSR +
-# calibration across BOTH logs).
+# Three agents:
+#   • sports_lock scan --confirm   every LOCK_INTERVAL  (default 15 min; free ESPN feed;
+#       --confirm gates confirmable leagues (nba/nhl) on a 2nd feed, others single-source)
+#   • devig_check scan             every DEVIG_INTERVAL (default 6 h) — INFREQUENT because
+#       The Odds API free tier is ~500 req/month and a sweep costs ~1 credit PER LIVE
+#       LEAGUE per run (≈ 4 runs/day × N live leagues). Raise DEVIG_INTERVAL if near cap.
+#   • sports_eval eval             hourly at :40 — resolve settled games → PSR/DSR + calibration
 #
-#   bash scripts/launchd/install_sports_agents.sh                          # default: nba (KXNBAGAMES)
-#   PAIRS="nba:KXNBAGAMES nhl:<series>" bash scripts/launchd/install_sports_agents.sh
+#   bash scripts/launchd/install_sports_agents.sh
+#   LOCK_INTERVAL=600 DEVIG_INTERVAL=14400 bash scripts/launchd/install_sports_agents.sh
 #   bash scripts/launchd/install_sports_agents.sh --uninstall
 #
-# Series tickers are SEASON-DEPENDENT and must be confirmed — KXNBAGAMES is the NBA
-# per-game series (note the plural 'S'); the NHL/NFL game series only list when in
-# season. FIRST verify each pair's ticker + team mapping (and 2nd-feed availability):
-#   python scripts/kalshi_survey.py --drill "Sports"      # find the live series tickers
-#   python scripts/sports_lock.py probe nba KXNBAGAMES    # confirm ESPN↔Kalshi + 2nd feed
-#   python scripts/devig_check.py probe nba KXNBAGAMES    # confirm OddsAPI↔Kalshi (needs ODDS_API_KEY)
+# Pre-flight (read-only) before relying on it:
+#   python scripts/sports_lock.py probe          # list every live per-game series + 2nd-feed status
+#   python scripts/devig_check.py probe          # same, for the odds side (needs ODDS_API_KEY)
 set -euo pipefail
 
-PAIRS="${PAIRS:-nba:KXNBAGAMES}"
-CONFIRMABLE="nba nhl"            # leagues with an independent 2nd feed (see sports_lock SECONDARY)
+LOCK_INTERVAL="${LOCK_INTERVAL:-900}"
+DEVIG_INTERVAL="${DEVIG_INTERVAL:-21600}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN="$PROJECT_ROOT/scripts/launchd/run_sports.sh"
@@ -75,25 +72,17 @@ EOF
   echo "  installed $label"
 }
 
-echo "Installing sports sleeve for: $PAIRS (paper/data only) ..."
-for pair in $PAIRS; do
-  league="${pair%%:*}"; series="${pair##*:}"
-  tag="$(echo "$league" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
-  # --confirm only where a 2nd independent feed exists (else it would suppress every lock)
-  if [[ " $CONFIRMABLE " == *" $league "* ]]; then
-    write_agent "$BASE.$tag.lock" 900 "$RUN" sports_lock scan "$league" "$series" --confirm
-  else
-    write_agent "$BASE.$tag.lock" 900 "$RUN" sports_lock scan "$league" "$series"
-    echo "    note: $league has no 2nd feed — lock runs UNconfirmed (single-source)."
-  fi
-  write_agent "$BASE.$tag.devig" 7200 "$RUN" devig_check scan "$league" "$series"
-done
-write_agent "$BASE.eval" cal:40 "$RUN" sports_eval eval     # hourly resolve + score both logs
+echo "Installing ALL-SPORTS sweep (paper/data only) ..."
+write_agent "$BASE.lock"  "$LOCK_INTERVAL"  "$RUN" sports_lock scan --confirm   # every 15 min, all live series
+write_agent "$BASE.devig" "$DEVIG_INTERVAL" "$RUN" devig_check scan             # every 6 h, all live series
+write_agent "$BASE.eval"  cal:40            "$RUN" sports_eval eval             # hourly resolve + score
 
 echo ""
-echo "Done. Paper only — no orders. Tail: tail -f logs/sports.log"
-echo "Score:  python scripts/sports_eval.py eval         (PSR/DSR + calibration, after settled games)"
-echo "Reqs:   devig_check needs ODDS_API_KEY in .env (free key: the-odds-api.com; mind the ~500/mo quota)"
-echo "Awake:  launchd timers don't fire while asleep — keep the Mac awake during game windows"
-echo "        (caffeinate -dimsu &) or you'll miss live locks."
+echo "Done. Sweeps EVERY live per-game series automatically — no ticker config."
+echo "  lock  every ${LOCK_INTERVAL}s   devig every ${DEVIG_INTERVAL}s   eval hourly :40"
+echo "Tail:   tail -f logs/sports.log"
+echo "Score:  python scripts/sports_eval.py eval"
+echo "Reqs:   devig needs ODDS_API_KEY in .env (the-odds-api.com); sweep costs ~1 credit/live-league/run"
+echo "        — free tier ~500/mo, so raise DEVIG_INTERVAL if many leagues are in season."
+echo "Awake:  launchd won't fire while asleep — caffeinate -dimsu & during game windows."
 echo "Uninstall: bash scripts/launchd/install_sports_agents.sh --uninstall"

@@ -19,9 +19,11 @@ near-certainty is robust, like requiring 'evening + clearly off the peak' for we
 READ-ONLY / paper. Logs lock signals for forward-collection; places NO orders.
 Free data via ESPN's public scoreboard JSON (no key). Kalshi via the repo's client.
 
-  python scripts/sports_lock.py probe nba KXNBAGAMES          # RUN FIRST: ESPN + 2nd feed + ladder, VERIFY mapping
-  python scripts/sports_lock.py scan  nba KXNBAGAMES          # flag near-locked, mispriced moneylines
-  python scripts/sports_lock.py scan  nba KXNBAGAMES --confirm  # only fire if an independent feed agrees
+  python scripts/sports_lock.py scan                         # ALL live sports series (auto-discovered) — the default sweep
+  python scripts/sports_lock.py scan --confirm               # ...gating each confirmable league on its 2nd feed
+  python scripts/sports_lock.py probe                        # list every live per-game sports series on Kalshi
+  python scripts/sports_lock.py probe nba KXNBAGAMES         # one league: ESPN + 2nd feed + ladder, VERIFY mapping
+  python scripts/sports_lock.py scan  nba KXNBAGAMES         # one league only
   python scripts/sports_lock.py selftest
 
 ⚠ VERIFY two things with `probe` before trusting a signal: (1) the ESPN league matches
@@ -312,6 +314,50 @@ def fetch_market_ladder(series: str) -> list:
     return out
 
 
+def infer_league(text: str):
+    """Map a Kalshi series ticker/title to one of our league codes (None if we don't
+    model it). Order matters: WNBA before NBA (substring); college before the pros it
+    contains nothing of. Covers both sleeves — sports_lock skips ones it can't clock
+    (e.g. mlb), devig handles those."""
+    t = str(text).upper()
+    if "WNBA" in t:
+        return "wnba"
+    if "NBA" in t:
+        return "nba"
+    if "NHL" in t:
+        return "nhl"
+    if "NCAAF" in t or "COLLEGE FOOTBALL" in t:
+        return "ncaaf"
+    if "NCAAB" in t or "NCAAM" in t or "COLLEGE BASKETBALL" in t:
+        return "ncaab"
+    if "NFL" in t:
+        return "nfl"
+    if "MLB" in t:
+        return "mlb"
+    return None
+
+
+def discover_game_series() -> list:
+    """Live Kalshi per-game sports series → [(league, ticker, title)]. Reads
+    /series?category=Sports and keeps the ones whose league we recognize AND whose
+    ticker looks per-game (contains GAME), so player-props/futures series are skipped.
+    Auto-adapts to the season: off-season leagues simply have no live games to lock."""
+    from fetch_backtest_data import _kalshi_get
+    try:
+        data = _kalshi_get("/series", {"category": "Sports", "limit": 200})
+    except Exception as e:
+        print(f"! discover sports series: {e}", file=sys.stderr)
+        return []
+    seen, out = set(), []
+    for s in data.get("series", []) or []:
+        tk = (s.get("ticker") or "")
+        league = infer_league(tk + " " + (s.get("title") or ""))
+        if league and "GAME" in tk.upper() and tk not in seen:
+            seen.add(tk)
+            out.append((league, tk, s.get("title") or ""))
+    return out
+
+
 def _eval_game(g: dict, cfg: dict):
     """Pure-ish: given an in-progress game dict, return (leader_name, margin, tf,
     p, locked) or None if it isn't an evaluable in-progress game."""
@@ -355,7 +401,7 @@ def cmd_probe(args) -> None:
                  if s is not None else "UNAVAILABLE here (network) — verify locally"))
     else:
         print(f"\nSecondary feed: none for {args.league} (only {', '.join(SECONDARY)} "
-              "are confirmable; scan --confirm would suppress this league).")
+              "are confirmable; scan --confirm runs this league single-source).")
     ladder = fetch_market_ladder(args.series)
     print(f"\nKalshi ladder ({len(ladder)} markets):")
     for tk, title, sub, yes_p in ladder[:12]:
@@ -365,37 +411,41 @@ def cmd_probe(args) -> None:
           "side mapping will be wrong — fix match_team or pick the correct series.")
 
 
-def cmd_scan(args) -> None:
-    cfg = LEAGUES.get(args.league)
+def _write_hits(hits: list) -> None:
+    if hits:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a") as f:
+            for h in hits:
+                f.write(json.dumps(h) + "\n")
+
+
+def _scan_one(league: str, series: str, ts: str, confirm: bool):
+    """Scan ONE league/series → (hits, locked_games), printing the per-league confirm
+    note. --confirm gates only where a 2nd feed exists; a league without one runs
+    single-source (so 'scan all' still covers every sport)."""
+    cfg = LEAGUES.get(league)
     if not cfg:
-        print(f"unknown league {args.league}; known: {', '.join(LEAGUES)}")
-        return
-    ts = datetime.now(timezone.utc).isoformat()
+        return [], 0
     try:
         games = fetch_espn_games(cfg)
     except Exception as e:
-        print(f"! ESPN {args.league}: {e}", file=sys.stderr)
-        return
-    if getattr(args, "confirm", False):
-        fetcher = SECONDARY.get(args.league)
+        print(f"! ESPN {league}: {e}", file=sys.stderr)
+        return [], 0
+    if confirm:
+        fetcher = SECONDARY.get(league)
         if fetcher is None:
-            print(f"  --confirm: no independent second feed for {args.league}; "
-                  f"suppressing locks (only {', '.join(SECONDARY)} are confirmable).")
-            games = []
+            print(f"  [{league}] --confirm: no 2nd feed — running single-source.")
         else:
             secondary = fetcher(cfg)
             if secondary is None:
-                print("  --confirm: second feed unavailable (network/parse) — "
-                      "suppressing locks rather than trusting one source.")
+                print(f"  [{league}] --confirm: 2nd feed unavailable — suppressing locks.")
                 games = []
             else:
                 before = sum(1 for g in games if g.get("state") == "in")
                 games = reconcile(games, secondary)
-                print(f"  --confirm: {len(games)}/{before} in-progress games agree "
-                      f"across ESPN + the second feed.")
-    ladder = fetch_market_ladder(args.series)
-    hits = []
-    locked_games = 0
+                print(f"  [{league}] --confirm: {len(games)}/{before} in-progress games agree.")
+    ladder = fetch_market_ladder(series)
+    hits, locked_games = [], 0
     for g in games:
         ev = _eval_game(g, cfg)
         if not ev:
@@ -404,9 +454,8 @@ def cmd_scan(args) -> None:
         if not locked:
             continue
         locked_games += 1
-        # Pick the market for THIS game and decide which side backs the locked leader.
-        # The yes_sub_title names the YES outcome (e.g. "Boston Celtics"), so:
-        #   YES sub names the leader  → buy YES;  YES sub names the loser → buy NO.
+        # The yes_sub_title names the YES outcome (e.g. "Boston Celtics"):
+        #   YES sub names the leader → buy YES;  YES sub names the loser → buy NO.
         loser = g["home"] if leader == g["away"] else g["away"]
         match, outcome_is_yes = None, None
         for tk, title, sub, yes_p in ladder:
@@ -424,25 +473,69 @@ def cmd_scan(args) -> None:
         if sig is None:
             continue
         side, prob, edge = sig
-        rec = {"ts": ts, "league": args.league, "series": args.series, "ticker": tk,
-               "game": f"{g['away']} @ {g['home']}", "leader": leader,
-               "margin": margin, "time_frac": round(tf, 3), "win_prob": round(p, 4),
-               "side": side, "market_yes": yes_p, "edge": edge}
-        hits.append(rec)
-    if hits:
-        LOG.parent.mkdir(parents=True, exist_ok=True)
-        with LOG.open("a") as f:
-            for h in hits:
-                f.write(json.dumps(h) + "\n")
+        hits.append({"ts": ts, "league": league, "series": series, "ticker": tk,
+                     "game": f"{g['away']} @ {g['home']}", "leader": leader,
+                     "margin": margin, "time_frac": round(tf, 3), "win_prob": round(p, 4),
+                     "side": side, "market_yes": yes_p, "edge": edge})
+    return hits, locked_games
+
+
+def _print_scan_summary(label: str, hits: list, locked_games: int) -> None:
     flagged = [h for h in hits if h["edge"] is not None and h["edge"] > 0]
-    print(f"=== sports lock scan {args.league}/{args.series} — {locked_games} locked games, "
+    print(f"=== sports lock scan {label} — {locked_games} locked games, "
           f"{len(hits)} matched to markets, {len(flagged)} mispriced (edge>0) ===")
     for h in sorted(flagged, key=lambda x: -x["edge"])[:20]:
         print(f"  {h['ticker'][:30]:30} {h['side']:>3} {h['leader']} +{h['margin']:.0f} "
               f"({h['time_frac']*100:.0f}% left) mkt_yes {h['market_yes']} edge {h['edge']:+.2f}")
-    print("\n  Logged to data/sports_lock.jsonl. NOTE: top-of-book/last-price + a live "
-          "score that can still swing (runs, OT, injuries) — confirm fillability and that "
-          "the team mapping is right before trusting. Paper only.")
+
+
+def cmd_scan(args) -> None:
+    if not LEAGUES.get(args.league):
+        print(f"unknown league {args.league}; known: {', '.join(LEAGUES)}")
+        return
+    ts = datetime.now(timezone.utc).isoformat()
+    hits, locked = _scan_one(args.league, args.series, ts, getattr(args, "confirm", False))
+    _write_hits(hits)
+    _print_scan_summary(f"{args.league}/{args.series}", hits, locked)
+    print("\n  Logged to data/sports_lock.jsonl. Paper only — top-of-book + a live score "
+          "that can still swing; confirm fillability and team mapping before trusting.")
+
+
+def cmd_scan_all(args) -> None:
+    """Auto-discover every live per-game sports series and scan them all."""
+    ts = datetime.now(timezone.utc).isoformat()
+    series = discover_game_series()
+    modeled = [(lg, tk, ti) for lg, tk, ti in series if lg in LEAGUES]
+    skipped = sorted({lg for lg, _, _ in series if lg not in LEAGUES})
+    covered = ", ".join(sorted({lg for lg, _, _ in modeled})) or "none live"
+    print(f"=== sports lock scan ALL — {len(modeled)} live per-game series ({covered}) ===")
+    if skipped:
+        print(f"  (skipped {', '.join(skipped)}: no clock model in the lock — devig_check covers them)")
+    all_hits, total_locked = [], 0
+    for lg, tk, ti in modeled:
+        hits, locked = _scan_one(lg, tk, ts, getattr(args, "confirm", False))
+        total_locked += locked
+        all_hits += hits
+        if hits or locked:
+            _print_scan_summary(f"{lg}/{tk}", hits, locked)
+    _write_hits(all_hits)
+    flagged = [h for h in all_hits if h["edge"] is not None and h["edge"] > 0]
+    print(f"\nTOTAL across all live series: {total_locked} locked, {len(all_hits)} matched, "
+          f"{len(flagged)} mispriced. Logged to data/sports_lock.jsonl. Paper only.")
+
+
+def cmd_probe_all(args) -> None:
+    """List every live per-game sports series Kalshi exposes (the universe scan sweeps)."""
+    series = discover_game_series()
+    print(f"=== PROBE ALL — {len(series)} per-game sports series on Kalshi ===")
+    if not series:
+        print("  none discovered (off-season, or run on your home IP with Kalshi auth).")
+        return
+    for lg, tk, ti in series:
+        ladder = fetch_market_ladder(tk)
+        cover = "lock+devig" if lg in LEAGUES else "devig-only"
+        print(f"  {lg:6} {tk:22} {len(ladder):>3} open  [{cover}]  «{ti}»")
+    print("\nThen: `scan` (sweeps all)  |  `probe <league> <series>` for team-mapping detail.")
 
 
 def selftest() -> int:
@@ -499,6 +592,16 @@ def selftest() -> int:
     assert abs(_iso_clock_to_sec("PT00M30.0S") - 30.0) < 1e-6
     assert _iso_clock_to_sec("garbage") is None
     print("_iso_clock_to_sec OK")
+    # infer_league: specific codes, WNBA before NBA, None for sports we don't model
+    assert infer_league("KXNBAGAMES") == "nba"
+    assert infer_league("WNBA games") == "wnba"
+    assert infer_league("KXNHLGAMES") == "nhl"
+    assert infer_league("KXNCAAFGAMES") == "ncaaf"
+    assert infer_league("College basketball game") == "ncaab"
+    assert infer_league("KXNFLGAMES") == "nfl"
+    assert infer_league("KXMLBGAMES") == "mlb"
+    assert infer_league("Wimbledon mens winner") is None
+    print("infer_league OK")
     print("PASS")
     return 0
 
@@ -507,17 +610,24 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["probe", "scan", "selftest"])
-    ap.add_argument("league", nargs="?", help=f"one of: {', '.join(LEAGUES)}")
+    ap.add_argument("league", nargs="?",
+                    help=f"one of: {', '.join(LEAGUES)} — omit (or 'all') to sweep every live series")
     ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXNBAGAMES")
     ap.add_argument("--confirm", action="store_true",
-                    help="require an independent second feed to agree on score+clock "
-                         f"before a lock fires (available: {', '.join(SECONDARY)})")
+                    help="gate each confirmable league on an independent 2nd feed agreeing on "
+                         f"score+clock (available: {', '.join(SECONDARY)}; others run single-source)")
     args = ap.parse_args()
     if args.mode == "selftest":
         raise SystemExit(selftest())
-    if not args.league or not args.series:
-        ap.error(f"{args.mode} needs a league and a Kalshi series, e.g. {args.mode} nba KXNBAGAMES")
-    (cmd_probe if args.mode == "probe" else cmd_scan)(args)
+    all_mode = args.league is None or args.league.lower() == "all"
+    if args.mode == "probe":
+        cmd_probe_all(args) if all_mode else cmd_probe(args)
+    elif all_mode:
+        cmd_scan_all(args)
+    elif not args.series:
+        ap.error("scan needs a series (e.g. scan nba KXNBAGAMES) — or omit league to sweep ALL")
+    else:
+        cmd_scan(args)
 
 
 if __name__ == "__main__":

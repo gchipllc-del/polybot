@@ -88,6 +88,15 @@ hindsight, the right outcome. Do not un-pause anything.
   edge assumes Kalshi is wrong *relative to the sharp book*, which it may not be; that's
   why it's paired with pypbo/netcal (validate by per-day PSR on `data/devig_check.jsonl`
   before real money). selftest green. Paper only.
+- **sports sleeves — all-sports sweep** (NEW): both `sports_lock` and `devig_check`
+  now default to scanning EVERY live per-game series. `scan`/`probe` with no league
+  auto-discover via Kalshi `/series?category=Sports` (`discover_game_series`) and map
+  each to a league (`infer_league`); no hardcoded tickers, auto-adapts to season.
+  `--confirm` is now per-league lenient (confirmable leagues gated on a 2nd feed, others
+  single-source) so the sweep covers every sport. devig adds **mlb** (no clock needed);
+  the lock skips mlb. launchd installer simplified to three agents (lock sweep / devig
+  sweep / eval) with no PAIRS config. Watch the Odds API quota: a devig sweep costs ~1
+  credit per live league per run.
 - **sports_lock — two-source confirmation gate** (NEW): `scan --confirm` only fires a
   lock when an INDEPENDENT-origin feed (NBA.com CDN / NHLE, different servers from ESPN,
   no new deps) agrees on score + period + clock (within `CLOCK_TOL_SEC`). Kills the
