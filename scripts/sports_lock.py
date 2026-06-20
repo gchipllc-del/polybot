@@ -337,11 +337,18 @@ def infer_league(text: str):
     return None
 
 
+def _is_per_game(ticker: str) -> bool:
+    """True only for per-game moneyline series. The ticker must END in GAME/GAMES —
+    this drops prop series that merely CONTAIN 'game', e.g. KXNFLGAMESACK (Pro Football
+    Sacks) or KXNFLGAMESPREAD, which aren't team-win markets the lock/devig can price."""
+    return str(ticker).upper().endswith(("GAME", "GAMES"))
+
+
 def discover_game_series() -> list:
     """Live Kalshi per-game sports series → [(league, ticker, title)]. Reads
     /series?category=Sports and keeps the ones whose league we recognize AND whose
-    ticker looks per-game (contains GAME), so player-props/futures series are skipped.
-    Auto-adapts to the season: off-season leagues simply have no live games to lock."""
+    ticker is per-game (ends in GAME/GAMES — see _is_per_game), so player-props/futures
+    series are skipped. Auto-adapts to the season: off-season leagues have no live games."""
     from fetch_backtest_data import _kalshi_get
     try:
         data = _kalshi_get("/series", {"category": "Sports", "limit": 200})
@@ -352,7 +359,7 @@ def discover_game_series() -> list:
     for s in data.get("series", []) or []:
         tk = (s.get("ticker") or "")
         league = infer_league(tk + " " + (s.get("title") or ""))
-        if league and "GAME" in tk.upper() and tk not in seen:
+        if league and _is_per_game(tk) and tk not in seen:
             seen.add(tk)
             out.append((league, tk, s.get("title") or ""))
     return out
@@ -602,6 +609,12 @@ def selftest() -> int:
     assert infer_league("KXMLBGAMES") == "mlb"
     assert infer_league("Wimbledon mens winner") is None
     print("infer_league OK")
+    # _is_per_game: keep series ending in GAME/GAMES; drop props that merely contain it
+    assert _is_per_game("KXMLBGAME") and _is_per_game("KXNBAGAMES") and _is_per_game("KXWNBAGAME")
+    assert not _is_per_game("KXNFLGAMESACK")     # Pro Football Sacks (prop)
+    assert not _is_per_game("KXNFLGAMESPREAD")
+    assert not _is_per_game("KXNBASERIES")
+    print("_is_per_game OK")
     print("PASS")
     return 0
 
