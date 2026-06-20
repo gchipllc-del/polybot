@@ -16,8 +16,8 @@ only exists if Kalshi is mispriced *relative to that*, net of fees.
 READ-ONLY / paper. Logs signals for forward-collection; places NO orders.
 Odds via The Odds API (free key in env ODDS_API_KEY); Kalshi via the repo client.
 
-  python scripts/devig_check.py probe nba KXNBAGAME   # RUN FIRST: odds + devig + Kalshi ladder, VERIFY mapping
-  python scripts/devig_check.py scan  nba KXNBAGAME   # flag Kalshi YES mispriced vs sharp fair prob
+  python scripts/devig_check.py probe nba KXNBAGAMES   # RUN FIRST: odds + devig + Kalshi ladder, VERIFY mapping
+  python scripts/devig_check.py scan  nba KXNBAGAMES   # flag Kalshi YES mispriced vs sharp fair prob
   python scripts/devig_check.py selftest
 
 ⚠ Edge here depends on Kalshi being inefficient *relative to the sharp book* — it may
@@ -363,12 +363,12 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["probe", "scan", "selftest"])
     ap.add_argument("league", nargs="?", help=f"one of: {', '.join(SPORTS)}")
-    ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXNBAGAME")
+    ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXNBAGAMES")
     args = ap.parse_args()
     if args.mode == "selftest":
         raise SystemExit(selftest())
     if not args.league or not args.series:
-        ap.error(f"{args.mode} needs a league and a Kalshi series, e.g. {args.mode} nba KXNBAGAME")
+        ap.error(f"{args.mode} needs a league and a Kalshi series, e.g. {args.mode} nba KXNBAGAMES")
     (cmd_probe if args.mode == "probe" else cmd_scan)(args)
 
 

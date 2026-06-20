@@ -19,9 +19,9 @@ near-certainty is robust, like requiring 'evening + clearly off the peak' for we
 READ-ONLY / paper. Logs lock signals for forward-collection; places NO orders.
 Free data via ESPN's public scoreboard JSON (no key). Kalshi via the repo's client.
 
-  python scripts/sports_lock.py probe nba KXNBAGAME          # RUN FIRST: ESPN + 2nd feed + ladder, VERIFY mapping
-  python scripts/sports_lock.py scan  nba KXNBAGAME          # flag near-locked, mispriced moneylines
-  python scripts/sports_lock.py scan  nba KXNBAGAME --confirm  # only fire if an independent feed agrees
+  python scripts/sports_lock.py probe nba KXNBAGAMES          # RUN FIRST: ESPN + 2nd feed + ladder, VERIFY mapping
+  python scripts/sports_lock.py scan  nba KXNBAGAMES          # flag near-locked, mispriced moneylines
+  python scripts/sports_lock.py scan  nba KXNBAGAMES --confirm  # only fire if an independent feed agrees
   python scripts/sports_lock.py selftest
 
 ⚠ VERIFY two things with `probe` before trusting a signal: (1) the ESPN league matches
@@ -504,7 +504,7 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["probe", "scan", "selftest"])
     ap.add_argument("league", nargs="?", help=f"one of: {', '.join(LEAGUES)}")
-    ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXNBAGAME")
+    ap.add_argument("series", nargs="?", help="Kalshi series ticker, e.g. KXNBAGAMES")
     ap.add_argument("--confirm", action="store_true",
                     help="require an independent second feed to agree on score+clock "
                          f"before a lock fires (available: {', '.join(SECONDARY)})")
@@ -512,7 +512,7 @@ def main() -> None:
     if args.mode == "selftest":
         raise SystemExit(selftest())
     if not args.league or not args.series:
-        ap.error(f"{args.mode} needs a league and a Kalshi series, e.g. {args.mode} nba KXNBAGAME")
+        ap.error(f"{args.mode} needs a league and a Kalshi series, e.g. {args.mode} nba KXNBAGAMES")
     (cmd_probe if args.mode == "probe" else cmd_scan)(args)
 
 

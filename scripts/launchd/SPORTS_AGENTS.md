@@ -7,13 +7,19 @@ LaunchAgents. Runners live here; the live `.plist` files in
 ## Install
 ```bash
 # verify tickers + mappings FIRST (per league you'll run):
-python scripts/kalshi_survey.py --drill "Sports"      # find liquid series tickers
-python scripts/sports_lock.py  probe nba KXNBAGAME    # ESPN ↔ Kalshi + 2nd-feed check
-python scripts/devig_check.py  probe nba KXNBAGAME    # OddsAPI ↔ Kalshi (needs ODDS_API_KEY)
+python scripts/kalshi_survey.py --drill "Sports"      # find the LIVE series tickers
+python scripts/sports_lock.py  probe nba KXNBAGAMES   # ESPN ↔ Kalshi + 2nd-feed check
+python scripts/devig_check.py  probe nba KXNBAGAMES   # OddsAPI ↔ Kalshi (needs ODDS_API_KEY)
 
-PAIRS="nba:KXNBAGAME nhl:KXNHLGAME" bash scripts/launchd/install_sports_agents.sh
+# KXNBAGAMES = NBA per-game series (note the plural). NHL/NFL game-series tickers are
+# season-dependent — confirm each in kalshi_survey, then add them as more pairs:
+PAIRS="nba:KXNBAGAMES" bash scripts/launchd/install_sports_agents.sh
 caffeinate -dimsu &     # launchd won't fire while asleep — stay awake during games
 ```
+
+> **Season check:** NBA/NHL/NFL only have open game-markets in season. Off-season the
+> survey shows `open=0 vol=0` and scans find nothing to do — that's expected, not a bug.
+> Install when the league is actually playing.
 
 ## What runs (`com.jesse.polybot.sports.*`)
 | Agent | Fires | Does |

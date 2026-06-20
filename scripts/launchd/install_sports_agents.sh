@@ -11,17 +11,19 @@
 # Plus ONE shared sports_eval agent hourly at :40 (resolve settled games → PSR/DSR +
 # calibration across BOTH logs).
 #
-#   bash scripts/launchd/install_sports_agents.sh                                  # default: nba
-#   PAIRS="nba:KXNBAGAME nhl:KXNHLGAME nfl:KXNFLGAME" bash scripts/launchd/install_sports_agents.sh
+#   bash scripts/launchd/install_sports_agents.sh                          # default: nba (KXNBAGAMES)
+#   PAIRS="nba:KXNBAGAMES nhl:<series>" bash scripts/launchd/install_sports_agents.sh
 #   bash scripts/launchd/install_sports_agents.sh --uninstall
 #
-# FIRST verify each pair's series ticker + team mapping (and 2nd-feed availability):
-#   python scripts/kalshi_survey.py --drill "Sports"     # find liquid series tickers
-#   python scripts/sports_lock.py probe nba KXNBAGAME    # confirm ESPN↔Kalshi + 2nd feed
-#   python scripts/devig_check.py probe nba KXNBAGAME    # confirm OddsAPI↔Kalshi (needs ODDS_API_KEY)
+# Series tickers are SEASON-DEPENDENT and must be confirmed — KXNBAGAMES is the NBA
+# per-game series (note the plural 'S'); the NHL/NFL game series only list when in
+# season. FIRST verify each pair's ticker + team mapping (and 2nd-feed availability):
+#   python scripts/kalshi_survey.py --drill "Sports"      # find the live series tickers
+#   python scripts/sports_lock.py probe nba KXNBAGAMES    # confirm ESPN↔Kalshi + 2nd feed
+#   python scripts/devig_check.py probe nba KXNBAGAMES    # confirm OddsAPI↔Kalshi (needs ODDS_API_KEY)
 set -euo pipefail
 
-PAIRS="${PAIRS:-nba:KXNBAGAME}"
+PAIRS="${PAIRS:-nba:KXNBAGAMES}"
 CONFIRMABLE="nba nhl"            # leagues with an independent 2nd feed (see sports_lock SECONDARY)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"

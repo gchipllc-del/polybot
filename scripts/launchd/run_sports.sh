@@ -2,8 +2,8 @@
 # sports sleeves runner — dispatches to sports_lock / devig_check / sports_eval.
 # Paper/data only — places NO orders. Sources .env (Kalshi + ODDS_API_KEY).
 #
-# Usage:  run_sports.sh sports_lock scan nba KXNBAGAME --confirm
-#         run_sports.sh devig_check scan nba KXNBAGAME
+# Usage:  run_sports.sh sports_lock scan nba KXNBAGAMES --confirm
+#         run_sports.sh devig_check scan nba KXNBAGAMES
 #         run_sports.sh sports_eval  eval
 set -euo pipefail
 
