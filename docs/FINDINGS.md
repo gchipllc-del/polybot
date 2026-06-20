@@ -64,7 +64,15 @@ hindsight, the right outcome. Do not un-pause anything.
 
 - **fc2s** — forecast two-sided (bets on *forecast skill*, a different hypothesis
   than the price-fade above). Thin so far; the early "+$5.43" was NY-on-one-day,
-  never significant. Keep accumulating; judge by per-day PSR.
+  never significant. Keep accumulating; judge by per-day PSR. ABOVE-strike (tail)
+  trades stay VETOED (σ=3 claimed ~73% exceedance, realized ~18%).
+- **fc2s_shadow** (NEW) — measurement-only collector that re-enables the vetoed tail.
+  Decoupled from trading (never books, own ledger): logs the day-ahead forecast high
+  per city-day, fills the realized high after, so the (forecast, realized) error
+  distribution accrues. `report` shows measured bias/σ and an exceedance-calibration
+  table — model(σ=3) vs realized vs a recalibrated(bias+σ̂) prediction — so the tail
+  can be re-enabled with measured params once recal≈realized. Runs hourly via the
+  weather-fade installer (collect :34, settle :48). selftest green.
 - **ensemble_collect** — forward A/B of an ensemble forecast vs flat σ=3. Still
   accumulating settled rows; needs ~200+ over ~15–20 days before `eval`.
 - **bucket_arb** — structural (prediction-free) arbitrage on Kalshi

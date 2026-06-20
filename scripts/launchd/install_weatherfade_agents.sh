@@ -14,10 +14,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN="$PROJECT_ROOT/scripts/launchd/run_weather_fade.sh"
 RUN_DASH="$PROJECT_ROOT/scripts/launchd/run_weather_fade_dash.sh"
 RUN_FC2S="$PROJECT_ROOT/scripts/launchd/run_fc2s.sh"
+RUN_SHADOW="$PROJECT_ROOT/scripts/launchd/run_fc2s_shadow.sh"
 RUN_ENS="$PROJECT_ROOT/scripts/launchd/run_ensemble.sh"
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS"
-chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" "$RUN_ENS" 2>/dev/null || true
+chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" "$RUN_SHADOW" "$RUN_ENS" 2>/dev/null || true
 
 # write_agent LABEL  CADENCE  RUNNER  [args...]
 #   CADENCE: a number    = StartInterval seconds (fires at load too)
@@ -71,6 +72,11 @@ echo "Installing weather sleeve agents (PROJECT_ROOT=$PROJECT_ROOT) ..."
 write_agent "$P.fc2ssettle"    cal:12 "$RUN_FC2S" settle
 write_agent "$P.fc2sscan"      cal:20 "$RUN_FC2S" scan --thr 0.05
 write_agent "$P.enscollect"    cal:26 "$RUN_ENS" collect
+# fc2s_shadow: measurement-only tail-recalibration collector (NEVER trades). Logs
+# day-ahead forecast highs (:34) and fills realized highs (:48) so the forecast-error
+# distribution accrues even while above-strike trading stays vetoed.
+write_agent "$P.fc2sshadowcollect" cal:34 "$RUN_SHADOW" collect
+write_agent "$P.fc2sshadowsettle"  cal:48 "$RUN_SHADOW" settle
 write_agent "$P.enssettle"     cal:56 "$RUN_ENS" settle
 # dashboard — file render every 5 min (the reliable view: open the HTML file).
 # Now shows honest "retired/stale" banners; still renders the fc2s + ensemble panels.
@@ -87,6 +93,7 @@ launchctl list 2>/dev/null | grep weatherfade || echo "  (none listed — check 
 echo ""
 echo "Dashboard (file): open $PROJECT_ROOT/data/weather_fade_dash.html"
 echo "Scorecards: python scripts/fc_two_sided.py report   |   python scripts/ensemble_collect.py status"
+echo "Tail recal: python scripts/fc2s_shadow.py report   (measured bias/σ + exceedance calibration)"
 echo "NOTE: staggered agents fire at their minute-of-hour (fc2ssettle :12, fc2sscan :20,"
 echo "      enscollect :26, enssettle :56) — first runs happen within the next hour, NOT at install."
 echo "NOTE: caffeinate is now a MANAGED KeepAlive agent (auto-starts at login, respawns if"
