@@ -225,18 +225,20 @@ def _iso_clock_to_sec(s: str):
         return None
 
 
-def fetch_nba_cdn_games(cfg: dict):
+def fetch_nba_cdn_games(cfg: dict, debug: bool = False):
     """SECONDARY (NBA only): NBA.com's live CDN scoreboard — a DIFFERENT origin from
     ESPN, so it's a real independent confirmation. No key. Returns the normalized game
     shape, or None if unavailable (so --confirm can tell 'no second opinion' apart from
-    'no agreement'). ⚠ verify locally: this sandbox blocks the network."""
+    'no agreement'). Pass debug=True (probe does) to print WHY it failed."""
     import requests
     try:
         r = requests.get("https://cdn.nba.com/static/json/liveData/scoreboard/"
                          "todaysScoreboard_00.json", timeout=20)
         r.raise_for_status()
         games = (r.json().get("scoreboard") or {}).get("games") or []
-    except Exception:
+    except Exception as e:
+        if debug:
+            print(f"  [nba 2nd feed] {type(e).__name__}: {e}", file=sys.stderr)
         return None
     out = []
     for g in games:
@@ -252,16 +254,18 @@ def fetch_nba_cdn_games(cfg: dict):
     return out
 
 
-def fetch_nhl_api_games(cfg: dict):
+def fetch_nhl_api_games(cfg: dict, debug: bool = False):
     """SECONDARY (NHL only): NHLE's public score feed (api-web.nhle.com) — independent
-    of ESPN. No key. Returns the normalized shape or None if unavailable.
-    ⚠ verify locally: this sandbox blocks the network."""
+    of ESPN. No key. Returns the normalized shape or None if unavailable. Pass
+    debug=True (probe does) to print WHY it failed."""
     import requests
     try:
         r = requests.get("https://api-web.nhle.com/v1/score/now", timeout=20)
         r.raise_for_status()
         games = r.json().get("games") or []
-    except Exception:
+    except Exception as e:
+        if debug:
+            print(f"  [nhl 2nd feed] {type(e).__name__}: {e}", file=sys.stderr)
         return None
     out = []
     for g in games:
@@ -344,7 +348,7 @@ def cmd_probe(args) -> None:
               f"{g['away_score']}-{g['home_score']} Q{g['period']}{tag}")
     sec = SECONDARY.get(args.league)
     if sec is not None:
-        s = sec(cfg)
+        s = sec(cfg, debug=True)
         n = sum(1 for g in (s or []) if g.get("state") == "in")
         print(f"\nSecondary feed ({args.league}): "
               + (f"available, {n} in-progress — scan --confirm will gate on it"
