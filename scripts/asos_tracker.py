@@ -61,8 +61,17 @@ STATIONS = {
 }
 
 LOCK_MIN_HOUR = 19      # local hour after which the daily high is almost always set
-LOCK_MIN_DROP = 2.0     # °F current temp must be below the realized high (clearly past peak)
-BOUNDARY_MARGIN = 1.0   # °F: don't trust a lock within this of a bucket edge (T-group/revision risk)
+LOCK_MIN_DROP = 3.0     # °F current temp must be below the realized high (clearly past peak)
+# Mode-aware margins (from the asos_segment.py diagnosis, 2026-06-21). Two failure modes:
+#  · "Mode B" — raw 1-min ASOS overshoots the QC'd NWS CLI max that Kalshi settles on,
+#    worst on hot days. So YES locks compare against qc_high (isolated spikes removed,
+#    see _qc_temps) and must clear the strike by YES_MARGIN to absorb residual overshoot.
+#  · "Mode A" — the day can still warm after the evening lock, beating a thin NO. So NO
+#    locks compare against the raw high (a conservative upper bound) and need NO_MARGIN
+#    of headroom below the strike.
+YES_MARGIN = 4.0
+NO_MARGIN = 3.0
+SPIKE_TOL = 2.5         # °F: a reading with no neighbour within this is treated as a spike
 NEAR_CERTAIN = 0.98     # prob we assign a locked outcome (not 1.0 — CLI can still revise)
 
 
@@ -75,13 +84,51 @@ def _local_hour(iso_local: str):
         return None
 
 
+def _minute_index(iso) -> int | None:
+    """Rough within-day minute index from an IEM timestamp ('YYYY-MM-DD HH:MM' or with
+    a 'T'). Only used for same-day time *differences*, so day-of-month granularity is
+    enough; returns None if unparseable."""
+    try:
+        s = str(iso).replace("T", " ")
+        date_part, time_part = s.split(" ")[0], s.split(" ")[1]
+        dd = int(date_part.split("-")[2])
+        hh, mm = (int(x) for x in time_part.split(":")[:2])
+        return (dd * 24 + hh) * 60 + mm
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _qc_high(pts: list, tol: float = SPIKE_TOL, window_min: int = 30) -> float:
+    """QC'd daily high: the highest reading corroborated by *another* reading within
+    `window_min` minutes to within `tol`°F. On dense feeds (1-min ASOS) this drops lone
+    sensor spikes — the "Mode B" phantom that raw max() catches but the QC'd NWS CLI max
+    rejects. On sparse feeds (hourly METARs) nothing falls inside the window, so it falls
+    back to the raw max and never corrupts a genuine peak. NOTE: does NOT fix a
+    consistently-wrong station (use `probe`) — validate against settled CLI maxes."""
+    vals = [v for _, v in pts]
+    times = [_minute_index(t) for t, _ in pts]
+    raw = max(vals)
+    for i in sorted(range(len(vals)), key=lambda k: -vals[k]):       # high → low
+        if times[i] is None:
+            continue
+        for j in range(len(vals)):
+            if j == i or times[j] is None:
+                continue
+            if abs(times[i] - times[j]) <= window_min and abs(vals[i] - vals[j]) <= tol:
+                return vals[i]                                       # corroborated
+    return raw                                                       # sparse → trust raw
+
+
 def realized_high(obs: list):
-    """obs = [(iso_local_time, tmpf), …] → dict(high, last_temp, last_time, n) or None."""
+    """obs = [(iso_local_time, tmpf), …] → dict(high, qc_high, last_temp, last_time, n)
+    or None. `high` is the raw max (conservative upper bound, used for NO locks);
+    `qc_high` removes lone spikes (used for YES locks) to approximate the QC'd NWS CLI
+    daily max Kalshi settles on."""
     pts = [(t, float(v)) for t, v in obs if v not in (None, "", "M")]
     if not pts:
         return None
-    return {"high": max(v for _, v in pts), "last_temp": pts[-1][1],
-            "last_time": pts[-1][0], "n": len(pts)}
+    return {"high": max(v for _, v in pts), "qc_high": _qc_high(pts),
+            "last_temp": pts[-1][1], "last_time": pts[-1][0], "n": len(pts)}
 
 
 def is_locked(local_hr, high, last_temp,
@@ -94,23 +141,28 @@ def is_locked(local_hr, high, last_temp,
 
 
 def lock_signal(kind: str, strike: float, high: float, market_yes,
-                margin: float = BOUNDARY_MARGIN):
+                qc_high: float = None,
+                yes_margin: float = YES_MARGIN, no_margin: float = NO_MARGIN):
     """Given a LOCKED realized high, is a bucket near-certain and mispriced?
     Returns (side, certain_prob, edge) or None if too close to a boundary to trust.
-    edge = certain_prob − market's implied prob for that side (positive = mispriced
-    in our favor). market_yes may be None (then edge=None, signal still shown)."""
+    YES decisions use `qc_high` (spikes removed — defends against the Mode B overshoot);
+    NO decisions use the raw `high` (a conservative upper bound) with extra headroom for
+    late-day warming (Mode A). edge = certain_prob − market's implied prob for that side
+    (positive = mispriced in our favor). market_yes may be None (edge=None, signal shown)."""
     from join_weather_trials import BAND_HALF_WIDTH
-    yes_is, no_is = None, None
+    if qc_high is None:
+        qc_high = high
+    yes_is = None
     if kind == "above":
-        if high >= strike + margin:
+        if qc_high >= strike + yes_margin:
             yes_is = True
-        elif high <= strike - margin:
+        elif high <= strike - no_margin:
             yes_is = False
     elif kind == "band":
         lo, hi = strike - BAND_HALF_WIDTH, strike + BAND_HALF_WIDTH
-        if lo + margin <= high <= hi - margin:
+        if lo + yes_margin <= qc_high <= hi - yes_margin:
             yes_is = True
-        elif high <= lo - margin or high >= hi + margin:
+        elif qc_high >= hi + yes_margin or high <= lo - no_margin:
             yes_is = False
     if yes_is is None:
         return None                                   # within margin of an edge → skip
@@ -246,13 +298,14 @@ def cmd_scan(args) -> None:
         for tk, kind, strike, yes_p in fetch_market_ladder(s):
             if tk in seen:
                 continue                                # already locked this market earlier
-            sig = lock_signal(kind, strike, rh["high"], yes_p)
+            sig = lock_signal(kind, strike, rh["high"], yes_p, qc_high=rh["qc_high"])
             if sig is None:
                 continue
             side, prob, edge = sig
             rec = {"ts": ts, "series": s, "station": station, "ticker": tk,
                    "kind": kind, "strike": strike, "realized_high": rh["high"],
-                   "last_temp": rh["last_temp"], "side": side, "market_yes": yes_p,
+                   "qc_high": rh["qc_high"], "last_temp": rh["last_temp"],
+                   "side": side, "market_yes": yes_p,
                    "edge": edge, "status": "open", "result": "", "paper_pnl": None,
                    "resolved_at": ""}
             hits.append(rec)
@@ -347,31 +400,41 @@ def cmd_report(args) -> None:
 
 
 def selftest() -> int:
-    # realized high
+    # realized high — sparse (hourly) feed: qc_high falls back to the raw max
     rh = realized_high([("2026-06-19T13:00", 80), ("2026-06-19T17:00", 88),
                         ("2026-06-19T20:00", 79)])
-    assert rh["high"] == 88 and rh["last_temp"] == 79, rh
-    print("realized_high OK")
+    assert rh["high"] == 88 and rh["qc_high"] == 88 and rh["last_temp"] == 79, rh
+    # dense feed: a lone spike (99) is uncorroborated → dropped; corroborated peak (91) kept
+    rhd = realized_high([("2026-06-19 14:00", 90), ("2026-06-19 14:05", 91),
+                         ("2026-06-19 14:10", 90), ("2026-06-19 14:15", 99),
+                         ("2026-06-19 14:20", 90)])
+    assert rhd["high"] == 99 and rhd["qc_high"] == 91, rhd
+    print("realized_high OK (sparse fallback + dense spike drop)")
     # lock: evening + clearly off the peak
     assert is_locked(20, 88, 79) is True
     assert is_locked(14, 88, 87) is False          # midday, still near peak
     assert is_locked(20, 88, 87) is False          # evening but barely dropped
     print("is_locked OK")
-    # lock_signal — above strike, realized clearly above → YES near-certain, mispriced
-    sig = lock_signal("above", 85.0, 88.0, market_yes=0.60)
+    # lock_signal — YES uses qc_high and must clear the strike by YES_MARGIN (4°F)
+    sig = lock_signal("above", 83.0, 88.0, market_yes=0.60)          # qc=high=88 ≥ 83+4
     assert sig == ("YES", 0.98, 0.38), sig
-    # above strike, realized clearly below → NO near-certain
+    # Mode B: raw high clears the strike but qc_high (spike-removed) does not → no YES
+    assert lock_signal("above", 88.0, 95.0, market_yes=0.5, qc_high=90.0) is None
+    # qc_high clears the strike by the margin → YES (regardless of the raw high)
+    assert lock_signal("above", 85.0, 95.0, market_yes=0.5, qc_high=90.0)[0] == "YES"
+    # NO uses the raw high and needs NO_MARGIN (3°F) of headroom below the strike
     sig = lock_signal("above", 92.0, 88.0, market_yes=0.30)
     assert sig[0] == "NO" and abs(sig[2] - (0.30 - 0.02)) < 1e-9, sig
-    # within boundary margin → no signal (T-group/revision risk)
+    # Mode A: a thin NO (high only 1°F under the strike) is now rejected
+    assert lock_signal("above", 89.0, 88.0, market_yes=0.30) is None
+    # within margin of the edge → no signal
     assert lock_signal("above", 88.5, 88.0, market_yes=0.5) is None
-    # band: a 1°F-wide band CAN'T be safely locked with a 1°F margin (honest:
-    # T-group/revision risk) → None at default margin, YES only with tight margin.
+    # band: too narrow to lock at the default YES margin; only lockable with a tight margin
     assert lock_signal("band", 88.0, 88.0, market_yes=0.4) is None
-    assert lock_signal("band", 88.0, 88.0, market_yes=0.4, margin=0.3)[0] == "YES"
-    # band: realized well outside → NO (works at default margin)
+    assert lock_signal("band", 88.0, 88.0, market_yes=0.4, yes_margin=0.3)[0] == "YES"
+    # band: realized well above the band → NO
     assert lock_signal("band", 80.0, 88.0, market_yes=0.4)[0] == "NO"
-    print("lock_signal OK (above/band, YES/NO, boundary-margin skip; tight bands not lockable)")
+    print("lock_signal OK (qc-gated YES, raw-gated NO, Mode A/B margins, band)")
     # P&L: YES locked at 0.60 cost, wins → +0.40; loses → −0.60
     assert lock_pnl("YES", 0.60, "yes") == 0.40, lock_pnl("YES", 0.60, "yes")
     assert lock_pnl("YES", 0.60, "no") == -0.60

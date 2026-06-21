@@ -104,9 +104,10 @@ def main() -> None:
             gap = f", high−strike={float(r.get('realized_high')) - float(r.get('strike')):+.0f}"
         except (TypeError, ValueError):
             pass
+        qc = f" qc_high {r.get('qc_high')}" if r.get("qc_high") is not None else ""
         print(f"  {_date(r)}  {r.get('series', '?'):<12} [{r.get('station', '?'):<5}] "
               f"strike {r.get('strike')} side {r.get('side')} "
-              f"realized_high {r.get('realized_high')} -> result {r.get('result')}{gap} "
+              f"realized_high {r.get('realized_high')}{qc} -> result {r.get('result')}{gap} "
               f"(yes_px {r.get('market_yes')})")
 
 
