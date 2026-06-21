@@ -57,4 +57,19 @@ else
   echo "Logs: $PROJECT_ROOT/logs/com.jesse.polybot.dashboard.log (+ .kalshi_dashboard.log)"
   echo "      $PROJECT_ROOT/logs/weather_fade_dash.log"
   echo "Status: launchctl list | grep -E 'dashboard|dashserve'"
+  # Self-verify: the unload/reload restarts each server and they take ~1-2s to bind,
+  # so wait before health-checking (avoids a false "couldn't connect" right after load).
+  if command -v curl >/dev/null 2>&1; then
+    echo "Verifying (giving the servers a moment to bind)…"
+    sleep 4
+    for entry in "main 5050" "weather 5052" "kalshi 5053"; do
+      name="${entry% *}"; port="${entry#* }"
+      code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "http://localhost:$port/" 2>/dev/null || echo 000)
+      if [ "$code" = "200" ]; then
+        echo "  ✓ $name  :$port → HTTP 200"
+      else
+        echo "  ⚠ $name  :$port → HTTP $code (may still be binding; re-check: curl -I http://localhost:$port)"
+      fi
+    done
+  fi
 fi
