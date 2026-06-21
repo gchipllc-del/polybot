@@ -43,13 +43,18 @@ EOF
 
 mk "com.jesse.polybot.dashboard"        "$SCRIPT_DIR/run_dashboard.sh"
 mk "com.jesse.polybot.kalshi_dashboard" "$SCRIPT_DIR/run_kalshi_dashboard.sh"
+# Weather research view (fade + fc2s + ensemble). run_weather_fade_dash.sh with no
+# args defaults to `serve --port 5052`; embedded inline in the main dashboard.
+mk "com.jesse.polybot.weatherfade.dashserve" "$SCRIPT_DIR/run_weather_fade_dash.sh"
 
 if [ "$UNINSTALL" = "1" ]; then
   echo "dashboards uninstalled."
 else
   echo "Done — serving from $PROJECT_ROOT:"
-  echo "  main:   http://localhost:5050"
-  echo "  kalshi: http://localhost:5053"
+  echo "  main:    http://localhost:5050"
+  echo "  kalshi:  http://localhost:5053"
+  echo "  weather: http://localhost:5052  (also embedded in the main dashboard)"
   echo "Logs: $PROJECT_ROOT/logs/com.jesse.polybot.dashboard.log (+ .kalshi_dashboard.log)"
-  echo "Status: launchctl list | grep dashboard"
+  echo "      $PROJECT_ROOT/logs/weather_fade_dash.log"
+  echo "Status: launchctl list | grep -E 'dashboard|dashserve'"
 fi

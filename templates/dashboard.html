@@ -84,6 +84,34 @@
         </div>
     </div>
 
+    <!-- Weather research (paper sleeves). Served by weather_fade_dash on :5052 and
+         embedded here so weather shows alongside crypto. Uses location.hostname so it
+         works from localhost AND phone/LAN. Blank panel = the :5052 server isn't up. -->
+    <div class="grid">
+        <div class="card full" id="weather-research-card">
+            <h2>🌦️ Weather Research (paper)
+                <a id="weather-open-link" href="#" target="_blank" rel="noopener"
+                   style="font-size:0.58em;padding:3px 12px;border-radius:4px;margin-left:10px;vertical-align:middle;background:#0d1117;border:1px solid #58a6ff;color:#58a6ff;text-decoration:none;font-weight:700">open full ↗</a>
+            </h2>
+            <div style="color:#8b949e;font-size:0.85em;margin:2px 0 8px 0">
+                fade · fc2s · ensemble — a separate paper bankroll from the crypto sleeves above.
+                Blank? The weather view server isn't running:
+                <code>bash scripts/launchd/install_dashboard_agents.sh</code>
+            </div>
+            <iframe id="weather-iframe" title="Weather research dashboard"
+                    style="width:100%;height:820px;border:1px solid #30363d;border-radius:6px;background:#0d1117"></iframe>
+        </div>
+    </div>
+    <script>
+      (function () {
+        var base = location.protocol + '//' + location.hostname + ':5052/';
+        var f = document.getElementById('weather-iframe');
+        var a = document.getElementById('weather-open-link');
+        if (f) { f.src = base; }
+        if (a) { a.href = base; }
+      })();
+    </script>
+
     <!-- Kalshi paper-trading P&L summary (weather + KXBTCD combined) -->
     <div class="grid">
         <div class="card full" id="kalshi-paper-pnl-card">
