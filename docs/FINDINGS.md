@@ -13,6 +13,27 @@ non-positive, so no amount of additional data rescues it. (See
 
 ---
 
+## ⚠️ LIVE-MONEY SAFETY (read first)
+
+This repo HAS placed real money, despite most ledgers being paper:
+- **`data/weather_paper.jsonl` contains 25 REAL Kalshi orders** (`is_live: true`, real
+  `live_order_id` UUIDs), KXTEMPNYCH NYC-hourly, **2026-05-26 → 06-01**, 9W/16L,
+  ~$245 notional, **+$163 realized** — all settled, no open exposure. The +$163 is 3–4
+  longshot hits over a 16-loss majority = the variance the **PSR 0.24** gate retired.
+  Do NOT read it as edge. (The file is misleadingly named `_paper`; do NOT rename it —
+  it's read by `dashboard_web`, `hermes_weather/daily`, `maker_fill_sim`, settle.)
+- **The live switch is committed ON:** `config/settings.yaml → kalshi_daily_live.enabled:
+  true` (flipped 2026-05-24). `kalshi_live_executor.is_live_enabled()` arms when that's
+  true AND `data/kalshi_live_smoke_passed.marker` exists AND the kill-switch is untripped.
+  The marker is a local file, so a machine that passed smoke test is **ARMED** unless
+  explicitly disarmed. To hard-disarm: set `enabled: false` and/or `rm` the marker.
+- **Standing guard:** `python scripts/preflight_live_check.py` — scans every `data/*.jsonl`
+  for `is_live=true` (flags OPEN live exposure) and reports whether the switch is armed.
+  Exits non-zero if there's open real exposure OR the switch is armed. Run it before
+  trusting any "it's all paper" claim; wire it as a cron alarm if going live again.
+
+---
+
 ## ❌ RULED OUT
 
 ### weather-fade — price-calibration / favorite-longshot fade (2026-06-17)
