@@ -122,6 +122,22 @@ hindsight, the right outcome. Do not un-pause anything.
   open question as weather: does the gap *fill* before settlement, net of fees, and
   is the ESPN↔Kalshi team mapping right (run `probe` first)? Judge by per-day PSR on
   `data/sports_lock.jsonl` once forward-collected. Paper only.
+- **asos_tracker / bucket-lock** (STOOD UP 2026-06-21) — the weather observation edge,
+  the legitimate version of "we can see the temp beforehand." NOT a forecast and NOT
+  satellite: reads the REALIZED daily high off the EXACT ASOS station Kalshi settles on
+  (Iowa Environmental Mesonet, free) and, once the high is physically locked (evening,
+  temps fallen ≥2°F off peak), flags the now-near-certain bucket the thin overnight book
+  still misprices until the 11:59pm ET cutoff. **Why gate-tuning the forecast sleeves
+  won't add wins:** once the temp is observable the *market sees it too*, so the
+  day-ahead-only rule in weather_fade/fc2s is correct — the edge that survives observation
+  is this structural/speed play, not a sharper forecast. **Station map VERIFIED** against
+  `_cities()` settlement coords + `weather_daily_signal.DAILY_CITIES`: Chicago corrected
+  MDW→**ORD** (both sources put it at O'Hare); DFW (not DAL) and IAH (not HOU) confirmed.
+  Now has `scan`/`settle`/`report` (per-day PSR/DSR, hit-rate vs the 98% target — below it
+  the lock was *wrong*, not unlucky), a dashboard (`asos_dash`, :5058), and a launchd
+  installer (`install_asos_agents.sh`: scan 30 min, settle hourly). **Unproven** — the
+  risks the scorecard can't see are CLI revision near a bucket edge and overnight
+  fillability; forward-collect, judge by DSR≥0.95 AND hit-rate≥98%. Paper only.
 
 ---
 
