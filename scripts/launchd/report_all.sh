@@ -26,7 +26,22 @@ run "ENSEMBLE"                         ensemble_collect.py status
 run "BUCKET ARB (paper bankroll)"      bucket_arb.py status
 run "ASOS TRACKER"                     asos_tracker.py report
 run "SPORTS (lock + devig)"            sports_eval.py eval
-run "SERIES COLLECT (sports calib)"    series_collect.py status
+
+# series_collect is per-series (one ledger each) and needs the ticker as an arg —
+# discover every series_collect_<TICKER>.jsonl and report each.
+echo
+echo "════════════════════════════════════════════════════════════"
+echo "  SERIES COLLECT (sports calib)"
+echo "════════════════════════════════════════════════════════════"
+shopt -s nullglob
+series_found=0
+for led in data/series_collect_*.jsonl; do
+  series="${led#data/series_collect_}"; series="${series%.jsonl}"
+  echo "  --- $series ---"
+  python scripts/series_collect.py status "$series" 2>&1 || echo "  (errored)"
+  series_found=1
+done
+[ "$series_found" -eq 0 ] && echo "  (no series_collect_*.jsonl ledgers yet)"
 
 echo
 echo "Tip: dashboards (if up) — weather 5052, bucket 5053, series 5054."
