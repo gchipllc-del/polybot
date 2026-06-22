@@ -25,7 +25,7 @@ if [ -n "$live" ]; then echo "⚠ LIVE AGENT PRESENT:"; echo "$live"; else echo 
 
 echo
 echo "=== paper log freshness (threshold: ${STALE_H}h) ==="
-for log in fc2s ensemble fc2s_shadow asos sports weather_fade series_collect; do
+for log in fc2s ensemble fc2s_shadow asos sports series_collect; do
   f="$PROJECT_ROOT/logs/$log.log"
   if [ ! -f "$f" ]; then printf "  %-16s  MISSING\n" "$log"; continue; fi
   m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)
@@ -34,6 +34,9 @@ for log in fc2s ensemble fc2s_shadow asos sports weather_fade series_collect; do
   last=$(tail -n 1 "$f" 2>/dev/null | cut -c1-80)
   printf "  %-16s  %3dh ago  %-8s | %s\n" "$log" "$age_h" "$flag" "$last"
 done
+# Retired sleeves: listed for the record but NOT freshness-checked — their agents were
+# removed during the disarm, so a stale log is expected, not an alert.
+printf "  %-16s  %s\n" "weather_fade" "retired (scan/settle agents removed; not monitored)"
 
 echo
 echo "(For trade counts/P&L use each sleeve's own report, e.g. python scripts/weather_fade.py report)"
