@@ -32,27 +32,46 @@ def _clip(p, eps=1e-6):
     return min(max(p, eps), 1.0 - eps)
 
 
-def loglik(pairs, sigma) -> float:
-    """Σ log P(outcome | Φ(margin/σ)).  pairs = [(margin = qc_high−strike, yes_outcome)]."""
+def loglik(pairs, bias, sigma) -> float:
+    """Σ log P(outcome | Φ((margin − bias)/σ)).  pairs = [(margin = qc_high−strike, yes)].
+    `bias` > 0 means our reading runs HOT (margin overstated): the true margin is margin−bias."""
     if sigma <= 0:
         return float("-inf")
     ll = 0.0
     for m, y in pairs:
-        p = _clip(_N.cdf(m / sigma))
+        p = _clip(_N.cdf((m - bias) / sigma))
         ll += (log(p) if y else log(1.0 - p))
     return ll
 
 
 def fit_sigma(pairs, lo=0.3, hi=6.0, step=0.05):
-    """Grid-search MLE for σ."""
+    """Grid-search MLE for σ with bias fixed at 0 (the naive fit — kept for comparison)."""
     best_s, best_ll = None, float("-inf")
     s = lo
     while s <= hi + 1e-9:
-        ll = loglik(pairs, s)
+        ll = loglik(pairs, 0.0, s)
         if ll > best_ll:
             best_ll, best_s = ll, round(s, 2)
         s += step
     return best_s, best_ll
+
+
+def fit_bias_sigma(pairs, b_lo=-2.0, b_hi=8.0, b_step=0.25,
+                   s_lo=0.3, s_hi=4.0, s_step=0.1):
+    """Joint grid-search MLE for (bias, σ). Separating bias from σ is the whole point:
+    a one-directional reading error shows up as bias (fixable in the pipeline), while the
+    residual σ is the true sensor/CLI noise that the distance-aware lock should use."""
+    best, best_ll = (None, None), float("-inf")
+    b = b_lo
+    while b <= b_hi + 1e-9:
+        s = s_lo
+        while s <= s_hi + 1e-9:
+            ll = loglik(pairs, b, s)
+            if ll > best_ll:
+                best_ll, best = ll, (round(b, 2), round(s, 2))
+            s += s_step
+        b += b_step
+    return best[0], best[1], best_ll
 
 
 def load_pairs(path: Path) -> list:
@@ -94,45 +113,60 @@ def main() -> None:
     if len(pairs) < 8:
         print(f"  only {len(pairs)} settled above-strike locks — need ~8+ for a stable fit. Keep collecting.")
         return
-    sigma, ll = fit_sigma(pairs)
+    s_only, ll_s = fit_sigma(pairs)                       # naive (bias≡0) fit, for contrast
+    bias, sigma, ll_bs = fit_bias_sigma(pairs)            # joint fit — separates bias from noise
     eff_margin = _N.inv_cdf(MIN_LOCK_PROB) * sigma
     print(f"  n={len(pairs)} settled above-strike locks")
-    print(f"  fitted σ̂ = {sigma:.2f}°F   (current default SETTLE_SIGMA_F = {DEFAULT_SIGMA})")
-    print(f"  → at MIN_LOCK_PROB={MIN_LOCK_PROB:.0%} that's a {eff_margin:.1f}°F effective lock margin")
-    print(f"  log-likelihood: fitted {ll:.2f}  vs  default σ={DEFAULT_SIGMA} {loglik(pairs, DEFAULT_SIGMA):.2f}")
+    print(f"  σ-only fit (assumes zero bias): σ̂ = {s_only:.2f}°F   (LL {ll_s:.1f})")
+    print(f"  JOINT fit:  bias = {bias:+.2f}°F   residual σ̂ = {sigma:.2f}°F   (LL {ll_bs:.1f})")
+    print(f"  current default SETTLE_SIGMA_F = {DEFAULT_SIGMA}")
+    if abs(bias) >= 2.0:
+        print(f"  ⚠ bias {bias:+.2f}°F dominates — our reading runs {'HOT' if bias > 0 else 'COLD'} by ~{abs(bias):.0f}°F.")
+        print(f"    This is a DATA-PIPELINE bug (wrong day-window / settlement source), NOT σ. The σ-only")
+        print(f"    fit inflates σ̂ to {s_only:.1f} just to absorb it. Fixing the bias is what rescues the sleeve;")
+        print(f"    then the true sensor σ ≈ {sigma:.1f}°F is what the distance-aware lock should use.")
+    else:
+        print(f"  bias is small — σ̂ ≈ {sigma:.1f}°F is genuine sensor/CLI noise; set SETTLE_SIGMA_F to it.")
 
-    # Calibration: bucket by |margin| and show predicted (at σ̂) vs realized hit-rate.
-    print("\n  calibration at σ̂ (predicted vs realized P(settled>strike)):")
-    print("   margin band    n   pred   realized")
-    bands = [(-99, -3), (-3, -1), (-1, 1), (1, 3), (3, 99)]
-    for lo_b, hi_b in bands:
+    # Calibration: predicted under the JOINT (bias-corrected) model vs realized hit-rate.
+    print("\n  calibration — bias-corrected model vs realized P(settled>strike):")
+    print("   margin band    n   pred(joint)   realized")
+    for lo_b, hi_b in [(-99, -3), (-3, -1), (-1, 1), (1, 3), (3, 99)]:
         grp = [(m, y) for m, y in pairs if lo_b <= m < hi_b]
         if not grp:
             continue
-        pred = sum(_N.cdf(m / sigma) for m, _ in grp) / len(grp)
+        pred = sum(_N.cdf((m - bias) / sigma) for m, _ in grp) / len(grp)
         real = sum(y for _, y in grp) / len(grp)
-        print(f"   [{lo_b:+3.0f},{hi_b:+3.0f})  {len(grp):3d}  {pred:5.2f}    {real:5.2f}")
+        print(f"   [{lo_b:+3.0f},{hi_b:+3.0f})  {len(grp):3d}     {pred:5.2f}       {real:5.2f}")
 
-    print("\n  Read: set SETTLE_SIGMA_F to σ̂ if it differs from the default. If σ̂ > ~3°F, that's")
-    print("  likely a wrong-station bias, not sensor noise — run asos_tracker probe on the misses.")
+    print("\n  Read: if bias ≫ 0 the lock sleeve is reading a hotter max than Kalshi settles on —")
+    print("  fix the day-window in asos_tracker.fetch_iem_today before trusting any lock again.")
 
 
 def _selftest() -> int:
-    # Recover a known σ from synthetic data: outcome ~ Bernoulli(Φ(margin/σ_true)).
     import random
     rng = random.Random(7)
+    # 1) zero-bias data: σ-only fit recovers σ.
     true_sigma = 2.0
-    pairs = []
+    clean = []
     for _ in range(4000):
         m = rng.uniform(-6, 6)
-        p = _N.cdf(m / true_sigma)
-        pairs.append((m, 1 if rng.random() < p else 0))
-    sigma, _ = fit_sigma(pairs)
-    assert abs(sigma - true_sigma) <= 0.3, sigma          # MLE recovers σ within grid noise
-    # loglik is maximized near the truth (better than a far-off σ)
-    assert loglik(pairs, true_sigma) > loglik(pairs, 0.5), "truth should beat tiny σ"
-    assert loglik(pairs, true_sigma) > loglik(pairs, 5.0), "truth should beat huge σ"
-    print(f"fit_sigma recovered σ≈{sigma} (true {true_sigma}) OK")
+        clean.append((m, 1 if rng.random() < _N.cdf(m / true_sigma) else 0))
+    sigma, _ = fit_sigma(clean)
+    assert abs(sigma - true_sigma) <= 0.3, sigma
+    # 2) biased data: outcome ~ Bernoulli(Φ((margin − b_true)/σ_true)). Joint fit must
+    #    recover BOTH, and the σ-only fit must inflate σ (the bug we're diagnosing).
+    b_true, s_true = 4.0, 1.5
+    biased = []
+    for _ in range(6000):
+        m = rng.uniform(-4, 10)
+        biased.append((m, 1 if rng.random() < _N.cdf((m - b_true) / s_true) else 0))
+    b_hat, s_hat, _ = fit_bias_sigma(biased)
+    assert abs(b_hat - b_true) <= 0.5 and abs(s_hat - s_true) <= 0.4, (b_hat, s_hat)
+    s_only, _ = fit_sigma(biased)
+    assert s_only > s_hat + 1.0, (s_only, s_hat)          # σ-only absorbs the bias → inflated
+    print(f"fit_sigma σ≈{sigma} (true 2.0); joint bias≈{b_hat}/σ≈{s_hat} (true 4.0/1.5), "
+          f"σ-only inflates to {s_only} OK")
     print("PASS")
     return 0
 
