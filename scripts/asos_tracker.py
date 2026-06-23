@@ -203,17 +203,18 @@ def lock_pnl(side: str, market_yes, result: str) -> float | None:
 
 # ── live fetch (needs network / Kalshi auth) ────────────────────────────────
 
-def fetch_iem_today(station: str, tz: str) -> list:
-    """ASOS temperature obs for the STATION-LOCAL current calendar day — the settlement
-    day Kalshi/NWS use — via the Iowa Environmental Mesonet. Returns [(iso_local, tmpf), …].
+def fetch_iem_day(station: str, tz: str, target=None) -> list:
+    """ASOS temperature obs for a station on a STATION-LOCAL calendar day (default: today)
+    via the Iowa Environmental Mesonet. Returns [(iso_local, tmpf), …].
 
-    Fixed 2026-06-23 (the +3.75°F hot bias): the date is now taken in the *station's* tz
-    (was the server's local tz, which on a differently-zoned host pulled the wrong day's
-    max), and obs are CLIPPED client-side to the target local date (was a fragile
+    `target` (a date) lets the backtest replay past days — IEM is a historical archive.
+    Fixed 2026-06-23 (the +3.75°F hot bias): the date is taken in the *station's* tz (was
+    the server's), and obs are CLIPPED client-side to the target local date (was a fragile
     day1==day2 window that could include a hotter neighbouring day). Free, no key."""
     import requests
     from zoneinfo import ZoneInfo
-    target = datetime.now(ZoneInfo(tz)).date()
+    if target is None:
+        target = datetime.now(ZoneInfo(tz)).date()
     nxt = target + timedelta(days=1)
     url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
     params = {"station": station, "data": "tmpf", "tz": tz,
@@ -229,6 +230,11 @@ def fetch_iem_today(station: str, tz: str) -> list:
         if len(parts) >= 3 and parts[1].strip()[:10] == tgt:   # clip to the settlement day
             out.append((parts[1].strip(), parts[2].strip()))
     return out
+
+
+def fetch_iem_today(station: str, tz: str) -> list:
+    """Today's station-local obs — thin wrapper over fetch_iem_day (see it for the fix)."""
+    return fetch_iem_day(station, tz)
 
 
 def fetch_market_ladder(series: str) -> list:
