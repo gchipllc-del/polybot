@@ -26,6 +26,9 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import NormalDist
+
+_N = NormalDist()
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -62,17 +65,18 @@ STATIONS = {
 
 LOCK_MIN_HOUR = 19      # local hour after which the daily high is almost always set
 LOCK_MIN_DROP = 3.0     # °F current temp must be below the realized high (clearly past peak)
-# Mode-aware margins (from the asos_segment.py diagnosis, 2026-06-21). Two failure modes:
-#  · "Mode B" — raw 1-min ASOS overshoots the QC'd NWS CLI max that Kalshi settles on,
-#    worst on hot days. So YES locks compare against qc_high (isolated spikes removed,
-#    see _qc_temps) and must clear the strike by YES_MARGIN to absorb residual overshoot.
-#  · "Mode A" — the day can still warm after the evening lock, beating a thin NO. So NO
-#    locks compare against the raw high (a conservative upper bound) and need NO_MARGIN
-#    of headroom below the strike.
-YES_MARGIN = 4.0
-NO_MARGIN = 3.0
 SPIKE_TOL = 2.5         # °F: a reading with no neighbour within this is treated as a spike
-NEAR_CERTAIN = 0.98     # prob we assign a locked outcome (not 1.0 — CLI can still revise)
+# Distance-aware certainty (replaces the old flat NEAR_CERTAIN + hard YES/NO margins).
+# We model the SETTLED daily max as Normal around our observed high with σ = the sensor +
+# CLI-revision uncertainty — "the degree or two the thermometer isn't sure of". So
+# confidence fades smoothly near a strike instead of a hard margin cliff:
+#   P(settles above strike) = Φ((observed_high − strike) / SETTLE_SIGMA_F)
+# A lock only fires when the modeled P(correct side) ≥ MIN_LOCK_PROB. With σ=1.5 and
+# min_prob=0.95 that's a ~2.5°F effective margin, but it now SCALES with the measured σ.
+# Calibrate SETTLE_SIGMA_F from settled locks with: python scripts/asos_sigma.py
+SETTLE_SIGMA_F = 1.5    # °F sensor + CLI-revision uncertainty (the "degree or two")
+MIN_LOCK_PROB = 0.95    # don't call it a lock unless modeled P(correct side) ≥ this
+NEAR_CERTAIN = 0.99     # cap on assigned certainty — never claim 1.0 (CLI can always revise)
 
 
 # ── pure logic (testable) ───────────────────────────────────────────────────
@@ -142,36 +146,39 @@ def is_locked(local_hr, high, last_temp,
 
 def lock_signal(kind: str, strike: float, high: float, market_yes,
                 qc_high: float = None,
-                yes_margin: float = YES_MARGIN, no_margin: float = NO_MARGIN):
-    """Given a LOCKED realized high, is a bucket near-certain and mispriced?
-    Returns (side, certain_prob, edge) or None if too close to a boundary to trust.
-    YES decisions use `qc_high` (spikes removed — defends against the Mode B overshoot);
-    NO decisions use the raw `high` (a conservative upper bound) with extra headroom for
-    late-day warming (Mode A). edge = certain_prob − market's implied prob for that side
-    (positive = mispriced in our favor). market_yes may be None (edge=None, signal shown)."""
+                sigma: float = SETTLE_SIGMA_F, min_prob: float = MIN_LOCK_PROB):
+    """Is a bucket near-certain and mispriced, given a LOCKED realized high?
+
+    Models the SETTLED daily max as Normal(observed_high, σ) — σ = sensor + CLI-revision
+    uncertainty — so confidence fades smoothly near a strike (no hard margin cliff).
+    YES uses `qc_high` (spikes removed → Mode-B defence); NO uses the raw `high` (a
+    conservative upper bound → Mode-A late-warming defence). Fires only when the modeled
+    P(correct side) ≥ min_prob. Returns (side, certainty, edge) or None. certainty is
+    capped at NEAR_CERTAIN (the CLI can always revise). edge = certainty − market's
+    implied prob for that side; market_yes may be None (edge=None, signal still shown)."""
     from join_weather_trials import BAND_HALF_WIDTH
     if qc_high is None:
         qc_high = high
-    yes_is = None
+    if sigma <= 0:
+        return None
     if kind == "above":
-        if qc_high >= strike + yes_margin:
-            yes_is = True
-        elif high <= strike - no_margin:
-            yes_is = False
+        p_yes = _N.cdf((qc_high - strike) / sigma)            # P(settled > strike)
+        p_no = _N.cdf((strike - high) / sigma)                # P(settled < strike), raw=conservative
     elif kind == "band":
         lo, hi = strike - BAND_HALF_WIDTH, strike + BAND_HALF_WIDTH
-        if lo + yes_margin <= qc_high <= hi - yes_margin:
-            yes_is = True
-        elif qc_high >= hi + yes_margin or high <= lo - no_margin:
-            yes_is = False
-    if yes_is is None:
-        return None                                   # within margin of an edge → skip
-    if yes_is:                                         # YES near-certain → buy YES
-        edge = (NEAR_CERTAIN - market_yes) if market_yes is not None else None
-        return ("YES", NEAR_CERTAIN, (round(edge, 3) if edge is not None else None))
-    # NO near-certain → buy NO (implied NO cost = market_yes; near-certain payout)
-    edge = (market_yes - (1 - NEAR_CERTAIN)) if market_yes is not None else None
-    return ("NO", NEAR_CERTAIN, (round(edge, 3) if edge is not None else None))
+        p_yes = max(0.0, _N.cdf((hi - qc_high) / sigma) - _N.cdf((lo - qc_high) / sigma))
+        p_no = min(1.0, (1.0 - _N.cdf((hi - high) / sigma)) + _N.cdf((lo - high) / sigma))
+    else:
+        return None
+    if p_yes >= min_prob and p_yes >= p_no:
+        cert = min(p_yes, NEAR_CERTAIN)
+        edge = (cert - market_yes) if market_yes is not None else None
+        return ("YES", round(cert, 3), (round(edge, 3) if edge is not None else None))
+    if p_no >= min_prob:
+        cert = min(p_no, NEAR_CERTAIN)
+        edge = (cert - (1.0 - market_yes)) if market_yes is not None else None
+        return ("NO", round(cert, 3), (round(edge, 3) if edge is not None else None))
+    return None                                               # neither side near-certain → skip
 
 
 def lock_entry_cost(side: str, market_yes) -> float | None:
@@ -305,7 +312,7 @@ def cmd_scan(args) -> None:
             rec = {"ts": ts, "series": s, "station": station, "ticker": tk,
                    "kind": kind, "strike": strike, "realized_high": rh["high"],
                    "qc_high": rh["qc_high"], "last_temp": rh["last_temp"],
-                   "side": side, "market_yes": yes_p,
+                   "side": side, "cert": prob, "market_yes": yes_p,
                    "edge": edge, "status": "open", "result": "", "paper_pnl": None,
                    "resolved_at": ""}
             hits.append(rec)
@@ -371,7 +378,7 @@ def cmd_report(args) -> None:
     priced = [r for r in settled if r.get("paper_pnl") is not None]
     net = sum(float(r["paper_pnl"]) for r in priced)
     print(f"  hit-rate {hits}/{len(settled)} = {hits/len(settled):.0%} "
-          f"(target ≥ {NEAR_CERTAIN:.0%}; below it = the lock is wrong, not just unlucky)")
+          f"(target ≥ {MIN_LOCK_PROB:.0%}, the lock floor; below it = σ too small or station wrong)")
     print(f"  paper net ${net:+.2f} over {len(priced)} priced locks")
     # per-day returns → PSR/DSR/MinTRL (distinct days are the independent sample)
     by_day: dict = {}
@@ -415,26 +422,29 @@ def selftest() -> int:
     assert is_locked(14, 88, 87) is False          # midday, still near peak
     assert is_locked(20, 88, 87) is False          # evening but barely dropped
     print("is_locked OK")
-    # lock_signal — YES uses qc_high and must clear the strike by YES_MARGIN (4°F)
-    sig = lock_signal("above", 83.0, 88.0, market_yes=0.60)          # qc=high=88 ≥ 83+4
-    assert sig == ("YES", 0.98, 0.38), sig
-    # Mode B: raw high clears the strike but qc_high (spike-removed) does not → no YES
+    # lock_signal — distance-aware certainty Φ((high−strike)/σ), σ=1.5, min_prob=0.95
+    # YES: high 5°F over strike → Φ(3.33)=0.9996, capped at NEAR_CERTAIN 0.99
+    sig = lock_signal("above", 83.0, 88.0, market_yes=0.60)          # qc=high=88
+    assert sig == ("YES", 0.99, 0.39), sig
+    # Mode B: raw 95 would lock, but qc_high 90 → Φ(2/1.5)=0.91 < 0.95 → no YES, no NO
     assert lock_signal("above", 88.0, 95.0, market_yes=0.5, qc_high=90.0) is None
-    # qc_high clears the strike by the margin → YES (regardless of the raw high)
+    # qc_high 5°F over → YES regardless of the raw high
     assert lock_signal("above", 85.0, 95.0, market_yes=0.5, qc_high=90.0)[0] == "YES"
-    # NO uses the raw high and needs NO_MARGIN (3°F) of headroom below the strike
+    # NO: raw high 4°F under strike → Φ(2.67)=0.996 → NO; edge = cert − (1−market_yes)
     sig = lock_signal("above", 92.0, 88.0, market_yes=0.30)
-    assert sig[0] == "NO" and abs(sig[2] - (0.30 - 0.02)) < 1e-9, sig
-    # Mode A: a thin NO (high only 1°F under the strike) is now rejected
+    assert sig[0] == "NO" and abs(sig[2] - (0.99 - 0.70)) < 1e-9, sig
+    # Mode A: a thin NO (high 1°F under) → Φ(0.67)=0.75 < 0.95 → rejected
     assert lock_signal("above", 89.0, 88.0, market_yes=0.30) is None
-    # within margin of the edge → no signal
+    # right at the strike → ~0.5 each way → no signal
     assert lock_signal("above", 88.5, 88.0, market_yes=0.5) is None
-    # band: too narrow to lock at the default YES margin; only lockable with a tight margin
+    # σ scales the effective margin: 3°F over locks at σ=1.5 (Φ(2)=0.977) but not σ=3 (Φ(1)=0.84)
+    assert lock_signal("above", 88.0, 91.0, market_yes=0.5)[0] == "YES"
+    assert lock_signal("above", 88.0, 91.0, market_yes=0.5, sigma=3.0) is None
+    # band: 1°F-wide band not lockable at σ=1.5, but YES at a tight σ; far-outside → NO
     assert lock_signal("band", 88.0, 88.0, market_yes=0.4) is None
-    assert lock_signal("band", 88.0, 88.0, market_yes=0.4, yes_margin=0.3)[0] == "YES"
-    # band: realized well above the band → NO
+    assert lock_signal("band", 88.0, 88.0, market_yes=0.4, sigma=0.2)[0] == "YES"
     assert lock_signal("band", 80.0, 88.0, market_yes=0.4)[0] == "NO"
-    print("lock_signal OK (qc-gated YES, raw-gated NO, Mode A/B margins, band)")
+    print("lock_signal OK (distance-aware certainty, qc/raw split, σ-scaled margin, band)")
     # P&L: YES locked at 0.60 cost, wins → +0.40; loses → −0.60
     assert lock_pnl("YES", 0.60, "yes") == 0.40, lock_pnl("YES", 0.60, "yes")
     assert lock_pnl("YES", 0.60, "no") == -0.60
