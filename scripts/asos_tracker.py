@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import NormalDist
 
@@ -103,24 +103,26 @@ def _minute_index(iso) -> int | None:
 
 
 def _qc_high(pts: list, tol: float = SPIKE_TOL, window_min: int = 30) -> float:
-    """QC'd daily high: the highest reading corroborated by *another* reading within
-    `window_min` minutes to within `tol`°F. On dense feeds (1-min ASOS) this drops lone
-    sensor spikes — the "Mode B" phantom that raw max() catches but the QC'd NWS CLI max
-    rejects. On sparse feeds (hourly METARs) nothing falls inside the window, so it falls
-    back to the raw max and never corrupts a genuine peak. NOTE: does NOT fix a
-    consistently-wrong station (use `probe`) — validate against settled CLI maxes."""
+    """QC'd daily high: trust the raw max UNLESS it is a dense, uncorroborated spike.
+    Walking high→low, the first reading that is either time-isolated (no other reading
+    within `window_min` min — a sparse/hourly peak we must trust) OR corroborated (a
+    neighbour within `window_min` agrees to within `tol`°F) is the QC'd high. Only a
+    reading with dense neighbours that ALL disagree by >tol is demoted as a lone sensor
+    spike. This drops 1-min glitches on dense feeds without ever discarding a genuine peak
+    on a sparse feed (the over-correction bug fixed 2026-06-23). NOTE: does NOT fix a
+    consistently-wrong day-window or station — those are upstream of QC."""
     vals = [v for _, v in pts]
     times = [_minute_index(t) for t, _ in pts]
-    raw = max(vals)
     for i in sorted(range(len(vals)), key=lambda k: -vals[k]):       # high → low
         if times[i] is None:
-            continue
-        for j in range(len(vals)):
-            if j == i or times[j] is None:
-                continue
-            if abs(times[i] - times[j]) <= window_min and abs(vals[i] - vals[j]) <= tol:
-                return vals[i]                                       # corroborated
-    return raw                                                       # sparse → trust raw
+            return vals[i]                                           # can't assess → trust
+        near = [vals[j] for j in range(len(vals))
+                if j != i and times[j] is not None
+                and abs(times[i] - times[j]) <= window_min]
+        if not near or any(abs(vals[i] - nb) <= tol for nb in near):
+            return vals[i]                  # isolated (sparse peak) OR corroborated → real
+        # dense neighbours all >tol below → lone spike → demote, try the next-highest
+    return max(vals)
 
 
 def realized_high(obs: list):
@@ -202,22 +204,29 @@ def lock_pnl(side: str, market_yes, result: str) -> float | None:
 # ── live fetch (needs network / Kalshi auth) ────────────────────────────────
 
 def fetch_iem_today(station: str, tz: str) -> list:
-    """Today's (local) ASOS temperature obs for a station via the Iowa Environmental
-    Mesonet. Returns [(iso_local, tmpf), …]. Free, no key."""
+    """ASOS temperature obs for the STATION-LOCAL current calendar day — the settlement
+    day Kalshi/NWS use — via the Iowa Environmental Mesonet. Returns [(iso_local, tmpf), …].
+
+    Fixed 2026-06-23 (the +3.75°F hot bias): the date is now taken in the *station's* tz
+    (was the server's local tz, which on a differently-zoned host pulled the wrong day's
+    max), and obs are CLIPPED client-side to the target local date (was a fragile
+    day1==day2 window that could include a hotter neighbouring day). Free, no key."""
     import requests
-    now_local_date = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")  # rough; tz refined by IEM
-    y, m, d = now_local_date.split("-")
+    from zoneinfo import ZoneInfo
+    target = datetime.now(ZoneInfo(tz)).date()
+    nxt = target + timedelta(days=1)
     url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
     params = {"station": station, "data": "tmpf", "tz": tz,
-              "year1": y, "month1": m, "day1": d,
-              "year2": y, "month2": m, "day2": d,
+              "year1": target.year, "month1": target.month, "day1": target.day,
+              "year2": nxt.year, "month2": nxt.month, "day2": nxt.day,
               "format": "onlycomma", "missing": "M", "latlon": "no"}
     r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
+    tgt = target.strftime("%Y-%m-%d")
     out = []
     for line in r.text.splitlines()[1:]:               # skip header
         parts = line.split(",")
-        if len(parts) >= 3:
+        if len(parts) >= 3 and parts[1].strip()[:10] == tgt:   # clip to the settlement day
             out.append((parts[1].strip(), parts[2].strip()))
     return out
 
@@ -416,7 +425,12 @@ def selftest() -> int:
                          ("2026-06-19 14:10", 90), ("2026-06-19 14:15", 99),
                          ("2026-06-19 14:20", 90)])
     assert rhd["high"] == 99 and rhd["qc_high"] == 91, rhd
-    print("realized_high OK (sparse fallback + dense spike drop)")
+    # mixed cadence: a dense morning cluster (74/74/75) + an ISOLATED real afternoon peak
+    # (88). qc_high must keep 88, not demote to the corroborated 75 (the over-correction bug).
+    rhm = realized_high([("2026-06-19 09:00", 74), ("2026-06-19 09:05", 74),
+                         ("2026-06-19 09:10", 75), ("2026-06-19 15:00", 88)])
+    assert rhm["high"] == 88 and rhm["qc_high"] == 88, rhm
+    print("realized_high OK (sparse peak kept, dense spike dropped, isolated peak kept)")
     # lock: evening + clearly off the peak
     assert is_locked(20, 88, 79) is True
     assert is_locked(14, 88, 87) is False          # midday, still near peak
