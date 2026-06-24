@@ -80,6 +80,10 @@ def main() -> None:
     ap.add_argument("--series", default=",".join(DEFAULT_SERIES),
                     help="comma-separated Kalshi series tickers")
     ap.add_argument("--top", type=int, default=5, help="show top-N markets by volume per series")
+    ap.add_argument("--log", metavar="PATH", default=None,
+                    help="append a timestamped one-line summary per series (for scheduled "
+                         "capture during live-game windows — event-driven books only show "
+                         "liquidity while the event is live)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -87,7 +91,8 @@ def main() -> None:
 
     series_list = [s.strip() for s in args.series.split(",") if s.strip()]
     print("=== kalshi_liquidity — resting-book check (run BEFORE modeling) ===")
-    for s in run(series_list):
+    results = run(series_list)
+    for s in results:
         if "error" in s:
             print(f"\n  {s['series']:<14} ERROR: {s['error']}")
             continue
@@ -97,6 +102,17 @@ def main() -> None:
             sp = f"{r['spread']}c" if r["spread"] is not None else "—"
             print(f"     {r['ticker']:<28} bid {r['yes_bid']:>2} ask {r['yes_ask']:>2} "
                   f"spread {sp:<4} vol {r['volume']:>4} OI {r['open_interest']:>4}")
+    if args.log:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        with open(args.log, "a") as f:
+            for s in results:
+                if "error" in s:
+                    continue
+                f.write(json.dumps({"ts": ts, "series": s["series"], "n": s["n"],
+                                    "fillable": s["fillable"], "volume": s["volume"],
+                                    "open_interest": s["open_interest"]}) + "\n")
+        print(f"\n  logged {len([s for s in results if 'error' not in s])} series → {args.log}")
     print("\n  Read: only a LIQUID series is worth modeling. For a borderline one, confirm")
     print("  resting DEPTH (sizes) via the orderbook before trusting the quote.")
 
