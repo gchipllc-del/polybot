@@ -68,20 +68,34 @@ selection). Not fees, not sizing, not selection — just negative forecast edge 
 
 **Disposition:** retire — stop `fc2sscan` booking / unload the agent. Do not allocate.
 
-### ASOS bucket-lock — observation edge on realized daily highs (2026-06-23)
+### ASOS bucket-lock — observation edge on realized daily highs (2026-06-23 → REOPENED 2026-06-24)
 **What it was:** read the realized daily high from the ASOS station Kalshi settles on and
 "lock" a near-certain above/band bucket before next-morning settlement — a fast-OBSERVATION
 play (the high is already set), not a forecast.
 
-**Verdict: UNTRADEABLE — no fillable book.** `asos_edge.py`: 155 settled locks, **0 priced**
-(every `market_yes` = None). The `KXHIGH*` high-temp markets are quote-on-demand with **no
-resting liquidity** — even a perfect lock is unfillable. Hit-rate was a red herring: it
-plateaued 78→81→85% across station-map / day-window / qc fixes, was station-specific (the
-global day-window fix *regressed* MIA/DFW/LAS), and none of it matters with no book to hit.
+**Status: REOPENED — the "unfillable" verdict was a FIELD-NAME BUG, not a fact.** The
+earlier "UNTRADEABLE — 0/155 priced" was wrong: `asos_tracker.fetch_market_ladder` (and
+`kalshi_liquidity`) read `m.get("yes_bid")`, but Kalshi's /markets serves prices as
+`yes_bid_dollars` (the bare field is absent → None). So `market_yes` was never recorded and
+every market falsely read DEAD. The `/markets/{ticker}/orderbook` endpoint proves `KXHIGHNY`
+has a **real two-sided book** (1¢ spread, ~1,858 contracts/24h, 54 NO levels). Weather
+markets are liquid. (Fixed: both readers now use `*_dollars`. Validate with the positive
+control — `kalshi_liquidity` must return LIQUID for KXINX during market hours.)
 
-**Lesson — LIQUIDITY-FIRST:** the `None` price was visible in the very first probe; a
-liquidity check would have killed this on day one instead of after a multi-day forecasting
-detour. **Check resting bid/ask depth BEFORE investing any forecasting/accuracy effort.**
+**What survives / what's now testable:**
+- The lock **hit-rate** (~85% vs the 98% lock target) stands — it was measured against
+  settlement OUTCOMES, not prices, so the bug doesn't touch it. The day-window/station
+  signal-quality work is real.
+- The **edge-vs-price test was never actually run** (prices were all None). Now it can be:
+  KXHIGHNY YES strikes quote as **1–5¢ longshots**, so an 85%-accurate lock signal need only
+  beat ~5¢, not reach 98% — potentially large +EV. Re-run `asos_edge` on a FORWARD cohort
+  recorded with the price fix (old locks' lock-time prices are unrecoverable).
+
+**Lesson — LIQUIDITY-FIRST, but VALIDATE THE TOOL:** the instinct is right, but a liquidity
+tool that has *never* returned a positive is untrustworthy — the missing positive control
+was the tell, and the self-test passed only because its fixtures shared the code's wrong
+field names. **Check resting bid/ask depth BEFORE forecasting effort — AND confirm the
+checker reads LIQUID for a known-liquid market first.**
 Tools retained (adversarially audited — 7 bugs found & fixed): `asos_sigma` (bias/σ joint
 MLE), `asos_segment` (cohort split), `asos_backtest` (replay w/ persistent obs cache),
 `asos_edge` (tradeability).

@@ -263,6 +263,20 @@ def fetch_iem_today(station: str, tz: str) -> list:
     return fetch_iem_day(station, tz)
 
 
+def _price01(m: dict, *names):
+    """Best price as a 0-1 probability: Kalshi *_dollars fields are already 0-1; bare
+    cent names are /100. None if absent. (The bare-name read was the field-name bug.)"""
+    for n in names:
+        v = m.get(n)
+        if v is not None:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            return v if v <= 1.0 else v / 100.0
+    return None
+
+
 def fetch_market_ladder(series: str) -> list:
     """Open markets for the series' nearest event → [(ticker, kind, strike, yes_p)].
     yes_p from last_price (quote-on-demand books are often empty) else the mid."""
@@ -279,11 +293,17 @@ def fetch_market_ladder(series: str) -> list:
         kind, strike = parse_strike2(tk, m.get("yes_sub_title", "") or "")
         if strike is None:
             continue
-        yb, ya, last = m.get("yes_bid"), m.get("yes_ask"), m.get("last_price")
-        if isinstance(yb, (int, float)) and isinstance(ya, (int, float)) and 0 < yb and ya < 100:
-            yes_p = (yb + ya) / 200.0
-        elif isinstance(last, (int, float)) and 0 < last < 100:
-            yes_p = last / 100.0
+        # Kalshi /markets serves prices as *_dollars (float 0-1). The old code read the
+        # bare yes_bid/yes_ask, which are absent here → always None → market_yes never
+        # recorded (the field-name bug that made asos_edge read "0/155 priced"). Read the
+        # _dollars fields (0-1), with the bare cents names as a fallback.
+        yb = _price01(m, "yes_bid_dollars", "yes_bid")
+        ya = _price01(m, "yes_ask_dollars", "yes_ask")
+        last = _price01(m, "last_price_dollars", "last_price")
+        if yb is not None and ya is not None and 0 < yb and ya < 1.0:
+            yes_p = (yb + ya) / 2.0
+        elif last is not None and 0 < last < 1.0:
+            yes_p = last
         else:
             yes_p = None
         out.append((tk, kind, strike, yes_p))

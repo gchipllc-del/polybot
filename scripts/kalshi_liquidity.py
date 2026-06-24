@@ -24,16 +24,41 @@ from pathlib import Path
 DEFAULT_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX"]
 
 
+def _cents(m: dict, *names) -> int:
+    """Best price as integer cents. Kalshi's /markets serves prices as *_dollars (float
+    0-1) — NOT the bare yes_bid/yes_ask (which are absent → None, the field-name bug that
+    made every market read DEAD). Falls back to bare names (cents) for older shapes."""
+    for n in names:
+        v = m.get(n)
+        if v is not None:
+            v = float(v)
+            return round(v * 100) if v <= 1.0 else round(v)   # dollars→cents, else already cents
+    return 0
+
+
+def _num(m: dict, *names) -> int:
+    for n in names:
+        v = m.get(n)
+        if v is not None:
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
 def market_liquidity(m: dict) -> dict:
-    yb, ya = int(m.get("yes_bid") or 0), int(m.get("yes_ask") or 0)
-    nb, na = int(m.get("no_bid") or 0), int(m.get("no_ask") or 0)
+    yb = _cents(m, "yes_bid_dollars", "yes_bid")
+    ya = _cents(m, "yes_ask_dollars", "yes_ask")
+    nb = _cents(m, "no_bid_dollars", "no_bid")
+    na = _cents(m, "no_ask_dollars", "no_ask")
     two_sided = (yb > 0 and ya > 0) or (nb > 0 and na > 0)
     spread = (ya - yb) if (yb > 0 and ya > 0) else None
     return {"ticker": m.get("ticker", "?"), "yes_bid": yb, "yes_ask": ya,
             "two_sided": two_sided, "spread": spread,
-            "volume": int(m.get("volume") or 0),
-            "open_interest": int(m.get("open_interest") or 0),
-            "liquidity": int(m.get("liquidity") or 0)}
+            "volume": _num(m, "volume", "volume_24h", "volume_fp"),
+            "open_interest": _num(m, "open_interest", "open_interest_fp"),
+            "liquidity": _num(m, "liquidity_dollars", "liquidity")}
 
 
 def summarize(series: str, markets: list) -> dict:
@@ -178,17 +203,23 @@ def main() -> None:
 
 
 def _selftest() -> int:
-    dead = [{"ticker": "KXHIGHNY-T87", "yes_bid": 0, "yes_ask": 0, "no_bid": 0, "no_ask": 0,
-             "volume": 0, "open_interest": 0}]          # ASOS-style empty book
-    liquid = [{"ticker": "KXTEMPNYC-T70", "yes_bid": 45, "yes_ask": 52, "volume": 120, "open_interest": 80},
-              {"ticker": "KXTEMPNYC-T72", "yes_bid": 0, "yes_ask": 0, "volume": 0, "open_interest": 0}]
+    # Fixtures use the REAL API shape (*_dollars, floats 0-1) — the field-name bug was that
+    # the old code/fixtures used bare yes_bid (absent on /markets) and so always read DEAD.
+    dead = [{"ticker": "KXHIGHNY-T87", "yes_bid_dollars": None, "yes_ask_dollars": None,
+             "volume": 0, "open_interest": 0}]            # genuinely empty book
+    liquid = [{"ticker": "KXTEMPNYC-T70", "yes_bid_dollars": 0.45, "yes_ask_dollars": 0.52,
+               "volume": 120, "open_interest": 80, "liquidity_dollars": 900},
+              {"ticker": "KXTEMPNYC-T72", "yes_bid_dollars": None, "yes_ask_dollars": None}]
     fake = {"DEAD": dead, "LIVE": liquid}
     res = run(["DEAD", "LIVE"], fetch=lambda s: fake[s])
     d, lv = res[0], res[1]
     assert d["fillable"] == 0 and "DEAD" in verdict(d), verdict(d)
     assert lv["fillable"] == 1 and lv["volume"] == 120 and "LIQUID" in verdict(lv), (lv, verdict(lv))
     ml = market_liquidity(liquid[0])
-    assert ml["two_sided"] and ml["spread"] == 7, ml
+    # regression guard for the bug: *_dollars 0.45/0.52 must read as 45c/52c, spread 7c
+    assert ml["yes_bid"] == 45 and ml["yes_ask"] == 52 and ml["two_sided"] and ml["spread"] == 7, ml
+    # bare cents fallback still works (older shape)
+    assert market_liquidity({"yes_bid": 30, "yes_ask": 33})["spread"] == 3
     # rollup: KXINX live in 1 of 2 samples, KXHIGHNY dead in both
     log_rows = [
         {"ts": "2026-06-24T14:00:00+00:00", "series": "KXINX", "n": 5, "fillable": 4, "volume": 900, "open_interest": 500},
