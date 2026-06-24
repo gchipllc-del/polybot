@@ -64,22 +64,35 @@ def _mid(yes_bid, yes_ask):
     return (yb + ya) / 200.0
 
 
+def _p01(m: dict, *names):
+    """First present price as a 0-1 probability. Kalshi /markets serves prices as
+    *_dollars (0-1); the bare yes_bid/yes_ask are absent → None, the field-name bug that
+    made entry_p never record. Bare cents (/100) fallback retained."""
+    for n in names:
+        v = m.get(n)
+        if v is not None:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            return v if v <= 1.0 else v / 100.0
+    return None
+
+
 def _entry_prob(m: dict):
     """Best available entry probability for a market. Kalshi books are
     quote-on-demand (often NO resting bid/ask even where the market trades), so
     fall back to last_price — the last traded price IS a valid probability estimate
     when there's no resting quote. Returns (prob, source) or (None, None)."""
-    mid = _mid(m.get("yes_bid"), m.get("yes_ask"))
-    if mid is not None:
-        return mid, "mid"
-    for f in ("last_price", "yes_price", "previous_price"):
-        v = m.get(f)
-        try:
-            p = float(v)
-        except (TypeError, ValueError):
-            continue
-        if 0 < p < 100:                 # cents
-            return p / 100.0, f
+    yb = _p01(m, "yes_bid_dollars", "yes_bid")
+    ya = _p01(m, "yes_ask_dollars", "yes_ask")
+    if yb is not None and ya is not None and 0 < yb and ya < 1.0:
+        return (yb + ya) / 2.0, "mid"
+    for f in (("last_price_dollars", "last_price"), ("yes_price_dollars", "yes_price"),
+              ("previous_price_dollars", "previous_price")):
+        p = _p01(m, *f)
+        if p is not None and 0 < p < 1.0:
+            return p, f[-1]
     return None, None
 
 

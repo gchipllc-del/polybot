@@ -72,13 +72,26 @@ def fee_cents(price_cents: int, coef: float) -> int:
     return math.ceil(coef * p * (100 - p) / 100.0)
 
 
+def _ck(m: dict, *names) -> int:
+    """First present price field as integer cents. Kalshi /markets serves prices as
+    *_dollars (float 0-1); the bare yes_ask/no_ask are absent → 0, which silently made
+    every leg fail the exec guard (0<a<100) so NO arb was ever booked. Bare-cents fallback
+    retained for older shapes."""
+    for n in names:
+        v = m.get(n)
+        if v is not None:
+            v = float(v)
+            return round(v * 100) if v <= 1.0 else round(v)
+    return 0
+
+
 def _leg_quotes(m: dict) -> tuple[int, int]:
     """(yes_ask, no_ask) in cents for a market, deriving the NO side from the
     YES book if Kalshi didn't return it explicitly (no_ask = 100 - yes_bid)."""
-    yes_ask = int(m.get("yes_ask") or 0)
-    no_ask = int(m.get("no_ask") or 0)
+    yes_ask = _ck(m, "yes_ask_dollars", "yes_ask")
+    no_ask = _ck(m, "no_ask_dollars", "no_ask")
     if no_ask <= 0:
-        yes_bid = int(m.get("yes_bid") or 0)
+        yes_bid = _ck(m, "yes_bid_dollars", "yes_bid")
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
     return yes_ask, no_ask
 

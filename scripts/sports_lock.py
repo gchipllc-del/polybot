@@ -290,6 +290,20 @@ def fetch_nhl_api_games(cfg: dict, debug: bool = False):
 SECONDARY = {"nba": fetch_nba_cdn_games, "nhl": fetch_nhl_api_games}
 
 
+def _p01(m: dict, *names):
+    """First present price as a 0-1 probability: Kalshi *_dollars fields are already 0-1;
+    bare cent names are /100. None if absent. (Bare-name read was the field-name bug.)"""
+    for n in names:
+        v = m.get(n)
+        if v is not None:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            return v if v <= 1.0 else v / 100.0
+    return None
+
+
 def fetch_market_ladder(series: str) -> list:
     """Open markets for the series → [(ticker, title, yes_sub_title, yes_p)].
     yes_p from the mid when both sides are quoted, else last_price (quote-on-demand
@@ -303,11 +317,15 @@ def fetch_market_ladder(series: str) -> list:
     out = []
     for m in data.get("markets", []) or []:
         tk = m.get("ticker", "")
-        yb, ya, last = m.get("yes_bid"), m.get("yes_ask"), m.get("last_price")
-        if isinstance(yb, (int, float)) and isinstance(ya, (int, float)) and 0 < yb and ya < 100:
-            yes_p = (yb + ya) / 200.0
-        elif isinstance(last, (int, float)) and 0 < last < 100:
-            yes_p = last / 100.0
+        # Kalshi /markets serves prices as *_dollars (0-1); the bare yes_bid/yes_ask are
+        # absent → None → yes_p was never read (the field-name bug). Read *_dollars.
+        yb = _p01(m, "yes_bid_dollars", "yes_bid")
+        ya = _p01(m, "yes_ask_dollars", "yes_ask")
+        last = _p01(m, "last_price_dollars", "last_price")
+        if yb is not None and ya is not None and 0 < yb and ya < 1.0:
+            yes_p = (yb + ya) / 2.0
+        elif last is not None and 0 < last < 1.0:
+            yes_p = last
         else:
             yes_p = None
         out.append((tk, m.get("title", ""), m.get("yes_sub_title", "") or "", yes_p))
