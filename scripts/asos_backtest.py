@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from asos_tracker import (                                   # noqa: E402
-    realized_high, lock_signal, lock_pnl, fetch_iem_day, STATIONS, LOG,
+    realized_high, lock_signal, lock_pnl, fetch_iem_day, STATIONS, LOG, event_local_date,
 )
 
 
@@ -57,8 +57,10 @@ def replay(records: list, fetch_fn, tz_of, sleep: float = 0.0) -> dict:
     cache: dict = {}
     for r in records:
         a["n"] += 1
+        # Use the STATION-LOCAL settlement day (fetch_iem_day expects local, but ts is UTC
+        # and evening locks roll to the next UTC day — the off-by-one the audit caught).
         try:
-            d = date.fromisoformat(str(r.get("ts"))[:10])
+            d = date.fromisoformat(event_local_date(r))
         except ValueError:
             a["bad_date"] += 1
             continue
@@ -190,22 +192,30 @@ def _selftest() -> int:
         "DFW": 86,   # NO lock, fine
         "NYC": 79,   # was 88 → real 79 (below strike 80)
     }
+    # ts is a genuine EVENING-local instant stored in UTC (2026-06-21T01:00Z = 21:00 EDT /
+    # 20:00 CDT on 2026-06-20). The fix must re-fetch the LOCAL day 06-20, not the UTC 06-21.
     recs = [
         # A: old locked YES@88 and LOST (hot bug). Corrected 84 → NO, actual no → win (flip).
-        {"series": "KXHIGHMIA", "station": "MIA", "ts": "2026-06-20T20:00Z", "kind": "above",
+        {"series": "KXHIGHMIA", "station": "MIA", "ts": "2026-06-21T01:00:00+00:00", "kind": "above",
          "strike": 88, "side": "YES", "status": "lost", "result": "no", "market_yes": 0.6,
          "realized_high": 93, "paper_pnl": -0.6},
         # B: old locked NO@92 and WON. Corrected 86 → NO, actual no → win (unchanged).
-        {"series": "KXHIGHTDAL", "station": "DFW", "ts": "2026-06-20T20:00Z", "kind": "above",
+        {"series": "KXHIGHTDAL", "station": "DFW", "ts": "2026-06-21T01:00:00+00:00", "kind": "above",
          "strike": 92, "side": "NO", "status": "won", "result": "no", "market_yes": 0.3,
          "realized_high": 86, "paper_pnl": 0.3},
         # C: old locked YES@80 and WON. Corrected 79 → not confident → skip (missed winner).
-        {"series": "KXHIGHNY", "station": "NYC", "ts": "2026-06-20T20:00Z", "kind": "above",
+        {"series": "KXHIGHNY", "station": "NYC", "ts": "2026-06-21T01:00:00+00:00", "kind": "above",
          "strike": 80, "side": "YES", "status": "won", "result": "yes", "market_yes": 0.5,
          "realized_high": 88, "paper_pnl": 0.5},
     ]
-    fake_fetch = lambda station, tz, d: obs_by_max(corrected[station])
+    seen_dates = []
+
+    def fake_fetch(station, tz, d):
+        seen_dates.append(d.isoformat())
+        return obs_by_max(corrected[station])
+
     a = replay(recs, fake_fetch, lambda s: "America/New_York")
+    assert seen_dates == ["2026-06-20"] * 3, seen_dates   # re-fetched the LOCAL day, not UTC 06-21
     assert a["n"] == 3 and a["scored"] == 3, a
     assert a["bad_date"] == 0 and a["fetch_error"] == 0 and a["empty_obs"] == 0, a
     assert a["old_won"] == 2, a                              # B, C won; A lost

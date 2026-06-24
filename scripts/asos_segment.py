@@ -13,8 +13,12 @@ or near bucket edges (CLI revision). Read-only; reads data/asos_lock.jsonl.
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 from collections import defaultdict
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from asos_tracker import event_local_date              # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 LOG = ROOT / "data" / "asos_lock.jsonl"
@@ -41,7 +45,9 @@ def settled(rows: list) -> list:
 
 
 def _date(r: dict) -> str:
-    return str(r.get("ts", ""))[:10]
+    # Station-LOCAL booking day (the cutoff is a wall-clock event), not the UTC prefix of
+    # ts — evening locks roll to the next UTC day, leaking pre-cutoff locks into 'after'.
+    return event_local_date(r)
 
 
 def rate(rs: list):
@@ -91,17 +97,24 @@ def main() -> None:
         by[r.get("series", "?")].append(r)
     for s, rs in sorted(by.items(), key=lambda kv: -sum(1 for r in kv[1] if r.get("status") == "lost")):
         n, w, hr, pnl = rate(rs)
-        st = rs[0].get("station", "?")
-        print(f"  {s:<14} [{st:<5}] {w}/{n} = {hr:4.0%}  losses={n - w}  P&L {pnl:+.2f}")
+        # Show ALL stations in the group — a series can span the map correction (MDW→ORD),
+        # so rs[0] alone would mislabel half the cohort.
+        st = ",".join(sorted({str(r.get("station", "?")) for r in rs}))
+        print(f"  {s:<14} [{st:<9}] {w}/{n} = {hr:4.0%}  losses={n - w}  P&L {pnl:+.2f}")
 
     print("\n=== the misses (eyeball station mismatch vs near-edge revision) ===")
     misses = [r for r in rows if r.get("status") == "lost"]
     if not misses:
         print("  none")
     for r in sorted(misses, key=_date):
+        # YES locks decide on qc_high, NO on raw realized_high — show the gap from the
+        # SIDE-APPROPRIATE basis so a spike-removed YES miss reads as near-edge, not a
+        # phantom +Ndeg "station mismatch".
+        is_yes = str(r.get("side", "")).lower() == "yes"
+        basis = r.get("qc_high") if (is_yes and r.get("qc_high") is not None) else r.get("realized_high")
         gap = ""
         try:
-            gap = f", high−strike={float(r.get('realized_high')) - float(r.get('strike')):+.0f}"
+            gap = f", basis−strike={float(basis) - float(r.get('strike')):+.0f}"
         except (TypeError, ValueError):
             pass
         qc = f" qc_high {r.get('qc_high')}" if r.get("qc_high") is not None else ""

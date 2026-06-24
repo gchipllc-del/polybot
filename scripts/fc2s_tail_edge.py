@@ -74,8 +74,12 @@ def analyze(rows: list, bias: float, sigma: float, fee: float) -> dict:
     n = out["n"]
     for key in ("recal_mean", "mkt_mean", "realized_rate", "brier_recal", "brier_mkt"):
         out[key] = round(out[key] / n, 3)
-    out["recal_pnl"] = round(out["recal_pnl"], 2)
-    out["follow_market_pnl"] = round(out["follow_market_pnl"], 2)
+    # P&L reported PER CONTRACT (mean) — consistent with the per-n metrics above and the
+    # "per contract" label. Summing overstated the per-trade edge by a factor of n.
+    out["recal_pnl_total"] = round(out["recal_pnl"], 2)
+    out["follow_market_pnl_total"] = round(out["follow_market_pnl"], 2)
+    out["recal_pnl"] = round(out["recal_pnl"] / n, 4)
+    out["follow_market_pnl"] = round(out["follow_market_pnl"] / n, 4)
     return out
 
 
@@ -132,8 +136,9 @@ def main() -> None:
           f"recal mean {a['recal_mean']:.2f}   market mean {a['mkt_mean']:.2f}")
     print(f"  Brier (lower=better predictor):  recal {a['brier_recal']:.3f}   "
           f"market {a['brier_mkt']:.3f}  → {'recal' if a['brier_recal'] < a['brier_mkt'] else 'market'} predicts better")
-    print(f"  realized P&L per contract: follow-recal ${a['recal_pnl']:+.2f}   "
-          f"follow-market ${a['follow_market_pnl']:+.2f}")
+    print(f"  realized P&L per contract (mean): follow-recal ${a['recal_pnl']:+.3f}   "
+          f"follow-market ${a['follow_market_pnl']:+.3f}   "
+          f"[recal total ${a['recal_pnl_total']:+.2f} over {a['n']}]")
     edge = a["recal_pnl"] > 0 and a["brier_recal"] < a["brier_mkt"]
     print("\n  VERDICT: " + (
         "recal BEATS the market (positive P&L + better Brier) → a lift is justified; "

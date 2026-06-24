@@ -27,6 +27,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import NormalDist
+from zoneinfo import ZoneInfo
 
 _N = NormalDist()
 
@@ -80,6 +81,27 @@ NEAR_CERTAIN = 0.99     # cap on assigned certainty — never claim 1.0 (CLI can
 
 
 # ── pure logic (testable) ───────────────────────────────────────────────────
+
+def event_local_date(rec: dict) -> str:
+    """The station-LOCAL calendar date a lock belongs to (the settlement day), as
+    'YYYY-MM-DD'. Prefers the stored `local_date`; otherwise converts the UTC `ts` to the
+    series' station tz. ts is stored in UTC and locks fire in the evening (≥19:00 local),
+    so its UTC date is usually the NEXT day — using ts[:10] directly is an off-by-one that
+    corrupts cohort splits and backtest re-fetches (audit 2026-06-23)."""
+    ld = rec.get("local_date")
+    if ld:
+        return str(ld)[:10]
+    ts = str(rec.get("ts", ""))
+    st = STATIONS.get(rec.get("series", ""))
+    tz = st[1] if st else "America/New_York"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo(tz)).date().isoformat()
+    except (ValueError, KeyError):
+        return ts[:10]
+
 
 def _local_hour(iso_local: str):
     try:
@@ -168,8 +190,12 @@ def lock_signal(kind: str, strike: float, high: float, market_yes,
         p_no = _N.cdf((strike - high) / sigma)                # P(settled < strike), raw=conservative
     elif kind == "band":
         lo, hi = strike - BAND_HALF_WIDTH, strike + BAND_HALF_WIDTH
+        # Both sides share the qc-defended center. Using the RAW high for NO was wrong:
+        # for a band, a lone spike inflates the raw center ABOVE the band → p_no→1 and a
+        # correct YES flips to a losing NO (audit 2026-06-23). p_no = 1 − p_yes is the
+        # consistent two-sided exclusion. (For 'above', raw stays the conservative bound.)
         p_yes = max(0.0, _N.cdf((hi - qc_high) / sigma) - _N.cdf((lo - qc_high) / sigma))
-        p_no = min(1.0, (1.0 - _N.cdf((hi - high) / sigma)) + _N.cdf((lo - high) / sigma))
+        p_no = 1.0 - p_yes
     else:
         return None
     if p_yes >= min_prob and p_yes >= p_no:
@@ -298,7 +324,8 @@ def _load_ledger() -> list:
 
 def cmd_scan(args) -> None:
     series = [args.series] if args.series else list(STATIONS)
-    ts = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    ts = now_utc.isoformat()
     seen = {r.get("ticker") for r in _load_ledger()}    # one lock entry per market, ever
     hits = []
     for s in series:
@@ -324,7 +351,8 @@ def cmd_scan(args) -> None:
             if sig is None:
                 continue
             side, prob, edge = sig
-            rec = {"ts": ts, "series": s, "station": station, "ticker": tk,
+            rec = {"ts": ts, "local_date": now_utc.astimezone(ZoneInfo(tz)).date().isoformat(),
+                   "series": s, "station": station, "ticker": tk,
                    "kind": kind, "strike": strike, "realized_high": rh["high"],
                    "qc_high": rh["qc_high"], "last_temp": rh["last_temp"],
                    "side": side, "cert": prob, "market_yes": yes_p,
@@ -464,7 +492,16 @@ def selftest() -> int:
     assert lock_signal("band", 88.0, 88.0, market_yes=0.4) is None
     assert lock_signal("band", 88.0, 88.0, market_yes=0.4, sigma=0.2)[0] == "YES"
     assert lock_signal("band", 80.0, 88.0, market_yes=0.4)[0] == "NO"
-    print("lock_signal OK (distance-aware certainty, qc/raw split, σ-scaled margin, band)")
+    # band spike defence: qc_high is IN the band but a lone spike pushed raw high above it.
+    # Must NOT flip to a losing NO (p_no now shares the qc center, not the raw high).
+    assert lock_signal("band", 88.0, 94.0, market_yes=0.35, qc_high=88.0, sigma=0.2)[0] == "YES"
+    assert lock_signal("band", 88.0, 91.0, market_yes=0.5, qc_high=88.0) is None
+    print("lock_signal OK (distance-aware certainty, qc/raw split, σ-scaled margin, band spike-safe)")
+    # event_local_date: an evening lock stored in UTC maps to the LOCAL settlement day
+    assert event_local_date({"ts": "2026-06-21T03:00:00+00:00", "series": "KXHIGHTLV"}) == "2026-06-20"
+    assert event_local_date({"ts": "2026-06-21T00:00:00+00:00", "series": "KXHIGHNY"}) == "2026-06-20"
+    assert event_local_date({"local_date": "2026-07-04", "ts": "x", "series": "?"}) == "2026-07-04"
+    print("event_local_date OK (UTC→local settlement day, stored local_date wins)")
     # P&L: YES locked at 0.60 cost, wins → +0.40; loses → −0.60
     assert lock_pnl("YES", 0.60, "yes") == 0.40, lock_pnl("YES", 0.60, "yes")
     assert lock_pnl("YES", 0.60, "no") == -0.60
