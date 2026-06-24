@@ -53,6 +53,49 @@ settle. Validated in backtest (`becker_edge.py`): 13 months, 8 cities, OOS
 **Disposition:** code retained as a documented negative result; do not feed it
 capital. Reproduce with `weather_fade.py analyze --validated-only --psr`.
 
+### fc2s — forecast two-sided (Open-Meteo high vs Kalshi book) (2026-06-23)
+**What it was:** book two-sided paper trades when the Open-Meteo daily-high forecast
+disagrees with the Kalshi price by ≥ a threshold; the descendant of weather-fade.
+
+**Verdict: NO EDGE — the market out-forecasts the model at every price.** per-day PSR
+0.09 (noise). `fc2s_cost_attrib.py` on 114 settled: every cohort wins *below* its
+breakeven WR — NO/band 64% WR vs 70% breakeven (−$10.85), YES/above 18% vs 24%, ALL 55%
+vs 62% (−$42.26). The forecast is ~6–7% worse than the market-implied prob at **every**
+entry-price tier, so no price cap rescues it. The above-strike tail was separately shown
+to lose to the market (`fc2s_tail_edge.py` — recal vs market Brier 0.50 vs 0.13, adverse
+selection). Not fees, not sizing, not selection — just negative forecast edge everywhere.
+`fc2s_shadow` recalibration confirmed the σ=3 tail model but recalibration ≠ edge.
+
+**Disposition:** retire — stop `fc2sscan` booking / unload the agent. Do not allocate.
+
+### ASOS bucket-lock — observation edge on realized daily highs (2026-06-23)
+**What it was:** read the realized daily high from the ASOS station Kalshi settles on and
+"lock" a near-certain above/band bucket before next-morning settlement — a fast-OBSERVATION
+play (the high is already set), not a forecast.
+
+**Verdict: UNTRADEABLE — no fillable book.** `asos_edge.py`: 155 settled locks, **0 priced**
+(every `market_yes` = None). The `KXHIGH*` high-temp markets are quote-on-demand with **no
+resting liquidity** — even a perfect lock is unfillable. Hit-rate was a red herring: it
+plateaued 78→81→85% across station-map / day-window / qc fixes, was station-specific (the
+global day-window fix *regressed* MIA/DFW/LAS), and none of it matters with no book to hit.
+
+**Lesson — LIQUIDITY-FIRST:** the `None` price was visible in the very first probe; a
+liquidity check would have killed this on day one instead of after a multi-day forecasting
+detour. **Check resting bid/ask depth BEFORE investing any forecasting/accuracy effort.**
+Tools retained (adversarially audited — 7 bugs found & fixed): `asos_sigma` (bias/σ joint
+MLE), `asos_segment` (cohort split), `asos_backtest` (replay w/ persistent obs cache),
+`asos_edge` (tradeability).
+
+### Forecast-vs-market thesis — the meta-conclusion (2026-06-23)
+The thesis behind weather-fade AND fc2s — "predict the daily temperature better than the
+Kalshi market" — has now **failed end to end on live paper fills.** This market prices
+weather efficiently; these models (calibration fade, two-sided forecast, σ-recal tail) do
+not beat it at any horizon or price. The only structurally-different survivor is
+**bucket_arb** (prediction-free ladder arbitrage) — but it shares the liquidity caveat: its
+margins use `no_ask = 100 − yes_bid` synthetic prices when the NO book is empty and capture
+no ask *size*, so a positive near-miss is necessary-not-sufficient until a live order-book
+depth probe confirms all legs are fillable. (0 trades over 355 observed events.)
+
 ### BTC SHORT-horizon (5-min / hourly) — earlier
 **Verdict: efficient market, no edge.** Tested and ruled out — at minute/hour
 horizons the market prices the available data. NOTE: this is the *short* horizon
