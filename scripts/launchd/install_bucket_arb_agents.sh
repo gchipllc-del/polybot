@@ -80,15 +80,16 @@ echo "Installing bucket-arb agents (separate bankroll; weather harness untouched
 # its own minute so it never collides with the weather agents' Kalshi sweeps.
 write_agent "$P.scan"   cal:15 "$RUN_BARB" --collect --book
 write_agent "$P.settle" cal:42 "$RUN_BARB" settle
-# dashboard: file render every 5 min + a live link on :5053 (KeepAlive).
+# dashboard: file render every 5 min + a live link on :5055 (KeepAlive).
+# (:5055, not :5053 — kalshi_dashboard owns :5053; this avoids a bind clash.)
 write_agent "$P.dash"   300 "$RUN_BARB_DASH" render
-write_agent "$P.serve"  keepalive "$RUN_BARB_DASH" serve --port 5053 --host 127.0.0.1
+write_agent "$P.serve"  keepalive "$RUN_BARB_DASH" serve --port 5055 --host 127.0.0.1
 
 echo ""
 echo "Done. bucket-arb roster:"
 launchctl list 2>/dev/null | grep bucketarb || echo "  (none listed — check Console for load errors)"
 echo ""
-echo "Dashboard:  http://127.0.0.1:5053   (http, not https; separate \$100 bankroll)"
+echo "Dashboard:  http://127.0.0.1:5055   (http, not https; separate \$100 bankroll)"
 echo "File backup: open $PROJECT_ROOT/data/bucket_arb_dash.html"
 echo "Scoreboard: python scripts/bucket_arb.py status   |   python scripts/bucket_arb.py eval"
 echo "Uninstall:  bash scripts/launchd/install_bucket_arb_agents.sh --uninstall"
