@@ -73,6 +73,61 @@ def run(series_list: list, fetch=_fetch) -> list:
     return out
 
 
+def report_log(rows: list) -> list:
+    """Roll a liquidity_log.jsonl into a per-series summary: did it EVER show a book, and
+    in which ET hours. Turns a night of 20-min samples into one glance."""
+    from collections import defaultdict
+    by = defaultdict(list)
+    for r in rows:
+        by[r.get("series", "?")].append(r)
+    out = []
+    for s, rs in sorted(by.items()):
+        fillable = [r for r in rs if (r.get("fillable") or 0) > 0]
+        out.append({
+            "series": s,
+            "samples": len(rs),
+            "fillable_samples": len(fillable),
+            "max_fillable": max((r.get("fillable") or 0) for r in rs),
+            "max_volume": max((r.get("volume") or 0) for r in rs),
+            "no_markets": all((r.get("n") or 0) == 0 for r in rs),
+            "fillable_ts": [r.get("ts") for r in fillable],
+        })
+    return out
+
+
+def _et_hours(ts_list: list) -> str:
+    if not ts_list:
+        return "never"
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        hrs = sorted({datetime.fromisoformat(t).astimezone(ZoneInfo("America/New_York")).hour
+                      for t in ts_list if t})
+        return "ET h " + ",".join(str(h) for h in hrs)
+    except Exception:                                    # noqa: BLE001
+        return f"{len(ts_list)} samples"
+
+
+def _print_report(path: Path) -> None:
+    if not path.exists():
+        print(f"no log at {path} yet — the capture agent writes every 20 min.")
+        return
+    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    print(f"=== kalshi_liquidity rollup — {len(rows)} samples from {path.name} ===")
+    print("  series          samples  fillable  maxVol   when-fillable (ET hour)   verdict")
+    for s in report_log(rows):
+        if s["no_markets"]:
+            v = "NO MARKETS (off-season/delisted)"
+        elif s["fillable_samples"] == 0:
+            v = "DEAD across all samples"
+        else:
+            v = f"LIVE in {s['fillable_samples']}/{s['samples']} samples"
+        print(f"  {s['series']:<14} {s['samples']:>6}  {s['fillable_samples']:>7}  "
+              f"{s['max_volume']:>6}   {_et_hours(s['fillable_ts']):<24} {v}")
+    print("\n  A series LIVE during its active window (equities ET 9-16, sports mid-game) is")
+    print("  the real survivor; one DEAD across its active hours earns the ASOS verdict.")
+
+
 def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     ap = argparse.ArgumentParser(description=__doc__,
@@ -84,10 +139,15 @@ def main() -> None:
                     help="append a timestamped one-line summary per series (for scheduled "
                          "capture during live-game windows — event-driven books only show "
                          "liquidity while the event is live)")
+    ap.add_argument("--report", metavar="PATH", default=None,
+                    help="instead of probing, roll up a liquidity_log.jsonl into a per-series summary")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
         raise SystemExit(_selftest())
+    if args.report:
+        _print_report(Path(args.report))
+        return
 
     series_list = [s.strip() for s in args.series.split(",") if s.strip()]
     print("=== kalshi_liquidity — resting-book check (run BEFORE modeling) ===")
@@ -129,7 +189,16 @@ def _selftest() -> int:
     assert lv["fillable"] == 1 and lv["volume"] == 120 and "LIQUID" in verdict(lv), (lv, verdict(lv))
     ml = market_liquidity(liquid[0])
     assert ml["two_sided"] and ml["spread"] == 7, ml
-    print("market_liquidity + verdict OK (DEAD vs LIQUID classified correctly)")
+    # rollup: KXINX live in 1 of 2 samples, KXHIGHNY dead in both
+    log_rows = [
+        {"ts": "2026-06-24T14:00:00+00:00", "series": "KXINX", "n": 5, "fillable": 4, "volume": 900, "open_interest": 500},
+        {"ts": "2026-06-24T06:00:00+00:00", "series": "KXINX", "n": 5, "fillable": 0, "volume": 0, "open_interest": 0},
+        {"ts": "2026-06-24T14:00:00+00:00", "series": "KXHIGHNY", "n": 8, "fillable": 0, "volume": 0, "open_interest": 0},
+    ]
+    rep = {r["series"]: r for r in report_log(log_rows)}
+    assert rep["KXINX"]["fillable_samples"] == 1 and rep["KXINX"]["max_volume"] == 900, rep["KXINX"]
+    assert rep["KXHIGHNY"]["fillable_samples"] == 0 and not rep["KXHIGHNY"]["no_markets"], rep["KXHIGHNY"]
+    print("market_liquidity + verdict + rollup OK")
     print("PASS")
     return 0
 
