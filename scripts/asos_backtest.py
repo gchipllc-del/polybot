@@ -45,16 +45,54 @@ def _load_settled(path: Path) -> list:
     return rows
 
 
-def replay(records: list, fetch_fn, tz_of, sleep: float = 0.0) -> dict:
+CACHE_PATH = LOG.parent / "asos_backtest_obs_cache.json"
+
+
+def _load_cache(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+    return {}
+
+
+def _save_cache(path: Path, cache: dict) -> None:
+    try:
+        path.write_text(json.dumps(cache))
+    except OSError:
+        pass
+
+
+def _fetch_retry(fetch_fn, station, tz, d, sleep: float, retries: int):
+    """Fetch with bounded exponential backoff. Returns obs list, or None on persistent
+    failure (throttle/network) — None is NOT cached, so it's retried on a later run."""
+    for attempt in range(retries + 1):
+        try:
+            obs = fetch_fn(station, tz, d)
+            if sleep:
+                time.sleep(sleep)
+            return obs
+        except Exception:
+            if attempt < retries:
+                time.sleep(sleep * (2 ** attempt) + 0.5)
+    return None
+
+
+def replay(records: list, fetch_fn, tz_of, sleep: float = 0.0,
+           cache: dict = None, retries: int = 2, on_fetch=None) -> dict:
     """Re-decide each settled lock with the corrected high. fetch_fn(station, tz, date)→obs;
-    tz_of(series)→tz. OLD stats are scored on the SAME re-fetched set as FIXED (fair
-    comparison), and fetch failures are bucketed by reason."""
+    tz_of(series)→tz. OLD stats are scored on the SAME re-fetched set as FIXED. A persistent
+    `cache` (keyed 'station|YYYY-MM-DD') is read first and filled on each successful fetch,
+    so repeated runs ACCUMULATE coverage instead of re-hammering (and rate-limiting) IEM."""
     a = {"n": 0, "bad_date": 0, "fetch_error": 0, "empty_obs": 0,
+         "cache_hit": 0, "fetched": 0,
          "scored": 0, "old_won": 0, "old_pnl": 0.0,
          "new_lock": 0, "new_won": 0, "new_pnl": 0.0,
          "skip": 0, "skip_old_loss": 0, "skip_old_win": 0,
          "flips": [], "per_station": {}}
-    cache: dict = {}
+    cache = cache if cache is not None else {}
+    failed: set = set()
     for r in records:
         a["n"] += 1
         # Use the STATION-LOCAL settlement day (fetch_iem_day expects local, but ts is UTC
@@ -66,18 +104,23 @@ def replay(records: list, fetch_fn, tz_of, sleep: float = 0.0) -> dict:
             continue
         series, station = r.get("series"), r.get("station")
         tz = tz_of(series)
-        key = (station, tz, d)
-        if key not in cache:
-            try:
-                cache[key] = fetch_fn(station, tz, d)
-                if sleep:
-                    time.sleep(sleep)
-            except Exception:
-                cache[key] = None
-        obs = cache[key]
-        if obs is None:
-            a["fetch_error"] += 1
+        key = f"{station}|{d.isoformat()}"
+        if key in cache:
+            obs = cache[key]
+            a["cache_hit"] += 1
+        elif key in failed:
+            a["fetch_error"] += 1                         # already failed this run; don't re-hit
             continue
+        else:
+            obs = _fetch_retry(fetch_fn, station, tz, d, sleep, retries)
+            if obs is None:
+                failed.add(key)
+                a["fetch_error"] += 1
+                continue
+            cache[key] = obs
+            a["fetched"] += 1
+            if on_fetch:
+                on_fetch()                                # persist incrementally
         rh = realized_high(obs)
         if not rh:
             a["empty_obs"] += 1
@@ -121,8 +164,10 @@ def replay(records: list, fetch_fn, tz_of, sleep: float = 0.0) -> dict:
 def _report(a: dict) -> None:
     print("=== asos_backtest — old vs FIXED decision on settled locks ===")
     fails = a["bad_date"] + a["fetch_error"] + a["empty_obs"]
-    print(f"  {a['n']} settled locks · {a['scored']} re-fetched & scored · {fails} unusable "
+    print(f"  {a['n']} settled locks · {a['scored']} scored · {fails} unusable "
           f"(no-date {a['bad_date']}, fetch-error {a['fetch_error']}, empty-obs {a['empty_obs']})")
+    print(f"  obs: {a['cache_hit']} from cache, {a['fetched']} freshly fetched this run "
+          f"(re-run later to fill the {a['fetch_error']} throttled — coverage accumulates on disk)")
     scored = a["scored"]
     if scored <= 0:
         print("  nothing scored — could not re-fetch obs (network? station ids?).")
@@ -163,7 +208,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--path", default=str(LOG))
-    ap.add_argument("--sleep", type=float, default=0.3, help="seconds between IEM fetches (be polite)")
+    ap.add_argument("--sleep", type=float, default=0.7, help="seconds between IEM fetches (be polite)")
+    ap.add_argument("--no-cache", action="store_true", help="ignore the on-disk obs cache")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -178,8 +224,14 @@ def main() -> None:
         st = STATIONS.get(series)
         return st[1] if st else "America/New_York"
 
-    print(f"re-fetching corrected obs for {len(records)} locks (cached by station+day)…")
-    a = replay(records, fetch_iem_day, tz_of, sleep=args.sleep)
+    cache = {} if args.no_cache else _load_cache(CACHE_PATH)
+    n_before = len(cache)
+    print(f"re-deciding {len(records)} locks · {n_before} station-days already cached on disk…")
+    a = replay(records, fetch_iem_day, tz_of, sleep=args.sleep, cache=cache,
+               on_fetch=lambda: _save_cache(CACHE_PATH, cache))
+    if not args.no_cache:
+        _save_cache(CACHE_PATH, cache)
+    print(f"  obs cache now {len(cache)} station-days (+{len(cache) - n_before} new) at {CACHE_PATH.name}")
     _report(a)
 
 
