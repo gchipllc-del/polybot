@@ -18,7 +18,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tradingcore import log_event
+try:
+    from tradingcore import log_event
+except ImportError:  # tradingcore is vendored only in the live clone; no-op telemetry here
+    def log_event(*_a, **_k):
+        pass
 
 ROOT = Path(__file__).resolve().parent.parent
 PAPER_LOG = ROOT / "data" / "kalshi_daily_paper.jsonl"

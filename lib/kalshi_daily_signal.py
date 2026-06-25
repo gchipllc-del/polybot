@@ -22,7 +22,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tradingcore import log_event
+try:
+    from tradingcore import log_event
+except ImportError:  # tradingcore is vendored only in the live clone; no-op telemetry here
+    def log_event(*_a, **_k):
+        pass
 
 from lib.btc_5min_signal import compute_indicators_for_window
 

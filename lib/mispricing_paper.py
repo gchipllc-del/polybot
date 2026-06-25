@@ -35,7 +35,11 @@ import random
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tradingcore import log_event
+try:
+    from tradingcore import log_event
+except ImportError:  # tradingcore is vendored only in the live clone; no-op telemetry here
+    def log_event(*_a, **_k):
+        pass
 from lib.weather_signal import sample_signals
 from lib.mispricing_gauge import build_gauge, measured_p_win, measured_edge
 

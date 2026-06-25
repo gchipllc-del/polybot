@@ -16,7 +16,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tradingcore import log_event
+try:
+    from tradingcore import log_event
+except ImportError:  # tradingcore is vendored only in the live clone; no-op telemetry here
+    def log_event(*_a, **_k):
+        pass
 
 ROOT = Path(__file__).resolve().parent.parent
 # Output + config are env-overridable so a SECOND, parallel paper instance can

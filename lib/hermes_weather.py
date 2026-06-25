@@ -38,7 +38,11 @@ from typing import Literal
 
 import yaml
 
-from tradingcore import log_event
+try:
+    from tradingcore import log_event
+except ImportError:  # tradingcore is vendored only in the live clone; no-op telemetry here
+    def log_event(*_a, **_k):
+        pass
 
 ROOT = Path(__file__).resolve().parent.parent
 WEATHER_STRATEGY_PATH = ROOT / "config" / "weather_strategy.yaml"
