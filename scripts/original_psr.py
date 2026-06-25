@@ -8,9 +8,14 @@ test of whether the "old way that was winning" had edge or was longshot variance
 the same way we judged everything else (per-day PSR: <0.50 not even probably positive,
 0.50-0.95 provisional, >=0.95 evidence-backed). Read-only.
 
-  python scripts/original_psr.py
-  python scripts/original_psr.py --by strategy     # split per strategy/source if present
+  python scripts/original_psr.py                                   # trade_history.json (real money)
+  python scripts/original_psr.py --path data/kalshi_daily_paper.jsonl   # a crypto PAPER ledger
+  python scripts/original_psr.py --by strategy                     # split per strategy/source
   python scripts/original_psr.py --selftest
+
+Reads both shapes: trade_history.json (JSON array, `won`/`net_profit`) AND the paper JSONL
+ledgers (`status`/`paper_pnl`) — so the original crypto sleeves' paper record is judgeable
+even while the real-money trade_history.json is TCC-locked on the Desktop checkout.
 """
 import argparse
 import json
@@ -25,6 +30,27 @@ HIST = ROOT / "data" / "trade_history.json"
 
 def _date(t: dict) -> str:
     return str(t.get("closed_at") or t.get("resolved_at") or t.get("opened_at") or "")[:10]
+
+
+def _is_resolved(t: dict) -> bool:
+    """True for a settled trade in either schema: trade_history (`won` is bool) or the
+    paper JSONL ledgers (`status` in won/lost/won_early/cut_loss)."""
+    if isinstance(t.get("won"), bool):
+        return True
+    return str(t.get("status")) in ("won", "lost", "won_early", "cut_loss")
+
+
+def _won(t: dict) -> bool:
+    if isinstance(t.get("won"), bool):
+        return t["won"]
+    return str(t.get("status")) in ("won", "won_early")
+
+
+def _pnl(t: dict) -> float:
+    v = t.get("net_profit")
+    if v is None:
+        v = t.get("paper_pnl")
+    return float(v or 0)
 
 
 def _group_key(t: dict, field: str) -> str:
@@ -42,15 +68,15 @@ def per_day_returns(trades: list) -> list:
     for t in trades:
         d = _date(t)
         if d:
-            by[d] += float(t.get("net_profit") or 0)
+            by[d] += _pnl(t)
     return [by[d] for d in sorted(by)]
 
 
 def analyze(trades: list, trials: int = 1) -> dict:
-    resolved = [t for t in trades if isinstance(t.get("won"), bool)]
+    resolved = [t for t in trades if _is_resolved(t)]
     daily = per_day_returns(resolved)
-    n, wins = len(resolved), sum(1 for t in resolved if t.get("won"))
-    net = sum(float(t.get("net_profit") or 0) for t in resolved)
+    n, wins = len(resolved), sum(1 for t in resolved if _won(t))
+    net = sum(_pnl(t) for t in resolved)
     out = {"n": n, "wins": wins, "net": round(net, 2), "days": len(daily),
            "psr": None, "dsr": None, "mtrl": None, "verdict": "n<5 days — inconclusive"}
     if len(daily) >= 5:
@@ -71,13 +97,28 @@ def analyze(trades: list, trials: int = 1) -> dict:
 
 
 def _load(path: Path) -> list:
+    """Read a JSON array (trade_history.json) OR a JSONL paper ledger (one obj/line)."""
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        txt = path.read_text()
+    except OSError:
         return []
-    return data if isinstance(data, list) else []
+    if txt.lstrip().startswith("["):
+        try:
+            data = json.loads(txt)
+            return data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            return []
+    out = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
 
 
 def _print(label: str, a: dict) -> None:
@@ -135,6 +176,11 @@ def _selftest() -> int:
     same = [{"won": True, "net_profit": 1.0, "closed_at": "2026-05-01T09:00Z"},
             {"won": False, "net_profit": -1.0, "closed_at": "2026-05-01T15:00Z"}]
     assert analyze(same)["days"] == 1, analyze(same)
+    # paper-ledger schema (status/paper_pnl/resolved_at) parses identically
+    paper = [{"status": "won", "paper_pnl": 1.5, "resolved_at": f"2026-05-{d:02d}T12:00Z"}
+             for d in range(1, 8)] + [{"status": "lost", "paper_pnl": -1.0, "resolved_at": "2026-05-09T12:00Z"}]
+    p = analyze(paper)
+    assert p["n"] == 8 and p["wins"] == 7 and abs(p["net"] - (7 * 1.5 - 1.0)) < 1e-9, p
     print(f"loser set: net ${a['net']} PSR {a['psr']:.2f} (not real) — OK")
     print(f"steady set: PSR {s['psr']:.2f} (real) — OK; per-day grouping OK")
     print("PASS")
