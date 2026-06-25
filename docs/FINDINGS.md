@@ -110,6 +110,18 @@ margins use `no_ask = 100 − yes_bid` synthetic prices when the NO book is empt
 no ask *size*, so a positive near-miss is necessary-not-sufficient until a live order-book
 depth probe confirms all legs are fillable. (0 trades over 355 observed events.)
 
+**ROOT CAUSE proven (weather_source_bakeoff.py, 2026-06-24):** scoring every Open-Meteo
+model against the SETTLEMENT-EXACT IEM station max (70 station-days) shows the best
+forecast — GFS = Open-Meteo's default — hits **MAE 1.19°F, ~zero bias**, which is about the
+physical day-ahead limit for a daily high. It's **free and public**, so the market prices it
+in; you cannot buy a proprietary forecast meaningfully better than a free 1.19°F. *That* is
+why every weather sleeve died — not bad forecasting, but forecasting a public signal the
+market already shares. Two durable, reusable facts fell out: (1) **blending HURTS** — the
+4-model blend's MAE 1.52 is worse than the best single 1.19 (ECMWF 2.34 / GEM 2.48 drag it
+down); use single-source GFS/Open-Meteo, never an average. (2) **Score against the station,
+not ERA5** — ERA5 reanalysis carries 1.83°F of its own error vs the settlement station, so
+any model ranking built on ERA5 (e.g. the old forecaster_accuracy) is corrupted.
+
 ### BTC SHORT-horizon (5-min / hourly) — earlier
 **Verdict: efficient market, no edge.** Tested and ruled out — at minute/hour
 horizons the market prices the available data. NOTE: this is the *short* horizon
