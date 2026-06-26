@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jesse.polybot.weather_no_fill_probe</string>
+    <!--
+        weather-NO fill-realism probe — fires every 300s.
+        Discovers current weather-NO candidate markets via the live signal
+        and snapshots their Kalshi order books, logging NO-side depth to
+        data/weather_no_fill_probe.jsonl. Measures whether the cheap-NO
+        fills (the whole edge) are actually available in size.
+
+        Read-only: never places orders. Review with
+        `python scripts/weather_no_fill_probe.py report`.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/jesse/Desktop/projects/polybot/scripts/launchd/run_weather_no_fill_probe.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_weather_no_fill_probe.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_weather_no_fill_probe_err.log</string>
+</dict>
+</plist>
