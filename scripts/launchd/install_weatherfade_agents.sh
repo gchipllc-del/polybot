@@ -16,9 +16,10 @@ RUN_DASH="$PROJECT_ROOT/scripts/launchd/run_weather_fade_dash.sh"
 RUN_FC2S="$PROJECT_ROOT/scripts/launchd/run_fc2s.sh"
 RUN_SHADOW="$PROJECT_ROOT/scripts/launchd/run_fc2s_shadow.sh"
 RUN_ENS="$PROJECT_ROOT/scripts/launchd/run_ensemble.sh"
+RUN_FILLPROBE="$PROJECT_ROOT/scripts/launchd/run_weather_no_fill_probe.sh"
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS"
-chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" "$RUN_SHADOW" "$RUN_ENS" 2>/dev/null || true
+chmod +x "$RUN" "$RUN_DASH" "$RUN_FC2S" "$RUN_SHADOW" "$RUN_ENS" "$RUN_FILLPROBE" 2>/dev/null || true
 
 # write_agent LABEL  CADENCE  RUNNER  [args...]
 #   CADENCE: a number    = StartInterval seconds (fires at load too)
@@ -78,6 +79,10 @@ write_agent "$P.enscollect"    cal:26 "$RUN_ENS" collect
 write_agent "$P.fc2sshadowcollect" cal:34 "$RUN_SHADOW" collect
 write_agent "$P.fc2sshadowsettle"  cal:48 "$RUN_SHADOW" settle
 write_agent "$P.enssettle"     cal:56 "$RUN_ENS" settle
+# weather-NO fill-realism probe — snapshots the live order-book NO depth every 5 min so we
+# can verify the cheap-NO fills (the whole edge) are actually available in size BEFORE any
+# real money. Read-only (no orders). Review: python scripts/weather_no_fill_probe.py report
+write_agent "$P.fillprobe"      300 "$RUN_FILLPROBE"
 # dashboard — file render every 5 min (the reliable view: open the HTML file).
 # Now shows honest "retired/stale" banners; still renders the fc2s + ensemble panels.
 write_agent "$P.dashfile"       300 "$RUN_DASH" render

@@ -288,6 +288,65 @@ def _load(p: Path) -> list:
     return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
 
 
+# ── preflight (run once on the host before trusting the agent) ────────────────
+
+def preflight(ticker: str | None = None) -> int:
+    """End-to-end host check: creds → live order book → depth math. Run this ONCE on the
+    trading host; if it prints PASS you can schedule the capture agent and trust the data."""
+    print("weather_no_fill_probe preflight — verifying the host can capture real depth\n")
+
+    # 1) client + creds
+    try:
+        from lib.kalshi_client import KalshiClient
+        client = KalshiClient()
+        get_book = client.get_orderbook
+    except Exception as e:  # noqa: BLE001
+        print(f"  [FAIL] could not construct KalshiClient ({e}).")
+        print("         → ensure .env has the Kalshi API key/secret and you're on the host.")
+        return 1
+    print("  [ok]  KalshiClient constructed (creds loaded)")
+
+    # 2) discover weather-NO candidate markets (exercises the live signal path)
+    cands = []
+    if not ticker:
+        try:
+            cands = _discover_weather_no_tickers()
+            print(f"  [ok]  weather-NO candidate discovery returned {len(cands)} market(s)")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [warn] signal discovery failed ({e}); pass --ticker to test the book directly")
+    pick = ticker or (cands[0][0] if cands else None)
+    if not pick:
+        print("  [warn] no candidate market to test right now (off-window?). Re-run during a "
+              "live weather window, or pass --ticker <KXTEMP...> to test the book path.")
+        print("\nPARTIAL — creds OK, but no live market to validate the order book against.")
+        return 0
+
+    # 3) pull the real book and run the depth math on it
+    try:
+        book = get_book(pick)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [FAIL] get_orderbook({pick}) raised ({e}).")
+        return 1
+    bids, asks = book.get("bids", []), book.get("asks", [])
+    print(f"  [ok]  fetched order book for {pick}: {len(bids)} bid levels, {len(asks)} ask levels")
+    if not bids and not asks:
+        print("  [warn] book is EMPTY right now (thin hourly market). The depth math is fine; "
+              "this market just has no resting size this instant. Try another ticker/time.")
+        return 0
+    bay, ban = best_no_ask_via_yes(book), best_no_ask_via_no(book)
+    print(f"        best NO ask  — via YES bids: {bay}   via NO array: {ban}")
+    for p in (0.10, 0.15):
+        print(f"        NO buyable <= {p:.2f}  — via YES bids: {no_size_via_yes_bids(book, p):.0f}   "
+              f"via NO array: {no_size_via_no_asks(book, p):.0f}")
+    print("\n  Sanity: the interpretation whose best-NO-ask matches the price your paper sleeve")
+    print("  actually paid is the correct one; `report` picks it automatically once data lands.")
+    print("\nPASS — host can capture real NO-side depth. Next:")
+    print("  1) schedule it:  bash scripts/launchd/install_weatherfade_agents.sh   (adds the probe)")
+    print("     or one-off:    python scripts/weather_no_fill_probe.py capture --from-signals")
+    print("  2) after a few live windows:  python scripts/weather_no_fill_probe.py report")
+    return 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -298,8 +357,13 @@ def main() -> None:
                      help="discover current weather-NO candidate markets via the live signal")
     rep = sub.add_parser("report")
     rep.add_argument("--window-min", type=float, default=30.0)
+    pf = sub.add_parser("preflight")
+    pf.add_argument("--ticker", help="test the book for this market instead of auto-discovering")
     sub.add_parser("selftest")
     args = ap.parse_args()
+
+    if args.cmd == "preflight":
+        raise SystemExit(preflight(args.ticker))
 
     if args.cmd == "capture":
         if args.from_signals:
