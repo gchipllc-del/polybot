@@ -113,13 +113,22 @@ def _forecast_dir_ok(forecast_f: float, strike_f: float, side: str,
         return True, "gate_off"
     buf_no = params["forecast_buffer_f"]
     buf_yes = params.get("forecast_buffer_f_yes") or buf_no
+    # Opt-in decisive-forecast gate (default off): require the forecast to clear the strike
+    # by >= this margin, on top of the base coherence buffer. Selects the skill cohort and
+    # drops the blind-zone variance (see weather_settlement_diag.py). Distinct skip reason
+    # so the A/B can see how many trades the decisive threshold removed beyond the buffer.
+    dec = params.get("forecast_decisive_min_f")
     if side == "YES":
         # YES wins if temp >= strike. Need forecast clearly above.
         if forecast_f < (strike_f + buf_yes):
             return False, "forecast_dir_yes"
+        if dec and forecast_f < (strike_f + float(dec)):
+            return False, "forecast_decisive_yes"
     else:   # NO wins if temp < strike. Need forecast clearly below.
         if forecast_f > (strike_f - buf_no):
             return False, "forecast_dir_no"
+        if dec and forecast_f > (strike_f - float(dec)):
+            return False, "forecast_decisive_no"
     return True, "ok"
 
 
@@ -175,6 +184,19 @@ def _effective_params() -> dict:
         # is None, falls back to the symmetric forecast_buffer_f.
         "forecast_buffer_f_yes": (None if o.get("forecast_buffer_f_yes") is None
                                    else float(o.get("forecast_buffer_f_yes"))),
+        # 2026-06-26: OPT-IN decisive-forecast gate (default None = OFF, no behavior
+        # change). When set (e.g. 0.95 ≈ the NWS nowcast MAE), the trade additionally
+        # requires the forecast to clear the strike by >= this margin — i.e. only trade
+        # the DECISIVE cohort the forecast can actually call. weather_settlement_diag.py
+        # on 154 settled NO trades: decisive cohort (|fc−strike|>=0.95°F) = 63% WR /
+        # +$2,415 (real forecast skill), while the blind zone (within 0.95°F) netted +$854
+        # at 43% WR = payoff-asymmetry/variance, NOT skill, and is the part most exposed to
+        # live fills+fees. This gate drops the blind zone. Default OFF so the production
+        # instance is unchanged; enable it on the shadow A/B instance to test live whether
+        # the robust skill cohort beats keeping the variance. Skips log distinct reasons
+        # (forecast_decisive_no/yes) so the A/B shows the gate's marginal effect.
+        "forecast_decisive_min_f": (None if o.get("forecast_decisive_min_f") is None
+                                     else float(o.get("forecast_decisive_min_f"))),
         # Master switch for the forecast-direction (coherence) gate below.
         # True (default) = production 2026-05-26 HALT-fix behaviour. False =
         # pure probability-edge trading (the pre-HALT "original" behaviour),

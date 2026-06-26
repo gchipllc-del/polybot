@@ -97,3 +97,50 @@ def test_default_buffer_is_half_degree(monkeypatch):
     import lib.weather_paper as wp
     monkeypatch.setattr(wp, "_load_overrides", lambda: {})
     assert wp._effective_params()["forecast_buffer_f"] == 0.5
+
+
+# ── opt-in decisive-forecast gate (default OFF) ──────────────────────────────
+
+def test_decisive_gate_off_by_default(monkeypatch):
+    # Default None → OFF → no behavior change vs the base buffer.
+    import lib.weather_paper as wp
+    monkeypatch.setattr(wp, "_load_overrides", lambda: {})
+    assert wp._effective_params()["forecast_decisive_min_f"] is None
+
+
+def test_decisive_off_allows_base_buffer_pass():
+    # NO forecast 54.3 clears the 0.5 base buffer (<54.5) and, with decisive OFF, trades.
+    assert _forecast_dir_ok(54.3, 55.0, "NO", _params()) == (True, "ok")
+
+
+def test_decisive_no_blocks_within_decisive_margin():
+    # decisive=0.95 → NO needs forecast <= 54.05. 54.3 clears the base 0.5 buffer but is
+    # inside the decisive margin → blocked with the DISTINCT reason for A/B telemetry.
+    p = _params(forecast_decisive_min_f=0.95)
+    ok, reason = _forecast_dir_ok(54.3, 55.0, "NO", p)
+    assert ok is False and reason == "forecast_decisive_no"
+
+
+def test_decisive_no_passes_when_forecast_decisive():
+    # 54.0 clears both the base buffer and the 0.95 decisive margin.
+    assert _forecast_dir_ok(54.0, 55.0, "NO", _params(forecast_decisive_min_f=0.95)) == (True, "ok")
+
+
+def test_decisive_yes_blocks_within_decisive_margin():
+    # decisive=0.95 → YES needs forecast >= 55.95. 55.7 clears the base 0.5 buffer (>=55.5)
+    # but is inside the decisive margin → blocked.
+    ok, reason = _forecast_dir_ok(55.7, 55.0, "YES", _params(forecast_decisive_min_f=0.95))
+    assert ok is False and reason == "forecast_decisive_yes"
+
+
+def test_decisive_base_buffer_still_wins_against_forecast():
+    # Decisive gate never RELAXES the base gate: an against-forecast NO is still blocked by
+    # the base reason, not reached by the decisive check.
+    ok, reason = _forecast_dir_ok(56.0, 55.0, "NO", _params(forecast_decisive_min_f=0.95))
+    assert ok is False and reason == "forecast_dir_no"
+
+
+def test_effective_params_reads_decisive_override(monkeypatch):
+    import lib.weather_paper as wp
+    monkeypatch.setattr(wp, "_load_overrides", lambda: {"forecast_decisive_min_f": 0.95})
+    assert wp._effective_params()["forecast_decisive_min_f"] == 0.95
