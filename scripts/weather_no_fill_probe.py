@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +39,33 @@ sys.path.insert(0, str(ROOT))
 
 PROBE_LOG = ROOT / "data" / "weather_no_fill_probe.jsonl"
 LEDGER = ROOT / "data" / "weather_paper.jsonl"
+
+
+def _load_env() -> None:
+    """Load .env (KEY=VALUE) into the process so a MANUAL run matches the launchd runner,
+    which sources .env. Without this, `preflight`/`capture` run by hand miss the keys and
+    the PYTHONPATH that make the authenticated client (and vendored tradingcore) import —
+    the exact false-FAIL the host hit running preflight directly while the agent captured
+    fine. Sets only vars not already set; applies PYTHONPATH to sys.path. No-op if absent."""
+    envp = ROOT / ".env"
+    if not envp.exists():
+        return
+    try:
+        for line in envp.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            os.environ.setdefault(k, v)
+            if k == "PYTHONPATH":
+                for p in v.split(":"):
+                    if p and p not in sys.path:
+                        sys.path.insert(0, p)
+    except Exception:
+        pass
 
 
 # ── pure order-book math (testable; two interpretations) ─────────────────────
@@ -110,6 +138,7 @@ def capture(tickers: list, get_book=None) -> int:
     """Snapshot each ticker's book and append to PROBE_LOG. get_book is injectable for
     tests; defaults to a live KalshiClient().get_orderbook."""
     if get_book is None:
+        _load_env()
         from lib.kalshi_client import KalshiClient
         client = KalshiClient()
         get_book = client.get_orderbook
@@ -224,9 +253,19 @@ def build_report(ledger_rows: list, probe_rows: list, window_min: float = 30.0) 
 
 def _print_report(rep: dict) -> None:
     if rep.get("matched", 0) == 0:
-        print(f"no joinable probe data yet — {rep.get('n_probes',0)} snapshots, "
-              f"{rep.get('n_no',0)} NO fills, 0 matched within the time window.\n"
-              f"Run `capture` on the live host during weather windows first.")
+        n_probes, n_no = rep.get("n_probes", 0), rep.get("n_no", 0)
+        if n_probes == 0:
+            print(f"no snapshots yet ({n_no} NO fills on file). Run `capture` during weather "
+                  f"windows first — schedule the fillprobe agent or run capture --from-signals.")
+            return
+        print(f"{n_probes} snapshots, {n_no} NO fills, 0 matched — EXPECTED at this stage. A "
+              f"match needs a snapshot of the SAME ticker within the time window of a fill.\n"
+              f"This is FORWARD-collection: your {n_no} fills are historical (recorded before "
+              f"any snapshots existed), and Kalshi serves only the CURRENT book — so the old "
+              f"fills can never be matched retroactively. Matches accrue only as NEW weather-NO "
+              f"fills are recorded alongside fresh snapshots. Check back after the live sleeve "
+              f"has booked a few NO trades during captured windows (a few days), and confirm the "
+              f"sleeve is still trading (else no new fills ever land).")
         return
     real_pct = "—" if rep["pnl_real_frac"] is None else f"{100*rep['pnl_real_frac']:.0f}%"
     print(f"matched {rep['matched']}/{rep['n_no']} NO fills to book snapshots "
@@ -293,16 +332,21 @@ def _load(p: Path) -> list:
 def preflight(ticker: str | None = None) -> int:
     """End-to-end host check: creds → live order book → depth math. Run this ONCE on the
     trading host; if it prints PASS you can schedule the capture agent and trust the data."""
-    print("weather_no_fill_probe preflight — verifying the host can capture real depth\n")
+    print("weather_no_fill_probe preflight — verifying the host can capture real depth")
+    print("(this checks the TAKER side: is the cheap-NO depth we 'fill' in paper actually "
+          "there to buy)\n")
 
-    # 1) client + creds
+    # 1) client + creds — load .env first so a manual run matches the launchd runner.
+    _load_env()
     try:
         from lib.kalshi_client import KalshiClient
         client = KalshiClient()
         get_book = client.get_orderbook
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] could not construct KalshiClient ({e}).")
-        print("         → ensure .env has the Kalshi API key/secret and you're on the host.")
+        print("         → if capture works via the agent but this FAILs, you ran preflight")
+        print("           without the runner's env; retry via the runner, or ensure .env sets")
+        print("           the Kalshi keys (and PYTHONPATH for tradingcore) and you're on the host.")
         return 1
     print("  [ok]  KalshiClient constructed (creds loaded)")
 
