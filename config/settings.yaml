@@ -103,7 +103,10 @@ kalshi_daily_live:
   # Plus realistic paper now has notional-scaled slippage + latency drift
   # so paper P&L tracks live within ~5pp. User-requested re-enable to
   # deploy the calibrated strategy on remaining $7.93 cash.
-  enabled: true
+  # 2026-06-21: DISARMED — every live weather/daily strategy is retired/ruled-out
+  # (see docs/FINDINGS.md). Committed default is now paper-safe; flip back to true
+  # ONLY for a deliberate, smoke-tested live deploy. preflight_live_check.py guards this.
+  enabled: false
   # 2026-05-25 EOD-EU: raised $5 → $9 after first 24h proved out.
   # 2026-05-25 PM: pulled back $9 → $7 after losing streak (11L of 17).
   # 2026-05-25 PM: lowered $7 → $6 for the $6 BTC + $6 weather split.

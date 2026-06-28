@@ -16,7 +16,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tradingcore import log_event
+try:
+    from tradingcore import log_event
+except ImportError:  # tradingcore is vendored only in the live clone; no-op telemetry here
+    def log_event(*_a, **_k):
+        pass
 
 ROOT = Path(__file__).resolve().parent.parent
 # Output + config are env-overridable so a SECOND, parallel paper instance can
@@ -92,6 +96,42 @@ def _live_trend_veto(s: dict, side: str, raw_fill_live: float,
     return True, "trend_ok"
 
 
+def _forecast_dir_ok(forecast_f: float, strike_f: float, side: str,
+                     params: dict) -> tuple[bool, str]:
+    """Forecast-direction (coherence) gate — the 2026-05-26 PM HALT FIX, extracted to a
+    pure, testable helper (mirrors _live_trend_veto). Refuse a trade whose NWS point
+    forecast doesn't agree with the bet side, using an asymmetric buffer: YES needs the
+    forecast clearly ABOVE the strike, NO clearly BELOW. Returns (ok, reason); reason is
+    the skip_counts key on refusal. When forecast_dir_gate is off, always ok.
+
+    Buffer math (verified on weather_paper.jsonl, 162 settled NO): the 0.5°F default is
+    optimal — conditioned on gate-passing NO trades, even the tightest [0,0.5°F]-below-
+    strike band is 80% WR/+$217; raising the buffer 0.5→1.0 drops 12 winners (−$444). So
+    do NOT widen it. The gate itself cut against-forecast NO trades from 45/59 (pre) to
+    2/103 (post)."""
+    if not params.get("forecast_dir_gate", True):
+        return True, "gate_off"
+    buf_no = params["forecast_buffer_f"]
+    buf_yes = params.get("forecast_buffer_f_yes") or buf_no
+    # Opt-in decisive-forecast gate (default off): require the forecast to clear the strike
+    # by >= this margin, on top of the base coherence buffer. Selects the skill cohort and
+    # drops the blind-zone variance (see weather_settlement_diag.py). Distinct skip reason
+    # so the A/B can see how many trades the decisive threshold removed beyond the buffer.
+    dec = params.get("forecast_decisive_min_f")
+    if side == "YES":
+        # YES wins if temp >= strike. Need forecast clearly above.
+        if forecast_f < (strike_f + buf_yes):
+            return False, "forecast_dir_yes"
+        if dec and forecast_f < (strike_f + float(dec)):
+            return False, "forecast_decisive_yes"
+    else:   # NO wins if temp < strike. Need forecast clearly below.
+        if forecast_f > (strike_f - buf_no):
+            return False, "forecast_dir_no"
+        if dec and forecast_f > (strike_f - float(dec)):
+            return False, "forecast_decisive_no"
+    return True, "ok"
+
+
 def _load_overrides() -> dict:
     """Read weather_strategy.yaml overrides (written by hermes_weather).
     Returns {} if file missing/unreadable so module-level defaults win.
@@ -144,6 +184,19 @@ def _effective_params() -> dict:
         # is None, falls back to the symmetric forecast_buffer_f.
         "forecast_buffer_f_yes": (None if o.get("forecast_buffer_f_yes") is None
                                    else float(o.get("forecast_buffer_f_yes"))),
+        # 2026-06-26: OPT-IN decisive-forecast gate (default None = OFF, no behavior
+        # change). When set (e.g. 0.95 ≈ the NWS nowcast MAE), the trade additionally
+        # requires the forecast to clear the strike by >= this margin — i.e. only trade
+        # the DECISIVE cohort the forecast can actually call. weather_settlement_diag.py
+        # on 154 settled NO trades: decisive cohort (|fc−strike|>=0.95°F) = 63% WR /
+        # +$2,415 (real forecast skill), while the blind zone (within 0.95°F) netted +$854
+        # at 43% WR = payoff-asymmetry/variance, NOT skill, and is the part most exposed to
+        # live fills+fees. This gate drops the blind zone. Default OFF so the production
+        # instance is unchanged; enable it on the shadow A/B instance to test live whether
+        # the robust skill cohort beats keeping the variance. Skips log distinct reasons
+        # (forecast_decisive_no/yes) so the A/B shows the gate's marginal effect.
+        "forecast_decisive_min_f": (None if o.get("forecast_decisive_min_f") is None
+                                     else float(o.get("forecast_decisive_min_f"))),
         # Master switch for the forecast-direction (coherence) gate below.
         # True (default) = production 2026-05-26 HALT-fix behaviour. False =
         # pure probability-edge trading (the pre-HALT "original" behaviour),
@@ -305,23 +358,10 @@ def record_paper_trades_from_samples(samples: list[dict]) -> list[WeatherPaperTr
         # gap vs losers +0.06°F — YES needs more upside conviction
         # than NO because forecasts often miss low (warmer than
         # predicted) more than they miss high.
-        buf_no  = params["forecast_buffer_f"]
-        buf_yes = params.get("forecast_buffer_f_yes") or buf_no
-        if params["forecast_dir_gate"]:
-            if side == "YES":
-                # YES wins if temp >= strike. Need forecast clearly above.
-                if forecast_f < (strike_f + buf_yes):
-                    skip_counts["forecast_dir_yes"] = (
-                        skip_counts.get("forecast_dir_yes", 0) + 1
-                    )
-                    continue
-            else:   # NO
-                # NO wins if temp < strike. Need forecast clearly below.
-                if forecast_f > (strike_f - buf_no):
-                    skip_counts["forecast_dir_no"] = (
-                        skip_counts.get("forecast_dir_no", 0) + 1
-                    )
-                    continue
+        ok, reason = _forecast_dir_ok(forecast_f, strike_f, side, params)
+        if not ok:
+            skip_counts[reason] = skip_counts.get(reason, 0) + 1
+            continue
 
         # YES side disable gate. Backtest showed weather YES = 40% WR /
         # -$2; NO = 77% WR / +$608. Mirror of BTC where one side was

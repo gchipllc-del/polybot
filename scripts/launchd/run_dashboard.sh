@@ -6,7 +6,8 @@
 set -euo pipefail
 
 export PATH="/Users/jesse/anaconda3/bin:$PATH"
-PROJECT_ROOT="/Users/jesse/Desktop/projects/polybot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 if [ -f "$PROJECT_ROOT/.env" ]; then

@@ -27,7 +27,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from tradingcore import log_event
+try:
+    from tradingcore import log_event
+except ImportError:  # tradingcore is vendored only in the live clone; no-op telemetry here
+    def log_event(*_a, **_k):
+        pass
 from lib.forecaster_ensemble import skill_weighted_point as _ensemble_point
 
 # Reuse shared NWS/Kalshi plumbing from the hourly module.

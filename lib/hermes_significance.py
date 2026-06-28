@@ -28,6 +28,9 @@ No I/O, no global state — just math, so it is trivially safe to import anywher
 from __future__ import annotations
 
 import math
+from statistics import NormalDist
+
+_N = NormalDist()
 
 # Sample size at which a recommendation earns its FULL stated confidence.
 # Below this, confidence is scaled down linearly. 30 is the usual rule-of-thumb
@@ -59,6 +62,106 @@ def wilson_bounds(wins: int, n: int, z: float = _Z95) -> tuple[float, float]:
     lo = max(0.0, center - half)
     hi = min(1.0, center + half)
     return lo, hi
+
+
+def _moments(xs: list[float]) -> tuple[float, float, float, float]:
+    """mean, sample stdev, skew, NON-excess kurtosis (normal = 3)."""
+    n = len(xs)
+    mean = sum(xs) / n
+    var = sum((x - mean) ** 2 for x in xs) / (n - 1) if n > 1 else 0.0
+    sd = math.sqrt(var)
+    if sd == 0:
+        return mean, 0.0, 0.0, 3.0
+    skew = (sum((x - mean) ** 3 for x in xs) / n) / sd ** 3
+    kurt = (sum((x - mean) ** 4 for x in xs) / n) / sd ** 4
+    return mean, sd, skew, kurt
+
+
+def probabilistic_sharpe_ratio(returns: list[float],
+                               sr_benchmark: float = 0.0) -> float | None:
+    """PSR: P(true Sharpe > sr_benchmark) given the observed per-trade
+    return series, skew/kurtosis-adjusted (Bailey & Lopez de Prado).
+
+    Ported from traderbot lib/track_record (2026-06-15) — the prediction-
+    market analogue of "is this edge real": for Kalshi/Manifold the
+    return series is per-resolution net_profit / capital-deployed. None
+    when n<5 or the series has no variance.
+    """
+    n = len(returns)
+    if n < 5:
+        return None
+    mean, sd, skew, kurt = _moments(returns)
+    if sd == 0:
+        return None
+    sr = mean / sd
+    denom = math.sqrt(max(1e-12, 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr))
+    return _N.cdf((sr - sr_benchmark) * math.sqrt(n - 1) / denom)
+
+
+def min_track_record_length(returns: list[float],
+                            sr_benchmark: float = 0.0,
+                            confidence: float = 0.95) -> float | None:
+    """How many trades before the observed Sharpe is distinguishable from
+    the benchmark at `confidence`. inf when the edge is non-positive (no
+    sample size rescues a losing strategy). None when n<5."""
+    n = len(returns)
+    if n < 5:
+        return None
+    mean, sd, skew, kurt = _moments(returns)
+    if sd == 0:
+        return None
+    sr = mean / sd
+    if sr <= sr_benchmark:
+        return float("inf")
+    z = _N.inv_cdf(confidence)
+    return 1.0 + (1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr) \
+        * (z / (sr - sr_benchmark)) ** 2
+
+
+_EULER_MASCHERONI = 0.5772156649015329
+
+
+def expected_max_sharpe(n_trials: int, sharpe_std: float) -> float:
+    """E[max Sharpe] across `n_trials` strategies whose true edge is ZERO but whose
+    Sharpe *estimates* scatter ~N(0, sharpe_std²). Bailey & López de Prado: the more
+    configs you try, the higher the best one looks by luck alone. This is the bar a
+    real edge must clear — and it RISES with the number of things you tried."""
+    if n_trials < 2 or sharpe_std <= 0:
+        return 0.0
+    g = _EULER_MASCHERONI
+    z1 = _N.inv_cdf(1.0 - 1.0 / n_trials)
+    z2 = _N.inv_cdf(1.0 - 1.0 / (n_trials * math.e))
+    return sharpe_std * ((1.0 - g) * z1 + g * z2)
+
+
+def deflated_sharpe_ratio(returns: list[float], n_trials: int,
+                          trial_sharpes: "list[float] | None" = None) -> "float | None":
+    """Deflated Sharpe Ratio — the antidote to tuning gates on the scoreboard.
+
+    DSR = P(true Sharpe > expected-best-of-`n_trials`), skew/kurtosis adjusted.
+    Unlike PSR (benchmark 0), DSR raises the benchmark to what the BEST of n_trials
+    configs would score by pure luck — so optimizing over many gate settings makes
+    the bar HARDER, not easier. >0.95 = the result survives the search; if you tried
+    50 configs and the winner's DSR is <0.95, you found noise, not edge. None when n<5.
+
+    If you have each trial's Sharpe, pass them (variance is measured from them — the
+    honest input); else a conservative single-sample estimator variance is used."""
+    n = len(returns)
+    if n < 5:
+        return None
+    mean, sd, skew, kurt = _moments(returns)
+    if sd == 0:
+        return None
+    sr = mean / sd
+    adj = max(1e-12, 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr)
+    if trial_sharpes and len(trial_sharpes) > 1:
+        m = sum(trial_sharpes) / len(trial_sharpes)
+        sharpe_std = math.sqrt(sum((x - m) ** 2 for x in trial_sharpes)
+                               / (len(trial_sharpes) - 1))
+    else:
+        sharpe_std = math.sqrt(adj / (n - 1))   # variance of this Sharpe estimator
+    sr0 = expected_max_sharpe(n_trials, sharpe_std)
+    return _N.cdf((sr - sr0) * math.sqrt(n - 1) / math.sqrt(adj))
 
 
 def sample_factor(n: int, full_n: int = FULL_CONFIDENCE_N) -> float:

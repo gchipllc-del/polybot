@@ -38,3 +38,6 @@ logs/*.jsonl
 # OS
 .DS_Store
 Thumbs.db
+
+# asos_backtest re-fetched obs cache (local, accumulates across runs)
+data/asos_backtest_obs_cache.json
