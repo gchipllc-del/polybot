@@ -72,6 +72,22 @@ def build_fc2s() -> dict | None:
             "net": round(net, 2), "open": len(openn), "sides": sides}
 
 
+def build_fill_probe() -> dict | None:
+    """Compact weather-NO fill-realism summary — the cheap-NO TAKER depth check (was the
+    size we 'fill' in paper actually in the live book?). Defensive: any error → None so the
+    page never blanks. Reuses the probe's own join logic so the dashboard and CLI agree."""
+    try:
+        import weather_no_fill_probe as wp
+        rep = wp.build_report(wp._load(wp.LEDGER), wp._load(wp.PROBE_LOG))
+    except Exception:
+        return None
+    return {
+        "snapshots": rep.get("n_probes", 0), "n_no": rep.get("n_no", 0),
+        "matched": rep.get("matched", 0), "fillable_frac": rep.get("fillable_frac"),
+        "pnl_real_frac": rep.get("pnl_real_frac"), "cheap_real_frac": rep.get("cheap_real_frac"),
+    }
+
+
 def build_summary() -> dict:
     """All weather_fade metrics in one dict — pure, testable."""
     rows = _load_ledger()
@@ -145,6 +161,7 @@ def build_summary() -> dict:
         "by_hour": byhr,
         "hourly_collected": len(_read_jsonl(COLLECT_LEDGER)),
         "fc2s": build_fc2s(),
+        "fill_probe": build_fill_probe(),
     }
 
 
@@ -213,6 +230,34 @@ def _fc2s_panel(f: dict | None) -> str:
             f"real fills beat that. <code>python scripts/fc_two_sided.py report</code></span></div>")
 
 
+def _fill_probe_panel(d: dict | None) -> str:
+    """The make-or-break gate before real money: of the cheap-NO P&L, how much sat on fills
+    that were actually available in the live book (taker depth)? Accrues via forward-collect."""
+    if not d:
+        return ""
+    if not d["snapshots"]:
+        body = ("<span class=dim>no order-book snapshots yet — the fillprobe agent writes "
+                "every 5 min during weather windows.</span>")
+    elif not d["matched"]:
+        body = (f"<b>{d['snapshots']}</b> snapshots · {d['n_no']} NO fills · "
+                f"<b>0 matched yet</b><br><span class=dim>forward-collection: matches accrue as "
+                f"NEW NO fills land alongside fresh snapshots (old fills can't be matched "
+                f"retroactively — Kalshi serves only the current book).</span>")
+    else:
+        rp, cp = d["pnl_real_frac"], d["cheap_real_frac"]
+        rp_s = "—" if rp is None else f"{rp*100:.0f}%"
+        cp_s = "—" if cp is None else f"{cp*100:.0f}%"
+        body = (f"matched <b>{d['matched']}</b> · fillable {d['fillable_frac']*100:.0f}% · "
+                f"P&amp;L on REAL fills <span class=\"big {_cls((rp or 0) - 0.5)}\">{rp_s}</span> · "
+                f"cheap-NO real <b>{cp_s}</b><br><span class=dim>high % ⇒ the edge is "
+                f"capturable; low % ⇒ the cheap-bucket profit is phantom depth.</span>")
+    return (f"<h2>fill-realism probe — is the cheap-NO depth actually there (taker)</h2>"
+            f"<div class=dim style='border:1px solid #30363d;border-radius:6px;"
+            f"padding:8px 12px;background:#161b22;color:#c9d1d9'>{body}"
+            f"<br><span class=dim>the gate before real money. "
+            f"<code>python scripts/weather_no_fill_probe.py report</code></span></div>")
+
+
 def render_html(s: dict) -> str:
     def money(v):
         return "—" if v is None else f"${v:+,.2f}"
@@ -277,6 +322,7 @@ th{{color:#8b949e;font-size:11px}} .stat{{display:inline-block;margin-right:32px
 </div>
 <p class=dim>↑ the real-fill verdict — judge the edge by this, not the backtest.</p>
 {_fc2s_panel(s.get('fc2s'))}
+{_fill_probe_panel(s.get('fill_probe'))}
 <h2>Per-city (settled) — *new = outside the validated 8</h2>
 <table><tr><th>City</th><th>W/L</th><th>WR</th><th>Net $</th></tr>{city_html}</table>
 <h2>Open fades ({s['open']})</h2>
