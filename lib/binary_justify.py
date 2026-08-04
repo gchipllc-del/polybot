@@ -146,15 +146,27 @@ DEFAULTS = {
     "calib_max_brier_excess": 0.0,  # G4: model Brier must beat price-as-forecast Brier
     "decisive_z": 0.5,          # G5: |ln(K/S)| >= this many sigma_T (blind-zone floor)
     "nu": 4.0,                  # fat-tail dof for fair value
+    # 2026-08-04 council fixes (Logician+Allocator, independently): a 15-min binary near
+    # expiry is a live delta bet — one 30s spot move takes a far strike from 7c fair to
+    # 40c fair, and a polling loop selling stale p_fair gets adversely selected. G6 voids
+    # any decision whose spot has drifted more than this fraction of sigma_T since the
+    # quoted prices were observed. G7 refuses to trade through scheduled jump events
+    # (CPI/FOMC/liquidation regimes) — the caller wires the calendar.
+    "max_stale_drift_z": 0.25,  # G6: |ln(spot_now/spot_at_quote)| / sigma_T ceiling
 }
 
 
 def justify(*, market_id: str, spot: float, strike: float, minutes_left: float,
             returns: list[float], bar_minutes: float, yes_price: float | None,
             no_price: float | None, data_age_s: float = 0.0,
+            spot_at_quote: float | None = None, event_blackout: bool = False,
             calib_stats: dict | None = None, config: dict | None = None,
             now: float | None = None) -> Justification:
-    """Evaluate one market, both sides. Pure function of its inputs."""
+    """Evaluate one market, both sides. Pure function of its inputs.
+
+    spot_at_quote: the spot when yes/no prices were observed — G6 voids the decision if
+    spot has since drifted materially (the stale-quote/adverse-selection guard).
+    event_blackout: True during scheduled jump windows (CPI/FOMC etc.) — G7 refuses."""
     cfg = {**DEFAULTS, **(config or {})}
     gates: list[Gate] = []
 
@@ -213,6 +225,22 @@ def justify(*, market_id: str, spot: float, strike: float, minutes_left: float,
         note4 = f"brier_model-brier_price={excess:+.4f}"
     gates.append(Gate("G4_calibration", g4, value=n_resolved,
                       threshold=cfg["calib_min_n"], note=note4))
+
+    # G6 staleness — the quoted prices must belong to the CURRENT spot
+    if spot_at_quote is not None and spot_at_quote > 0 and sigma_T > 0:
+        drift_z = abs(math.log(spot / spot_at_quote)) / sigma_T
+        g6 = drift_z <= cfg["max_stale_drift_z"]
+        gates.append(Gate("G6_staleness", g6, value=round(drift_z, 3),
+                          threshold=cfg["max_stale_drift_z"],
+                          note="" if g6 else "spot moved since quote — stale-fill risk"))
+    else:
+        gates.append(Gate("G6_staleness", True, value="untracked",
+                          threshold=cfg["max_stale_drift_z"],
+                          note="caller did not supply spot_at_quote"))
+
+    # G7 event blackout — never sell tails through scheduled jumps
+    gates.append(Gate("G7_event_blackout", not event_blackout,
+                      value="blackout" if event_blackout else "clear", threshold="clear"))
 
     all_pass = all(g.passed for g in gates)
     verdict = best_side if (all_pass and g2) else "PASS"

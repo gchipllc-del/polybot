@@ -153,6 +153,30 @@ def test_side_neutral_prefers_larger_net_edge():
     assert j.verdict == "BUY_YES"
 
 
+def test_g6_blocks_stale_quote():
+    # spot drifted 20bps since the quote; sigma_T ~ 8.7bps -> drift_z ~ 2.3 >> 0.25 cap.
+    j = justify(**_base(spot_at_quote=64000.0, spot=64000 * 1.002))
+    assert not [g for g in j.gates if g.name == "G6_staleness"][0].passed
+    assert j.verdict == "PASS"
+
+
+def test_g6_passes_fresh_quote():
+    j = justify(**_base(spot_at_quote=64000.0))            # no drift
+    assert [g for g in j.gates if g.name == "G6_staleness"][0].passed
+
+
+def test_g6_untracked_passes_with_note():
+    j = justify(**_base())                                  # spot_at_quote not supplied
+    g6 = [g for g in j.gates if g.name == "G6_staleness"][0]
+    assert g6.passed and "did not supply" in g6.note
+
+
+def test_g7_blocks_event_blackout():
+    j = justify(**_base(event_blackout=True))
+    assert not [g for g in j.gates if g.name == "G7_event_blackout"][0].passed
+    assert j.verdict == "PASS"
+
+
 # ── ledger + calibration loop ────────────────────────────────────────────────
 
 def test_ledger_roundtrip_and_calibration(tmp_path):
