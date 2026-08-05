@@ -86,6 +86,28 @@ def fetch_spot(symbol: str, get=_get) -> float | None:
         return None
 
 
+def _default_book_fetcher():
+    """Authenticated order-book depth, if Kalshi creds are configured (.env). Returns a
+    fetch(ticker)->dict|None, or None when auth is absent — the collector then simply
+    logs rows without depth. Depth is the weather fill-realism lesson built in from day
+    one: a price without resting size behind it is not a tradeable price."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        from lib.kalshi_auth import can_sign, signed_get
+        if not can_sign():
+            return None
+
+        def fetch(ticker: str):
+            try:
+                ob = signed_get(f"/markets/{ticker}/orderbook", params={"depth": 5})
+                return ob.get("orderbook") or ob
+            except Exception:
+                return None
+        return fetch
+    except Exception:
+        return None
+
+
 # ── collection ───────────────────────────────────────────────────────────────
 
 def _dollars(m: dict, name: str) -> float | None:
@@ -118,11 +140,15 @@ def _seen_settles(path: Path) -> set:
     return seen
 
 
-def run_cycle(get=_get, now: datetime | None = None, path: Path | None = None) -> dict:
-    """One collection pass. Returns counters for the log line."""
+def run_cycle(get=_get, now: datetime | None = None, path: Path | None = None,
+              fetch_book=None) -> dict:
+    """One collection pass. Returns counters for the log line. fetch_book: optional
+    callable(ticker)->book dict; defaults to authenticated depth when creds exist."""
     p = path or LOG
     p.parent.mkdir(parents=True, exist_ok=True)
     now = now or datetime.now(timezone.utc)
+    if fetch_book is None:
+        fetch_book = _default_book_fetcher()
     rows, n_obs, n_settle = [], 0, 0
     seen = _seen_settles(p)
 
@@ -134,7 +160,7 @@ def run_cycle(get=_get, now: datetime | None = None, path: Path | None = None) -
             print(f"[warn] discovery failed for {series}: {e}")
             continue
         for m in markets:
-            rows.append({
+            row = {
                 "t": "obs", "ts": now.isoformat(), "series": series,
                 "ticker": m.get("ticker"), "strike": m.get("floor_strike"),
                 "close_ts": m.get("close_time"),
@@ -143,7 +169,12 @@ def run_cycle(get=_get, now: datetime | None = None, path: Path | None = None) -
                 "no_bid": _dollars(m, "no_bid"), "no_ask": _dollars(m, "no_ask"),
                 "volume": m.get("volume"), "oi": m.get("open_interest"),
                 "spot": spot,
-            })
+            }
+            if fetch_book is not None and row["ticker"]:
+                book = fetch_book(row["ticker"])
+                if book is not None:
+                    row["book"] = book
+            rows.append(row)
             n_obs += 1
         try:
             for m in fetch_settled(series, get=get):
