@@ -42,3 +42,6 @@ logs/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# private keys never belong in git (Kalshi RSA key lives outside the repo anyway)
+*.pem
