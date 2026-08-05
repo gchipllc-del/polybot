@@ -32,16 +32,23 @@ DASHBOARDS = [
 ]
 
 
+# What the dashboards actually import. Deliberately NOT `pip install -r
+# requirements.txt`: that file pins `tradingcore @ file:../tradingcore` (a sibling repo
+# from the original machine), and pip aborts the WHOLE install when the path is missing —
+# which bricked first-run on a fresh Windows box. The dashboards don't need tradingcore.
+DASH_DEPS = ["flask>=3.0.0", "python-dotenv>=1.0.0", "requests>=2.31.0",
+             "pyyaml>=6.0", "rich>=13.7.0"]
+
+
 def ensure_deps() -> None:
-    """Install requirements.txt only if a core import is missing (fast when healthy)."""
+    """Install only the dashboard deps, and only if an import is missing."""
     try:
         import flask, dotenv, requests, yaml  # noqa: F401
         return
     except ImportError:
         pass
-    print("first run on this machine — installing python deps from requirements.txt ...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-r",
-                           str(ROOT / "requirements.txt")])
+    print("first run on this machine — installing dashboard deps ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *DASH_DEPS])
 
 
 def load_env() -> None:
