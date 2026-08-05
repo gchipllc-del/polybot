@@ -86,11 +86,15 @@ def main() -> int:
     load_env()
     (ROOT / "logs").mkdir(exist_ok=True)
 
+    # Windows: child stdout redirected to a file defaults to cp1252, so the dashboards'
+    # unicode banners (─ → ▲) raise UnicodeEncodeError at boot -> exit 1. Force UTF-8.
+    child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     procs = []
     for name, cmd, port in DASHBOARDS:
-        log = open(ROOT / "logs" / f"dash_{name}.log", "a")
+        log = open(ROOT / "logs" / f"dash_{name}.log", "a", encoding="utf-8")
         p = subprocess.Popen([sys.executable, str(ROOT / "main.py"), cmd, f"--port={port}"],
-                             cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT)
+                             cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+                             env=child_env)
         procs.append((name, port, p))
         print(f"  {name:8} -> http://127.0.0.1:{port}   (log: logs/dash_{name}.log)")
 
