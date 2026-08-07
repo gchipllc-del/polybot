@@ -73,7 +73,7 @@ def load_env() -> None:
 def check() -> int:
     print(f"python      : {sys.version.split()[0]}  ({sys.executable})")
     print(f"repo root   : {ROOT}")
-    print(f"main.py     : {'OK' if (ROOT / 'main.py').exists() else 'MISSING — wrong folder?'}")
+    print(f"main.py     : {'OK' if (ROOT / 'main.py').exists() else 'MISSING - wrong folder?'}")
     try:
         import flask  # noqa: F401
         print("deps        : OK")
@@ -83,9 +83,138 @@ def check() -> int:
     return 0
 
 
+# ── doctor: one command that says WHY the pages are unreachable ──────────────
+# Stdlib only, ASCII only — it must run even when deps/encoding are the problem.
+
+def _port_listening(host: str, port: int, timeout: float = 0.6) -> bool:
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((host, port)) == 0
+    finally:
+        s.close()
+
+
+def _http_probe(host: str, port: int, timeout: float = 3.0):
+    """Returns (status_code, note). Bypasses any proxy env — a system proxy is itself
+    a known reason 127.0.0.1 pages 'do not work' in a browser."""
+    import urllib.request
+    import urllib.error
+    url = f"http://{host}:{port}/"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as r:
+            return r.status, "served"
+    except urllib.error.HTTPError as e:
+        return e.code, "served (http error)"
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {str(e)[:60]}"
+
+
+def _run(cmd: list[str], timeout: int = 15) -> str:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                             cwd=str(ROOT))
+        return (out.stdout or out.stderr or "").strip()
+    except Exception as e:  # noqa: BLE001
+        return f"({type(e).__name__})"
+
+
+def _tail(p: Path, n: int = 15) -> str:
+    if not p.exists():
+        return "(no log file)"
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        return f"(unreadable: {e})"
+    return "\n".join(f"      | {l}" for l in lines[-n:]) or "      | (empty)"
+
+
+def doctor() -> int:
+    is_win = sys.platform.startswith("win")
+    print("=" * 68)
+    print("polybot dashboard doctor")
+    print("=" * 68)
+
+    # 1. which code is actually on disk
+    print("\n[1] code version on disk")
+    head = _run(["git", "log", "--oneline", "-1"])
+    branch = _run(["git", "branch", "--show-current"])
+    print(f"      branch : {branch}")
+    print(f"      HEAD   : {head}")
+    src = (ROOT / "scripts" / "run_dashboards.py").read_text(encoding="utf-8",
+                                                             errors="replace")
+    new_ports = "5153" in src
+    print(f"      ports in this file: {'5153/5154 (NEW)' if new_ports else '5053/5054 (OLD - you have not pulled)'}")
+    behind = _run(["git", "status", "-sb"]).splitlines()[:1]
+    if behind:
+        print(f"      status : {behind[0]}")
+
+    # 2. what is listening where
+    print("\n[2] ports (is anything actually serving?)")
+    host = DASH_HOST
+    watch = [("crypto NEW", host, 5153), ("weather NEW", host, 5154),
+             ("crypto OLD", host, 5053), ("weather OLD", host, 5054),
+             ("openclaw", "127.0.0.1", 5050), ("openclaw", "127.0.0.1", 5051)]
+    for name, h, p in watch:
+        if _port_listening(h, p):
+            code, note = _http_probe(h, p)
+            print(f"      {h}:{p:<5} LISTENING  ({name})  http={code} {note}")
+        else:
+            print(f"      {h}:{p:<5} -          ({name})")
+
+    # 3. scheduled tasks (windows)
+    print("\n[3] background tasks")
+    if is_win:
+        out = _run(["powershell", "-NoProfile", "-Command",
+                    "Get-ScheduledTask PolybotDashboards,PolybotStage0 | "
+                    "Select-Object TaskName,State | Format-Table -AutoSize | Out-String"])
+        print("\n".join(f"      {l}" for l in out.splitlines() if l.strip()) or "      (none found)")
+    else:
+        print("      (not Windows - skipping scheduled-task check)")
+
+    # 4. logs
+    print("\n[4] dashboard logs (last lines)")
+    for name in ("crypto", "weather"):
+        print(f"    logs/dash_{name}.log:")
+        print(_tail(ROOT / "logs" / f"dash_{name}.log"))
+
+    # 5. verdict
+    print("\n[5] verdict")
+    serving_new = any(_port_listening(host, p) for p in (5153, 5154))
+    serving_old = any(_port_listening(host, p) for p in (5053, 5054))
+    if serving_new:
+        print(f"      OK - dashboards are serving. Open http://{host}:5153 and :5154")
+        print("      If the browser still fails, it is browser-side: try a different")
+        print("      browser, or check for a system/corporate proxy that hijacks localhost.")
+    elif serving_old and not new_ports:
+        print("      CAUSE: old code is running on 5053/5054 - you have not pulled yet.")
+        print("      FIX (run each line separately):")
+        print("        git pull origin claude/polybot-kalshi-bugs-IyuvP")
+        print("        Stop-ScheduledTask PolybotDashboards")
+        print("        Start-ScheduledTask PolybotDashboards")
+    elif serving_old and new_ports:
+        print("      CAUSE: code is updated but the RUNNING process is the old one.")
+        print("      FIX (run each line separately):")
+        print("        Stop-ScheduledTask PolybotDashboards")
+        print("        Start-ScheduledTask PolybotDashboards")
+    else:
+        print("      CAUSE: nothing is listening - the dashboards are not running or they")
+        print("      crashed at boot. Read section [4] above for the traceback, then:")
+        print("        Start-ScheduledTask PolybotDashboards")
+        print("      or run in the foreground to watch it live:")
+        print("        py scripts\\run_dashboards.py" if is_win
+              else "        python3 scripts/run_dashboards.py")
+    print("=" * 68)
+    return 0
+
+
 def main() -> int:
     if "--check" in sys.argv:
         return check()
+    if "--doctor" in sys.argv or "doctor" in sys.argv[1:]:
+        return doctor()
     ensure_deps()
     load_env()
     (ROOT / "logs").mkdir(exist_ok=True)
