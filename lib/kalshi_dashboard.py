@@ -195,6 +195,42 @@ def _cron_health_payload() -> dict:
 
 # ── Flask app ────────────────────────────────────────────────────────
 
+def _stage0_payload() -> dict:
+    """Stage-0 mispricing-experiment summary (the restart's $0 test). Reuses the
+    collector's own join logic so dashboard and CLI report always agree. Defensive:
+    any error -> {'error': ...} so the page never blanks."""
+    import sys as _sys
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import stage0_collector as s0
+        rows = []
+        if s0.LOG.exists():
+            for line in s0.LOG.read_text(encoding="utf-8").splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        rep = s0.build_report(rows)
+        cells = []
+        for band in [b[2] for b in s0.TIME_BANDS]:
+            for lo, hi in s0.BUCKETS:
+                cell = rep["table"].get((band, f"{lo:02d}-{hi:02d}c"))
+                if not cell or not cell["n"]:
+                    continue
+                n = cell["n"]
+                cells.append({"band": band, "bucket": f"{lo}-{hi}c", "n": n,
+                              "avg_cost": cell["cost"] / n,
+                              "realized": cell["wins"] / n,
+                              "gap": cell["wins"] / n - cell["cost"] / n,
+                              "fee": cell["fee"] / n})
+        return {"joined": rep["joined"], "n_settles": rep["n_settles"],
+                "verdict_ready": rep["joined"] >= 1500, "cells": cells}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
 def make_app():
     from flask import Flask, jsonify, render_template_string
 
@@ -223,11 +259,20 @@ def make_app():
     @app.route("/api/all")
     def api_all():
         """One-shot fetch — used by the page on every refresh."""
+        # Each section is independently guarded: one broken payload (missing sibling
+        # repo, network egress, bad data file) must degrade to an error string in ITS
+        # panel, never 500 the whole page (which froze every panel at "loading...").
+        def safe(fn):
+            try:
+                return fn()
+            except Exception as e:  # noqa: BLE001
+                return {"error": str(e)[:200]}
         return jsonify({
-            "live": _live_markets_payload(),
-            "paper": _paper_payload(),
-            "account": _account_payload(),
-            "cron": _cron_health_payload(),
+            "live": safe(_live_markets_payload),
+            "paper": safe(_paper_payload),
+            "account": safe(_account_payload),
+            "cron": safe(_cron_health_payload),
+            "stage0": safe(_stage0_payload),
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -345,6 +390,15 @@ tr:last-child td { border-bottom: none; }
 
   <div class="grid" style="margin-top: 12px;">
     <div class="panel">
+      <h2>Stage-0 — mispricing experiment (measure first, bet never until proven)</h2>
+      <div id="stage0-status" class="sub">loading…</div>
+      <table><thead><tr>
+        <th>band</th><th>bucket</th><th class="right">n</th><th class="right">avg cost</th>
+        <th class="right">realized</th><th class="right">gap</th><th class="right">fee</th><th>read</th>
+      </tr></thead><tbody id="stage0-tbody"></tbody></table>
+    </div>
+
+    <div class="panel">
       <h2>Live Markets</h2>
       <table><thead><tr>
         <th>asset</th><th>T-close</th><th>strike</th><th>spot</th>
@@ -453,11 +507,43 @@ async function refresh() {
       : '<div class="muted">No trades yet.</div>';
     document.getElementById('summary').innerHTML = summaryHtml;
 
+    // Stage-0 mispricing experiment
+    const s0 = data.stage0 || {};
+    const s0status = document.getElementById('stage0-status');
+    const s0body = document.getElementById('stage0-tbody');
+    if (s0.error) {
+      s0status.textContent = 'stage0 error: ' + s0.error;
+      s0body.innerHTML = '';
+    } else {
+      s0status.innerHTML = 'joined observations: <b>' + (s0.joined||0) + '</b>' +
+        ' &middot; settled markets seen: ' + (s0.n_settles||0) +
+        (s0.verdict_ready
+          ? ' &middot; <span class="green">n&ge;1500 — table is verdict-grade</span>'
+          : ' &middot; <span class="yellow">n&lt;1500 — directional only, no verdict (frozen protocol)</span>');
+      const cells = s0.cells || [];
+      s0body.innerHTML = cells.length === 0
+        ? '<tr><td colspan="8" class="muted">no joined observations yet — the collector must see a market before it settles.</td></tr>'
+        : cells.map(c => {
+            const net = c.gap - c.fee;
+            const gc = c.gap > 0 ? 'green' : c.gap < 0 ? 'red' : 'muted';
+            const read = c.n < 100 ? 'thin-n' : (net > 0.01 ? 'edge?' : 'no');
+            const rc = read === 'edge?' ? 'green' : 'muted';
+            return '<tr><td>' + c.band + '</td><td>' + c.bucket + '</td>' +
+              '<td class="right">' + c.n + '</td>' +
+              '<td class="right">' + c.avg_cost.toFixed(3) + '</td>' +
+              '<td class="right">' + c.realized.toFixed(3) + '</td>' +
+              '<td class="right ' + gc + '">' + (c.gap>=0?'+':'') + c.gap.toFixed(3) + '</td>' +
+              '<td class="right">' + c.fee.toFixed(2) + '</td>' +
+              '<td class="' + rc + '">' + read + '</td></tr>';
+          }).join('');
+    }
+
     // Live markets
     const liveBody = document.getElementById('live-tbody');
-    const live = data.live || [];
+    const live = Array.isArray(data.live) ? data.live : [];
+    const liveErr = (data.live && data.live.error) ? ' (' + data.live.error + ')' : '';
     liveBody.innerHTML = live.length === 0
-      ? '<tr><td colspan="10" class="muted">No active markets right now.</td></tr>'
+      ? '<tr><td colspan="10" class="muted">No active markets right now.' + liveErr + '</td></tr>'
       : live.map(m => {
           const rowClass = m.passes_threshold ? 'pass' : '';
           const gap = m.theo_yes_gap;

@@ -38,7 +38,12 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tradingcore.audit import log_event
+# tradingcore is the original machine's sibling repo; absent on fresh clones — no-op.
+try:
+    from tradingcore.audit import log_event
+except ImportError:
+    def log_event(*_a, **_k):
+        pass
 
 PAPER_PATH = Path(__file__).parent.parent / "data" / "btc_5min_paper.jsonl"
 

@@ -30,7 +30,13 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tradingcore.audit import log_event
+# tradingcore is the original machine's sibling repo; absent on fresh clones. Degrade to
+# a no-op audit log instead of taking down every importer (the dashboard 500'd on this).
+try:
+    from tradingcore.audit import log_event
+except ImportError:
+    def log_event(*_a, **_k):
+        pass
 from lib.btc_5min_signal import (
     fetch_binance_btc_price, fetch_binance_klines,
     compute_indicators_for_window,
