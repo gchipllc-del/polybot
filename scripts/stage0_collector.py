@@ -38,6 +38,9 @@ KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 SERIES = ["KXBTC15M", "KXETH15M"]                    # frozen
 SPOT_SYMBOL = {"KXBTC15M": "BTC-USD", "KXETH15M": "ETH-USD"}
 CYCLE_S = 60                                          # frozen
+HISTORY = Path(os.environ.get("STAGE0_HISTORY")
+               or (ROOT / "data" / "stage0_history.jsonl"))
+SNAPSHOT_EVERY_CYCLES = 60                            # hourly trajectory snapshots
 # Frozen price buckets (cents, inclusive lower edge) for the report join:
 BUCKETS = [(1, 5), (5, 10), (10, 20), (20, 35), (35, 50),
            (50, 65), (65, 80), (80, 90), (90, 95), (95, 99)]
@@ -194,14 +197,44 @@ def run_cycle(get=_get, now: datetime | None = None, path: Path | None = None,
     return {"obs": n_obs, "settles": n_settle}
 
 
+def write_snapshot(path: Path | None = None, history: Path | None = None) -> None:
+    """Append a compact snapshot of the current report to the trajectory history.
+    Read-aid only — collection and the frozen verdict rule are untouched."""
+    hp = history or HISTORY
+    lp = path or LOG
+    rows = []
+    if lp.exists():
+        for line in lp.read_text(encoding="utf-8").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    rep = build_report(rows)
+    cells = []
+    for (band, bucket), c in rep["table"].items():
+        if c["n"]:
+            cells.append({"band": band, "bucket": bucket, "n": c["n"],
+                          "gap": round(c["wins"] / c["n"] - c["cost"] / c["n"], 4),
+                          "fee": round(c["fee"] / c["n"], 3)})
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    with open(hp, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": _now_iso(), "joined": rep["joined"],
+                            "cells": cells}, separators=(",", ":")) + "\n")
+
+
 def collect_loop() -> int:
     print(f"stage0 collector - every {CYCLE_S}s, series {SERIES} -> {LOG}")
     print("ctrl-c to stop. Frozen protocol: no parameter changes mid-sample.")
+    cycles = 0
     while True:
         t0 = time.time()
         try:
             c = run_cycle()
             print(f"[{_now_iso()}] obs={c['obs']} new_settles={c['settles']}")
+            cycles += 1
+            if cycles % SNAPSHOT_EVERY_CYCLES == 0:
+                write_snapshot()
+                print(f"[{_now_iso()}] trajectory snapshot -> {HISTORY}")
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001
@@ -294,6 +327,89 @@ def print_report(rep: dict) -> None:
     print("the maker/adverse-selection questions in docs/CRYPTO15_RESTART.md.")
 
 
+# ── trend: is a cell's gap HOLDING as n grows, or regressing to the fee line? ─
+
+def classify_trajectory(points: list[tuple[int, float]]) -> str:
+    """points = [(n, gap), ...] in snapshot order. A real edge's gap holds as n grows;
+    noise shrinks toward zero. Compares the latest gap to the gap around half the
+    current sample. Pure read-aid — never a verdict."""
+    pts = [(n, g) for n, g in points if n > 0]
+    if len(pts) < 3:
+        return "insufficient"
+    n_last, g_last = pts[-1]
+    half = next((g for n, g in pts if n >= n_last / 2), pts[0][1])
+    if half == 0:
+        return "stable" if abs(g_last) < 0.01 else "strengthening"
+    if g_last * half < 0:
+        return "flipped"
+    ratio = abs(g_last) / abs(half)
+    if ratio < 0.5:
+        return "fading"
+    if ratio > 1.5:
+        return "strengthening"
+    return "stable"
+
+
+def print_trend(history: Path | None = None, min_n: int = 20) -> None:
+    hp = history or HISTORY
+    if not hp.exists():
+        print(f"no trajectory history yet at {hp} - snapshots are written hourly by the")
+        print("collect loop (after this update; restart the collector task once).")
+        return
+    snaps = []
+    for line in hp.read_text(encoding="utf-8").splitlines():
+        try:
+            snaps.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    if not snaps:
+        print("history file empty.")
+        return
+    series: dict[tuple, list] = {}
+    for s in snaps:
+        for c in s.get("cells", []):
+            series.setdefault((c["band"], c["bucket"]), []).append((c["n"], c["gap"]))
+    latest = snaps[-1]
+    print(f"stage0 trend - {len(snaps)} snapshots, latest joined={latest.get('joined')} "
+          f"({latest.get('ts', '')[:16]})")
+    print()
+    print("band     bucket   n_now  gap_now  ci95    traj           read")
+    import math
+    flagged = []
+    for (band, bucket), pts in sorted(series.items()):
+        n_now, gap_now = pts[-1]
+        if n_now < min_n:
+            continue
+        cell_fee = 0.02
+        for s in reversed(snaps):
+            for c in s.get("cells", []):
+                if c["band"] == band and c["bucket"] == bucket:
+                    cell_fee = c.get("fee", 0.02)
+                    break
+            break
+        # binomial 95% CI on the realized frequency, as a gap uncertainty band
+        r = None
+        ci = 1.96 * math.sqrt(0.25 / n_now)      # worst-case p=0.5 (conservative)
+        traj = classify_trajectory(pts)
+        sig = abs(gap_now) > ci + cell_fee
+        read = ("CANDIDATE" if sig and traj in ("stable", "strengthening") and n_now >= 100
+                else "watch" if sig and traj != "fading"
+                else "noise-like")
+        if read == "CANDIDATE":
+            flagged.append((band, bucket, n_now, gap_now))
+        print(f"{band:8} {bucket:8} {n_now:5}  {gap_now:+7.3f}  {ci:5.3f}  {traj:13}  {read}")
+    print()
+    if flagged:
+        print("CANDIDATES (gap beyond CI+fee, trajectory holding, n>=100):")
+        for band, bucket, n, g in flagged:
+            print(f"  {band} {bucket}: gap {g:+.3f} at n={n} - pre-registered next step is")
+            print("  the maker/adverse-selection checks in docs/CRYPTO15_RESTART.md, NOT sizing.")
+    else:
+        print("no candidates yet - gaps are inside CI+fee or trajectories fading/thin.")
+    print("Discipline: a pattern found here is a HYPOTHESIS; it must hold on data")
+    print("collected AFTER you name it, before it earns a paper phase.")
+
+
 # ── selftest (no network) ────────────────────────────────────────────────────
 
 def _selftest() -> int:
@@ -343,6 +459,25 @@ def _selftest() -> int:
         assert yes_cell and yes_cell["wins"] == 0        # YES @7c lost
         assert no_cell and no_cell["wins"] == no_cell["n"]  # NO @95c won
     assert kalshi_taker_fee(0.07) == 0.01
+
+    # trajectory classifier: holds -> stable; shrinks toward 0 as n grows -> fading
+    assert classify_trajectory([(20, 0.15), (60, 0.14), (120, 0.15)]) == "stable"
+    assert classify_trajectory([(20, 0.15), (60, 0.06), (120, 0.02)]) == "fading"
+    assert classify_trajectory([(20, 0.03), (60, 0.04), (120, 0.12)]) == "strengthening"
+    assert classify_trajectory([(20, 0.10), (120, -0.05)]) == "insufficient"
+    assert classify_trajectory([(20, 0.10), (60, 0.08), (120, -0.05)]) == "flipped"
+
+    # snapshot -> history -> trend round-trip
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        lp, hp = Path(td) / "log.jsonl", Path(td) / "hist.jsonl"
+        with open(lp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"t": "obs", "ticker": "T9", "mins_left": 1.0,
+                                "yes_ask": 0.85, "no_ask": 0.17}) + "\n")
+            f.write(json.dumps({"t": "settle", "ticker": "T9", "result": "yes"}) + "\n")
+        write_snapshot(path=lp, history=hp)
+        snap = json.loads(hp.read_text().splitlines()[0])
+        assert snap["joined"] == 1 and any(c["bucket"] == "80-90c" for c in snap["cells"])
     print("selftest OK")
     return 0
 
@@ -364,6 +499,13 @@ def main() -> int:
                 except json.JSONDecodeError:
                     pass
         print_report(build_report(rows))
+        return 0
+    if cmd == "trend":
+        print_trend()
+        return 0
+    if cmd == "snapshot":
+        write_snapshot()
+        print(f"snapshot appended -> {HISTORY}")
         return 0
     if cmd == "selftest":
         return _selftest()
