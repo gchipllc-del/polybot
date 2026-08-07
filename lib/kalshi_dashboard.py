@@ -1,7 +1,7 @@
 """
 Kalshi 15-min trader dashboard — live view of the Phase 2 pipeline.
 
-Flask app + single-page HTML at localhost:5053. Auto-refreshes every
+Flask app + single-page HTML at localhost:5153 (POLYBOT_CRYPTO_DASH_PORT). Auto-refreshes every
 20s. No external JS deps; one inline template.
 
 Panels:
@@ -279,26 +279,26 @@ def make_app():
     return app
 
 
-def run_dashboard(port: int = 5053):
-    """Boot the Flask app. Port defaults to 5053 to avoid colliding
-    with the existing polybot dashboards on 5050/5051/5052.
-    """
+def run_dashboard(port: int = 5153):
+    """Boot the Flask app. Port defaults to 5153 — the 51xx block keeps polybot
+    clear of the openclaw wheel-trader dashboards (5000/5050/5051/8080).
+    Host via POLYBOT_DASH_HOST (default 127.0.0.1)."""
     import socket
     # Pre-flight: confirm the port is free so we fail loudly, not silently.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.bind(("127.0.0.1", port))
+        s.bind((os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port))
     except OSError as e:
         s.close()
         raise RuntimeError(
             f"Port {port} is already in use ({e}). "
-            f"Try --port=5054 or check `lsof -i :{port}`."
+            f"Try --port=5155 or check what holds it (netstat -ano | findstr :{port})."
         )
     s.close()
 
     app = make_app()
     print(f"Kalshi dashboard → http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+    app.run(host=os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
 
 
 # ── HTML template (inline) ───────────────────────────────────────────
@@ -367,9 +367,8 @@ tr:last-child td { border-bottom: none; }
 <body>
   <h1>Kalshi 15-min Trader</h1>
   <div class="nav">
-    <a href="http://localhost:5050/">📊 Main</a>
-    <a href="http://localhost:5053/" class="active">₿ Crypto 15-min</a>
-    <a href="http://localhost:5054/">🌡 Weather</a>
+    <a href="http://localhost:5153/" class="active">₿ Crypto 15-min</a>
+    <a href="http://localhost:5154/">🌡 Weather</a>
   </div>
   <div class="sub" id="ts">loading…</div>
 

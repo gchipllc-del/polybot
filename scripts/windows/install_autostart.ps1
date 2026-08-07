@@ -5,7 +5,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\windows\install_autostart.ps1 -Uninstall
 #
 # Registers two Scheduled Tasks (current user, at logon, hidden window):
-#   PolybotDashboards -> py scripts\run_dashboards.py     (crypto :5053, weather :5054)
+#   PolybotDashboards -> py scripts\run_dashboards.py     (crypto :5153, weather :5154)
 #   PolybotStage0     -> py scripts\stage0_collector.py collect
 # Logs land in the repo's logs\ folder (each child writes its own log).
 param([switch]$Uninstall)
@@ -47,7 +47,7 @@ foreach ($t in $tasks) {
 
 Write-Host ""
 Write-Host "Done. Both run now and at every logon (background, no window)."
-Write-Host "  dashboards : http://127.0.0.1:5053  and  http://127.0.0.1:5054"
+Write-Host "  dashboards : http://127.0.0.1:5153  and  http://127.0.0.1:5154"
 Write-Host "  collector  : py scripts\stage0_collector.py report   (check after a few hours)"
 Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0"
 Write-Host "  remove     : rerun this script with -Uninstall"

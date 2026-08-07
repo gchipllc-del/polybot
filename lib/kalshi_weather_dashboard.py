@@ -1,6 +1,6 @@
 """
 Kalshi weather sleeve dashboard — live view of the hourly-temperature
-paper pipeline. Flask app + single-page HTML at localhost:5054
+paper pipeline. Flask app + single-page HTML at localhost:5154 (POLYBOT_WEATHER_DASH_PORT)
 (crypto sleeve owns 5053). Auto-refreshes every 20s.
 
 Panels:
@@ -21,6 +21,7 @@ the balance call is the only signed one.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -173,8 +174,8 @@ def make_app():
     return app
 
 
-def run_dashboard(port: int = 5054):
-    """Boot the Flask app. Port 5054 avoids the crypto sleeve on 5053."""
+def run_dashboard(port: int = 5154):
+    """Boot the Flask app. Port 5154 (51xx block, clear of openclaw on 50xx)."""
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -185,7 +186,7 @@ def run_dashboard(port: int = 5054):
     s.close()
     app = make_app()
     print(f"Kalshi weather dashboard → http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+    app.run(host=os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
 
 
 _TEMPLATE = """<!doctype html>
@@ -215,9 +216,8 @@ th{color:var(--muted);font-weight:500;font-size:11px;}tr:last-child td{border-bo
 </style></head><body>
 <h1>Kalshi Weather — Hourly Temperature</h1>
 <div class="nav">
-  <a href="http://localhost:5050/">📊 Main</a>
-  <a href="http://localhost:5053/">₿ Crypto 15-min</a>
-  <a href="http://localhost:5054/" class="active">🌡 Weather</a>
+  <a href="http://localhost:5153/">₿ Crypto 15-min</a>
+  <a href="http://localhost:5154/" class="active">🌡 Weather</a>
 </div>
 <div class="sub" id="ts">loading…</div>
 <div class="grid">

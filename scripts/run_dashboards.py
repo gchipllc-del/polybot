@@ -9,8 +9,8 @@ The launchd installer only works on macOS; this is the portable path. One comman
 Self-locating (derives the repo root from this file), installs missing Python deps
 from requirements.txt on first run, loads .env if present, then serves:
 
-    crypto  (15-min sleeve)  ->  http://127.0.0.1:5053
-    weather (temp sleeve)    ->  http://127.0.0.1:5054
+    crypto  (15-min sleeve)  ->  http://127.0.0.1:5153
+    weather (temp sleeve)    ->  http://127.0.0.1:5154
 
 Notes for a fresh machine: the pages come up immediately, but panels are empty until
 the paper bots have produced data files, and portfolio panels need .env Kalshi keys
@@ -26,10 +26,14 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# Ports live in the 51xx block to stay clear of the openclaw wheel-trader dashboards
+# (5000/5050/5051/8080). Override per machine without code edits:
+#   POLYBOT_CRYPTO_DASH_PORT / POLYBOT_WEATHER_DASH_PORT / POLYBOT_DASH_HOST
 DASHBOARDS = [
-    ("crypto", "kalshi-dashboard", 5053),
-    ("weather", "kalshi-weather-dashboard", 5054),
+    ("crypto", "kalshi-dashboard", int(os.environ.get("POLYBOT_CRYPTO_DASH_PORT", 5153))),
+    ("weather", "kalshi-weather-dashboard", int(os.environ.get("POLYBOT_WEATHER_DASH_PORT", 5154))),
 ]
+DASH_HOST = os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1")
 
 
 # What the dashboards actually import. Deliberately NOT `pip install -r
@@ -96,7 +100,7 @@ def main() -> int:
                              cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
                              env=child_env)
         procs.append((name, port, p))
-        print(f"  {name:8} -> http://127.0.0.1:{port}   (log: logs/dash_{name}.log)")
+        print(f"  {name:8} -> http://{DASH_HOST}:{port}   (log: logs/dash_{name}.log)")
 
     print("\nboth dashboards running — open the links above in a browser ON THIS computer.")
     print("press ctrl-c here to stop both.")
