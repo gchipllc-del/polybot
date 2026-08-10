@@ -93,9 +93,15 @@ def _default_book_fetcher():
     """Authenticated order-book depth, if Kalshi creds are configured (.env). Returns a
     fetch(ticker)->dict|None, or None when auth is absent — the collector then simply
     logs rows without depth. Depth is the weather fill-realism lesson built in from day
-    one: a price without resting size behind it is not a tradeable price."""
+    one: a price without resting size behind it is not a tradeable price.
+
+    BUGFIX 2026-08-07: this used to check can_sign() WITHOUT loading .env first, so the
+    scheduled task (which gets no shell environment) always saw no credentials and logged
+    zero depth — the shadow book's "fills n/a" column was this bug, not a Kalshi limit."""
     try:
         sys.path.insert(0, str(ROOT))
+        from lib.envload import load_env
+        load_env()
         from lib.kalshi_auth import can_sign, signed_get
         if not can_sign():
             return None

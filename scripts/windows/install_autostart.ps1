@@ -15,7 +15,8 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 $tasks = @(
     @{ Name = "PolybotDashboards"; Args = "scripts\run_dashboards.py" },
-    @{ Name = "PolybotStage0";     Args = "scripts\stage0_collector.py collect" }
+    @{ Name = "PolybotStage0";     Args = "scripts\stage0_collector.py collect" },
+    @{ Name = "PolybotPaper";      Args = "scripts\paper_trader.py run" }
 )
 
 if ($Uninstall) {
@@ -35,19 +36,32 @@ Write-Host "repo   : $RepoRoot"
 Write-Host "python : $py"
 
 foreach ($t in $tasks) {
-    $action  = New-ScheduledTaskAction -Execute $py -Argument $t.Args -WorkingDirectory $RepoRoot
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:UserName
+    $action = New-ScheduledTaskAction -Execute $py -Argument $t.Args -WorkingDirectory $RepoRoot
+
+    # TWO triggers, because AtLogOn alone is not enough: the doctor caught every task
+    # sitting in state "Ready" (i.e. dead) after a process exit, silently stopping data
+    # collection. The second trigger re-fires every 10 minutes forever, and
+    # -MultipleInstances IgnoreNew makes that a no-op while the task is alive. Net
+    # effect: anything that dies is back within 10 minutes, no babysitting.
+    $tLogon  = New-ScheduledTaskTrigger -AtLogOn -User $env:UserName
+    $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 10)
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3650)
-    Register-ScheduledTask -TaskName $t.Name -Action $action -Trigger $trigger `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit (New-TimeSpan -Days 3650) -MultipleInstances IgnoreNew `
+        -StartWhenAvailable
+    Register-ScheduledTask -TaskName $t.Name -Action $action -Trigger $tLogon, $tRepeat `
         -Settings $settings -Force | Out-Null
     Start-ScheduledTask -TaskName $t.Name
     Write-Host "installed + started $($t.Name)"
 }
 
 Write-Host ""
-Write-Host "Done. Both run now and at every logon (background, no window)."
+Write-Host "Done. All three run now, at every logon, and self-heal every 10 min if they die."
 Write-Host "  dashboards : http://127.0.0.1:5153  and  http://127.0.0.1:5154"
-Write-Host "  collector  : py scripts\stage0_collector.py report   (check after a few hours)"
-Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0"
+Write-Host "  collector  : py scripts\stage0_collector.py report"
+Write-Host "  paper      : py scripts\paper_trader.py report    (forward-only, no real orders)"
+Write-Host "  shadow     : py scripts\shadow_book.py report"
+Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper"
+Write-Host "  diagnose   : py scripts\run_dashboards.py --doctor"
 Write-Host "  remove     : rerun this script with -Uninstall"

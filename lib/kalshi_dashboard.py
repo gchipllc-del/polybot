@@ -255,19 +255,44 @@ def _shadow_payload() -> dict:
         return {"error": str(e)[:200]}
 
 
+def _paper_crypto_payload() -> dict:
+    """Forward-only paper book for the crypto-15 restart (scripts/paper_trader.py)."""
+    import sys as _sys
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import paper_trader as pt
+        rep = pt.build_report(pt._load(pt.LEDGER))
+        rep["by_rule"] = [{"rule": k, **v} for k, v in rep.get("by_rule", {}).items()]
+        rep["open_positions"] = rep.get("open_positions", [])[:10]
+        return rep
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
 def _trading_status_payload() -> dict:
     """Unambiguous answer to 'are we trading?' — read from the actual ledgers, not from
     intent. live=any real order path active; paper=any paper ledger with rows."""
-    paper_rows = len(_load_jsonl(PAPER_PATH))
+    import sys as _sys
+    paper_rows = 0
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import paper_trader as pt
+        paper_rows = len([r for r in pt._load(pt.LEDGER) if r.get("t") == "open"])
+    except Exception:
+        pass
     return {
         "live": False,
         "paper": paper_rows > 0,
         "paper_rows": paper_rows,
-        "mode": "STAGE-0: MEASUREMENT ONLY",
-        "why": ("No bets are placed - not even paper. The restart's rule is that trading "
-                "must be earned: a price bucket has to clear fees at n>=100 in the "
-                "Stage-0 table first. The shadow book below shows what the frozen "
-                "hypotheses WOULD have earned meanwhile."),
+        "mode": ("PAPER TRADING (forward-only)" if paper_rows
+                 else "PAPER ARMED - waiting for a frozen rule to fire"),
+        "why": ("No real orders, ever, until an OUT-OF-SAMPLE rule earns it. Paper trades "
+                "are stamped when the signal fires on an unsettled market, so this ledger "
+                "is the honest test the shadow book's in-sample replay cannot be."),
     }
 
 
@@ -315,6 +340,7 @@ def make_app():
             "stage0": safe(_stage0_payload),
             "shadow": safe(_shadow_payload),
             "trading": safe(_trading_status_payload),
+            "paper_crypto": safe(_paper_crypto_payload),
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -433,6 +459,16 @@ tr:last-child td { border-bottom: none; }
     <div class="panel">
       <h2>Trading status</h2>
       <div id="trading">…</div>
+    </div>
+
+    <div class="panel">
+      <h2>Paper book — forward-only, out-of-sample (no real orders)</h2>
+      <div id="paper-crypto-status" class="sub">loading…</div>
+      <table><thead><tr>
+        <th>rule</th><th class="right">n</th><th class="right">WR</th>
+        <th class="right">net $</th><th class="right">$/trade</th>
+      </tr></thead><tbody id="paper-crypto-tbody"></tbody></table>
+      <div id="paper-crypto-open" class="sub"></div>
     </div>
 
     <div class="panel">
@@ -576,6 +612,34 @@ async function refresh() {
           (tr.paper ? tr.paper_rows + ' rows' : 'PAPER OFF') + '</span><span class="k">paper trades</span></div>' +
         '<div class="bigstat"><span class="v yellow">' + (tr.mode||'') + '</span><span class="k">mode</span></div>' +
         '<div class="sub">' + (tr.why||'') + '</div>';
+
+    // Paper book (forward-only)
+    const pc = data.paper_crypto || {};
+    const pcs = document.getElementById('paper-crypto-status');
+    const pcb = document.getElementById('paper-crypto-tbody');
+    if (pc.error) {
+      pcs.textContent = 'paper error: ' + pc.error;
+      pcb.innerHTML = '';
+    } else {
+      const wr = pc.win_rate == null ? '—' : (pc.win_rate*100).toFixed(1) + '%';
+      pcs.innerHTML = 'closed <b>' + (pc.n_closed||0) + '</b> &middot; open <b>' +
+        (pc.n_open||0) + '</b> &middot; WR ' + wr +
+        ' &middot; net <span class="' + pnlClass(pc.net) + '">$' + fmt(pc.net) + '</span>' +
+        ' &middot; equity $' + fmt(pc.equity) +
+        (pc.since ? ' &middot; since ' + String(pc.since).slice(0,16) : '');
+      const br = pc.by_rule || [];
+      pcb.innerHTML = br.length === 0
+        ? '<tr><td colspan="5" class="muted">no closed paper trades yet — a frozen rule must fire on a live market.</td></tr>'
+        : br.map(r => '<tr><td>' + r.rule + '</td>' +
+            '<td class="right">' + r.n + '</td>' +
+            '<td class="right">' + (r.n ? (r.wins/r.n*100).toFixed(1)+'%' : '—') + '</td>' +
+            '<td class="right ' + pnlClass(r.pnl) + '">$' + fmt(r.pnl) + '</td>' +
+            '<td class="right">' + (r.n ? (r.pnl/r.n>=0?'+':'') + (r.pnl/r.n).toFixed(3) : '—') + '</td></tr>').join('');
+      const op = pc.open_positions || [];
+      document.getElementById('paper-crypto-open').innerHTML = op.length
+        ? 'open: ' + op.map(o => o.ticker + ' (' + o.side + ' @' + Number(o.price).toFixed(2) + ')').join(', ')
+        : '';
+    }
 
     // Shadow book
     const sh = data.shadow || {};
