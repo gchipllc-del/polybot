@@ -265,6 +265,7 @@ def _paper_crypto_payload() -> dict:
         import paper_trader as pt
         rep = pt.build_report(pt._load(pt.LEDGER))
         rep["by_rule"] = [{"rule": k, **v} for k, v in rep.get("by_rule", {}).items()]
+        rep["windows"] = rep.get("windows", 0)
         rep["open_positions"] = rep.get("open_positions", [])[:10]
         return rep
     except Exception as e:  # noqa: BLE001
@@ -465,8 +466,8 @@ tr:last-child td { border-bottom: none; }
       <h2>Paper book — forward-only, out-of-sample (no real orders)</h2>
       <div id="paper-crypto-status" class="sub">loading…</div>
       <table><thead><tr>
-        <th>rule</th><th class="right">n</th><th class="right">WR</th>
-        <th class="right">net $</th><th class="right">$/trade</th>
+        <th>rule</th><th class="right">trades</th><th class="right">windows</th>
+        <th class="right">WR</th><th class="right">net $</th><th class="right">$/trade</th>
       </tr></thead><tbody id="paper-crypto-tbody"></tbody></table>
       <div id="paper-crypto-open" class="sub"></div>
     </div>
@@ -622,16 +623,19 @@ async function refresh() {
       pcb.innerHTML = '';
     } else {
       const wr = pc.win_rate == null ? '—' : (pc.win_rate*100).toFixed(1) + '%';
-      pcs.innerHTML = 'closed <b>' + (pc.n_closed||0) + '</b> &middot; open <b>' +
-        (pc.n_open||0) + '</b> &middot; WR ' + wr +
+      pcs.innerHTML = 'closed <b>' + (pc.n_closed||0) + '</b> trades across <b>' +
+        (pc.windows||0) + '</b> independent 15-min windows (windows are the real sample ' +
+        'size &mdash; many strikes share one window and resolve together)' +
+        ' &middot; open <b>' + (pc.n_open||0) + '</b> &middot; WR ' + wr +
         ' &middot; net <span class="' + pnlClass(pc.net) + '">$' + fmt(pc.net) + '</span>' +
         ' &middot; equity $' + fmt(pc.equity) +
         (pc.since ? ' &middot; since ' + String(pc.since).slice(0,16) : '');
       const br = pc.by_rule || [];
       pcb.innerHTML = br.length === 0
-        ? '<tr><td colspan="5" class="muted">no closed paper trades yet — a frozen rule must fire on a live market.</td></tr>'
+        ? '<tr><td colspan="6" class="muted">no closed paper trades yet — a frozen rule must fire on a live market.</td></tr>'
         : br.map(r => '<tr><td>' + r.rule + '</td>' +
             '<td class="right">' + r.n + '</td>' +
+            '<td class="right"><b>' + (r.windows||0) + '</b></td>' +
             '<td class="right">' + (r.n ? (r.wins/r.n*100).toFixed(1)+'%' : '—') + '</td>' +
             '<td class="right ' + pnlClass(r.pnl) + '">$' + fmt(r.pnl) + '</td>' +
             '<td class="right">' + (r.n ? (r.pnl/r.n>=0?'+':'') + (r.pnl/r.n).toFixed(3) : '—') + '</td></tr>').join('');
