@@ -16,7 +16,12 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $tasks = @(
     @{ Name = "PolybotDashboards"; Args = "scripts\run_dashboards.py" },
     @{ Name = "PolybotStage0";     Args = "scripts\stage0_collector.py collect" },
-    @{ Name = "PolybotPaper";      Args = "scripts\paper_trader.py run" }
+    @{ Name = "PolybotPaper";      Args = "scripts\paper_trader.py run" },
+    # Watchdog: every 15 min, prove the system is actually WORKING (not merely alive)
+    # and restart anything dead. This is the layer that makes breakage self-correcting
+    # instead of something you discover days later.
+    @{ Name = "PolybotHealth";     Args = "scripts\healthcheck.py --repair --quiet --log --fast";
+       Every = 15 }
 )
 
 if ($Uninstall) {
@@ -44,8 +49,9 @@ foreach ($t in $tasks) {
     # -MultipleInstances IgnoreNew makes that a no-op while the task is alive. Net
     # effect: anything that dies is back within 10 minutes, no babysitting.
     $tLogon  = New-ScheduledTaskTrigger -AtLogOn -User $env:UserName
+    $everyMin = if ($t.Every) { [int]$t.Every } else { 10 }
     $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-        -RepetitionInterval (New-TimeSpan -Minutes 10)
+        -RepetitionInterval (New-TimeSpan -Minutes $everyMin)
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit (New-TimeSpan -Days 3650) -MultipleInstances IgnoreNew `
@@ -63,5 +69,6 @@ Write-Host "  collector  : py scripts\stage0_collector.py report"
 Write-Host "  paper      : py scripts\paper_trader.py report    (forward-only, no real orders)"
 Write-Host "  shadow     : py scripts\shadow_book.py report"
 Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper"
+Write-Host "  health     : py scripts\healthcheck.py           (add --repair to fix)"
 Write-Host "  diagnose   : py scripts\run_dashboards.py --doctor"
 Write-Host "  remove     : rerun this script with -Uninstall"
