@@ -231,6 +231,46 @@ def _stage0_payload() -> dict:
         return {"error": str(e)[:200]}
 
 
+def _shadow_payload() -> dict:
+    """Shadow-book replay: what the frozen pre-registered rules WOULD have earned on
+    already-collected data, after real Kalshi fees. No orders, no paper ledger."""
+    import sys as _sys
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import shadow_book as sb
+        rep = sb.build(sb._load(sb.LOG))
+        rules = []
+        for name, r in rep["rules"].items():
+            rules.append({"name": name, "thesis": r["thesis"], "band": r["band"],
+                          "side": r["side"], "price_range": r["price_range"],
+                          "n": r["n"], "win_rate": r["win_rate"], "net": r["net"],
+                          "fees": r["fees"], "net_per_trade": r["net_per_trade"],
+                          "wr_ci95": r["wr_ci95"], "meaningful": r["meaningful"],
+                          "depth_known": r["depth_known"], "fillable": r["fillable"]})
+        return {"rules": rules, "n_settled_markets": rep["n_settled_markets"],
+                "min_n": sb.MIN_N_MEANINGFUL}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def _trading_status_payload() -> dict:
+    """Unambiguous answer to 'are we trading?' — read from the actual ledgers, not from
+    intent. live=any real order path active; paper=any paper ledger with rows."""
+    paper_rows = len(_load_jsonl(PAPER_PATH))
+    return {
+        "live": False,
+        "paper": paper_rows > 0,
+        "paper_rows": paper_rows,
+        "mode": "STAGE-0: MEASUREMENT ONLY",
+        "why": ("No bets are placed - not even paper. The restart's rule is that trading "
+                "must be earned: a price bucket has to clear fees at n>=100 in the "
+                "Stage-0 table first. The shadow book below shows what the frozen "
+                "hypotheses WOULD have earned meanwhile."),
+    }
+
+
 def make_app():
     from flask import Flask, jsonify, render_template_string
 
@@ -273,6 +313,8 @@ def make_app():
             "account": safe(_account_payload),
             "cron": safe(_cron_health_payload),
             "stage0": safe(_stage0_payload),
+            "shadow": safe(_shadow_payload),
+            "trading": safe(_trading_status_payload),
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -388,6 +430,24 @@ tr:last-child td { border-bottom: none; }
   </div>
 
   <div class="grid" style="margin-top: 12px;">
+    <div class="panel">
+      <h2>Trading status</h2>
+      <div id="trading">…</div>
+    </div>
+
+    <div class="panel">
+      <h2>Shadow book — what the frozen hypotheses WOULD have earned (no orders placed)</h2>
+      <div id="shadow-status" class="sub">loading…</div>
+      <table><thead><tr>
+        <th>rule</th><th>band</th><th>side / price</th><th class="right">n</th>
+        <th class="right">WR</th><th class="right">net $</th><th class="right">$/trade</th>
+        <th class="right">fills</th><th>status</th>
+      </tr></thead><tbody id="shadow-tbody"></tbody></table>
+      <div class="sub">Pre-registered rules replayed on collected data, after real Kalshi
+        fees. IN-SAMPLE until n&ge;100 and holding on data collected after naming — a
+        hypothesis with a dollar sign, not a track record.</div>
+    </div>
+
     <div class="panel">
       <h2>Stage-0 — mispricing experiment (measure first, bet never until proven)</h2>
       <div id="stage0-status" class="sub">loading…</div>
@@ -505,6 +565,50 @@ async function refresh() {
         '<div class="bigstat"><span class="v ' + pnlClass(s.roi_pct) + '">' + fmtPct(s.roi_pct) + '</span><span class="k">ROI</span></div>'
       : '<div class="muted">No trades yet.</div>';
     document.getElementById('summary').innerHTML = summaryHtml;
+
+    // Trading status — the unambiguous answer to "are we trading?"
+    const tr = data.trading || {};
+    document.getElementById('trading').innerHTML = tr.error
+      ? '<div class="red">' + tr.error + '</div>'
+      : '<div class="bigstat"><span class="v ' + (tr.live ? 'red' : 'muted') + '">' +
+          (tr.live ? 'LIVE ON' : 'LIVE OFF') + '</span><span class="k">real money</span></div>' +
+        '<div class="bigstat"><span class="v ' + (tr.paper ? 'green' : 'muted') + '">' +
+          (tr.paper ? tr.paper_rows + ' rows' : 'PAPER OFF') + '</span><span class="k">paper trades</span></div>' +
+        '<div class="bigstat"><span class="v yellow">' + (tr.mode||'') + '</span><span class="k">mode</span></div>' +
+        '<div class="sub">' + (tr.why||'') + '</div>';
+
+    // Shadow book
+    const sh = data.shadow || {};
+    const shStatus = document.getElementById('shadow-status');
+    const shBody = document.getElementById('shadow-tbody');
+    if (sh.error) {
+      shStatus.textContent = 'shadow error: ' + sh.error;
+      shBody.innerHTML = '';
+    } else {
+      shStatus.innerHTML = 'settled markets in log: <b>' + (sh.n_settled_markets||0) +
+        '</b> &middot; a rule needs n&ge;' + (sh.min_n||100) + ' before its P&L means anything';
+      const rl = sh.rules || [];
+      shBody.innerHTML = rl.length === 0
+        ? '<tr><td colspan="9" class="muted">no shadow trades yet.</td></tr>'
+        : rl.map(r => {
+            const wr = r.win_rate == null ? '—' : (r.win_rate*100).toFixed(1) + '%';
+            const ci = r.wr_ci95 == null ? '' : ' <span class="muted tiny">±' + (r.wr_ci95*100).toFixed(1) + '</span>';
+            const npt = r.net_per_trade == null ? '—' : (r.net_per_trade>=0?'+':'') + r.net_per_trade.toFixed(3);
+            const fills = r.depth_known ? (r.fillable + '/' + r.depth_known) : 'n/a';
+            const status = r.n === 0 ? 'no trades yet'
+              : !r.meaningful ? 'THIN (need ' + (sh.min_n||100) + ')'
+              : r.net > 0 ? 'positive — VERIFY' : 'negative';
+            const sc = status.indexOf('positive') === 0 ? 'green' : 'muted';
+            return '<tr><td>' + r.name + '</td><td>' + r.band + '</td>' +
+              '<td class="muted">' + r.side + ' ' + r.price_range + '</td>' +
+              '<td class="right">' + r.n + '</td>' +
+              '<td class="right">' + wr + ci + '</td>' +
+              '<td class="right ' + pnlClass(r.net) + '">$' + fmt(r.net) + '</td>' +
+              '<td class="right">' + npt + '</td>' +
+              '<td class="right">' + fills + '</td>' +
+              '<td class="' + sc + '">' + status + '</td></tr>';
+          }).join('');
+    }
 
     // Stage-0 mispricing experiment
     const s0 = data.stage0 || {};
