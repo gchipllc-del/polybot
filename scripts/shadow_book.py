@@ -47,6 +47,16 @@ RULES = [
     {"name": "CONTROL_midprice", "band": ">10min", "side": "favorite",
      "lo": 0.35, "hi": 0.65,
      "thesis": "control: the efficient core. Should print ~0 or negative."},
+    # NAMED 2026-08-10 from Stage-0 data (n=1356). NOT pre-registered from the start, so
+    # its shadow-book row is pure data-dredging and must be ignored; only FORWARD paper
+    # trades stamped after this date count as evidence. Motivation: at n=150 the mirror
+    # cell (2-10min longshot 20-35c) is SIGNIFICANTLY -EV (Wilson CI 0.138-0.257 vs 0.295
+    # breakeven), and the favorite side of the same band shows +7.5c gap at n=169 with CI
+    # low 0.726 vs 0.738 breakeven - just short of significance. Same phenomenon, two
+    # sides; the forward test decides it.
+    {"name": "H3_midband_favorite", "band": "2-10min", "side": "favorite",
+     "lo": 0.65, "hi": 0.90, "named_at": "2026-08-10",
+     "thesis": "2-10min favorites underpriced (mirror of a proven -EV longshot cell)"},
 ]
 BANDS = {">10min": (10.0, 1e9), "2-10min": (2.0, 10.0), "<2min": (0.0, 2.0)}
 CONTRACT = 1          # contracts per shadow trade — sizing is NOT the question here

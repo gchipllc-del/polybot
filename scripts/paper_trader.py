@@ -251,6 +251,15 @@ def run_loop() -> int:
 
 # ── report ───────────────────────────────────────────────────────────────────
 
+def _window_of(ticker: str) -> str:
+    """Kalshi 15-min tickers are SERIES-YYMMMDDHHMM-STRIKE, so many strikes share ONE
+    15-minute window. Outcomes inside a window are driven by the same price move, i.e.
+    they are ONE bet, not many. Counting trades as independent samples is the fastest way
+    to fool yourself here."""
+    parts = str(ticker or "").rsplit("-", 1)
+    return parts[0] if len(parts) == 2 else str(ticker)
+
+
 def build_report(rows: list[dict]) -> dict:
     closed = [r for r in rows if r.get("t") == "close"]
     live = open_positions(rows)
@@ -263,7 +272,12 @@ def build_report(rows: list[dict]) -> dict:
     total = sum(b["pnl"] for b in by_rule.values())
     n = sum(b["n"] for b in by_rule.values())
     first = next((r.get("ts") for r in rows if r.get("t") == "open" and r.get("ts")), None)
-    return {"n_closed": n, "n_open": len(live), "net": round(total, 2),
+    windows = {_window_of(r.get("ticker")) for r in closed}
+    for name, b in by_rule.items():
+        b["windows"] = len({_window_of(r.get("ticker")) for r in closed
+                            if r.get("rule") == name})
+    return {"n_closed": n, "n_open": len(live), "windows": len(windows),
+            "net": round(total, 2),
             "equity": round(START_BANKROLL + total, 2),
             "win_rate": (sum(b["wins"] for b in by_rule.values()) / n) if n else None,
             "by_rule": by_rule, "since": first,
@@ -278,17 +292,22 @@ def print_report(rep: dict) -> None:
     if rep["since"]:
         print(f"trading since : {rep['since'][:19]}")
     print(f"closed trades : {rep['n_closed']}     open now: {rep['n_open']}")
+    print(f"independent windows: {rep.get('windows', 0)}  <- the REAL sample size")
     wr = "-" if rep["win_rate"] is None else f"{rep['win_rate']*100:.1f}%"
     print(f"win rate      : {wr}")
     print(f"net P&L       : ${rep['net']:+.2f}   (paper equity ${rep['equity']:.2f})")
     print()
     if rep["by_rule"]:
-        print("rule                     n   WR      net$     $/trade  95% band")
+        print("rule                     n  wins  WR     net$    $/trade  windows  95% band*")
         for name, b in sorted(rep["by_rule"].items()):
             w = b["wins"] / b["n"] if b["n"] else 0
-            ci = 1.96 * math.sqrt(max(w * (1 - w), 0.01) / b["n"]) if b["n"] else 0
-            print(f"{name:<22} {b['n']:>4}  {w*100:5.1f}%  {b['pnl']:+7.2f}  "
-                  f"{b['pnl']/b['n'] if b['n'] else 0:+7.3f}  +/-{ci*100:4.1f}%")
+            wn = b.get("windows", 0)
+            # CI on WINDOWS, not trades - trades inside a window are one correlated bet
+            ci = 1.96 * math.sqrt(max(w * (1 - w), 0.01) / wn) if wn else 0
+            print(f"{name:<22} {b['n']:>4} {b['wins']:>5} {w*100:5.1f}% {b['pnl']:+7.2f} "
+                  f"{b['pnl']/b['n'] if b['n'] else 0:+8.3f} {wn:>8}  +/-{ci*100:5.1f}%")
+        print("* CI computed on independent WINDOWS, not trades - many strikes share one")
+        print("  15-min window and resolve together, so trade count overstates evidence.")
     else:
         print("no closed trades yet - signals fire only when a frozen rule's price band")
         print("is hit on a live market. Leave the task running.")

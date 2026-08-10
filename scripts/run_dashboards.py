@@ -168,7 +168,8 @@ def doctor() -> int:
     print("\n[3] background tasks")
     if is_win:
         out = _run(["powershell", "-NoProfile", "-Command",
-                    "Get-ScheduledTask PolybotDashboards,PolybotStage0 | "
+                    "Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper "
+                    "-ErrorAction SilentlyContinue | "
                     "Select-Object TaskName,State | Format-Table -AutoSize | Out-String"])
         print("\n".join(f"      {l}" for l in out.splitlines() if l.strip()) or "      (none found)")
     else:
