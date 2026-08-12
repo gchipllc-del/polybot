@@ -4,11 +4,14 @@ Web Dashboard Server — Flask API + HTML dashboard at localhost:5050.
 Usage:
     python main.py dashboard
     python main.py dashboard --port 8080
+    python main.py dashboard --host=0.0.0.0   # LAN/Tailscale expose (no auth — trusted networks only)
 
 Security:
-    - Binds to 127.0.0.1 only (not exposed to network)
+    - Binds to 127.0.0.1 by default (not exposed to network)
     - No secrets in any API response
     - Read-only endpoints (no mutations via web)
+    - Phone access: prefer `tailscale serve` (keeps the localhost bind) — see
+      the sibling traderbot repo's docs/MOBILE_ACCESS.md
 """
 
 from pathlib import Path
@@ -76,12 +79,16 @@ def api_breakers():
     return jsonify(get_circuit_breaker_status())
 
 
-def run_dashboard(port: int = 5050):
-    """Start the dashboard web server. Binds to localhost only.
+def run_dashboard(port: int = 5050, host: str = "127.0.0.1"):
+    """Start the dashboard web server. Binds to localhost by default.
 
     Fails fast with a helpful message if the port is already bound, so two
     dashboards on the same port can't silently conflict. See also the sibling
     traderbot project, which defaults to 5051 to avoid collision with polybot.
+
+    A non-localhost host exposes the dashboard, unauthenticated, to whatever
+    network that interface is on — prefer `tailscale serve`, which proxies to
+    the localhost bind instead.
     """
     import errno
     import socket
@@ -91,10 +98,10 @@ def run_dashboard(port: int = 5050):
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
     try:
-        probe.bind(("127.0.0.1", port))
+        probe.bind((host, port))
     except OSError as exc:
         if exc.errno in (errno.EADDRINUSE, errno.EACCES):
-            print(f"ERROR: Port {port} is already in use on 127.0.0.1.")
+            print(f"ERROR: Port {port} is already in use on {host}.")
             print(f"       Another dashboard may already be running.")
             print(f"       Check with:  lsof -i :{port}")
             print(f"       Or pick a different port:  python main.py dashboard --port <N>")
@@ -103,5 +110,10 @@ def run_dashboard(port: int = 5050):
     finally:
         probe.close()
 
-    print(f"Polybot Dashboard: http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("WARNING: Dashboard bound to a non-localhost address with NO authentication.")
+        print("         Anyone who can reach that network interface can view portfolio data.")
+        print("         Prefer `tailscale serve` (keeps the localhost-only bind).")
+
+    print(f"Polybot Dashboard: http://{'localhost' if host == '127.0.0.1' else host}:{port}")
+    app.run(host=host, port=port, debug=False, threaded=True)

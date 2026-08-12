@@ -3,6 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0d1117">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Polybot">
     <title>Polybot Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
@@ -36,6 +41,22 @@
         .event { padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 12px; }
         .event .ts { color: #8b949e; }
         .event .action { color: #58a6ff; }
+
+        /* Mobile (phone) support */
+        /* min-width: 0 lets cards shrink below their content's natural width, so
+           wide tables scroll inside .table-scroll instead of stretching the page. */
+        .grid > .card { min-width: 0; }
+        .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        .table-scroll table { min-width: 720px; }
+
+        @media (max-width: 700px) {
+            .grid { grid-template-columns: 1fr; gap: 12px; }
+            .container { padding: 10px; }
+            .card { padding: 12px; }
+            .stat { margin-right: 16px; }
+            .chart-container { height: 220px; }
+            .refresh-bar button { padding: 10px 16px; }
+        }
     </style>
 </head>
 <body>
@@ -54,12 +75,14 @@
     <div class="grid">
         <div class="card full">
             <h2>Open Positions</h2>
+            <div class="table-scroll">
             <table id="positions-table">
                 <thead>
                     <tr><th>Side</th><th>Question</th><th>Platform</th><th>Invested</th><th>Bets</th><th>Entry</th><th>Current</th><th>P/L</th><th>Edge</th><th>Score</th><th>Resolves</th></tr>
                 </thead>
                 <tbody id="positions-body"><tr><td colspan="11">Loading...</td></tr></tbody>
             </table>
+            </div>
         </div>
     </div>
 
