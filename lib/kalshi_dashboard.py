@@ -228,15 +228,19 @@ def make_app():
     return app
 
 
-def run_dashboard(port: int = 5053):
+def run_dashboard(port: int = 5053, host: str = "127.0.0.1"):
     """Boot the Flask app. Port defaults to 5053 to avoid colliding
     with the existing polybot dashboards on 5050/5051/5052.
+
+    Binds to localhost by default. A non-localhost host exposes the
+    dashboard, unauthenticated, to that network — prefer `tailscale serve`,
+    which proxies to the localhost bind instead.
     """
     import socket
     # Pre-flight: confirm the port is free so we fail loudly, not silently.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.bind(("127.0.0.1", port))
+        s.bind((host, port))
     except OSError as e:
         s.close()
         raise RuntimeError(
@@ -245,9 +249,13 @@ def run_dashboard(port: int = 5053):
         )
     s.close()
 
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("WARNING: Dashboard bound to a non-localhost address with NO authentication.")
+        print("         Anyone who can reach that network interface can view trading data.")
+
     app = make_app()
-    print(f"Kalshi dashboard → http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+    print(f"Kalshi dashboard → http://{'localhost' if host == '127.0.0.1' else host}:{port}")
+    app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
 # ── HTML template (inline) ───────────────────────────────────────────
@@ -256,6 +264,12 @@ _TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0e1116">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Kalshi 15m">
 <title>Kalshi 15-min Trader Dashboard</title>
 <style>
 :root {
@@ -278,7 +292,8 @@ h1 { margin: 0 0 6px 0; font-size: 20px; }
 .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
 .grid {
   display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  /* min(380px, 100%) keeps panels from forcing the page wider than a phone screen */
+  grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
 }
 .panel {
   background: var(--panel); border: 1px solid var(--border);

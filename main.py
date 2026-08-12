@@ -22,7 +22,7 @@ Usage:
     python main.py news <question>   # Test news sentiment for a query
     python main.py kronos <ticker>   # Kronos zero-shot price forecast
     python main.py kronos-prob <ticker> <target> [above|below]  # Price probability
-    python main.py dashboard         # Launch web dashboard
+    python main.py dashboard         # Launch web dashboard (--host= to expose beyond localhost)
     python main.py chaos             # Run chaos tests
     python main.py smoke             # Pipeline regression (no external APIs)
     python main.py brier [--n=50]    # Cold-start calibration: replay ForecastBench dataset
@@ -731,16 +731,18 @@ def cmd_kronos_prob(ticker: str, target: float, direction: str = "above", horizo
     print_probability_report(result)
 
 
-def cmd_dashboard(port: int = 5050):
+def cmd_dashboard(port: int = 5050, host: str = "127.0.0.1"):
     """Launch web dashboard.
 
     Default port 5050. Sibling traderbot project uses 5051 to avoid collision.
+    Default bind is localhost-only; for phone access see the traderbot repo's
+    docs/MOBILE_ACCESS.md (Tailscale serve needs no --host change).
     """
     from lib.dashboard_web import run_dashboard
-    print(f"  Polybot Dashboard: http://localhost:{port}")
+    print(f"  Polybot Dashboard: http://{'localhost' if host == '127.0.0.1' else host}:{port}")
     print("  (Polybot uses 5050; traderbot uses 5051 to avoid conflict.)")
     print("  Press Ctrl+C to stop.\n")
-    run_dashboard(port=port)
+    run_dashboard(port=port, host=host)
 
 
 def cmd_smoke():
@@ -1513,10 +1515,13 @@ def main():
         cmd_kronos_prob(ticker, target, direction, horizon)
     elif command == "dashboard":
         port = 5050
+        host = "127.0.0.1"
         for arg in sys.argv[2:]:
             if arg.startswith("--port"):
                 port = int(sys.argv[sys.argv.index(arg) + 1]) if "=" not in arg else int(arg.split("=")[1])
-        cmd_dashboard(port=port)
+            elif arg.startswith("--host="):
+                host = arg.split("=", 1)[1]
+        cmd_dashboard(port=port, host=host)
     elif command == "chaos":
         cmd_chaos()
     elif command == "smoke":
@@ -1640,11 +1645,14 @@ def main():
         cmd_kalshi_15min_paper_report(asset=asset)
     elif command == "kalshi-dashboard":
         port = 5053
+        host = "127.0.0.1"
         for arg in sys.argv[2:]:
             if arg.startswith("--port="):
                 port = int(arg.split("=", 1)[1])
+            elif arg.startswith("--host="):
+                host = arg.split("=", 1)[1]
         from lib.kalshi_dashboard import run_dashboard
-        run_dashboard(port=port)
+        run_dashboard(port=port, host=host)
     elif command == "kalshi-auth-status":
         from lib.kalshi_auth import status
         s = status()
