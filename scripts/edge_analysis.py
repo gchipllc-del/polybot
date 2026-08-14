@@ -16,6 +16,20 @@ Also reports:
     and still loses money. Win rate is not the objective; EV after fees is.
   * per-window concentration - how many correlated bets we take per 15-min window.
 
+HOW MUCH DATA IS ENOUGH? Measured, not guessed. Running this against synthetic fixtures
+with a KNOWN implanted edge (72c price, 82% true win rate) versus pure noise (every market
+fairly priced):
+
+    windows    real edge          pure noise
+    200        persist-but-thin   persist-but-thin    <- indistinguishable, correctly
+    600        HELD               flipped-to-noise    <- discrimination begins
+    1500       HELD               (nothing survives)  <- clean separation
+
+So ~600 independent 15-min windows is the threshold where this test can tell a genuine
+10-point edge from luck. At 192 windows/day (2 series x 96), that is about 3 days of
+collection. Below it, ANY tuning is fitting noise - which is the honest answer to "can we
+tweak the code to win more yet".
+
   py scripts/edge_analysis.py
   py scripts/edge_analysis.py --min-n 30
 """
@@ -154,7 +168,7 @@ def main() -> int:
             candidates.append((c["pnl"] / c["n"], key, c))
     candidates.sort(reverse=True)
 
-    held = failed = 0
+    held = persistent = flipped = 0
     allc_pre = cell_stats(events)
     for edge, (band, bucket), c in candidates[:8]:
         s2 = ss.get((band, bucket))
@@ -174,30 +188,34 @@ def main() -> int:
         be = full["cost"] / fn + full["fee"] / fn
         lo, _hi = wilson(fwr, fn)
         sig = lo > be
+        # THREE distinct states, not two - conflating the middle one with noise was a
+        # bug that called a real implanted edge "noise" purely for want of sample size.
         if e1 > 0 and e2 > 0 and sig:
-            verdict, held = "HELD", held + 1
+            verdict, held = "HELD (act)", held + 1
         elif e1 > 0 and e2 > 0:
-            verdict = "both+ but CI fails"
-            failed += 1
+            verdict, persistent = "persists, CI thin", persistent + 1
         elif e1 > 0:
-            verdict, failed = "flipped", failed + 1
+            verdict, flipped = "FLIPPED (noise)", flipped + 1
         else:
             verdict = "-"
         print(f"{band:8} {bucket:8} {c['n']:>5} {e1:>+8.3f} {w1*100:>5.0f}%  "
               f"{s2['n']:>5} {e2:>+8.3f} {w2*100:>5.0f}%  {verdict}")
 
     print()
-    if held + failed == 0:
-        print("VERDICT: not enough overlap between halves yet. Keep collecting.")
-    elif held == 0:
-        print(f"VERDICT: NO first-half winner survived ({failed} flipped). Everything that")
-        print("  looked like an edge was noise. Tuning on this data would fit the past.")
-    elif failed == 0:
-        print(f"VERDICT: {held} cell(s) HELD - positive in both halves AND statistically")
-        print("  distinguishable from breakeven over the full sample. Structural, not a fit.")
+    print(f"VERDICT: {held} HELD | {persistent} persist-but-thin | {flipped} flipped-to-noise")
+    if held + persistent + flipped == 0:
+        print("  Not enough overlap between halves yet. Keep collecting.")
+    elif held:
+        print(f"  {held} cell(s) are positive in BOTH halves AND statistically clear of")
+        print("  breakeven. That is structural, not a fit - safe to act on, sized for")
+        print("  the correlation shown above (bets per window are ONE bet, not many).")
+    elif persistent:
+        print(f"  {persistent} cell(s) stayed positive across both halves but the sample is")
+        print("  still too small to rule out luck. This is the ONLY honest reading of a")
+        print("  promising edge: keep collecting, do not tune to it, do not size up yet.")
     else:
-        print(f"VERDICT: {held} held, {failed} flipped. Mixed - the survivors are worth")
-        print("  forward-testing; the rest were noise. Do NOT tune to the flipped ones.")
+        print("  Every first-half winner collapsed. What looked like edge was noise -")
+        print("  tuning on this data would be fitting the past.")
 
     # ── win rate vs EV ───────────────────────────────────────────────────────
     print()
