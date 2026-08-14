@@ -21,7 +21,11 @@ $tasks = @(
     # and restart anything dead. This is the layer that makes breakage self-correcting
     # instead of something you discover days later.
     @{ Name = "PolybotHealth";     Args = "scripts\healthcheck.py --repair --quiet --log --fast";
-       Every = 15 }
+       Every = 15 },
+    # Hermes: daily bounded-optimizer review. READ-ONLY - it can only write proposals;
+    # activating one always requires a human running `hermes.py apply <name>`.
+    @{ Name = "PolybotHermes";     Args = "scripts\hermes.py review";
+       Every = 1440 }
 )
 
 if ($Uninstall) {

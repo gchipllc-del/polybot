@@ -60,8 +60,20 @@ def _now_iso() -> str:
 
 
 def _rules():
+    """Frozen pre-registered rules + any ACTIVE Hermes overlay rules. The frozen set is
+    never modified (it is the permanent control group); Hermes rules were validated by
+    train/holdout/CI gates, applied explicitly, and trade as v3 under their own names so
+    their forward record stays separable and they can be retired individually."""
     import shadow_book as sb
-    return sb.RULES, sb.BANDS, sb.kalshi_taker_fee
+    rules = list(sb.RULES)
+    try:
+        import hermes
+        for r in hermes.active_rules():
+            if all(k in r for k in ("name", "band", "side", "lo", "hi")):
+                rules.append(r)
+    except Exception:  # noqa: BLE001
+        pass          # a broken overlay must never stop the frozen rules from trading
+    return rules, sb.BANDS, sb.kalshi_taker_fee
 
 
 def _load(path: Path) -> list[dict]:
@@ -132,7 +144,7 @@ def evaluate_market(m: dict, mins_left: float, rules, bands, fee_fn,
             "fee": fee_fn(ask, CONTRACTS), "mins_left": round(mins_left, 2),
             "strike": m.get("strike"), "spot": m.get("spot"), "depth": depth,
             "fv_edge": (round(fv_edge, 4) if fv_edge is not None else None),
-            "v": STRATEGY_VERSION,
+            "v": rule.get("v", STRATEGY_VERSION),   # Hermes rules stamp their own v
         }
         if depth is not None and depth < CONTRACTS:
             entry["skipped"] = "no_depth"
