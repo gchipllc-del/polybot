@@ -53,3 +53,33 @@ vol regime, and alerts are eyes on the market and a legitimate G7 input (e.g. tr
 volatility / state flips as blackout context). Its direction votes NEVER gate money —
 that composite is the exact architecture the ledger killed. The justification engine is
 the only money gate.
+
+## Is there an "ultimate source" of trade-placement logic? (asked 2026-08-12)
+
+**No — structurally.** A downloadable profitable mechanism is a near-contradiction: an
+edge is a disagreement with the market price, and once logic is public, the price absorbs
+it. We ran this experiment twice: the downloaded-pattern 7-indicator composite (lost,
+anti-predictive) and the papabrosio repo (no backtests, unsupported claims; only its BRTI
+settlement-tracking *idea* survived review). What IS permanently downloadable is the math
+that survives publication BECAUSE it isn't a tradeable secret: option pricing, Kelly,
+calibration scoring, the peer-reviewed favorite-longshot bias. All of it is already
+implemented here. The closest thing to an ultimate source for THIS venue is the dataset
+our own collector builds — minute-by-minute books + settlements that nobody else hands out.
+
+## Does openclaw-wheel-trader code apply here? (same session)
+
+**It already was applied — polybot IS the openclaw clone.** Evidence: openclaw's
+PREDICTION_MARKET_RESEARCH.md (2026-04-15) states its purpose as "research to inform
+cloning openclaw-wheel-trader for prediction market trading"; 11 lib modules are shared by
+name/lineage (audit, calibration, circuit_breaker, backtest, forecaster, market_scanner,
+dashboards...); tradingcore is the extracted shared core. The deep structural parallel is
+real and already exploited: a Kalshi binary is a digital option, and our favorite-side
+rules are short-vol premium harvesting — the same trade as the wheel's cash-secured puts
+(frequent small wins, occasional large loss). The wheel's CSP scoring (rank candidates by
+premium richness vs risk) is convergently the same design as our fair-value strike
+selection. Remaining port candidate: the Hermes optimizer PATTERN (disciplined post-data
+parameter updates with bounds + audit trail) — but only AFTER the 600-window gate, and
+subordinated to walk-forward validation, because openclaw's own git log shows the failure
+mode ("HARD REVERT to winning-era config", threshold churn) that killed our composite.
+Volume + OI are already logged in every Stage-0 observation for future pre-registered
+hypotheses.
