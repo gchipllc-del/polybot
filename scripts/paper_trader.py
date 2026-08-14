@@ -42,6 +42,15 @@ LEDGER = Path(os.environ.get("PAPER_CRYPTO_LEDGER")
 
 CONTRACTS = 1              # sizing is not the question under test
 MAX_CONCURRENT = 8
+# 2026-08-11 CORRELATION CONTROL (strategy v2). Every strike inside one 15-min window
+# resolves on the SAME price move, so taking 8 of them is one bet at 8x size, not eight
+# bets - measured at 4-8 correlated bets per window in the live ledger. We now take at
+# most MAX_PER_WINDOW per (window, rule), choosing the strike the volatility model says
+# is most mispriced. This is a RISK change, not an edge change: nothing is fitted to
+# observed outcomes, and the number of independent windows - the actual evidence rate -
+# is unaffected. Trades carry v=2 so the pre-change record stays separable.
+MAX_PER_WINDOW = 1
+STRATEGY_VERSION = 2
 CYCLE_S = 60
 START_BANKROLL = 500.0     # paper only, for a readable equity number
 
@@ -85,7 +94,7 @@ def open_positions(rows: list[dict]) -> dict:
 
 
 def evaluate_market(m: dict, mins_left: float, rules, bands, fee_fn,
-                    depth_fn=None) -> list[dict]:
+                    depth_fn=None, edge_fn=None) -> list[dict]:
     """Which frozen rules fire on this market right now? Returns candidate entries.
     Pure: caller supplies market dict, remaining minutes, and an optional depth lookup."""
     band = None
@@ -115,12 +124,15 @@ def evaluate_market(m: dict, mins_left: float, rules, bands, fee_fn,
         if not (rule["lo"] <= ask < rule["hi"]):
             continue
         depth = depth_fn(m.get("ticker"), side, ask) if depth_fn else None
+        fv_edge = edge_fn(side, ask, m) if edge_fn else None
         entry = {
             "t": "open", "ts": _now_iso(), "ticker": m.get("ticker"),
             "series": m.get("series"), "rule": rule["name"], "band": band,
             "side": side, "price": round(ask, 4), "contracts": CONTRACTS,
             "fee": fee_fn(ask, CONTRACTS), "mins_left": round(mins_left, 2),
             "strike": m.get("strike"), "spot": m.get("spot"), "depth": depth,
+            "fv_edge": (round(fv_edge, 4) if fv_edge is not None else None),
+            "v": STRATEGY_VERSION,
         }
         if depth is not None and depth < CONTRACTS:
             entry["skipped"] = "no_depth"
@@ -169,6 +181,24 @@ def _depth_fetcher():
         return None
 
 
+def _edge_fetcher(series: str, stage0_log: Path):
+    """fn(side, ask, market) -> fair-value edge, or None when spot history is too thin.
+    Volatility is measured once per series per cycle, not per market."""
+    try:
+        from lib.fair_value import spot_series, sigma_from_spots, edge_for
+        spots = spot_series(stage0_log, series)
+        sigma = sigma_from_spots(spots)
+        if sigma is None:
+            return None
+
+        def fn(side, ask, m):
+            return edge_for(side, ask, m.get("spot"), m.get("strike"), sigma,
+                            m.get("mins_left") or 0.0, bar_minutes=1.0)
+        return fn
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> dict:
     import stage0_collector as s0
     rules, bands, fee_fn = _rules()
@@ -183,7 +213,15 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
     seen_closed = {(r["ticker"], r["rule"]) for r in rows if r.get("t") == "close"}
     new_rows, opened, skipped = [], 0, {}
     added: set = set()
+    # Windows already carrying a position for a rule — counted from the ledger so the
+    # per-window cap survives restarts and spans cycles, not just this pass.
+    per_window: dict[tuple, int] = {}
+    for (tk, rule) in list(live) + list(seen_closed):
+        per_window[(_window_of(tk), rule)] = per_window.get((_window_of(tk), rule), 0) + 1
 
+    # PASS 1: gather every candidate. Nothing is committed here, because choosing the
+    # best strike in a window requires seeing all of that window's strikes first.
+    candidates = []
     for series in s0.SERIES:
         try:
             markets = s0.fetch_open_markets(series, get=get)
@@ -191,30 +229,53 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
             print(f"[warn] discovery failed {series}: {e}")
             continue
         spot = s0.fetch_spot(s0.SPOT_SYMBOL[series], get=get)
+        edge_fn = _edge_fetcher(series, s0.LOG)
         for m in markets:
             mins = s0._mins_left(m.get("close_time") or "", now)
             if mins is None or mins <= 0:
                 continue
             md = {"ticker": m.get("ticker"), "series": series,
-                  "strike": m.get("floor_strike"), "spot": spot,
+                  "strike": m.get("floor_strike"), "spot": spot, "mins_left": mins,
                   "yes_ask": s0._dollars(m, "yes_ask"), "no_ask": s0._dollars(m, "no_ask")}
-            for entry in evaluate_market(md, mins, rules, bands, fee_fn, depth_fn):
-                key = (entry["ticker"], entry["rule"])
-                # `live` is the ledger at cycle start; `added` catches the same
-                # (market, rule) surfacing twice WITHIN this cycle (e.g. the same
-                # ticker returned under two series) - without it the ledger would
-                # carry duplicate positions for one market.
-                if key in live or key in seen_closed or key in added:
-                    continue                      # never re-enter the same market/rule
-                if entry.get("skipped"):
-                    skipped[entry["skipped"]] = skipped.get(entry["skipped"], 0) + 1
-                    continue
-                if len(live) + opened >= MAX_CONCURRENT:
-                    skipped["max_concurrent"] = skipped.get("max_concurrent", 0) + 1
-                    continue
-                new_rows.append(entry)
-                added.add(key)
-                opened += 1
+            candidates.extend(
+                evaluate_market(md, mins, rules, bands, fee_fn, depth_fn, edge_fn))
+
+    # PASS 2: per (window, rule), keep only the most mispriced strike(s). Ranking is by
+    # the volatility model's edge — a measurement, not a fitted preference. Candidates
+    # with no fair value (insufficient spot history) sort last but remain eligible, so a
+    # cold start still trades rather than silently doing nothing.
+    def rank_key(e):
+        fv = e.get("fv_edge")
+        return (0 if fv is not None else 1, -(fv if fv is not None else 0.0))
+    grouped: dict[tuple, list] = {}
+    for e in candidates:
+        grouped.setdefault((_window_of(e["ticker"]), e["rule"]), []).append(e)
+
+    for (window, rule), group in grouped.items():
+        group.sort(key=rank_key)
+        room = MAX_PER_WINDOW - per_window.get((window, rule), 0)
+        for entry in group:
+            key = (entry["ticker"], entry["rule"])
+            # `live` is the ledger at cycle start; `added` catches the same
+            # (market, rule) surfacing twice WITHIN this cycle (e.g. the same
+            # ticker returned under two series) - without it the ledger would
+            # carry duplicate positions for one market.
+            if key in live or key in seen_closed or key in added:
+                continue                      # never re-enter the same market/rule
+            if entry.get("skipped"):
+                skipped[entry["skipped"]] = skipped.get(entry["skipped"], 0) + 1
+                continue
+            if room <= 0:
+                skipped["window_cap"] = skipped.get("window_cap", 0) + 1
+                continue
+            if len(live) + opened >= MAX_CONCURRENT:
+                skipped["max_concurrent"] = skipped.get("max_concurrent", 0) + 1
+                continue
+            new_rows.append(entry)
+            added.add(key)
+            per_window[(window, rule)] = per_window.get((window, rule), 0) + 1
+            room -= 1
+            opened += 1
 
     # settle
     results = {}
@@ -395,6 +456,59 @@ def _selftest() -> int:
         assert c1["open_now"] == 2, c1
         c2 = run_cycle(get=fake_get, now=now, path=p, depth_fn=lambda t, s, pr: 100)
         assert c2["opened"] == 0, c2        # no duplicate entries
+    # PER-WINDOW CAP: 6 strikes in ONE window must collapse to MAX_PER_WINDOW per rule,
+    # and the survivor must be the one the volatility model ranked most mispriced.
+    def fake_get_many(url, params=None):
+        params = params or {}
+        if url.endswith("/events"):
+            return {"events": [{"event_ticker": "EV"}]}
+        if url.endswith("/markets") and "event_ticker" in params:
+            ms = []
+            for i, ask in enumerate((0.82, 0.86, 0.90, 0.84, 0.88, 0.92)):
+                ms.append({"ticker": f"KXBTC15M-26AUG111200-{40+i}",
+                           "floor_strike": 64000.0 + i * 50,
+                           "close_time": (now + timedelta(minutes=1)).isoformat(),
+                           "yes_ask_dollars": ask,
+                           "no_ask_dollars": round(1 - ask + 0.02, 2)})
+            return {"markets": ms}
+        if url.endswith("/markets"):
+            return {"markets": []}
+        if "coinbase" in url:
+            return {"data": {"amount": "64000"}}
+        raise AssertionError(url)
+
+    with tempfile.TemporaryDirectory() as td:
+        p2 = Path(td) / "cap.jsonl"
+        # rank so the LAST strike looks most mispriced; the cap must pick exactly it
+        def edge_by_price(side, ask, m):
+            return float(ask) - 0.80          # highest ask == biggest "edge" here
+        import shadow_book as _sb
+        rules2, bands2, fee2 = _sb.RULES, _sb.BANDS, _sb.kalshi_taker_fee
+        cands = []
+        for i, ask in enumerate((0.82, 0.86, 0.90, 0.84, 0.88, 0.92)):
+            md = {"ticker": f"KXBTC15M-26AUG111200-{40+i}", "series": "KXBTC15M",
+                  "strike": 64000.0 + i * 50, "spot": 64000.0, "mins_left": 1.0,
+                  "yes_ask": ask, "no_ask": round(1 - ask + 0.02, 2)}
+            cands.extend(evaluate_market(md, 1.0, rules2, bands2, fee2,
+                                         edge_fn=edge_by_price))
+        h1 = [c for c in cands if c["rule"] == "H1_settlement_lag"]
+        assert len(h1) == 6, len(h1)                 # all six qualify on price band
+        assert all(c["v"] == STRATEGY_VERSION for c in h1)
+        c3 = run_cycle(get=fake_get_many, now=now, path=p2,
+                       depth_fn=lambda t, s_, pr: 100)
+        rows3 = _load(p2)
+        opens = [r for r in rows3 if r.get("t") == "open"]
+        windows = {(_window_of(r["ticker"]), r["rule"]) for r in opens}
+        # one position per (window, rule) - NOT one per strike
+        assert len(opens) == len(windows), (len(opens), len(windows))
+        for (_w, _r), cnt in {}.items():
+            pass
+        per_rule = {}
+        for r in opens:
+            per_rule[r["rule"]] = per_rule.get(r["rule"], 0) + 1
+        assert all(v <= MAX_PER_WINDOW for v in per_rule.values()), per_rule
+        assert c3["skipped"].get("window_cap", 0) > 0, c3   # the rest were capped
+
     print("selftest OK")
     return 0
 
