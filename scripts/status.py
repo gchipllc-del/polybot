@@ -38,7 +38,9 @@ def paper_section() -> list[str]:
     out = ["PAPER BOOK  (forward-only, out-of-sample - the record that counts)"]
     try:
         import paper_trader as pt
-        rep = pt.build_report(pt._load(pt.LEDGER))
+        rows_for_windows = pt._load(pt.LEDGER)
+        rep = pt.build_report(rows_for_windows)
+        _win_of = pt._window_of
     except Exception as e:  # noqa: BLE001
         return out + [f"  unavailable: {type(e).__name__}: {str(e)[:60]}"]
     if not rep["n_closed"]:
@@ -49,21 +51,37 @@ def paper_section() -> list[str]:
     out.append(f"  net ${rep['net']:+.2f}   equity ${rep['equity']:.2f}   WR {wr}")
     if rep.get("since"):
         out.append(f"  since {str(rep['since'])[:16]}")
+    # Per-window $ significance. The old verdict tested win-rate CI > 0.5, which a
+    # longshot rule (WR ~14%) can NEVER pass even when genuinely profitable - it
+    # mislabeled the book's only positive rule "inconclusive" forever. The honest test
+    # for every rule shape is the same one: mean $ per independent WINDOW vs zero.
+    win_pnl: dict = {}
+    for r in rows_for_windows:
+        if r.get("t") != "close":
+            continue
+        key = (r.get("rule"), _win_of(r.get("ticker")))
+        win_pnl[key] = win_pnl.get(key, 0.0) + float(r.get("pnl") or 0.0)
     out.append("")
-    out.append("  rule                    trades  windows    WR     net$   verdict")
+    out.append("  rule                    trades  windows    WR     net$   $/win     verdict")
     for name, b in sorted(rep["by_rule"].items()):
         n, w = b["n"], b.get("windows", 0)
         p = b["wins"] / n if n else 0.0
-        lo, hi = _wilson(p, w)
+        vals = [v for (rn, _), v in win_pnl.items() if rn == name]
+        nw = len(vals)
+        mean = sum(vals) / nw if nw else 0.0
+        var = (sum((x - mean) ** 2 for x in vals) / (nw - 1)) if nw > 1 else 0.0
+        se = math.sqrt(var / nw) if nw else 0.0
         if w < MIN_WINDOWS:
             v = f"thin ({w}/{MIN_WINDOWS} windows)"
-        elif b["pnl"] > 0 and lo > 0.5:
-            v = "POSITIVE - verify"
-        elif b["pnl"] < 0:
-            v = "negative"
+        elif nw > 1 and mean - 1.96 * se > 0:
+            v = "POSITIVE (significant)"
+        elif nw > 1 and mean + 1.96 * se < 0:
+            v = "NEGATIVE (significant)"
         else:
-            v = "inconclusive"
-        out.append(f"  {name:<22} {n:>6} {w:>8}  {p*100:5.1f}%  {b['pnl']:+7.2f}  {v}")
+            v = ("positive, not significant" if b["pnl"] > 0
+                 else "negative, not significant")
+        out.append(f"  {name:<22} {n:>6} {w:>8}  {p*100:5.1f}%  {b['pnl']:+7.2f}  "
+                   f"{mean:+7.3f}  {v}")
     if rep.get("open_positions"):
         out.append("")
         out.append("  open now:")
