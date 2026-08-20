@@ -57,6 +57,24 @@ RULES = [
     {"name": "H3_midband_favorite", "band": "2-10min", "side": "favorite",
      "lo": 0.65, "hi": 0.90, "named_at": "2026-08-10",
      "thesis": "2-10min favorites underpriced (mirror of a proven -EV longshot cell)"},
+    # NAMED 2026-08-20 at 1,605 stage-0 windows / 1,184 paper windows. Both are
+    # NARROWINGS that isolate the strong half of an already-registered rule, so each
+    # pairs with its parent as a direct forward A/B. In-sample motivation (which proves
+    # nothing - only their post-naming record counts):
+    #   H4: walk-forward 2-10min yes 80-90c persisted +5.5c/+1.9c across halves and sits
+    #       a hair under significance (stage0 gap +5.0c, n=299), while H3's other half
+    #       (65-80c) decayed to +0.1c/bet in the second half - H3 may be one good cell
+    #       diluted by one dead one.
+    #   H5: walk-forward <2min yes 05-10c persisted +5.2c/+3.0c while H1b's other half
+    #       (10-20c) reads -0.4c full-sample; H1b (+3.2c/window over 240 windows) may be
+    #       carried entirely by its cheap half. Also the mirror <2min favorites 90-99c
+    #       are SIGNIFICANTLY -EV, the structural complement of underpriced late longshots.
+    {"name": "H4_narrow_2_10_fav", "band": "2-10min", "side": "favorite",
+     "lo": 0.80, "hi": 0.90, "named_at": "2026-08-20",
+     "thesis": "the strong half of H3: 2-10min favorites at 80-90c only"},
+    {"name": "H5_narrow_late_long", "band": "<2min", "side": "longshot",
+     "lo": 0.05, "hi": 0.10, "named_at": "2026-08-20",
+     "thesis": "the strong half of H1b: late longshots at 05-10c only"},
 ]
 BANDS = {">10min": (10.0, 1e9), "2-10min": (2.0, 10.0), "<2min": (0.0, 2.0)}
 CONTRACT = 1          # contracts per shadow trade — sizing is NOT the question here
