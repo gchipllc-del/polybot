@@ -137,26 +137,36 @@ def build(rows: list[dict]) -> dict:
                     continue
                 if not (0 < bid < 1):
                     continue
-                # fill scan: does the ask on our side ever come down to our bid later?
-                filled = False
+                # Dual fill bounds, per hftbacktest's queue-model semantics (repo scan,
+                # verified at source): with queue position unknowable from snapshots,
+                # honest replay reports a BAND, not a point.
+                #   touch  (optimistic):   later ask <= our bid - price reached our level
+                #   cross  (conservative): later ask <  our bid - price traded THROUGH
+                #                          our level, so even the back of the queue filled
+                touch = cross = False
                 for later in seq[i + 1:]:
                     ask = later.get(f"{side}_ask")
                     if ask is None:
                         continue
                     try:
-                        if float(ask) <= bid + 1e-9:
-                            filled = True
-                            break
+                        a = float(ask)
                     except (TypeError, ValueError):
                         continue
+                    if a <= bid + 1e-9:
+                        touch = True
+                        if a < bid - 1e-9:
+                            cross = True
+                            break
                 won = (result == side)
                 fee = maker_fee(bid)
-                pnl = ((1.0 - bid) if won else -bid) - fee if filled else 0.0
+                fill_pnl = ((1.0 - bid) if won else -bid) - fee
                 postings.append({"ticker": ticker, "window": _window_of(ticker),
                                  "band": band, "side": side, "price": bid,
-                                 "bucket": _bucket_of(bid), "filled": filled,
-                                 "won": won if filled else None,
-                                 "pnl": round(pnl, 4)})
+                                 "bucket": _bucket_of(bid),
+                                 "filled": touch, "filled_cross": cross,
+                                 "won": won if touch else None,
+                                 "pnl": round(fill_pnl if touch else 0.0, 4),
+                                 "pnl_cross": round(fill_pnl if cross else 0.0, 4)})
     return {"postings": postings, "n_settled": len(settles)}
 
 
@@ -167,7 +177,7 @@ def cell_table(postings: list[dict]) -> dict:
             continue
         c = out.setdefault((p["band"], p["bucket"]), {
             "posts": 0, "fills": 0, "wins": 0, "cost": 0.0, "pnl": 0.0,
-            "windows": set()})
+            "fills_cross": 0, "pnl_cross": 0.0, "windows": set()})
         c["posts"] += 1
         c["windows"].add(p["window"])
         if p["filled"]:
@@ -175,6 +185,9 @@ def cell_table(postings: list[dict]) -> dict:
             c["cost"] += p["price"]
             c["wins"] += 1 if p["won"] else 0
             c["pnl"] += p["pnl"]
+        if p.get("filled_cross"):
+            c["fills_cross"] += 1
+            c["pnl_cross"] += p["pnl_cross"]
     return out
 
 
@@ -204,16 +217,18 @@ def print_report(rep: dict) -> None:
         tk = taker_cells()
     except Exception:  # noqa: BLE001
         pass
-    print("  band     bucket   posts  fill%  fills  WR(fill)  $/fill   $/post   taker$/bet  read")
+    print("  band     bucket   posts  touch%  cross%  WR(fill)  $/fill  $/post[T]  $/post[C]  taker$/bet  read")
     cells = cell_table(postings)
     rows_out = []
     for (band, bucket), c in cells.items():
         if c["posts"] < MIN_N:
             continue
         fr = c["fills"] / c["posts"]
+        fr_x = c["fills_cross"] / c["posts"]
         wr = (c["wins"] / c["fills"]) if c["fills"] else None
         per_fill = (c["pnl"] / c["fills"]) if c["fills"] else 0.0
         per_post = c["pnl"] / c["posts"]
+        per_post_x = c["pnl_cross"] / c["posts"]
         t = tk.get((band, bucket))
         tk_ev = (t["pnl"] / t["n"]) if t and t["n"] else None
         # significance on per-POSTING EV over windows is what matters; quick screen:
@@ -231,16 +246,18 @@ def print_report(rep: dict) -> None:
                 read = "inconclusive"
         else:
             read = "few fills"
-        rows_out.append((per_post, band, bucket, c["posts"], fr, c["fills"], wr,
-                         per_fill, tk_ev, read))
-    for per_post, band, bucket, posts, fr, fills, wr, per_fill, tk_ev, read in \
-            sorted(rows_out, reverse=True):
+        rows_out.append((per_post, band, bucket, c["posts"], fr, fr_x, wr,
+                         per_fill, per_post_x, tk_ev, read))
+    for per_post, band, bucket, posts, fr, fr_x, wr, per_fill, per_post_x, tk_ev, read \
+            in sorted(rows_out, reverse=True):
         wr_s = "  -  " if wr is None else f"{wr*100:5.1f}%"
         tk_s = "   -   " if tk_ev is None else f"{tk_ev:+7.3f}"
-        print(f"  {band:8} {bucket:8} {posts:>5} {fr*100:5.1f}% {fills:>6}  {wr_s}  "
-              f"{per_fill:+7.3f}  {per_post:+7.3f}  {tk_s}   {read}")
+        print(f"  {band:8} {bucket:8} {posts:>5} {fr*100:5.1f}%  {fr_x*100:5.1f}%  {wr_s}  "
+              f"{per_fill:+7.3f}  {per_post:+7.3f}   {per_post_x:+7.3f}  {tk_s}   {read}")
     print()
-    print("$/post is the decision number (unfilled postings earn 0 but cost nothing).")
+    print("$/post[T] counts TOUCH fills (optimistic: front of queue); $/post[C] counts only")
+    print("CROSS fills (conservative: even the back of the queue filled). Truth is between;")
+    print("a maker cell is credible only when [C] is also positive.")
     print("Compare $/post (maker) with taker$/bet: cells where takers bleed and makers")
     print("print are the spread being harvested - IF real fill rates cooperate.")
     print("=" * 78)
@@ -277,10 +294,24 @@ def _selftest() -> int:
     ps = {(p["ticker"], p["side"]): p for p in rep["postings"]}
     a = ps[("W1-45", "yes")]
     assert a["filled"] and a["won"] and abs(a["pnl"] - (0.20 - 0.01)) < 1e-9, a
+    assert a["filled_cross"], a               # 0.79 < 0.80: strict cross too
     b = ps[("W2-45", "yes")]
     assert not b["filled"] and b["pnl"] == 0.0, b
     c = ps[("W3-45", "yes")]
     assert c["filled"] and c["won"] is False and abs(c["pnl"] - (-0.80 - 0.01)) < 1e-9, c
+    # TOUCH-only vs CROSS distinction: post yes@0.80, later ask EXACTLY 0.80 ->
+    # touch fills, cross does not
+    rows_t = [
+        {"t": "obs", "ticker": "W7-45", "ts": "t1", "mins_left": 5.0,
+         "yes_bid": 0.80, "yes_ask": 0.84, "no_bid": 0.14, "no_ask": 0.18},
+        {"t": "obs", "ticker": "W7-45", "ts": "t2", "mins_left": 4.0,
+         "yes_bid": 0.78, "yes_ask": 0.80, "no_bid": 0.18, "no_ask": 0.21},
+        {"t": "settle", "ticker": "W7-45", "result": "yes"},
+    ]
+    rt = build(rows_t)
+    t7 = {(p2["ticker"], p2["side"]): p2 for p2 in rt["postings"]}[("W7-45", "yes")]
+    assert t7["filled"] and not t7["filled_cross"], t7
+    assert t7["pnl"] > 0 and t7["pnl_cross"] == 0.0, t7
     assert ("W4-45", "yes") not in ps
     # NO-side postings exist too (B's no side: bid 0.14; later no_ask 0.16 > 0.14 unfilled;
     # A's no side: later no_ask 0.23 > 0.14 unfilled; C's no side: later no_ask 0.38 unfilled)
