@@ -24,6 +24,10 @@ GATED, because retention depth is the one thing the scan could not verify remote
   py scripts/history_backfill.py probe
   py scripts/history_backfill.py run --series KXBTC15M --max-markets 500
   py scripts/history_backfill.py export
+
+Per-venue screening: scope BOTH files by env var so venues never mix -
+  $env:BACKFILL_LOG="data\backfill_weather.jsonl"
+  $env:BACKFILL_EXPORT="data\stage0_weather.jsonl"
 """
 from __future__ import annotations
 
@@ -41,7 +45,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 SERIES = ["KXBTC15M", "KXETH15M"]
 OUT = Path(os.environ.get("BACKFILL_LOG") or (ROOT / "data" / "history_backfill.jsonl"))
-EXPORT = ROOT / "data" / "stage0_backfill.jsonl"
+EXPORT = Path(os.environ.get("BACKFILL_EXPORT")
+              or (ROOT / "data" / "stage0_backfill.jsonl"))
 SLEEP_S = 0.35              # polite pacing; these are public endpoints
 
 
