@@ -1,7 +1,7 @@
 """
 Kalshi 15-min trader dashboard — live view of the Phase 2 pipeline.
 
-Flask app + single-page HTML at localhost:5053. Auto-refreshes every
+Flask app + single-page HTML at localhost:5153 (POLYBOT_CRYPTO_DASH_PORT). Auto-refreshes every
 20s. No external JS deps; one inline template.
 
 Panels:
@@ -128,7 +128,13 @@ def _paper_payload() -> dict:
     rows = _load_jsonl(PAPER_PATH)
     open_trades = [r for r in rows if r.get("status") == "open"]
     settled = [r for r in rows if r.get("status") != "open"]
-    settled.sort(key=lambda r: r.get("opened_at", ""), reverse=True)
+    # Sort by when they actually RESOLVED (intra-window exits resolve
+    # mid-window, regular settlements at close), falling back to
+    # opened_at for any legacy row missing resolved_at.
+    settled.sort(
+        key=lambda r: r.get("resolved_at") or r.get("opened_at", ""),
+        reverse=True,
+    )
     return {
         "summary": summary(),
         "open_trades": open_trades[:20],
@@ -189,6 +195,108 @@ def _cron_health_payload() -> dict:
 
 # ── Flask app ────────────────────────────────────────────────────────
 
+def _stage0_payload() -> dict:
+    """Stage-0 mispricing-experiment summary (the restart's $0 test). Reuses the
+    collector's own join logic so dashboard and CLI report always agree. Defensive:
+    any error -> {'error': ...} so the page never blanks."""
+    import sys as _sys
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import stage0_collector as s0
+        rows = []
+        if s0.LOG.exists():
+            for line in s0.LOG.read_text(encoding="utf-8").splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        rep = s0.build_report(rows)
+        cells = []
+        for band in [b[2] for b in s0.TIME_BANDS]:
+            for lo, hi in s0.BUCKETS:
+                cell = rep["table"].get((band, f"{lo:02d}-{hi:02d}c"))
+                if not cell or not cell["n"]:
+                    continue
+                n = cell["n"]
+                cells.append({"band": band, "bucket": f"{lo}-{hi}c", "n": n,
+                              "avg_cost": cell["cost"] / n,
+                              "realized": cell["wins"] / n,
+                              "gap": cell["wins"] / n - cell["cost"] / n,
+                              "fee": cell["fee"] / n})
+        return {"joined": rep["joined"], "n_settles": rep["n_settles"],
+                "verdict_ready": rep["joined"] >= 1500, "cells": cells}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def _shadow_payload() -> dict:
+    """Shadow-book replay: what the frozen pre-registered rules WOULD have earned on
+    already-collected data, after real Kalshi fees. No orders, no paper ledger."""
+    import sys as _sys
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import shadow_book as sb
+        rep = sb.build(sb._load(sb.LOG))
+        rules = []
+        for name, r in rep["rules"].items():
+            rules.append({"name": name, "thesis": r["thesis"], "band": r["band"],
+                          "side": r["side"], "price_range": r["price_range"],
+                          "n": r["n"], "win_rate": r["win_rate"], "net": r["net"],
+                          "fees": r["fees"], "net_per_trade": r["net_per_trade"],
+                          "wr_ci95": r["wr_ci95"], "meaningful": r["meaningful"],
+                          "depth_known": r["depth_known"], "fillable": r["fillable"]})
+        return {"rules": rules, "n_settled_markets": rep["n_settled_markets"],
+                "min_n": sb.MIN_N_MEANINGFUL}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def _paper_crypto_payload() -> dict:
+    """Forward-only paper book for the crypto-15 restart (scripts/paper_trader.py)."""
+    import sys as _sys
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import paper_trader as pt
+        rep = pt.build_report(pt._load(pt.LEDGER))
+        rep["by_rule"] = [{"rule": k, **v} for k, v in rep.get("by_rule", {}).items()]
+        rep["windows"] = rep.get("windows", 0)
+        rep["open_positions"] = rep.get("open_positions", [])[:10]
+        return rep
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def _trading_status_payload() -> dict:
+    """Unambiguous answer to 'are we trading?' — read from the actual ledgers, not from
+    intent. live=any real order path active; paper=any paper ledger with rows."""
+    import sys as _sys
+    paper_rows = 0
+    try:
+        sdir = str(ROOT / "scripts")
+        if sdir not in _sys.path:
+            _sys.path.insert(0, sdir)
+        import paper_trader as pt
+        paper_rows = len([r for r in pt._load(pt.LEDGER) if r.get("t") == "open"])
+    except Exception:
+        pass
+    return {
+        "live": False,
+        "paper": paper_rows > 0,
+        "paper_rows": paper_rows,
+        "mode": ("PAPER TRADING (forward-only)" if paper_rows
+                 else "PAPER ARMED - waiting for a frozen rule to fire"),
+        "why": ("No real orders, ever, until an OUT-OF-SAMPLE rule earns it. Paper trades "
+                "are stamped when the signal fires on an unsettled market, so this ledger "
+                "is the honest test the shadow book's in-sample replay cannot be."),
+    }
+
+
 def make_app():
     from flask import Flask, jsonify, render_template_string
 
@@ -217,37 +325,49 @@ def make_app():
     @app.route("/api/all")
     def api_all():
         """One-shot fetch — used by the page on every refresh."""
+        # Each section is independently guarded: one broken payload (missing sibling
+        # repo, network egress, bad data file) must degrade to an error string in ITS
+        # panel, never 500 the whole page (which froze every panel at "loading...").
+        def safe(fn):
+            try:
+                return fn()
+            except Exception as e:  # noqa: BLE001
+                return {"error": str(e)[:200]}
         return jsonify({
-            "live": _live_markets_payload(),
-            "paper": _paper_payload(),
-            "account": _account_payload(),
-            "cron": _cron_health_payload(),
+            "live": safe(_live_markets_payload),
+            "paper": safe(_paper_payload),
+            "account": safe(_account_payload),
+            "cron": safe(_cron_health_payload),
+            "stage0": safe(_stage0_payload),
+            "shadow": safe(_shadow_payload),
+            "trading": safe(_trading_status_payload),
+            "paper_crypto": safe(_paper_crypto_payload),
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
     return app
 
 
-def run_dashboard(port: int = 5053):
-    """Boot the Flask app. Port defaults to 5053 to avoid colliding
-    with the existing polybot dashboards on 5050/5051/5052.
-    """
+def run_dashboard(port: int = 5153):
+    """Boot the Flask app. Port defaults to 5153 — the 51xx block keeps polybot
+    clear of the openclaw wheel-trader dashboards (5000/5050/5051/8080).
+    Host via POLYBOT_DASH_HOST (default 127.0.0.1)."""
     import socket
     # Pre-flight: confirm the port is free so we fail loudly, not silently.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.bind(("127.0.0.1", port))
+        s.bind((os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port))
     except OSError as e:
         s.close()
         raise RuntimeError(
             f"Port {port} is already in use ({e}). "
-            f"Try --port=5054 or check `lsof -i :{port}`."
+            f"Try --port=5155 or check what holds it (netstat -ano | findstr :{port})."
         )
     s.close()
 
     app = make_app()
     print(f"Kalshi dashboard → http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+    app.run(host=os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
 
 
 # ── HTML template (inline) ───────────────────────────────────────────
@@ -307,10 +427,18 @@ tr:last-child td { border-bottom: none; }
 .tiny { font-size: 10px; color: var(--muted); }
 .bar { display: inline-block; height: 6px; background: var(--border); border-radius: 3px; width: 60px; vertical-align: middle; position: relative; }
 .bar .fill { position: absolute; top: 0; left: 0; height: 100%; border-radius: 3px; background: var(--blue); }
+.nav { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.nav a { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); text-decoration: none; }
+.nav a:hover { color: var(--text); border-color: var(--blue); }
+.nav a.active { color: var(--blue); border-color: var(--blue); background: rgba(88,166,255,0.12); }
 </style>
 </head>
 <body>
   <h1>Kalshi 15-min Trader</h1>
+  <div class="nav">
+    <a href="http://localhost:5153/" class="active">₿ Crypto 15-min</a>
+    <a href="http://localhost:5154/">🌡 Weather</a>
+  </div>
   <div class="sub" id="ts">loading…</div>
 
   <div class="grid">
@@ -329,6 +457,43 @@ tr:last-child td { border-bottom: none; }
   </div>
 
   <div class="grid" style="margin-top: 12px;">
+    <div class="panel">
+      <h2>Trading status</h2>
+      <div id="trading">…</div>
+    </div>
+
+    <div class="panel">
+      <h2>Paper book — forward-only, out-of-sample (no real orders)</h2>
+      <div id="paper-crypto-status" class="sub">loading…</div>
+      <table><thead><tr>
+        <th>rule</th><th class="right">trades</th><th class="right">windows</th>
+        <th class="right">WR</th><th class="right">net $</th><th class="right">$/trade</th>
+      </tr></thead><tbody id="paper-crypto-tbody"></tbody></table>
+      <div id="paper-crypto-open" class="sub"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Shadow book — what the frozen hypotheses WOULD have earned (no orders placed)</h2>
+      <div id="shadow-status" class="sub">loading…</div>
+      <table><thead><tr>
+        <th>rule</th><th>band</th><th>side / price</th><th class="right">n</th>
+        <th class="right">WR</th><th class="right">net $</th><th class="right">$/trade</th>
+        <th class="right">fills</th><th>status</th>
+      </tr></thead><tbody id="shadow-tbody"></tbody></table>
+      <div class="sub">Pre-registered rules replayed on collected data, after real Kalshi
+        fees. IN-SAMPLE until n&ge;100 and holding on data collected after naming — a
+        hypothesis with a dollar sign, not a track record.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Stage-0 — mispricing experiment (measure first, bet never until proven)</h2>
+      <div id="stage0-status" class="sub">loading…</div>
+      <table><thead><tr>
+        <th>band</th><th>bucket</th><th class="right">n</th><th class="right">avg cost</th>
+        <th class="right">realized</th><th class="right">gap</th><th class="right">fee</th><th>read</th>
+      </tr></thead><tbody id="stage0-tbody"></tbody></table>
+    </div>
+
     <div class="panel">
       <h2>Live Markets</h2>
       <table><thead><tr>
@@ -398,7 +563,8 @@ function fmtPct(v) {
 }
 function pnlClass(v) { return v > 0 ? 'green' : v < 0 ? 'red' : 'muted'; }
 function statusClass(s) {
-  if (s === 'won') return 'green'; if (s === 'lost') return 'red';
+  if (s === 'won' || s === 'won_early') return 'green';
+  if (s === 'lost' || s === 'cut_loss') return 'red';
   if (s === 'void') return 'yellow'; return 'muted';
 }
 
@@ -437,11 +603,118 @@ async function refresh() {
       : '<div class="muted">No trades yet.</div>';
     document.getElementById('summary').innerHTML = summaryHtml;
 
+    // Trading status — the unambiguous answer to "are we trading?"
+    const tr = data.trading || {};
+    document.getElementById('trading').innerHTML = tr.error
+      ? '<div class="red">' + tr.error + '</div>'
+      : '<div class="bigstat"><span class="v ' + (tr.live ? 'red' : 'muted') + '">' +
+          (tr.live ? 'LIVE ON' : 'LIVE OFF') + '</span><span class="k">real money</span></div>' +
+        '<div class="bigstat"><span class="v ' + (tr.paper ? 'green' : 'muted') + '">' +
+          (tr.paper ? tr.paper_rows + ' rows' : 'PAPER OFF') + '</span><span class="k">paper trades</span></div>' +
+        '<div class="bigstat"><span class="v yellow">' + (tr.mode||'') + '</span><span class="k">mode</span></div>' +
+        '<div class="sub">' + (tr.why||'') + '</div>';
+
+    // Paper book (forward-only)
+    const pc = data.paper_crypto || {};
+    const pcs = document.getElementById('paper-crypto-status');
+    const pcb = document.getElementById('paper-crypto-tbody');
+    if (pc.error) {
+      pcs.textContent = 'paper error: ' + pc.error;
+      pcb.innerHTML = '';
+    } else {
+      const wr = pc.win_rate == null ? '—' : (pc.win_rate*100).toFixed(1) + '%';
+      pcs.innerHTML = 'closed <b>' + (pc.n_closed||0) + '</b> trades across <b>' +
+        (pc.windows||0) + '</b> independent 15-min windows (windows are the real sample ' +
+        'size &mdash; many strikes share one window and resolve together)' +
+        ' &middot; open <b>' + (pc.n_open||0) + '</b> &middot; WR ' + wr +
+        ' &middot; net <span class="' + pnlClass(pc.net) + '">$' + fmt(pc.net) + '</span>' +
+        ' &middot; equity $' + fmt(pc.equity) +
+        (pc.since ? ' &middot; since ' + String(pc.since).slice(0,16) : '');
+      const br = pc.by_rule || [];
+      pcb.innerHTML = br.length === 0
+        ? '<tr><td colspan="6" class="muted">no closed paper trades yet — a frozen rule must fire on a live market.</td></tr>'
+        : br.map(r => '<tr><td>' + r.rule + '</td>' +
+            '<td class="right">' + r.n + '</td>' +
+            '<td class="right"><b>' + (r.windows||0) + '</b></td>' +
+            '<td class="right">' + (r.n ? (r.wins/r.n*100).toFixed(1)+'%' : '—') + '</td>' +
+            '<td class="right ' + pnlClass(r.pnl) + '">$' + fmt(r.pnl) + '</td>' +
+            '<td class="right">' + (r.n ? (r.pnl/r.n>=0?'+':'') + (r.pnl/r.n).toFixed(3) : '—') + '</td></tr>').join('');
+      const op = pc.open_positions || [];
+      document.getElementById('paper-crypto-open').innerHTML = op.length
+        ? 'open: ' + op.map(o => o.ticker + ' (' + o.side + ' @' + Number(o.price).toFixed(2) + ')').join(', ')
+        : '';
+    }
+
+    // Shadow book
+    const sh = data.shadow || {};
+    const shStatus = document.getElementById('shadow-status');
+    const shBody = document.getElementById('shadow-tbody');
+    if (sh.error) {
+      shStatus.textContent = 'shadow error: ' + sh.error;
+      shBody.innerHTML = '';
+    } else {
+      shStatus.innerHTML = 'settled markets in log: <b>' + (sh.n_settled_markets||0) +
+        '</b> &middot; a rule needs n&ge;' + (sh.min_n||100) + ' before its P&L means anything';
+      const rl = sh.rules || [];
+      shBody.innerHTML = rl.length === 0
+        ? '<tr><td colspan="9" class="muted">no shadow trades yet.</td></tr>'
+        : rl.map(r => {
+            const wr = r.win_rate == null ? '—' : (r.win_rate*100).toFixed(1) + '%';
+            const ci = r.wr_ci95 == null ? '' : ' <span class="muted tiny">±' + (r.wr_ci95*100).toFixed(1) + '</span>';
+            const npt = r.net_per_trade == null ? '—' : (r.net_per_trade>=0?'+':'') + r.net_per_trade.toFixed(3);
+            const fills = r.depth_known ? (r.fillable + '/' + r.depth_known) : 'n/a';
+            const status = r.n === 0 ? 'no trades yet'
+              : !r.meaningful ? 'THIN (need ' + (sh.min_n||100) + ')'
+              : r.net > 0 ? 'positive — VERIFY' : 'negative';
+            const sc = status.indexOf('positive') === 0 ? 'green' : 'muted';
+            return '<tr><td>' + r.name + '</td><td>' + r.band + '</td>' +
+              '<td class="muted">' + r.side + ' ' + r.price_range + '</td>' +
+              '<td class="right">' + r.n + '</td>' +
+              '<td class="right">' + wr + ci + '</td>' +
+              '<td class="right ' + pnlClass(r.net) + '">$' + fmt(r.net) + '</td>' +
+              '<td class="right">' + npt + '</td>' +
+              '<td class="right">' + fills + '</td>' +
+              '<td class="' + sc + '">' + status + '</td></tr>';
+          }).join('');
+    }
+
+    // Stage-0 mispricing experiment
+    const s0 = data.stage0 || {};
+    const s0status = document.getElementById('stage0-status');
+    const s0body = document.getElementById('stage0-tbody');
+    if (s0.error) {
+      s0status.textContent = 'stage0 error: ' + s0.error;
+      s0body.innerHTML = '';
+    } else {
+      s0status.innerHTML = 'joined observations: <b>' + (s0.joined||0) + '</b>' +
+        ' &middot; settled markets seen: ' + (s0.n_settles||0) +
+        (s0.verdict_ready
+          ? ' &middot; <span class="green">n&ge;1500 — table is verdict-grade</span>'
+          : ' &middot; <span class="yellow">n&lt;1500 — directional only, no verdict (frozen protocol)</span>');
+      const cells = s0.cells || [];
+      s0body.innerHTML = cells.length === 0
+        ? '<tr><td colspan="8" class="muted">no joined observations yet — the collector must see a market before it settles.</td></tr>'
+        : cells.map(c => {
+            const net = c.gap - c.fee;
+            const gc = c.gap > 0 ? 'green' : c.gap < 0 ? 'red' : 'muted';
+            const read = c.n < 100 ? 'thin-n' : (net > 0.01 ? 'edge?' : 'no');
+            const rc = read === 'edge?' ? 'green' : 'muted';
+            return '<tr><td>' + c.band + '</td><td>' + c.bucket + '</td>' +
+              '<td class="right">' + c.n + '</td>' +
+              '<td class="right">' + c.avg_cost.toFixed(3) + '</td>' +
+              '<td class="right">' + c.realized.toFixed(3) + '</td>' +
+              '<td class="right ' + gc + '">' + (c.gap>=0?'+':'') + c.gap.toFixed(3) + '</td>' +
+              '<td class="right">' + c.fee.toFixed(2) + '</td>' +
+              '<td class="' + rc + '">' + read + '</td></tr>';
+          }).join('');
+    }
+
     // Live markets
     const liveBody = document.getElementById('live-tbody');
-    const live = data.live || [];
+    const live = Array.isArray(data.live) ? data.live : [];
+    const liveErr = (data.live && data.live.error) ? ' (' + data.live.error + ')' : '';
     liveBody.innerHTML = live.length === 0
-      ? '<tr><td colspan="10" class="muted">No active markets right now.</td></tr>'
+      ? '<tr><td colspan="10" class="muted">No active markets right now.' + liveErr + '</td></tr>'
       : live.map(m => {
           const rowClass = m.passes_threshold ? 'pass' : '';
           const gap = m.theo_yes_gap;

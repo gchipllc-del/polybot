@@ -174,9 +174,13 @@ class KalshiClient(MarketClient):
         self._rate_limit()
         try:
             ob = self._client.get_market_orderbook(market_id)
+            # Kalshi's orderbook is two lists of resting BIDS in cents:
+            # `yes` = bids to buy YES, `no` = bids to buy NO. A YES ask is
+            # the synthetic complement of a NO bid: yes_ask = 1 - no_bid.
+            # Taking the raw no-bid price as a yes ask is wrong.
             return {
                 "bids": [{"price": b[0] / 100.0, "quantity": b[1]} for b in ob.get("yes", [])],
-                "asks": [{"price": a[0] / 100.0, "quantity": a[1]} for a in ob.get("no", [])],
+                "asks": [{"price": (100 - a[0]) / 100.0, "quantity": a[1]} for a in ob.get("no", [])],
             }
         except Exception:
             return {"bids": [], "asks": []}
@@ -220,6 +224,10 @@ class KalshiClient(MarketClient):
             response = self._client.create_order(**order_params)
             order = response.get("order", response)
 
+            # Kalshi reports `remaining_count` (the UNFILLED quantity),
+            # not the filled amount. Filled = count - remaining.
+            remaining = order.get("remaining_count", quantity)
+            filled = max(0, quantity - remaining)
             return OrderResult(
                 order_id=order.get("order_id", ""),
                 platform="kalshi",
@@ -228,7 +236,7 @@ class KalshiClient(MarketClient):
                 price=price,
                 quantity=quantity,
                 status=order.get("status", "pending"),
-                filled_quantity=order.get("remaining_count", 0),
+                filled_quantity=filled,
                 filled_price=price,
             )
 
