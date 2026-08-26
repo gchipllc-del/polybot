@@ -123,6 +123,36 @@ def cmd_probe(get=_get) -> int:
     print("=" * 72)
     print("BACKFILL PROBE - does Kalshi retain candles for long-settled markets?")
     print("=" * 72)
+    # RETENTION LADDER. The first probe version enumerated newest-first and stopped at
+    # its own 1200-market cap, so "oldest enumerated" (13 days) measured the CAP, not
+    # retention. This asks the question directly: request settled markets CLOSED BEFORE
+    # 30/60/90/150 days ago via max_close_ts and try candles on one from each rung.
+    now_ts = int(time.time())
+    for series in SERIES[:1]:                     # one series is enough for the ladder
+        for days in (30, 60, 90, 150):
+            try:
+                data = get(f"{KALSHI}/markets",
+                           {"series_ticker": series, "status": "settled", "limit": 5,
+                            "max_close_ts": now_ts - days * 86400})
+                ms = data.get("markets", [])
+            except Exception as e:  # noqa: BLE001
+                print(f"{series} closed>{days}d ago: enumeration FAILED ({str(e)[:80]})")
+                continue
+            if not ms:
+                print(f"{series} closed>{days}d ago: no markets returned "
+                      f"(series may be younger, or param unsupported)")
+                continue
+            m = ms[0]
+            try:
+                cs = fetch_candles(series, m["ticker"], m.get("open_time"),
+                                   m.get("close_time"), get=get)
+                print(f"{series} closed>{days}d ago: {m['ticker']} "
+                      f"(close {str(m.get('close_time'))[:10]}) -> {len(cs)} candles")
+            except Exception as e:  # noqa: BLE001
+                print(f"{series} closed>{days}d ago: {m['ticker']} candle fetch "
+                      f"FAILED ({str(e)[:80]})")
+            time.sleep(SLEEP_S)
+    print()
     for series in SERIES:
         try:
             ms = fetch_settled_markets(series, get=get, max_markets=1200)
