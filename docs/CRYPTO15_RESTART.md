@@ -83,3 +83,31 @@ subordinated to walk-forward validation, because openclaw's own git log shows th
 mode ("HARD REVERT to winning-era config", threshold churn) that killed our composite.
 Volume + OI are already logged in every Stage-0 observation for future pre-registered
 hypotheses.
+
+## FINAL VERDICT (2026-08-27, 67-day backfill: 12,821 independent windows)
+
+The deep-history analysis at ~7x the measured discrimination threshold:
+
+  TAKER : 0 HELD. The three "persist-but-thin" residuals are +0.6c to +2.2c per bet -
+          inside friction and inside the CI even at n=2,780 per cell. Every cell with a
+          large gap earlier flipped or shrank as n grew. No cell was tradeable in June,
+          July, or August - the market did not decay from an earlier edge; it was
+          efficient for its entire recorded life.
+  MAKER : replicated at 72,452 postings - every fillable cell "maker -EV even filled",
+          both fill bounds, all bands, all 67 days. The adverse-selection measurement
+          (fills happen exactly when the market has learned something bad about your
+          side) is structural, not a three-week fluke. (The <2min band shows 0% fills in
+          backfill data - a granularity artifact of minute-close candles, not a finding;
+          the live-collector replay covered that band and it was negative there too.)
+
+CASE CLOSED for KXBTC15M/KXETH15M at retail latency: no taker edge, no naive-maker edge,
+never was one. Total cost of this certainty: $0 risked, ~3 weeks of unattended collection,
+one 2.5-hour backfill. The frozen paper rules keep running as a zero-cost control; no
+further engineering is justified against this venue short of professional market-making
+infrastructure.
+
+THE REFRAME THAT SURVIVES: history_backfill + export + edge_analysis is a SAME-DAY VENUE
+SCREENER for any Kalshi series with candle history. The three-week question "does this
+venue have an edge?" now takes one afternoon per series. The path to winning is running
+that screen across venues until the math finds another weather - the one venue where this
+exact methodology DID find a real, disciplined edge.
