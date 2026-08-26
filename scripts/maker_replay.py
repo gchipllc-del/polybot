@@ -45,6 +45,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 LOG = Path(os.environ.get("STAGE0_LOG") or (ROOT / "data" / "stage0_crypto.jsonl"))
 
 BANDS = {">10min": (10.0, 1e9), "2-10min": (2.0, 10.0), "<2min": (0.0, 2.0)}
+MAX_SPREAD = 0.15   # data-validity: see edge_analysis - never post into a placeholder book
+
+
+def _book_formed(r) -> bool:
+    try:
+        yb, ya = float(r.get("yes_bid")), float(r.get("yes_ask"))
+    except (TypeError, ValueError):
+        return False
+    return 0.01 <= yb < ya <= 0.99 and (ya - yb) <= MAX_SPREAD
 BUCKETS = [(1, 5), (5, 10), (10, 20), (20, 35), (35, 50),
            (50, 65), (65, 80), (80, 90), (90, 95), (95, 99)]
 MIN_N = 100
@@ -126,6 +135,8 @@ def build(rows: list[dict]) -> dict:
             band = _band_of(r.get("mins_left"))
             if band is None or band in posted:
                 continue
+            if not _book_formed(r):
+                continue                 # wait for a formed book before posting
             posted.add(band)
             for side in ("yes", "no"):
                 bid = r.get(f"{side}_bid")
@@ -332,6 +343,14 @@ def _selftest() -> int:
     rep3 = build(rows3)
     bands = sorted(p["band"] for p in rep3["postings"] if p["side"] == "yes")
     assert bands == sorted([">10min", "2-10min", "<2min"]), bands
+    # placeholder-book skip: the junk opening obs (bid 0.001/ask 0.999) must NOT be the
+    # posting point; the first FORMED obs is.
+    rows4 = [obs("W8-45", "t1", 30.0, 0.001, 0.999, 0.001, 0.999),
+             obs("W8-45", "t2", 29.0, 0.70, 0.74, 0.24, 0.28),
+             {"t": "settle", "ticker": "W8-45", "result": "yes"}]
+    rep4 = build(rows4)
+    y8 = [p2 for p2 in rep4["postings"] if p2["ticker"] == "W8-45" and p2["side"] == "yes"]
+    assert len(y8) == 1 and y8[0]["price"] == 0.70, y8
     print("selftest OK")
     return 0
 

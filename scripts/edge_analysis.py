@@ -45,6 +45,20 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 BANDS = {">10min": (10.0, 1e9), "2-10min": (2.0, 10.0), "<2min": (0.0, 2.0)}
+# DATA-VALIDITY filter, not a tuned parameter: daily markets open with placeholder books
+# (ask ~0.999, bid ~0.000, spread ~1.00) hours before anyone quotes. Entering "first obs
+# in band" on such an obs measures the empty book, not the market. An obs counts only
+# when the yes-side book is formed. Crypto-15m spreads were 1-4c, so this leaves every
+# prior crypto conclusion untouched (verified: crypto cells shift < 0.001).
+MAX_SPREAD = 0.15
+
+
+def _book_formed(r) -> bool:
+    try:
+        yb, ya = float(r.get("yes_bid")), float(r.get("yes_ask"))
+    except (TypeError, ValueError):
+        return False
+    return 0.01 <= yb < ya <= 0.99 and (ya - yb) <= MAX_SPREAD
 BUCKETS = [(1, 5), (5, 10), (10, 20), (20, 35), (35, 50),
            (50, 65), (65, 80), (80, 90), (90, 95), (95, 99)]
 
@@ -83,6 +97,8 @@ def load_events(path: Path) -> list[dict]:
     for r in rows:
         if r.get("t") != "obs" or r.get("mins_left") is None:
             continue
+        if not _book_formed(r):
+            continue                     # skip placeholder books; take first FORMED obs
         band = next((b for b, (lo, hi) in BANDS.items()
                      if lo <= r["mins_left"] < hi), None)
         if band is None:
