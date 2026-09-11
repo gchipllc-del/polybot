@@ -111,3 +111,11 @@ SCREENER for any Kalshi series with candle history. The three-week question "doe
 venue have an edge?" now takes one afternoon per series. The path to winning is running
 that screen across venues until the math finds another weather - the one venue where this
 exact methodology DID find a real, disciplined edge.
+
+POSTSCRIPT (2026-09-11): running that screen across the 7-city weather backfill returned
+0 HELD — and that turned out to be the screener asking the wrong question, not an answer.
+The screen detects UNCONDITIONAL mispricing; weather's edge is conditional on
+forecast-vs-price and cancels out when averaged over all days. See
+`docs/WEATHER_CONDITIONAL.md` and `scripts/forecast_replay.py` for the test that does ask
+the right question. The lesson generalises: before reading a venue's 0 HELD as a verdict,
+check that the edge you believe in is one this screen can see.
