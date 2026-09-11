@@ -118,3 +118,44 @@ says so in place rather than quietly degrading.
 
 No result here moves real money. Real money stays off until a rule is positive
 out-of-sample on the *forward* paper ledger, which is the only record that can earn it.
+
+## RESULT — first real run (2026-09-11)
+
+476 city-days across 7 cities, 2026-06-19 .. 2026-08-25, 2,852 settled markets, full
+forecast coverage. `probe` confirmed the `previous-runs` archive carries the previous-day
+run, so the strict replay was possible.
+
+- **STRICT gate: forecast Brier 0.1749 vs price 0.1200 → PRICE WINS.** 0 HELD; every
+  out-of-sample cell ≤ 0 (−0.005 to −0.124 $/window). Not marginal.
+- **DIAGNOSTIC gate: 0.1485 vs 0.1200 → PRICE WINS *even with lookahead*.**
+
+The diagnostic losing is the real finding. On the fixtures the lookahead variant wins by
+construction (Brier 0.029 vs 0.139) — knowing the answer wins, *unless it is the answer
+to a different question*. It is. Open-Meteo's temperature at the station's lat/lon is a
+model grid value, not the station instrument Kalshi settles on, and the diagnostic
+calibration table measures that mismatch directly: settlement highs ran **+1.27 °F
+hotter** than Open-Meteo's own "actuals", with **1.60 °F** residual scatter (~0.58 °F of
+which is our bucket-midpoint quantization, leaving ~1.5 °F of genuine instrument
+disagreement) — in a market whose buckets are 2 °F wide. Decomposing the strict error:
+day-ahead forecast skill ≈ √(2.58² − 1.60²) ≈ 2.0 °F on top of that mismatch floor.
+
+**What this run closes, permanently and for $0:** any strategy that prices Kalshi
+daily-high buckets from Open-Meteo at these coordinates. Perfect foresight of the source
+still loses the Brier gate, so no amount of better modeling of this source can win — the
+bottleneck is the instrument, not the forecast.
+
+**What it does not close:** a source that measures the settling station itself (ASOS/METAR
+observations of KNYC, KMDW, … plus a station-point forecast). The market demonstrably
+watches the real thermometer; to compete you must read the same one. Whether that residual
+question is worth another fetch is a judgment call, not a default yes: even with the
+observation leg fixed, ~2 °F of day-ahead forecast error against 2 °F buckets, versus a
+market reading the same public forecasts, is a thin prior.
+
+Caveat carried with the verdict: this tested DAILY-HIGH markets with a single-source
+previous-day forecast. The live paper sleeve trades *hourly* markets off an NWS +
+Open-Meteo blend; that shape was not tested here and is judged only by its own forward
+ledger — noting that its Open-Meteo (and gridded-NWS) components measure the same proxy
+instrument this run just indicted.
+
+Decision recorded: weather stays paper-only; no live money; no further spend on
+Open-Meteo-based daily-high research.
