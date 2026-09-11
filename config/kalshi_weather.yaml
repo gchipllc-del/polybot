@@ -1,0 +1,148 @@
+# Kalshi weather sleeve — city → forecast-location registry.
+#
+# Kalshi temperature markets resolve on the official reading at a specific
+# city station (usually an airport / park climate site). To price a bucket
+# we need a forecast for THAT location, so each city maps to the lat/lon
+# we hand the weather providers (NWS, Open-Meteo, OpenWeather).
+#
+# Discovery is "all available temp cities": the sampler pulls every open
+# market in the Kalshi weather series below, identifies the city by
+# matching `aliases` against the series ticker / event title, and looks up
+# the coordinates here. A discovered city with no registry entry is logged
+# as `unmapped_city` and skipped — add an entry to enable it (no code
+# change needed).
+#
+# `station` is informational (the NWS/airport id Kalshi settles against);
+# the forecast is driven purely by lat/lon.
+#
+# VALIDATION NOTE: the exact Kalshi series tickers + station mapping must
+# be confirmed against the live API on the host (the dev sandbox can't
+# reach api.elections.kalshi.com). `series` / `aliases` below are the
+# documented set as of mid-2026; tune once `kalshi-weather-monitor`
+# surfaces the real tickers.
+
+# Weather series to discover. These are the documented daily-high series;
+# at runtime the sampler ALSO auto-discovers every live series in Kalshi's
+# "Climate and Weather" category (so hourly temperature series are picked
+# up even though their exact tickers aren't enumerated here). Markets are
+# then classified hourly-vs-daily by their window length, and filtered to
+# `market_type` below.
+series:
+  - KXHIGHNY
+  - KXHIGHCHI
+  - KXHIGHMIA
+  - KXHIGHAUS
+  - KXHIGHDEN
+  - KXHIGHLAX
+  - KXHIGHPHIL
+  - KXHIGHDC
+
+# Signal + risk parameters for the sleeve.
+params:
+  # Which markets to trade. "hourly" = only short-window temperature
+  # markets (priced on the reading AT the close hour). "daily" = daily-high
+  # markets (priced on the day's max). "any" = both.
+  market_type: hourly
+  # A market whose [open, close] window is <= this many minutes is treated
+  # as hourly. Daily-high markets run a full day, so this cleanly splits
+  # them without relying on title wording.
+  hourly_max_minutes: 90
+  # Only trade when our blended fair value beats the market price by at
+  # least this edge (after Kalshi's 7% win fee is implicitly absorbed by
+  # the Kelly math). Weather forecasts are good but not perfect — demand
+  # real edge before paying the spread. Lowered 0.08 -> 0.05 to capture more
+  # fills; Kelly still sizes by the actual edge so thin-edge trades stay small.
+  min_edge: 0.05
+  # Forecast lead-time window for entries (seconds to market close).
+  # min is a REALISM/anti-look-ahead guard: trading a market resolving in
+  # minutes prices off the current observed temp, not a forecast, and
+  # inflates paper P&L with fills you couldn't get. Require >= 30 min lead.
+  # max keeps us inside the horizon where the hourly forecast is trustworthy.
+  min_seconds_to_close: 1800      # 30 min
+  max_seconds_to_close: 21600     # 6 h
+  # Avoid only the brutal extremes (tiny payout per dollar at risk).
+  # Widened 0.10/0.90 -> 0.05/0.95 to stop dropping NO trades near the
+  # edges. CAVEAT: at 0.95 the payout is ~5c per $0.95 risked, so one loss
+  # erases ~19 wins — Kelly sizes these tiny, but watch them in the report.
+  # NOTE: unlike the crypto sleeve there is deliberately NO mid-range
+  # "neutral" skip — a bucket priced near 0.50 that our forecast
+  # disagrees with is exactly the edge we want.
+  extreme_floor: 0.05
+  extreme_ceil: 0.95
+  max_spread: 0.06
+  # Forecast sources to blend, in preference order. The two no-key
+  # providers are always on; openweather self-skips unless a key is set.
+  sources:
+    - nws
+    - open_meteo
+    - openweather
+  # Half-Kelly + caps mirror the crypto sleeve.
+  kelly_multiplier: 0.5
+  min_trade_usd: 1.0
+  max_trade_usd: 25.0
+  bankroll: 1000.0
+
+cities:
+  ny:
+    label: "New York City (Central Park)"
+    station: KNYC
+    lat: 40.7790
+    lon: -73.9693
+    aliases: ["KXHIGHNY", "NYC", "NEW YORK", "CENTRAL PARK"]
+    enabled: true
+
+  chi:
+    label: "Chicago (Midway)"
+    station: KMDW
+    lat: 41.7860
+    lon: -87.7524
+    aliases: ["KXHIGHCHI", "CHICAGO", "MIDWAY"]
+    enabled: true
+
+  mia:
+    label: "Miami (MIA)"
+    station: KMIA
+    lat: 25.7932
+    lon: -80.2906
+    aliases: ["KXHIGHMIA", "MIAMI"]
+    enabled: true
+
+  aus:
+    label: "Austin (Camp Mabry / AUS)"
+    station: KAUS
+    lat: 30.1945
+    lon: -97.6699
+    aliases: ["KXHIGHAUS", "AUSTIN"]
+    enabled: true
+
+  den:
+    label: "Denver (DEN)"
+    station: KDEN
+    lat: 39.8466
+    lon: -104.6562
+    aliases: ["KXHIGHDEN", "DENVER"]
+    enabled: true
+
+  lax:
+    label: "Los Angeles (LAX)"
+    station: KLAX
+    lat: 33.9381
+    lon: -118.3889
+    aliases: ["KXHIGHLAX", "LOS ANGELES", "LAX"]
+    enabled: true
+
+  phil:
+    label: "Philadelphia (PHL)"
+    station: KPHL
+    lat: 39.8729
+    lon: -75.2437
+    aliases: ["KXHIGHPHIL", "PHILADELPHIA", "PHILLY"]
+    enabled: true
+
+  dc:
+    label: "Washington DC (DCA)"
+    station: KDCA
+    lat: 38.8472
+    lon: -77.0349
+    aliases: ["KXHIGHDC", "KXHIGHWASH", "WASHINGTON", "DULLES", "REAGAN"]
+    enabled: true
