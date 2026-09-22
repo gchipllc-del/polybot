@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""history_backfill — months of Kalshi 15-min market history via public endpoints.
+r"""history_backfill — months of Kalshi 15-min market history via public endpoints.
 
 Source: the ccxt Kalshi integration (MIT, verified at source level in our repo scan)
 wraps GET /series/{series_ticker}/markets/{ticker}/candlesticks with period_interval
