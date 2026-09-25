@@ -269,9 +269,30 @@ def check_ledger_integrity() -> None:
         record(OK, "ledger", f"{opens} opens / {closes} closes, no duplicates")
 
 
+def check_model_integrity() -> None:
+    """The A/B/C/D layer (scripts/diagnostics.py): input bounds, exact-cents ledger
+    conservation, pricing-model identities, edge-case behavior - run against the LIVE
+    files every watchdog cycle. A process can be alive, fresh, and serving while the
+    ledger quietly stops conserving; this is the check that notices the same day."""
+    try:
+        import diagnostics as dg
+        results = dg.run_all(dg._load(dg.STAGE0), dg._load(dg.LEDGER))
+    except Exception as e:  # noqa: BLE001
+        record(FAIL, "model", f"diagnostics raised {type(e).__name__}: {str(e)[:70]}")
+        return
+    bad = [(name, detail) for name, ok, detail in results if not ok]
+    if bad:
+        for name, detail in bad:
+            record(FAIL, "model", f"{name}: {detail[:80]}")
+    else:
+        record(OK, "model", f"{len(results)} integrity checks pass "
+                            f"(bounds, conservation, identities, edge cases)")
+
+
 def check_selftests() -> None:
     """Every module ships a selftest; run them all. This is the post-pull smoke test."""
-    mods = ["stage0_collector.py", "shadow_book.py", "paper_trader.py"]
+    mods = ["stage0_collector.py", "shadow_book.py", "paper_trader.py",
+            "diagnostics.py"]
     for m in mods:
         try:
             r = subprocess.run([sys.executable, str(ROOT / "scripts" / m), "selftest"],
@@ -315,6 +336,7 @@ def main() -> int:
     check_data_flow()
     check_depth_coverage()
     check_ledger_integrity()
+    check_model_integrity()
     check_disk()
     if "--fast" not in sys.argv:
         check_selftests()

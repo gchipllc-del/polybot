@@ -172,6 +172,11 @@ def test_liftable_depth_reads_the_opposite_side():
     assert vr.liftable_depth(None, "yes", 0.07) is None
     # a dict with no recognizable side keys is an UNKNOWN format, never "empty"
     assert vr.liftable_depth({"bids": [[93, 5]]}, "yes", 0.07) is None
+    # cents/dollars ambiguity at p=1: a 1-CENT dust bid must parse as $0.01, not
+    # $1.00 (a $1.00 order cannot exist on Kalshi). With the old '>' heuristic this
+    # counted 200 phantom contracts as liftable at ANY ask - reproduced by review.
+    assert vr.liftable_depth({"no": [[1, 200]]}, "yes", 0.85) == 0.0
+    assert vr.liftable_depth({"no": [[15, 40]]}, "yes", 0.86) == 40.0  # real 15c bid
 
 
 def test_liftable_depth_real_payload():

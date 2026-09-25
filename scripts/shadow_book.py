@@ -145,8 +145,12 @@ def liftable_depth(book, side: str, ask: float) -> float | None:
             p, size = float(lvl[0]), float(lvl[1])
         except (TypeError, ValueError, IndexError):
             continue
-        if p > 1.0:                      # cents encoding, should it ever reappear
-            p /= 100.0
+        if p >= 1.0:                     # cents encoding, should it ever reappear.
+            p /= 100.0                   # >=, not >: a 1-CENT bid arrives as p=1 and
+                                         # a true $1.00 order cannot exist on Kalshi
+                                         # (prices are 1-99c) - with '>' a 1c dust bid
+                                         # parsed as $1.00 and counted as liftable for
+                                         # ANY ask. Reproduced by adversarial review.
         if p >= need:
             total += size
     return total
