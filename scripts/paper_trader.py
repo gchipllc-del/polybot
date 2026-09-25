@@ -233,7 +233,7 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
     rows = _load(p)
     live = open_positions(rows)
     seen_closed = {(r["ticker"], r["rule"]) for r in rows if r.get("t") == "close"}
-    new_rows, opened, skipped = [], 0, {}
+    new_rows, opened, skipped, ungated = [], 0, {}, 0
     added: set = set()
     # Windows already carrying a position for a rule — counted from the ledger so the
     # per-window cap survives restarts and spans cycles, not just this pass.
@@ -298,6 +298,12 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
             per_window[(window, rule)] = per_window.get((window, rule), 0) + 1
             room -= 1
             opened += 1
+            # depth None = the fill gate did not run (auth off, fetch failed, unknown
+            # book shape) - the entry is admitted ungated but still stamped v4. Count
+            # it so a degraded gate is visible in every cycle line instead of looking
+            # identical to a healthy one (the silent-no-op family, adversarial review).
+            if entry.get("depth") is None:
+                ungated += 1
 
     # settle
     results = {}
@@ -312,7 +318,7 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
     new_rows.extend(closes)
     _append(new_rows, p)
     return {"opened": opened, "closed": len(closes), "skipped": skipped,
-            "open_now": len(open_positions(_load(p)))}
+            "ungated": ungated, "open_now": len(open_positions(_load(p)))}
 
 
 def run_loop() -> int:
@@ -323,8 +329,9 @@ def run_loop() -> int:
         try:
             c = run_cycle()
             sk = " ".join(f"{k}={v}" for k, v in c["skipped"].items())
+            ug = f" UNGATED={c['ungated']}" if c.get("ungated") else ""
             print(f"[{_now_iso()}] opened={c['opened']} closed={c['closed']} "
-                  f"open_now={c['open_now']} {sk}")
+                  f"open_now={c['open_now']} {sk}{ug}")
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001
@@ -476,8 +483,16 @@ def _selftest() -> int:
         # collapse it to exactly 2 positions, not 4.
         assert c1["opened"] == 2, c1
         assert c1["open_now"] == 2, c1
+        assert c1["ungated"] == 0, c1       # depth known -> the gate actually ran
         c2 = run_cycle(get=fake_get, now=now, path=p, depth_fn=lambda t, s, pr: 100)
         assert c2["opened"] == 0, c2        # no duplicate entries
+
+    # a depth lookup that FAILS (returns None) admits the entry ungated - allowed,
+    # but it must be COUNTED, never look identical to a gated entry
+    with tempfile.TemporaryDirectory() as td:
+        pu = Path(td) / "ungated.jsonl"
+        cu = run_cycle(get=fake_get, now=now, path=pu, depth_fn=lambda t, s, pr: None)
+        assert cu["opened"] == 2 and cu["ungated"] == 2, cu
     # PER-WINDOW CAP: 6 strikes in ONE window must collapse to MAX_PER_WINDOW per rule,
     # and the survivor must be the one the volatility model ranked most mispriced.
     def fake_get_many(url, params=None):
