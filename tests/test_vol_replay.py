@@ -170,6 +170,31 @@ def test_liftable_depth_reads_the_opposite_side():
     # Kalshi serves null for an empty side: captured-and-empty is 0, not unknown
     assert vr.liftable_depth({"yes": [[85, 40]], "no": None}, "yes", 0.07) == 0.0
     assert vr.liftable_depth(None, "yes", 0.07) is None
+    # a dict with no recognizable side keys is an UNKNOWN format, never "empty"
+    assert vr.liftable_depth({"bids": [[93, 5]]}, "yes", 0.07) is None
+
+
+def test_liftable_depth_real_payload():
+    """The exact payload shape captured from the live stage0 log on 2026-09-25:
+    an 'orderbook_fp' wrapper with dollar-string levels. Both shadow_book._depth_at
+    and the first version of liftable_depth returned None/0 on this - the live depth
+    gate is a silent no-op and the first slice run read every book as empty."""
+    book = {"orderbook_fp": {
+        "no_dollars": [["0.9070", "108.00"], ["0.9080", "55.66"],
+                       ["0.9100", "1024.00"], ["0.9110", "1024.01"],
+                       ["0.9120", "1093.23"]],
+        "yes_dollars": [["0.0830", "108.00"], ["0.0840", "733.00"],
+                        ["0.0850", "359.01"], ["0.0860", "120.00"],
+                        ["0.0870", "147.84"]]}}
+    # buying YES at the 9.4c market ask lifts the NO bids at 90.7c+ (selling YES
+    # at <= 9.3c): all five levels qualify
+    d = vr.liftable_depth(book, "yes", 0.094)
+    assert d is not None and abs(d - (108.00 + 55.66 + 1024.00 + 1024.01 + 1093.23)) < 1e-6
+    # buying NO at 90.9c lifts YES bids >= 8.1c: 0.083..0.087 all qualify
+    d2 = vr.liftable_depth(book, "no", 0.909)
+    assert d2 is not None and abs(d2 - (108.00 + 733.00 + 359.01 + 120.00 + 147.84)) < 1e-6
+    # far too good a price finds nothing on the other side
+    assert vr.liftable_depth(book, "yes", 0.05) == 0.0
 
 
 def test_slice_rows_first_touch_not_hindsight_minimum():

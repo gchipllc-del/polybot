@@ -90,11 +90,17 @@ survived and all 7 are fixed and pinned as tests:
 
 **Open production flag (not fixed here, needs a decision):** that last defect lives
 in `shadow_book._depth_at`, which the LIVE paper trader uses for its `no_depth`
-refusals and its ledger `depth` stamps. Since 2026-08-07 the depth gate has been
-measuring same-side bid presence, not fillability — the gate is effectively random
-with respect to what it claims to check. Fixing it changes live paper behavior
-mid-sample, so it is flagged rather than silently patched; the fix should land with
-its own dated note, like the 2026-08-07 envload bugfix did.
+refusals and its ledger `depth` stamps. **Verified against a live book row on
+2026-09-25:** the API serves `{"orderbook_fp": {"yes_dollars": [...],
+"no_dollars": [...]}}` — a wrapper key and dollar-string levels `_depth_at` does not
+recognize, so it returns None and the paper trader applies NO gate at all. The
+production depth check is a silent no-op on current payloads (and was wrong-sided on
+any older payload it did parse). The first run of this tool's depth slices returned
+the same degenerate answer (every book "empty"), which is what exposed it;
+`liftable_depth` now parses the real payload and is pinned to that captured row in
+tests. Fixing `_depth_at` changes live paper behavior mid-sample, so it is flagged
+rather than silently patched; the fix should land with its own dated note, like the
+2026-08-07 envload bugfix did.
 
 ## Running it (on the host, where the data lives)
 
