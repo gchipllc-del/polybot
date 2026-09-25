@@ -282,8 +282,11 @@ def check_model_integrity() -> None:
         return
     bad = [(name, detail) for name, ok, detail in results if not ok]
     if bad:
+        # 200, not 80: an unattended night's log line is the only record, and the
+        # 80-char cut once landed mid-number and printed a WRONG recomputed value.
+        # diagnostics puts the offender first, so 200 always keeps it.
         for name, detail in bad:
-            record(FAIL, "model", f"{name}: {detail[:80]}")
+            record(FAIL, "model", f"{name}: {detail[:200]}")
     else:
         record(OK, "model", f"{len(results)} integrity checks pass "
                             f"(bounds, conservation, identities, edge cases)")
