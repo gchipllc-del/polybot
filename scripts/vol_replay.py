@@ -421,57 +421,11 @@ def grid(first: list[dict], second: list[dict], k: float) -> tuple[list, float]:
 
 # ── the frozen diagnostic slices (late-longshot forensics) ────────────────────
 
-_SIDE_KEYS = {"yes": ("yes_dollars", "yes"), "no": ("no_dollars", "no")}
-
-
-def liftable_depth(book, side: str, ask: float) -> float | None:
-    """Contracts a TAKER can actually lift when buying `side` at `ask`.
-
-    Two hard-won facts define this function:
-      * Liquidity lives on the OPPOSITE side. Buying YES at `ask` fills against
-        resting NO bids priced >= 1-ask - their owners are the ones selling YES at or
-        below our price. Same-side levels are our COMPETITION, not our liquidity;
-        counting them (which shadow_book._depth_at does) labels unfillable books as
-        deep. Caught by adversarial review.
-      * The REAL payload (verified against a live stage0 row, 2026-09-25) is
-        {"orderbook_fp": {"yes_dollars": [["0.0830","108.00"], ...],
-                          "no_dollars":  [["0.9070","108.00"], ...]}}
-        - a wrapper key and dollar-string levels that neither shadow_book._depth_at
-        nor the first version of this function recognized. _depth_at returns None on
-        it, which the live paper trader reads as "no gate": the production depth
-        check has been a silent no-op. Flagged in docs/CRYPTO15_CONDITIONAL.md.
-
-    One price tick of tolerance is applied: the market quote and the book snapshot
-    are fetched seconds apart, and a 1c skew would otherwise read a lit book as
-    empty. Missing/null opposite side on a recognized book is empty (0.0), not
-    unknown (None); an unrecognized shape is None."""
-    if not isinstance(book, dict):
-        return None
-    for wrap in ("orderbook_fp", "orderbook"):
-        inner = book.get(wrap)
-        if isinstance(inner, dict):
-            book = inner
-            break
-    if not any(k in book for keys in _SIDE_KEYS.values() for k in keys):
-        return None                      # no recognizable side at all: unknown format
-    opp_side = "no" if side == "yes" else "yes"
-    opp = next((book[k] for k in _SIDE_KEYS[opp_side] if book.get(k) is not None), None)
-    if opp is None:
-        return 0.0
-    if not isinstance(opp, list):
-        return None
-    need = 1.0 - ask - 0.01 - 1e-9      # one tick of snapshot-skew tolerance
-    total = 0.0
-    for lvl in opp:
-        try:
-            p, size = float(lvl[0]), float(lvl[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if p > 1.0:                      # cents encoding, should it ever reappear
-            p /= 100.0
-        if p >= need:
-            total += size
-    return total
+# Depth semantics live in ONE place: shadow_book.liftable_depth (fixed 2026-09-25
+# after a captured live row exposed the orderbook_fp payload; the same function
+# drives the paper trader's fill gate, so replay and production can never disagree
+# about what "fillable" means). Re-exported here because this module's tests pin it.
+from shadow_book import liftable_depth  # noqa: E402
 
 
 def _depth_state(e: dict, side: str, ask: float) -> str:

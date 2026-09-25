@@ -97,28 +97,64 @@ def _band_of(mins_left) -> str | None:
     return None
 
 
-def _depth_at(book: dict | None, side: str, price: float) -> float | None:
-    """Contracts available at <= price on `side`, from a captured book snapshot.
-    Kalshi serves levels as [[price_cents, size], ...] under 'yes'/'no'. Returns None
-    when no book was captured (auth off at the time)."""
+# BUGFIX 2026-09-25 - the depth gate was a silent no-op, and wrong-sided besides.
+# A live stage0 row settled what the orderbook payload actually looks like:
+#   {"orderbook_fp": {"yes_dollars": [["0.0830","108.00"], ...],
+#                     "no_dollars":  [["0.9070","108.00"], ...]}}
+# a wrapper key and dollar-string levels the old parser did not recognize, so it
+# returned None - and paper_trader treats None as "apply no gate": every entry since
+# the API served this shape went through unfiltered, and the ledger's depth stamps
+# are empty. Worse, on any payload it DID parse the old code read book[side] - the
+# taker's own side - counting our competition as our liquidity. Correct semantics:
+# buying YES at `ask` fills against resting NO bids priced >= 1-ask (their owners
+# are selling YES at or below our price), and symmetrically for NO. vol_replay's
+# slice table is why this matters: the late-longshot paper "edge" sat entirely in
+# entries with NO liftable size behind the quote (+21c/window phantom vs -3c/window
+# fillable, out of sample). Found by adversarial review + one captured book row;
+# pinned in tests/test_vol_replay.py. Paper entries after this fix are stamped v=4.
+_SIDE_KEYS = {"yes": ("yes_dollars", "yes"), "no": ("no_dollars", "no")}
+
+
+def liftable_depth(book, side: str, ask: float) -> float | None:
+    """Contracts a TAKER can actually lift when buying `side` at `ask`.
+
+    Accepts the live payload (orderbook_fp wrapper, *_dollars sides, dollar-string
+    levels), the bare {'yes'/'no': [[cents, size], ...]} shape, and either price
+    encoding. One price tick of tolerance absorbs quote-vs-book snapshot skew.
+    Missing/null opposite side on a recognized book is empty (0.0), not unknown
+    (None); an unrecognized shape is None ("no book captured")."""
     if not isinstance(book, dict):
         return None
-    levels = book.get(side)
-    if not isinstance(levels, list):
+    for wrap in ("orderbook_fp", "orderbook"):
+        inner = book.get(wrap)
+        if isinstance(inner, dict):
+            book = inner
+            break
+    if not any(k in book for keys in _SIDE_KEYS.values() for k in keys):
+        return None                      # no recognizable side at all: unknown format
+    opp_side = "no" if side == "yes" else "yes"
+    opp = next((book[k] for k in _SIDE_KEYS[opp_side] if book.get(k) is not None), None)
+    if opp is None:
+        return 0.0
+    if not isinstance(opp, list):
         return None
+    need = 1.0 - ask - 0.01 - 1e-9      # one tick of snapshot-skew tolerance
     total = 0.0
-    for lvl in levels:
+    for lvl in opp:
         try:
-            p_c, size = float(lvl[0]), float(lvl[1])
+            p, size = float(lvl[0]), float(lvl[1])
         except (TypeError, ValueError, IndexError):
             continue
-        # a resting order on the OPPOSITE side at (100 - p) is what we lift; accept
-        # either encoding by taking any level whose implied ask is <= our price
-        for implied in (p_c / 100.0, 1.0 - p_c / 100.0):
-            if implied <= price + 1e-9:
-                total += size
-                break
+        if p > 1.0:                      # cents encoding, should it ever reappear
+            p /= 100.0
+        if p >= need:
+            total += size
     return total
+
+
+def _depth_at(book: dict | None, side: str, price: float) -> float | None:
+    """Back-compat name (paper_trader calls this); see liftable_depth."""
+    return liftable_depth(book, side, price)
 
 
 def build(rows: list[dict]) -> dict:
@@ -241,12 +277,17 @@ def _selftest() -> int:
     assert kalshi_taker_fee(0.90) == 0.01 and kalshi_taker_fee(0.50) == 0.02
 
     rows = [
-        # <2min favorite at 0.85 -> settles yes (side 'yes' is favorite) => WIN
+        # <2min favorite at 0.85 -> settles yes (side 'yes' is favorite) => WIN.
+        # Book in the LIVE payload shape: buying YES at 0.85 lifts NO bids >= 0.14,
+        # so the 0.16 NO bid makes it fillable.
         {"t": "obs", "ticker": "A", "mins_left": 1.0, "yes_ask": 0.85, "no_ask": 0.17,
-         "book": {"yes": [[85, 40]]}},
+         "book": {"orderbook_fp": {"no_dollars": [["0.1600", "40.00"]]}}},
         {"t": "settle", "ticker": "A", "result": "yes"},
-        # <2min favorite at 0.90 -> settles no => LOSS
-        {"t": "obs", "ticker": "B", "mins_left": 0.5, "yes_ask": 0.90, "no_ask": 0.12},
+        # <2min favorite at 0.90 -> settles no => LOSS. Book has SAME-side bids only:
+        # our competition, not our liquidity - must count as depth 0, never fillable
+        # (the pre-2026-09-25 parser got exactly this wrong).
+        {"t": "obs", "ticker": "B", "mins_left": 0.5, "yes_ask": 0.90, "no_ask": 0.12,
+         "book": {"yes": [[89, 500]]}},
         {"t": "settle", "ticker": "B", "result": "no"},
         # control band, should land in CONTROL_midprice only
         {"t": "obs", "ticker": "C", "mins_left": 30.0, "yes_ask": 0.55, "no_ask": 0.47},
@@ -262,7 +303,8 @@ def _selftest() -> int:
     # B: -0.90 gross, fee ceil(0.07*.90*.10)=ceil(0.63c)=0.01 -> -0.91
     assert abs(h1["gross"] - (0.15 - 0.90)) < 1e-9, h1["gross"]
     assert abs(h1["net"] - (0.15 - 0.90 - 0.02)) < 1e-9, h1["net"]
-    assert h1["depth_known"] == 1 and h1["fillable"] == 1, h1
+    # A's live-shape book is fillable; B's same-side-only book must not be
+    assert h1["depth_known"] == 2 and h1["fillable"] == 1, h1
     assert not h1["meaningful"]
 
     ctrl = rep["rules"]["CONTROL_midprice"]

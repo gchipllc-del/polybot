@@ -88,19 +88,26 @@ survived and all 7 are fixed and pinned as tests:
   YES fills against resting NO bids; `shadow_book._depth_at` counts same-side bids —
   your competition — as liquidity. vol_replay now has a correct `liftable_depth`.
 
-**Open production flag (not fixed here, needs a decision):** that last defect lives
-in `shadow_book._depth_at`, which the LIVE paper trader uses for its `no_depth`
-refusals and its ledger `depth` stamps. **Verified against a live book row on
-2026-09-25:** the API serves `{"orderbook_fp": {"yes_dollars": [...],
-"no_dollars": [...]}}` — a wrapper key and dollar-string levels `_depth_at` does not
-recognize, so it returns None and the paper trader applies NO gate at all. The
-production depth check is a silent no-op on current payloads (and was wrong-sided on
-any older payload it did parse). The first run of this tool's depth slices returned
-the same degenerate answer (every book "empty"), which is what exposed it;
-`liftable_depth` now parses the real payload and is pinned to that captured row in
-tests. Fixing `_depth_at` changes live paper behavior mid-sample, so it is flagged
-rather than silently patched; the fix should land with its own dated note, like the
-2026-08-07 envload bugfix did.
+**Production fix, RESOLVED 2026-09-25 (user-approved):** that last defect lived in
+`shadow_book._depth_at`, which the LIVE paper trader uses for its `no_depth`
+refusals and its ledger `depth` stamps. A captured live book row proved the API
+serves `{"orderbook_fp": {"yes_dollars": [...], "no_dollars": [...]}}` — a wrapper
+key and dollar-string levels the old parser did not recognize, so it returned None
+and the paper trader applied NO gate at all: a silent no-op (and wrong-sided on any
+older payload it did parse). Depth semantics now live in ONE function,
+`shadow_book.liftable_depth` (correct opposite-side fills, live payload parsing, one
+tick of snapshot-skew tolerance), used identically by the paper trader, the shadow
+book, and this tool's slices — replay and production can no longer disagree about
+what "fillable" means. Paper entries after the fix are stamped **v=4** so the record
+with a working fill filter stays separable from the v2 record without one. The
+captured payload is pinned verbatim in tests.
+
+The first slice run with the fixed parser is also why this mattered so much: out of
+sample, the late-longshot P&L sat ENTIRELY in entries with no liftable size behind
+the quote (+21c/window, CI [+0.085,+0.334]) while fillable entries LOST
+(−3c/window, CI [−0.059,−0.001]). The "edge" was phantom liquidity — quotes that
+were stale or gone by the next snapshot. The v4 forward record tests what remains
+when only fillable entries count.
 
 ## Running it (on the host, where the data lives)
 

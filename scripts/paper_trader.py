@@ -50,7 +50,17 @@ MAX_CONCURRENT = 8
 # observed outcomes, and the number of independent windows - the actual evidence rate -
 # is unaffected. Trades carry v=2 so the pre-change record stays separable.
 MAX_PER_WINDOW = 1
-STRATEGY_VERSION = 2
+# 2026-09-25 DEPTH GATE FIX (strategy v4; v3 is taken by Hermes overlay rules).
+# The fill gate had been a silent no-op: shadow_book's depth parser could not read
+# the live orderbook_fp payload, returned None, and None means "no gate" here - so
+# every entry went through unfiltered and the ledger's depth stamps are empty.
+# vol_replay's out-of-sample slice table showed the stakes: the late-longshot paper
+# edge sat ENTIRELY in entries with no liftable size behind the quote (+21c/window
+# phantom vs -3c/window fillable, corrected CIs clear of zero on both). With the
+# parser fixed, unfillable quotes are refused again ("no_depth"), so the v4 record
+# answers the fill-realism question the v2 record structurally could not. This is a
+# REALISM change, not an edge change: no rule, band, or threshold moved.
+STRATEGY_VERSION = 4
 CYCLE_S = 60
 START_BANKROLL = 500.0     # paper only, for a readable equity number
 
