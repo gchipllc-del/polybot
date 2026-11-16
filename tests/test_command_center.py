@@ -169,10 +169,18 @@ def _sleeve_rule(sp, name, losses, n=100, ask=0.90, lots=10):
     sp._append(sp.LEDGER, rows)
 
 
-def _crypto_ledger(path, rules=3, n=40, losses=7):
-    """Forward crypto rules with n fill-checked (v4 gated) windows each - ordinary records."""
+def _crypto_ledger(path, rules=3, n=40, losses=7, glowing_prefix=0):
+    """Forward crypto rules with n fill-checked (v4 gated) windows each - ordinary records.
+    glowing_prefix adds that many PRE-FIX windows per rule, all wins - the real ledger's
+    shape, where the pre-fix era looked great on fills the book could not give."""
     rows = []
     for j in range(rules):
+        for i in range(glowing_prefix):
+            tk = f"KXBTC15M-26AUG{j:02d}{i:04d}-B{j}"
+            rows.append({"t": "open", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "contracts": 1, "fee": 0.01})       # no v: pre-fix
+            rows.append({"t": "close", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "won": True, "pnl": 0.14})
         for i in range(n):
             tk, won = f"KXBTC15M-26SEP{j:02d}{i:04d}-B{j}", i >= losses
             rows.append({"t": "open", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
@@ -203,6 +211,15 @@ def test_report_and_command_center_correct_over_one_family(tmp_path, monkeypatch
     _crypto_ledger(cc.CRYPTO_LEDGER)                   # three more forward rules: m = 4
     line, verdict = _both_verdicts(sp, "S_FAV90", capsys)
     assert line.endswith("positive, not significant") and verdict == "no edge yet"
+    # the crypto members are judged on their FILL-CHECKED record on both surfaces: a
+    # glowing pre-fix era must not make them survive and loosen S_FAV90's threshold
+    _crypto_ledger(cc.CRYPTO_LEDGER, glowing_prefix=400)
+    line, verdict = _both_verdicts(sp, "S_FAV90", capsys)
+    assert line.endswith("positive, not significant") and verdict == "no edge yet"
+    cc._CACHE.update(t=0.0, payload=None)
+    dec = {r["rule"]: r["decision"] for r in cc.build_payload()["rules"]
+           if r["venue"] == "crypto"}
+    assert cc.crypto_family() == [dec[k] for k in sorted(dec)]
 
 
 def test_retiring_rules_never_raises_another_rules_verdict(tmp_path, monkeypatch, capsys):
@@ -265,3 +282,22 @@ def test_a_rule_spanning_many_series_scores_and_counts(tmp_path, monkeypatch):
     assert r["series"] == "KXHIGHNY +2 more" and r["decision"]["n"] == 3
     assert abs(r["decision"]["mean"] - 0.018) < 1e-9          # per contract: 2c - 0.2c fee
     assert abs(r["decision"]["p"] - 0.982 ** 3) < 1e-9          # exact: 3/3 is luck
+
+
+def test_scores_are_reused_until_a_record_changes(monkeypatch):
+    """The page rebuilds on every poll; exact tails are costly on long records. A record
+    is scored once until one of its trades settles, and a sleeve rule (whose decision
+    record IS its full record) is scored once, not twice."""
+    import sleeve_paper as sp
+    calls = []
+    real = sp.forward_stats
+    monkeypatch.setattr(sp, "forward_stats", lambda ts: calls.append(len(ts)) or real(ts))
+    cc._STATS_MEMO.clear()
+    trades = [dict(_t("S1", f"E{i}", 0.14 if i % 10 else -0.86, venue="sleeves"),
+                   pnl_pc=0.14 if i % 10 else -0.86, fee_pc=0.01) for i in range(60)]
+    first = cc.score_rules(trades)
+    assert len(calls) == 1                             # all == decision: scored once
+    assert cc.score_rules(trades) == first and len(calls) == 1      # reused
+    more = trades + [dict(trades[0], event="E999")]
+    cc.score_rules(more)
+    assert len(calls) == 2                             # a new settlement: rescored
