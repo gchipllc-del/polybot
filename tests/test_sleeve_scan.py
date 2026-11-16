@@ -201,5 +201,13 @@ def test_find_searches_ticker_title_and_category_any_case(tmp_path, monkeypatch,
     assert "2 series match" in out and "KXTEMPNYCH" in out and "KXHIGHNY" in out
     assert "KXBTC15M" not in out
     assert ss.cmd_find("mönchen") == 0 and "KXESOCCERGAME" in capsys.readouterr().out
+    # in no title: "kxhigh" only in a ticker, "weather" and "crypto" only in categories
+    assert ss.cmd_find("kxhigh") == 0
+    out = capsys.readouterr().out
+    assert "1 series match" in out and "KXHIGHNY" in out
+    assert ss.cmd_find("WEATHER") == 0
+    out = capsys.readouterr().out
+    assert "2 series match" in out and "KXTEMPNYCH" in out and "KXHIGHNY" in out
+    assert ss.cmd_find("crypto") == 0 and "1 series match" in capsys.readouterr().out
     monkeypatch.setattr(ss, "CATALOG", tmp_path / "missing.json")
     assert ss.cmd_find("x") == 1
