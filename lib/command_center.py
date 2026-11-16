@@ -123,9 +123,34 @@ def _series_count(srules: dict) -> int:
 
 # ── the one scoring family ────────────────────────────────────────────────────
 
+_STATS_MEMO: dict[str, dict] = {}
+_STATS_MEMO_MAX = 512
+
+
+def _record_key(trades: list[dict]) -> str:
+    """A fingerprint of everything forward_stats reads. A rule's record only changes when
+    one of its trades settles, so the exact tails are reused across dashboard rebuilds."""
+    import hashlib
+    h = hashlib.sha1()
+    for t in trades:
+        h.update(repr((str(t["event"]), bool(t["won"]), float(t["ask"]), t.get("fee_pc"),
+                       t.get("pnl_pc"), float(t["pnl"]))).encode())
+    return f"{len(trades)}:{h.hexdigest()}"
+
+
 def _stats(trades: list[dict]) -> dict:
+    """sleeve_paper.forward_stats, memoized on the record. Exact Poisson-binomial tails
+    cost up to ~0.15 s each on long records and the page rebuilds every poll; without
+    this a 40-rule ledger took 17 s per refresh."""
     import sleeve_paper as sp
-    return sp.forward_stats(trades)
+    key = _record_key(trades)
+    hit = _STATS_MEMO.get(key)
+    if hit is None:
+        hit = sp.forward_stats(trades)
+        if len(_STATS_MEMO) >= _STATS_MEMO_MAX:
+            _STATS_MEMO.pop(next(iter(_STATS_MEMO)))          # oldest first
+        _STATS_MEMO[key] = hit
+    return dict(hit)
 
 
 def _decision_basis(ts: list[dict], venue: str) -> list[dict]:
@@ -159,7 +184,8 @@ def score_rules(trades: list[dict], sleeve_rule_names: set | None = None,
     for name, ts in by_rule.items():
         venue = ts[0]["venue"] if ts else "sleeves"
         basis = _decision_basis(ts, venue)
-        s_all, s_dec = _stats(ts), _stats(basis)
+        s_all = _stats(ts)
+        s_dec = dict(s_all) if basis is ts else _stats(basis)   # sleeves: the same list
         cum, acc = [], 0.0
         for t in sorted(ts, key=lambda x: x["ts"]):
             acc += t["pnl"]
