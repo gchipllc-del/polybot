@@ -11,6 +11,7 @@ from requirements.txt on first run, loads .env if present, then serves:
 
     crypto  (15-min sleeve)  ->  http://127.0.0.1:5153
     weather (temp sleeve)    ->  http://127.0.0.1:5154
+    command center           ->  http://127.0.0.1:5155   (every rule, one standard)
 
 Notes for a fresh machine: the pages come up immediately, but panels are empty until
 the paper bots have produced data files, and portfolio panels need .env Kalshi keys
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DASHBOARDS = [
     ("crypto", "kalshi-dashboard", int(os.environ.get("POLYBOT_CRYPTO_DASH_PORT", 5153))),
     ("weather", "kalshi-weather-dashboard", int(os.environ.get("POLYBOT_WEATHER_DASH_PORT", 5154))),
+    ("command", "command-center", int(os.environ.get("POLYBOT_COMMAND_DASH_PORT", 5155))),
 ]
 DASH_HOST = os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1")
 
@@ -178,7 +180,7 @@ def doctor() -> int:
 
     # 4. logs
     print("\n[4] dashboard logs (last lines)")
-    for name in ("crypto", "weather"):
+    for name in ("crypto", "weather", "command"):
         print(f"    logs/dash_{name}.log:")
         print(_tail(ROOT / "logs" / f"dash_{name}.log"))
 

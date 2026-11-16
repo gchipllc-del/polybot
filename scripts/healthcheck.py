@@ -37,7 +37,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 IS_WIN = sys.platform.startswith("win")
 TASKS = ["PolybotDashboards", "PolybotStage0", "PolybotPaper", "PolybotSleeves"]
-PORTS = [("crypto dashboard", 5153), ("weather dashboard", 5154)]
+PORTS = [("crypto dashboard", 5153), ("weather dashboard", 5154), ("command center", 5155)]
 STAGE0_LOG = ROOT / "data" / "stage0_crypto.jsonl"
 PAPER_LOG = ROOT / "data" / "paper_crypto15.jsonl"
 HISTORY_LOG = ROOT / "data" / "stage0_history.jsonl"

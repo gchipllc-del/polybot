@@ -1763,6 +1763,14 @@ def main():
                 port = int(arg.split("=", 1)[1])
         from lib.kalshi_weather_dashboard import run_dashboard
         run_dashboard(port=port)
+    elif command == "command-center":
+        import os
+        port = int(os.environ.get("POLYBOT_COMMAND_DASH_PORT", 5155))
+        for arg in sys.argv[2:]:
+            if arg.startswith("--port="):
+                port = int(arg.split("=", 1)[1])
+        from lib.command_center import run_dashboard
+        run_dashboard(port=port)
     elif command == "kalshi-dashboard":
         port = 5053
         for arg in sys.argv[2:]:
