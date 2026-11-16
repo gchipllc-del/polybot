@@ -26,7 +26,8 @@ running it would actually have lived through:
 
 Entry rule ("favorites"): the FIRST moment a side's ask sits in [lo, hi] (inclusive), on a
 formed book, buy `contracts` of that side at that ask; hold to settlement. One entry per
-market. Optional --min-hours / --max-hours restrict entries by time before close.
+market, always strictly BEFORE the close (the bar ending at the close quotes the answer).
+Optional --min-hours / --max-hours restrict entries by time before close.
 --one-per-event keeps only each event's FIRST entry - exactly what the forward paper
 trader does - and makes the p-values exact (sleeve_paper.forward_stats). Last-hour tests
 need 1-minute candles: `sleeve_scan.py backfill --final-hours 2` (it warns otherwise).
@@ -101,7 +102,9 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
                                                     and ya - yb <= MAX_SPREAD):
                     continue
                 hours = ((m["close_ts"] - ts) / 3600.0) if m["close_ts"] else None
-                if hours is not None and not (min_h <= hours <= max_h):
+                # never at or after the close: the bar ending AT the close quotes the
+                # settled price, and the forward trader only buys while now < close
+                if hours is not None and (hours <= 0 or not (min_h <= hours <= max_h)):
                     continue
                 na = round(1.0 - yb, 4)
                 side = ask = None

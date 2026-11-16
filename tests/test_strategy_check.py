@@ -1,6 +1,7 @@
 """strategy_check - an outside method tested as ONE pre-specified hypothesis."""
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -16,6 +17,31 @@ def _file(tmp_path, p_win, name="w"):
         for r in sc._world(p_win):
             f.write(json.dumps(r) + "\n")
     return p
+
+
+def _iso(t):
+    return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+
+
+def _minute_file(path, quote, n=40, minutes=120, result="yes", series="KXT"):
+    """`final/`-style data: n daily events of one 20h market each, with 1-minute candles
+    over only the last `minutes`. quote(seconds_left) -> (yes_bid, yes_ask) in cents."""
+    t0 = 1_780_000_000
+    with open(path, "w", encoding="utf-8") as f:
+        for d in range(n):
+            o = t0 + d * 86400
+            c = o + 20 * 3600
+            tk = f"{series}-D{d:04d}-B0"
+            f.write(json.dumps({"t": "market", "series": series, "ticker": tk,
+                                "event_ticker": f"{series}-D{d:04d}", "result": result,
+                                "open_time": _iso(o), "close_time": _iso(c)}) + "\n")
+            for k in range(minutes):
+                end = c - 60 * minutes + 60 * (k + 1)
+                yb, ya = quote(c - end)
+                f.write(json.dumps({"t": "candle", "series": series, "ticker": tk,
+                                    "end_period_ts": end, "yes_bid": {"close": yb},
+                                    "yes_ask": {"close": ya}}) + "\n")
+    return path
 
 
 def test_fee_is_per_order_and_rounds_up():
@@ -98,3 +124,17 @@ def test_hourly_candles_warn_before_a_last_hour_test(tmp_path, capsys):
     assert "HOURLY candles" in capsys.readouterr().out
     assert sc.cmd_favorites([p], 0.97, 0.99, 10, 0.0, 1e9) == 0
     assert "HOURLY candles" not in capsys.readouterr().out    # no window: no warning
+
+
+def test_no_entry_on_the_bar_ending_at_the_close(tmp_path):
+    """The bar ending AT the close quotes the settled price, and the forward trader only
+    buys while now < close. A market that shows the band only on that bar is never
+    entered - in a last-hour window or with none - while one minute earlier still is."""
+    at_close = _minute_file(tmp_path / "c.jsonl",
+                            lambda left: (98, 99) if left <= 0 else (88, 90))
+    for max_h in (1.0, 1e9):
+        assert sc.scan(at_close, 0.97, 0.99, 0.0, max_h)["entries"] == {}
+    a_minute_before = _minute_file(tmp_path / "m.jsonl",
+                                   lambda left: (98, 99) if left <= 60 else (88, 90))
+    e = sc.scan(a_minute_before, 0.97, 0.99, 0.0, 1.0)["entries"]
+    assert len(e) == 40 and {x["hours"] for x in e.values()} == {1 / 60}
