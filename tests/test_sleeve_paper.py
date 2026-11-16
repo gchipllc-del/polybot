@@ -206,6 +206,20 @@ def test_the_family_correction_decides_an_edge_verdict():
     assert sp.evaluate(rows, only_m, crowd)[0]["category"] == "positive_ns"
 
 
+def test_trades_opened_before_named_at_never_count():
+    """Pre-registration is the whole point: a position opened before the rule was named
+    (e.g. a rebuilt registry re-registering old names over an older ledger) never reaches
+    the verdict - not in the report, not in the dashboard (both go through trades_of)."""
+    rules = {"R": {"name": "R", "series": "S", "named_at": "2026-11-10T00:00:00+00:00"}}
+    before = {"t": "open", "ticker": "S-E1-A", "rule": "R", "event": "S-E1", "series": "S",
+              "ts": "2026-11-09T23:59:00+00:00", "price": 0.85, "side": "yes", "fee": 0.01}
+    at = dict(before, ticker="S-E2-A", event="S-E2", ts="2026-11-10T00:00:00+00:00")
+    rows = [before, sp.settle(before, "yes"), at, sp.settle(at, "yes")]
+    assert [t["event"] for t in sp.trades_of(rows, rules)["R"]] == ["S-E2"]
+    assert sp.trades_of(rows[:2], rules) == {"R": []}
+    assert sp.evaluate(rows[:2], rules)[0]["events"] == 0
+
+
 def test_any_band_rule_trades_at_any_time(tmp_path):
     rp = tmp_path / "r.jsonl"
     sp.register([{"name": "F9799_KXHIGHNY", "series": "KXHIGHNY", "band": "any",

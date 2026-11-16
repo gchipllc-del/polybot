@@ -222,6 +222,19 @@ def test_retiring_rules_never_raises_another_rules_verdict(tmp_path, monkeypatch
     assert [r["rule"] for r in cc.build_payload()["rules"]] == ["R0"]   # retired: not shown
 
 
+def test_dashboard_never_counts_a_trade_opened_before_named_at(tmp_path, monkeypatch):
+    sp = _isolate(tmp_path, monkeypatch)
+    sp.register([{"name": "R", "series": "KXA", "band": "any", "side": "favorite",
+                  "lo": 0.80, "hi": 0.90}], sp.RULES, T0)
+    o = {"t": "open", "ts": (T0 - timedelta(minutes=1)).isoformat(), "ticker": "KXA-E1-A",
+         "rule": "R", "event": "KXA-E1", "series": "KXA", "side": "yes", "price": 0.85,
+         "fee": 0.01, "depth": 5}
+    sp._append(sp.LEDGER, [o, sp.settle(o, "yes")])
+    cc._CACHE.update(t=0.0, payload=None)
+    p = cc.build_payload()
+    assert p["rules"][0]["decision"]["n"] == 0 and p["kpi"]["events"] == 0
+
+
 def test_a_rule_spanning_many_series_scores_and_counts(tmp_path, monkeypatch):
     """One hypothesis over seven cities is one rule: the payload must count its series
     and label it - a list-valued series once crashed the series count."""
