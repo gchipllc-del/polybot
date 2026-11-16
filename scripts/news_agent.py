@@ -319,7 +319,7 @@ def _selftest() -> int:
     assert nr.et_offset_hours(datetime(2026, 12, 1, tzinfo=timezone.utc)) == -5
     cal = [{"date": "2026-11-16", "time_et": "08:30", "event": "CPI", "impact": "high"}]
     assert nr.calendar_vote(cal, "2026-11-16")["vote"] == nr.CAUTIOUS
-    assert nr.calendar_vote(cal, "2026-11-17")["vote"] == nr.GOOD
+    assert nr.calendar_vote(cal, "2026-11-17")["vote"] is None   # only ADDS caution
     assert nr.calendar_vote([], "2026-11-16")["vote"] is None
 
     # volatility: calm -> good, hot last 6h -> cautious, no history -> abstain

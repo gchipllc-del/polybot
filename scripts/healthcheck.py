@@ -305,9 +305,22 @@ def check_news_regime() -> None:
         record(WARN, "news", "news agent has never run - rerun install_autostart.ps1 "
                              "(adds the hourly PolybotNews task)")
         return
-    r = current_regime()
+    r = current_regime(REGIME_LOG)
+    try:                       # are the LIVE data layers voting, or only the fallbacks?
+        from lib.news_regime import load_history
+        votes = ((load_history(REGIME_LOG, max_bytes=200_000) or [{}])[-1]
+                 .get("votes") or {})
+        silent = {k: (votes.get(k) or {}).get("why", "no vote")
+                  for k in ("headlines", "volatility")
+                  if (votes.get(k) or {}).get("vote") is None}
+    except Exception:  # noqa: BLE001
+        silent = {}
     if r["regime"] == "unknown":
         record(WARN, "news", r["why"][:120])
+    elif len(silent) == 2:
+        record(WARN, "news", f"regime {r['regime'].upper()} but no live data layer voted - "
+                             f"headlines: {silent['headlines'][:50]}; "
+                             f"volatility: {silent['volatility'][:50]}")
     else:
         record(OK, "news", f"regime {r['regime'].upper()} (size x{r['mult']}) - "
                            f"{r['why'][:80]}")
