@@ -45,7 +45,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from forecast_replay import mean_ci, norm_cdf  # noqa: E402
-from sleeve_scan import _ohlc, event_of  # noqa: E402
+from sleeve_scan import _ohlc, candle_volume, event_of  # noqa: E402
 import history_backfill as hb  # noqa: E402
 
 MAX_SPREAD = 0.15
@@ -111,7 +111,7 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
                     side, ask = "no", na
                 if side is None:
                     continue
-                vol = d.get("volume") or 0
+                vol = candle_volume(d)
                 t_lo, t_hi = _ohlc(d, "price", "low"), _ohlc(d, "price", "high")
                 traded = bool(vol) and (
                     (side == "yes" and t_lo is not None and t_lo <= ya + 1e-9) or

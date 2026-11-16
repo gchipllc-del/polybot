@@ -169,6 +169,16 @@ def bh_select(pvals: list[float], q: float = FDR_Q) -> set[int]:
 
 # ── loading: any history_backfill-format file ─────────────────────────────────
 
+def candle_volume(c: dict) -> float:
+    """Contracts traded in a candle. The API renamed `volume` to `volume_fp` (a string
+    like "12.00"); read either, so trade confirmation does not silently go to zero."""
+    for key in ("volume", "volume_fp"):
+        v = _num(c.get(key))
+        if v:
+            return v
+    return 0.0
+
+
 def load_sleeve_file(path: Path) -> dict:
     """-> {series: {"markets": {ticker: {...}}, "candles": {ticker: [(ts, yb, ya,
     t_lo, t_hi, vol), ...]}}}. Streams; keeps only formed-book candles."""
@@ -200,7 +210,7 @@ def load_sleeve_file(path: Path) -> dict:
                     continue
                 if not (0.01 <= yb < ya <= 0.99 and ya - yb <= MAX_SPREAD):
                     continue                       # unformed / placeholder book
-                vol = _num(d.get("volume")) or 0.0
+                vol = candle_volume(d)
                 s["candles"].setdefault(d["ticker"], []).append(
                     (ts, yb, ya, _ohlc(d, "price", "low"), _ohlc(d, "price", "high"), vol))
     return out

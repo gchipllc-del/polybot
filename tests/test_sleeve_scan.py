@@ -134,6 +134,14 @@ def test_final_hours_backfill_fetches_minute_candles_for_the_last_hours(tmp_path
     assert out.exists() and not (tmp_path / "KXT.jsonl").exists()   # kept out of screen
 
 
+def test_candle_volume_reads_renamed_field():
+    from sleeve_scan import candle_volume
+    assert candle_volume({"volume": 5}) == 5
+    assert candle_volume({"volume_fp": "12.00"}) == 12.0
+    assert candle_volume({"volume_fp": "0.00"}) == 0.0
+    assert candle_volume({}) == 0.0
+
+
 def test_find_searches_ticker_title_and_category_any_case(tmp_path, monkeypatch, capsys):
     import json as _json
     cat = tmp_path / "catalog.json"
