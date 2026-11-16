@@ -149,10 +149,12 @@ def test_headline_baseline_warmup_and_trigger():
     assert nr.headline_vote(reading, sw, [])["vote"] is None
     # no warm-up exception (review finding #7): a huge raw score still abstains
     assert nr.headline_vote(dict(reading, score=1000.0), sw, [])["vote"] is None
-    hist = [{"votes": {"headlines": {"density": reading["density"] / 3, "n": 40}}}] \
+    # the baseline must come from sweeps as complete as this one (review finding #4)
+    n = reading["n"]
+    hist = [{"votes": {"headlines": {"density": reading["density"] / 3, "n": n}}}] \
         * nr.HEADLINE_BASELINE_MIN_RUNS
     assert nr.headline_vote(dict(reading, score=10.0), sw, hist)["vote"] == nr.CAUTIOUS
-    calm_hist = [{"votes": {"headlines": {"density": reading["density"], "n": 40}}}] \
+    calm_hist = [{"votes": {"headlines": {"density": reading["density"], "n": n}}}] \
         * nr.HEADLINE_BASELINE_MIN_RUNS
     assert nr.headline_vote(reading, sw, calm_hist)["vote"] == nr.GOOD
 
@@ -449,3 +451,73 @@ def test_warmup_abstains_on_a_busy_ordinary_day():
     assert v["vote"] is None and "warming up" in v["why"], v
     assert nr.headline_vote(dict(reading, score=1e6), sw, [])["vote"] is None
     assert not hasattr(nr, "HEADLINE_EXTREME")
+
+
+def _baseline(**headlines):
+    """A full warm baseline of history rows as run_once writes them: votes.headlines
+    carries density, n and the feed counts of each past sweep."""
+    return [{"t": "regime", "votes": {"headlines": dict(headlines)}}] \
+        * (nr.HEADLINE_BASELINE_MIN_RUNS + 24)
+
+
+def _google_split(google_hits, other_hits, google_down=False):
+    """F0-F13 stand for the 14 Google News feeds (one host, keyword searches built
+    from lexicon terms, so denser in hits); F14-F34 for the other 21."""
+    def fetch(u):
+        google = int(u[1:]) < 14
+        if google and google_down:
+            raise ConnectionError("429 Too Many Requests")
+        return _macro_feed(u, 15, google_hits if google else other_hits)
+    return fetch
+
+
+def test_partial_sweep_abstains_instead_of_reading_a_risky_day_good(tmp_path):
+    """Finding #4: one host throttling drops the 14 densest feeds together. Judged
+    against a full-sweep baseline, the risky day's partial sweep read GOOD (1.2x);
+    it must abstain - and with no other live layer the regime is UNKNOWN, not GOOD."""
+    base_sw = nr.sweep_headlines(_FEEDS35, fetch=_google_split(5, 1), now=NOW, pause_s=0)
+    base = nr.headline_reading(base_sw["headlines"], NOW)
+    hist = _baseline(density=base["density"], n=base["n"], feeds_ok=base_sw["feeds_ok"],
+                     feeds_failed=base_sw["feeds_failed"])
+    full = nr.sweep_headlines(_FEEDS35, fetch=_google_split(12, 3), now=NOW, pause_s=0)
+    assert nr.headline_vote(nr.headline_reading(full["headlines"], NOW), full, hist)["vote"] \
+        == nr.CAUTIOUS                       # every feed up: the risky day is seen
+    risky_partial = _google_split(12, 3, google_down=True)
+    part = nr.sweep_headlines(_FEEDS35, fetch=risky_partial, now=NOW, pause_s=0)
+    assert (part["feeds_ok"], part["feeds_failed"]) == (21, 14)
+    v = nr.headline_vote(nr.headline_reading(part["headlines"], NOW), part, hist)
+    assert v["vote"] is None and "partial sweep" in v["why"], v
+    row = nr.run_once(NOW, feeds=_FEEDS35, fetch=risky_partial, calendar=[], spots={},
+                      history=hist, ai=False, path=tmp_path / "r.jsonl", pause_s=0)
+    assert row["regime"] == nr.UNKNOWN and row["mult"] == 0.5, row["reasons"]
+
+
+def test_thin_sweep_abstains_even_when_every_feed_answers():
+    """Finding #4, the headline-count half: every feed answers, but with a third of
+    its usual recent items (a degraded or soft-throttled response)."""
+    base_sw = nr.sweep_headlines(_FEEDS35, fetch=lambda u: _macro_feed(u, 15, 1), now=NOW,
+                                 pause_s=0)
+    base = nr.headline_reading(base_sw["headlines"], NOW)
+    hist = _baseline(density=base["density"], n=base["n"], feeds_ok=35, feeds_failed=0)
+    thin = nr.sweep_headlines(_FEEDS35, fetch=lambda u: _macro_feed(u, 5, 0), now=NOW,
+                              pause_s=0)
+    assert thin["feeds_ok"] == 35
+    v = nr.headline_vote(nr.headline_reading(thin["headlines"], NOW), thin, hist)
+    assert v["vote"] is None and "headlines" in v["why"], v
+    # a sweep as complete as the baseline still votes
+    assert nr.headline_vote(base, base_sw, hist)["vote"] == nr.GOOD
+
+
+def test_a_non_feed_body_counts_as_a_failed_feed():
+    """Finding #4: a 200 whose body is not a feed (an HTML block page, an empty body,
+    a body over the 1MB parse cap) delivered no data - it is a FAILED feed, not an ok
+    one with zero headlines. Whitespace or a BOM before <?xml is a real feed."""
+    good = _macro_feed("X", 3, 0)
+    huge = good.replace(b"</channel>", b"<!--" + b"x" * 1_100_000 + b"--></channel>")
+    for body in (b"<html><body>Too many requests</body></html>", b"", huge):
+        sw = nr.sweep_headlines([("X", "x")], fetch=lambda u, b=body: b, now=NOW, pause_s=0)
+        assert (sw["feeds_ok"], sw["feeds_failed"]) == (0, 1), body[:40]
+    decl = b'<?xml version="1.0" encoding="utf-8"?>'
+    for body in (b"\n  " + decl + good, b"\xef\xbb\xbf\n" + decl + good):
+        sw = nr.sweep_headlines([("X", "x")], fetch=lambda u, b=body: b, now=NOW, pause_s=0)
+        assert (sw["feeds_ok"], len(sw["headlines"])) == (1, 3), body[:10]

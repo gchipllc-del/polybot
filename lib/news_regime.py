@@ -64,6 +64,7 @@ HEADLINE_MAX_PER_SOURCE = 15  # one noisy feed cannot dominate the score
 HEADLINE_BASELINE_MIN_RUNS = 24 * 7   # a week of hourly runs before trusting the baseline
 HEADLINE_RATIO = 2.0         # cautious when risk density > 2x its trailing median...
 HEADLINE_FLOOR = 6.0         # ...and the raw score clears this floor
+HEADLINE_MIN_COVERAGE = 0.75  # abstain when feeds answered or headlines < 75% of median
 VOL_WINDOW_H = 6
 VOL_HISTORY_DAYS = 14
 VOL_MIN_HISTORY_H = 72       # three days of hourly windows before the vol vote counts
@@ -181,10 +182,15 @@ def _parse_when(s: str | None) -> datetime | None:
 
 def parse_feed(xml_bytes: bytes, source: str) -> list[dict]:
     """RSS 2.0 <item> and Atom <entry> -> [{title, source, published}]. All content is
-    untrusted: capped, never executed, only titles and dates are kept."""
+    untrusted: capped, never executed, only titles and dates are kept. Whitespace (or a
+    BOM) before the XML declaration is tolerated: expat rejects a declaration that is
+    not at the very start, and some servers send a newline first."""
     import xml.etree.ElementTree as ET
+    body = xml_bytes.lstrip()
+    if body[:3] == b"\xef\xbb\xbf":
+        body = body[3:].lstrip()
     try:
-        root = ET.fromstring(xml_bytes[:1_000_000])
+        root = ET.fromstring(body[:1_000_000])
     except ET.ParseError:
         return []
     out = []
@@ -216,7 +222,8 @@ def _http_get_bytes(url: str, timeout: float = 8.0) -> bytes:
 def sweep_headlines(feeds: list | None = None, fetch=_http_get_bytes,
                     now: datetime | None = None, pause_s: float = 0.2) -> dict:
     """Fetch every feed once; keep recent, deduplicated headlines. Returns the
-    headlines plus feed health, so a dead network reads as 'no data', not 'calm'."""
+    headlines plus feed health, so a dead network reads as 'no data', not 'calm'. A
+    feed counts as ok only if its body parses to at least one item."""
     now = now or _utcnow()
     if feeds is None:
         from lib.news_feeds import feeds_by_category
@@ -228,10 +235,15 @@ def sweep_headlines(feeds: list | None = None, fetch=_http_get_bytes,
         name, url = (f.name, f.url) if hasattr(f, "url") else (f[0], f[1])
         try:
             items = parse_feed(fetch(url), name)
-            ok += 1
         except Exception:  # noqa: BLE001 - one dead feed must never stop the sweep
             failed += 1
             continue
+        if not items:
+            # a 200 that is not a feed (an HTML block page, a truncated or garbled
+            # body) delivered no data: a failed feed, not a quiet one
+            failed += 1
+            continue
+        ok += 1
         per_source = 0
         for it in sorted(items, key=lambda x: x["published"] or now, reverse=True):
             when = it["published"]
@@ -274,24 +286,35 @@ def headline_reading(headlines: list[dict], now: datetime | None = None) -> dict
 
 def headline_vote(reading: dict, sweep: dict, history: list[dict]) -> dict:
     """Judge today's density against the agent's own trailing median (prior runs
-    only - never the current one). Abstains when there is no data or no baseline."""
+    only - never the current one). Abstains when there is no data, no baseline, or a
+    PARTIAL sweep: density moves with which feeds answered (the Google News keyword
+    searches run denser than the rest and share one host), so a sweep that reached
+    far fewer feeds or headlines than usual is not comparable to the baseline."""
     if sweep.get("feeds_ok", 0) == 0 or reading["n"] == 0:
         return {"vote": None, "why": "no headlines (feeds unreachable)"}
-    # baseline = densities of past runs that actually SAW headlines; a run whose feeds
-    # were all down records density 0 and must not drag the median toward zero
+    # baseline = past runs that actually SAW headlines; a run whose feeds were all
+    # down records density 0 and must not drag the median toward zero
     past = []
     for r in history:
         h = r.get("votes", {}).get("headlines", {})
         if isinstance(h.get("density"), (int, float)) and (h.get("n") or 0) > 0:
-            past.append(h["density"])
+            past.append(h)
     if len(past) < HEADLINE_BASELINE_MIN_RUNS:
         # no absolute-score exception: the raw score is an unnormalized sum over ~500
         # headlines, so ordinary news flow clears any fixed bar - only a baseline can
         # say what is unusual
         return {"vote": None, "why": f"baseline warming up ({len(past)}/"
                                      f"{HEADLINE_BASELINE_MIN_RUNS} runs)"}
-    past = sorted(past[-24 * 14:])
-    med = past[len(past) // 2]
+    past = past[-24 * 14:]
+    for key, label, cur in (("feeds_ok", "feeds answered", sweep.get("feeds_ok", 0)),
+                            ("n", "headlines", reading["n"])):
+        base = sorted(h[key] for h in past if isinstance(h.get(key), (int, float)))
+        if base and cur < HEADLINE_MIN_COVERAGE * base[len(base) // 2]:
+            return {"vote": None, "why": f"partial sweep - {cur} {label} vs a 14-day "
+                                         f"median of {base[len(base) // 2]:g} (abstains "
+                                         f"under {HEADLINE_MIN_COVERAGE:.0%})"}
+    dens = sorted(h["density"] for h in past)
+    med = dens[len(dens) // 2]
     ratio = reading["density"] / med if med > 0 else float("inf")
     if ratio > HEADLINE_RATIO and reading["score"] >= HEADLINE_FLOOR:
         return {"vote": CAUTIOUS, "why": f"risk density {ratio:.1f}x its 14-day median",
