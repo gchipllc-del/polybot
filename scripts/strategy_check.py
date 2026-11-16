@@ -30,7 +30,9 @@ market, always strictly BEFORE the close (the bar ending at the close quotes the
 Optional --min-hours / --max-hours restrict entries by time before close.
 --one-per-event keeps only each event's FIRST entry - exactly what the forward paper
 trader does - and makes the p-values exact (sleeve_paper.forward_stats). Last-hour tests
-need 1-minute candles: `sleeve_scan.py backfill --final-hours 2` (it warns otherwise).
+need 1-minute candles: `sleeve_scan.py backfill --final-hours 2` (it warns otherwise). It
+also warns when the data starts after the test window opens (2 hours of final/ candles
+tested over 3, or over the whole life): an unseen first touch leaves only survivors.
 Streams the files: a 3M-candle backfill never has to fit in memory.
 """
 from __future__ import annotations
@@ -46,7 +48,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from forecast_replay import mean_ci, norm_cdf  # noqa: E402
-from sleeve_scan import _ohlc, candle_volume, event_of  # noqa: E402
+from sleeve_scan import _num, _ohlc, candle_volume, event_of  # noqa: E402
 import history_backfill as hb  # noqa: E402
 
 MAX_SPREAD = 0.15
@@ -62,11 +64,15 @@ def order_fee(price: float, contracts: int) -> float:
 
 def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e9) -> dict:
     """Stream a history_backfill-format file -> {"markets": {...}, "entries": {...}}.
-    Keeps one market record and at most one (earliest) entry per ticker."""
+    Keeps one market record and at most one (earliest) entry per ticker.
+    starts: ticker -> (where its data begins, whether a --final-hours fetch window is
+    recorded for it) - see late_data()."""
     markets: dict[str, dict] = {}
     entries: dict[str, dict] = {}
     orphans = 0
     last: dict[str, float] = {}
+    first: dict[str, float] = {}        # each ticker's earliest candle
+    step: dict[str, float] = {}         # and its candle spacing (the smallest gap seen)
     gaps = [0, 0]                       # [under an hour, an hour or more] between candles
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -78,9 +84,12 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
             if t == "market":
                 if d.get("result") not in ("yes", "no"):
                     continue
+                fh = max(_num(d.get("final_hours")) or 0.0,          # a re-fetch adds a row
+                         (markets.get(d["ticker"]) or {}).get("final_hours") or 0.0)
                 markets[d["ticker"]] = {
                     "ticker": d["ticker"], "series": d.get("series"), "event": event_of(d),
-                    "result": d["result"], "close_ts": hb._iso_to_ts(d.get("close_time"))}
+                    "result": d["result"], "close_ts": hb._iso_to_ts(d.get("close_time")),
+                    "open_ts": hb._iso_to_ts(d.get("open_time")), "final_hours": fh or None}
             elif t == "candle":
                 tk = d.get("ticker")
                 m = markets.get(tk)
@@ -94,7 +103,9 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
                     continue
                 if tk in last and ts > last[tk]:
                     gaps[ts - last[tk] >= 3600] += 1
+                    step[tk] = min(step.get(tk, math.inf), ts - last[tk])
                 last[tk] = ts
+                first[tk] = min(first.get(tk, ts), ts)
                 if tk in entries and entries[tk]["ts"] <= ts:
                     continue                       # first touch already recorded
                 yb, ya = _ohlc(d, "yes_bid", "close"), _ohlc(d, "yes_ask", "close")
@@ -121,7 +132,43 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
                     (side == "no" and t_hi is not None and t_hi >= yb - 1e-9))
                 entries[tk] = {"ts": ts, "side": side, "ask": ask, "hours": hours,
                                "trade_ok": traded}
-    return {"markets": markets, "entries": entries, "orphans": orphans, "gaps": gaps}
+    starts = {}
+    for tk, m in markets.items():
+        c, o, fh = m["close_ts"], m["open_ts"], m["final_hours"]
+        rec = None
+        if fh and c is not None:                   # where the recorded fetch began
+            rec = c - fh * 3600.0 if o is None else max(o, c - fh * 3600.0)
+        got = [x for x in (rec, first[tk] - step[tk] if tk in step else None)
+               if x is not None]                   # ... or the first candle's own period
+        if got:
+            starts[tk] = (min(got), rec is not None)
+    return {"markets": markets, "entries": entries, "orphans": orphans, "gaps": gaps,
+            "starts": starts}
+
+
+def late_data(res: dict, max_h: float = 1e9) -> dict[str, float]:
+    """ticker -> hours by which its data starts AFTER the test window opens (the window is
+    the last max_h hours before close, or the market's whole life). A first touch before
+    the data starts is invisible, so a short history only sees the markets still in range
+    later - survivors. Data starts where a recorded --final-hours fetch began, or one
+    candle step before the first candle, whichever is earlier. A whole-life test checks
+    only markets with a recorded fetch window: in candles alone, a book that formed late
+    looks the same as a history cut short."""
+    out = {}
+    for tk, (start, recorded) in res.get("starts", {}).items():
+        m = res["markets"].get(tk)
+        if m is None or m["close_ts"] is None:
+            continue
+        o, want = m.get("open_ts"), m["close_ts"] - max_h * 3600.0
+        if o is None and max_h >= 1e8:
+            continue
+        if o is not None and want <= o:            # the window is the whole life
+            if not recorded:
+                continue
+            want = o
+        if start - want > 1.0:
+            out[tk] = (start - want) / 3600.0
+    return out
 
 
 def expand_files(spec: str) -> list[Path]:
@@ -143,13 +190,17 @@ def scan_many(paths: list[Path], lo: float, hi: float, min_h: float = 0.0,
     trader takes - whatever order the files are read in.
     hourly_files: the files whose OWN candles are mostly an hour or more apart - voted per
     file, because one dense 1-minute file would outvote any number of hourly ones."""
-    res = {"markets": {}, "entries": {}, "orphans": 0, "gaps": [0, 0], "hourly_files": []}
+    res = {"markets": {}, "entries": {}, "orphans": 0, "gaps": [0, 0], "hourly_files": [],
+           "starts": {}}
     for path in paths:
         r = scan(path, lo, hi, min_h, max_h)
         res["markets"].update(r["markets"])
         for tk, e in r["entries"].items():
             if tk not in res["entries"] or e["ts"] < res["entries"][tk]["ts"]:
                 res["entries"][tk] = e
+        for tk, (s, rec) in r["starts"].items():    # the data begins at its earliest file
+            s0, rec0 = res["starts"].get(tk, (s, rec))
+            res["starts"][tk] = (min(s0, s), rec0 or rec)
         res["orphans"] += r["orphans"]
         res["gaps"] = [a + b for a, b in zip(res["gaps"], r["gaps"])]
         if r["gaps"][1] > r["gaps"][0]:
@@ -271,6 +322,14 @@ def cmd_favorites(paths: list[Path], lo: float, hi: float, contracts: int,
         print("so its closing quote is the settled price.")
         print("Run: py scripts/sleeve_scan.py backfill --series ... --final-hours 2")
         print("and point --file at data/sleeves/final.")
+    late = late_data(res, max_h)
+    if late:
+        print(f"WARNING: for {len(late)} of {len(res['markets'])} markets the data starts AFTER "
+              "the test window opens")
+        print(f"(by up to {max(late.values()):.2f}h). A first touch before the data starts is "
+              "invisible, so the")
+        print("test only sees the markets still in range later - survivors. Narrow --max-hours")
+        print("to the data, or re-fetch: py scripts/sleeve_scan.py backfill ... --final-hours H")
     trades = trades_from(res, contracts)
     if one_per_event:
         trades = first_per_event(trades)
