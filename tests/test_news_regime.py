@@ -521,3 +521,91 @@ def test_a_non_feed_body_counts_as_a_failed_feed():
     for body in (b"\n  " + decl + good, b"\xef\xbb\xbf\n" + decl + good):
         sw = nr.sweep_headlines([("X", "x")], fetch=lambda u, b=body: b, now=NOW, pause_s=0)
         assert (sw["feeds_ok"], len(sw["headlines"])) == (1, 3), body[:10]
+
+
+_EVENT_DAY = datetime(2027, 1, 13, 16, 0, tzinfo=timezone.utc)   # 11:00 ET, not listed
+                                                                  # in the shipped file
+
+
+def _cal_file(tmp_path, text, name="news_calendar.yaml"):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _calendar_vote_from_file(tmp_path, monkeypatch, text):
+    """The calendar vote exactly as the hourly run computes it: run_once reads the file."""
+    monkeypatch.setattr(nr, "CALENDAR_PATH", _cal_file(tmp_path, text))
+    row = nr.run_once(_EVENT_DAY, feeds=[], spots={}, history=[], ai=False,
+                      path=tmp_path / "r.jsonl", pause_s=0)
+    return row["votes"]["calendar"]
+
+
+def test_calendar_format_slips_still_mark_the_event_day(tmp_path, monkeypatch):
+    """Finding #5: dates and impact are normalized. An unpadded date, an unquoted YAML
+    date-time, a quoted date-time, ' High ' and a bare top-level list used to load as
+    values that never matched today (or crash the run): each must vote CAUTIOUS."""
+    for text in ("events:\n  - {date: 2027-1-13, time_et: '08:30', event: CPI, impact: high}\n",
+                 "events:\n  - {date: 2027-01-13 08:30:00, event: CPI, impact: high}\n",
+                 "events:\n  - {date: '2027-01-13T08:30', event: CPI, impact: high}\n",
+                 "events:\n  - {date: '2027-01-13', event: CPI, impact: ' High '}\n",
+                 "- {date: '2027-01-13', event: CPI, impact: high}\n"):
+        v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+        assert v["vote"] == nr.CAUTIOUS and "CPI" in v["why"], (text, v)
+    assert [e["date"] for e in nr.load_calendar(nr.CALENDAR_PATH)] == ["2027-01-13"]
+
+
+def test_unreadable_calendar_entries_are_reported_and_cost_only_themselves(
+        tmp_path, monkeypatch):
+    """Finding #5: an entry the vote cannot read is named in its why - never silently
+    dropped - and the readable entries still count."""
+    text = ("events:\n"
+            "  - {date: '2027-01-13', time_et: '08:30', event: CPI, impact: high}\n"
+            "  - {date: '01/14/2027', event: PPI, impact: high}\n"
+            "  - {date: '2027-01-15', event: Retail sales, impact: hgih}\n")
+    v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+    assert v["vote"] == nr.CAUTIOUS and "CPI" in v["why"], v
+    assert "calendar unreadable" in v["why"] and len(v["problems"]) == 2
+    events, problems = nr.read_calendar(nr.CALENDAR_PATH)
+    assert [e["event"] for e in events] == ["CPI"]
+    assert "01/14/2027" in problems[0] and "hgih" in problems[1]
+    off_day = nr.calendar_vote(events, "2027-01-20", problems)
+    assert off_day["vote"] is None and off_day["why"].startswith("calendar unreadable")
+
+
+def test_a_yaml_error_is_reported_not_read_as_an_empty_calendar(tmp_path, monkeypatch):
+    """Finding #5: one missing '}' made the whole file read as 'calendar empty - add
+    events', hiding the error behind advice to add what is already there."""
+    text = ("events:\n"
+            "  - {date: '2027-01-13', event: CPI, impact: high}\n"
+            "  - {date: '2027-01-14', event: PPI, impact: high\n")
+    v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+    assert v["vote"] is None and v["why"].startswith("calendar unreadable"), v
+    assert "YAML error at line 3" in v["why"], v
+
+
+def test_calendar_top_level_shapes_never_crash_the_run(tmp_path, monkeypatch):
+    """Finding #5: a top-level list reached data.get outside the try - AttributeError
+    killed run_once and no votes were written. A list now reads as the events; any
+    other shape is reported."""
+    listed = _cal_file(tmp_path, "- {date: '2027-01-13', event: CPI, impact: high}\n",
+                       "list.yaml")
+    assert [e["event"] for e in nr.load_calendar(listed)] == ["CPI"]
+    for text in ("just a sentence\n", "evnets:\n  - {date: '2027-01-13', event: CPI}\n",
+                 "events: {date: '2027-01-13', event: CPI}\n"):
+        v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+        assert v["vote"] is None and v["why"].startswith("calendar unreadable"), (text, v)
+
+
+def test_healthcheck_warns_on_an_unreadable_calendar(tmp_path, monkeypatch):
+    import healthcheck as hc
+    seen = []
+    monkeypatch.setattr(hc, "record", lambda level, name, msg: seen.append((level, msg)))
+    monkeypatch.setattr(nr, "CALENDAR_PATH", _cal_file(
+        tmp_path, "events:\n  - {date: '2027-01-13', event: CPI, impact: high\n"))
+    hc.check_news_calendar()
+    assert seen[-1][0] == hc.WARN and "calendar unreadable: YAML error" in seen[-1][1], seen
+    monkeypatch.setattr(nr, "CALENDAR_PATH", _cal_file(
+        tmp_path, "events:\n  - {date: '2027-01-13', event: CPI, impact: high}\n", "ok.yaml"))
+    hc.check_news_calendar()
+    assert seen[-1] == (hc.OK, "calendar readable (1 listed)")

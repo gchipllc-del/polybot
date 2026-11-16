@@ -9,7 +9,8 @@ from turning red), rebuilt to this project's evidence standard.
 FOUR INDEPENDENT VOTES (each one fails safe on its own):
   calendar    a high-impact scheduled release today (FOMC decision, CPI, jobs report)
               from config/news_calendar.yaml. It can only ADD caution: a day the file
-              does not list is not evidence of calm, so otherwise it abstains
+              does not list is not evidence of calm, so otherwise it abstains. An
+              entry it cannot read is named in its why and WARNed by the healthcheck
   headlines   a sweep of the curated macro/markets/crypto feeds (lib/news_feeds.py),
               scored with a transparent risk lexicon, recency-weighted, and judged
               against the agent's OWN trailing baseline - no magic threshold: until a
@@ -325,31 +326,109 @@ def headline_vote(reading: dict, sweep: dict, history: list[dict]) -> dict:
 
 # ── calendar ──────────────────────────────────────────────────────────────────
 
-def load_calendar(path: Path = CALENDAR_PATH) -> list[dict]:
+CALENDAR_IMPACTS = ("high", "medium", "low")
+
+
+def _calendar_event(e) -> dict:
+    """One entry normalized to {date: YYYY-MM-DD, time_et, event, impact}, or a
+    ValueError saying why it cannot be read. The vote compares date STRINGS, so
+    '2026-12-9' or a YAML date-time kept as written would never equal today's ET date
+    and the event day would pass for an unlisted one."""
+    if not isinstance(e, dict):
+        raise ValueError(f"not a mapping: {str(e)[:40]!r}")
+    name = str(e.get("event") or "").strip()[:120]
+    if not name:
+        raise ValueError("no event name")
+    d = e.get("date")
+    if isinstance(d, datetime):                  # an unquoted YAML date-time
+        d = d.date()
+    elif isinstance(d, str):
+        try:
+            d = datetime.strptime(d.strip(), "%Y-%m-%d").date()    # '2026-12-9' too
+        except ValueError:
+            try:
+                d = datetime.fromisoformat(d.strip()).date()        # a quoted date-time
+            except ValueError:
+                raise ValueError(f"{name}: date {d.strip()[:30]!r} is not YYYY-MM-DD") \
+                    from None
+    if not isinstance(d, date):
+        raise ValueError(f"{name}: no date" if d is None
+                         else f"{name}: date {d!r} is not YYYY-MM-DD")
+    impact = str(e.get("impact") or "high").strip().lower()
+    if impact not in CALENDAR_IMPACTS:
+        raise ValueError(f"{name}: impact {impact[:20]!r} is not high, medium or low")
+    return {"date": d.isoformat(), "time_et": str(e.get("time_et") or "").strip(),
+            "event": name, "impact": impact}
+
+
+def read_calendar(path: Path = CALENDAR_PATH) -> tuple[list[dict], list[str]]:
+    """(events, problems). A problem - a YAML error, a file without an events list,
+    an entry that cannot be read - is reported (the calendar vote's why, the
+    healthcheck), never swallowed: an unreadable FOMC line must not pass for an
+    unlisted day. A bad entry costs only itself; a YAML error costs the whole file."""
     if not path.exists():
-        return []
+        return [], []
     try:
         import yaml
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001 - a broken calendar file must not stop the agent
-        return []
-    out = []
-    for e in data.get("events") or []:
-        if isinstance(e, dict) and e.get("date") and e.get("event"):
-            out.append({"date": str(e["date"]), "time_et": str(e.get("time_et") or ""),
-                        "event": str(e["event"])[:120],
-                        "impact": str(e.get("impact") or "high").lower()})
-    return out
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 - a broken calendar file must not stop the agent
+        mark = getattr(e, "context_mark", None) or getattr(e, "problem_mark", None)
+        what = (getattr(e, "problem", None) or " ".join(str(e).split()))[:100]
+        if mark is not None:
+            return [], [f"YAML error at line {mark.line + 1}: {what} ({type(e).__name__})"]
+        return [], [f"{type(e).__name__}: {what}"]
+    if data is None or data == {}:
+        entries = []
+    elif isinstance(data, list):                 # a bare list of events reads the same
+        entries = data
+    elif isinstance(data, dict) and "events" in data:
+        entries = data["events"] or []
+    else:
+        shape = (f"keys: {', '.join(map(str, data))[:60]}" if isinstance(data, dict)
+                 else f"a {type(data).__name__}")
+        return [], [f"no 'events:' list ({shape})"]
+    if not isinstance(entries, list):
+        return [], [f"'events' is a {type(entries).__name__}, not a list"]
+    events, problems = [], []
+    for i, e in enumerate(entries, 1):
+        try:
+            events.append(_calendar_event(e))
+        except ValueError as err:
+            problems.append(f"entry {i}: {err}")
+    return events, problems
 
 
-def calendar_vote(events: list[dict], today_et: str) -> dict:
-    todays = [e for e in events if e["date"] == today_et]
+def load_calendar(path: Path = CALENDAR_PATH) -> list[dict]:
+    """The readable events only; read_calendar also says what could not be read."""
+    return read_calendar(path)[0]
+
+
+def calendar_vote(events: list[dict], today_et: str,
+                  problems: list[str] | None = None) -> dict:
+    """CAUTIOUS when a high-impact release is listed for today (ET), else abstain.
+    Entries are validated here too, and anything unreadable - here or in the file
+    (`problems`, from read_calendar) - is named in the why."""
+    problems = list(problems or [])
+    readable = []
+    for i, e in enumerate(events, 1):
+        try:
+            readable.append(_calendar_event(e))
+        except ValueError as err:
+            problems.append(f"entry {i}: {err}")
+    todays = [e for e in readable if e["date"] == today_et]
     high = [e for e in todays if e["impact"] == "high"]
+    unreadable = ""
+    if problems:
+        more = f" (+{len(problems) - 1} more)" if len(problems) > 1 else ""
+        unreadable = f"calendar unreadable: {problems[0]}{more}"
     if high:
         names = ", ".join(f"{e['event']} {e['time_et']}ET".strip() for e in high)
-        return {"vote": CAUTIOUS, "why": f"high-impact release today: {names}",
-                "events": high}
-    if not events:
+        why = f"high-impact release today: {names}" + (f"; {unreadable}" if problems else "")
+        return {"vote": CAUTIOUS, "why": why, "events": high,
+                **({"problems": problems} if problems else {})}
+    if problems:
+        return {"vote": None, "why": unreadable, "events": todays, "problems": problems}
+    if not readable:
         return {"vote": None, "why": "calendar empty - add events to config/news_calendar.yaml"}
     # an unlisted day is not evidence of calm (the file can be stale or incomplete):
     # the calendar can only ADD caution, so otherwise it abstains
@@ -578,7 +657,10 @@ def run_once(now: datetime | None = None, *, feeds=None, fetch=_http_get_bytes,
                "n": reading["n"], "feeds_ok": sweep["feeds_ok"],
                "feeds_failed": sweep["feeds_failed"]})
     today = et_date(now)
-    cv = calendar_vote(load_calendar() if calendar is None else calendar, today)
+    cal_problems: list[str] = []
+    if calendar is None:
+        calendar, cal_problems = read_calendar(CALENDAR_PATH)
+    cv = calendar_vote(calendar, today, cal_problems)
     vv = vol_vote(load_spots() if spots is None else spots, now.timestamp())
     votes = {"calendar": cv, "headlines": hv, "volatility": vv}
 

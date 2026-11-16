@@ -326,6 +326,25 @@ def check_news_regime() -> None:
                            f"{r['why'][:80]}")
 
 
+def check_news_calendar() -> None:
+    """config/news_calendar.yaml is the one news input kept by hand, and an entry the
+    agent cannot read makes its day look unlisted (FOMC day at full size). So a YAML
+    error or an unreadable entry is a WARN here - read from the file now, not from
+    the last hourly regime row."""
+    try:
+        from lib import news_regime as nr
+        events, problems = nr.read_calendar(nr.CALENDAR_PATH)
+    except Exception as e:  # noqa: BLE001
+        record(WARN, "news", f"calendar check raised {type(e).__name__}")
+        return
+    if problems:
+        more = f" (+{len(problems) - 1} more)" if len(problems) > 1 else ""
+        record(WARN, "news", f"calendar unreadable: {problems[0][:100]}{more} - fix "
+                             f"{nr.CALENDAR_PATH.name}")
+    else:
+        record(OK, "news", f"calendar readable ({len(events)} listed)")
+
+
 def check_sleeve_paper() -> None:
     """The multi-sleeve paper trader writes a heartbeat every cycle (2 min). Alive but
     with no rules is a setup step, not a fault - say exactly what to run."""
@@ -402,6 +421,7 @@ def main() -> int:
     check_ledger_integrity()
     check_model_integrity()
     check_news_regime()
+    check_news_calendar()
     check_sleeve_paper()
     check_disk()
     if "--fast" not in sys.argv:
