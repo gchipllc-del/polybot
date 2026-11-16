@@ -64,6 +64,13 @@ from dotenv import load_dotenv
 # the real value we put in .env under dotenv's default override=False.
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
+# Bootstrap the core before any command imports it: the real tradingcore where it is
+# installed, else vendor/tradingcore (lib/__init__.py). Several commands import
+# tradingcore before any lib module, so without this they died with ModuleNotFoundError
+# on every host lacking the real package. Kept below load_dotenv so core code never
+# reads os.environ before .env is in it.
+import lib  # noqa: E402,F401
+
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
 CONFIG_DIR = ROOT / "config"

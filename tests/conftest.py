@@ -52,13 +52,30 @@ def _isolate_live_writes(_isolated_dirs, monkeypatch):
         except ImportError:
             pass
 
-    try:
-        from lib import audit
-        monkeypatch.setattr(audit, "AUDIT_FILE",
-                            logs / "audit_log.jsonl", raising=False)
-        if hasattr(audit, "LOG_DIR"):
-            monkeypatch.setattr(audit, "LOG_DIR", logs, raising=False)
-    except ImportError:
-        pass
+    # The core's own logs. This block used to patch lib.audit, which no longer exists
+    # (audit, kelly and calibration moved into tradingcore), so the ImportError was
+    # swallowed and every log_event a test reached appended to the live
+    # data/audit_events.jsonl, which the dashboard shows as recent activity.
+    # vendor/tradingcore reads its path from the module global _LOG at call time. The other
+    # names are the pre-move lib.audit / lib.calibration globals, which the real package
+    # may still carry. Only names a module actually has get patched. The env vars cover a
+    # fresh import and any subprocess a test starts.
+    monkeypatch.setenv("TRADINGCORE_AUDIT_LOG", str(logs / "audit_events.jsonl"))
+    monkeypatch.setenv("TRADINGCORE_FORECAST_LOG", str(logs / "forecast_records.jsonl"))
+    core_paths = {
+        "tradingcore.audit": {"_LOG": logs / "audit_events.jsonl",
+                              "AUDIT_FILE": logs / "audit_log.jsonl", "LOG_DIR": logs},
+        "tradingcore.calibration": {"_LOG": logs / "forecast_records.jsonl",
+                                    "CALIBRATION_FILE": data / "calibration_log.json"},
+    }
+    for name, attrs in core_paths.items():
+        try:
+            importlib.import_module("lib")    # puts vendor/ on sys.path if the real one is absent
+            mod = importlib.import_module(name)
+        except ImportError:
+            continue
+        for attr, path in attrs.items():
+            if hasattr(mod, attr):
+                monkeypatch.setattr(mod, attr, path)
 
     yield

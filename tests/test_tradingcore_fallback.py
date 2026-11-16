@@ -13,6 +13,7 @@ replays a REAL call site and names it, so the shim and its callers can no longer
 import json
 import math
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -90,13 +91,89 @@ def test_backtest_265_kelly_bet_size_bankroll_first_with_cap():
                               volume_24h=10_000, market_type="CLOB")),
 ])
 def test_slippage_aware_returns_the_dict_callers_index(site, kwargs):
+    """Every key a caller indexes. 'iterations' was missing: market_scanner.py:558 and
+    backtest.py:1046 both read it, so the scanner dropped every market with an edge and
+    the smoke test crashed - while this test, which never asked for it, passed."""
     r = kelly_bet_size_slippage_aware(**kwargs)
     for k in ("bet_usd", "naive_kelly_usd", "effective_price", "slippage_pct",
-              "edge_post_slip"):
+              "edge_post_slip", "converged", "iterations"):
         assert k in r, (site, k)
     assert r["converged"] is True                     # backtest.py:1045 asserts this
+    assert isinstance(r["iterations"], int) and 1 <= r["iterations"] <= 60
     assert 0 <= r["bet_usd"] <= r["naive_kelly_usd"] <= kwargs["bankroll"]
     assert r["effective_price"] >= kwargs["market_prob"]
+
+
+def test_slippage_aware_iterations_counts_the_fixed_point_passes():
+    # no edge: the naive stake (0) is already the fixed point - one pass
+    flat = kelly_bet_size_slippage_aware(bankroll=1000, our_prob=0.5, market_prob=0.5,
+                                         volume_24h=1_000_000)
+    assert flat["bet_usd"] == 0.0 and flat["converged"] is True and flat["iterations"] == 1
+    # a stake that moves the price has to be re-solved, so it takes more than one pass
+    moved = kelly_bet_size_slippage_aware(bankroll=10_000, our_prob=0.6, market_prob=0.5,
+                                          volume_24h=20_000, max_per_market_pct=1.0)
+    assert moved["bet_usd"] < moved["naive_kelly_usd"]
+    assert moved["converged"] is True and 1 < moved["iterations"] <= 60
+
+
+def test_backtest_1026_pipeline_smoke_test_completes():
+    """`main.py smoke` -> backtest.pipeline_smoke_test, whose check detail formats
+    slip['iterations'] eagerly (backtest.py:1046). Without the key it raised KeyError
+    after 10 checks instead of reporting."""
+    from lib.backtest import pipeline_smoke_test
+    res = pipeline_smoke_test(verbose=False)
+    failed = [c for c in res["checks"] if not c["passed"]]
+    assert res["passed"] and not failed, failed
+    conv = next(c for c in res["checks"] if c["name"] == "slippage-aware converged")
+    assert conv["detail"].startswith("iterations=")
+
+
+def test_market_scanner_534_scan_keeps_a_market_with_an_edge(monkeypatch):
+    """scan_all_markets reads slip_result['iterations'] (market_scanner.py:558) inside its
+    per-market try. A missing key was swallowed as forecast_error, so EVERY market with
+    edge > 0 vanished from `main.py scan` / `trade` - not even listed as filtered out."""
+    import lib.market_scanner as ms
+    from lib.forecaster import ForecastResult
+    from lib.market_client import MarketInfo
+
+    resolves = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+
+    class _Client:
+        platform_name, fee_rate = "polymarket", 0.0
+
+        def get_markets(self, category=None, status="open", limit=100):
+            return [MarketInfo(market_id="M1", platform="polymarket", question="Will X?",
+                               description="", category="economics", status="open",
+                               yes_price=0.40, no_price=0.60, volume_24h=50_000.0,
+                               total_volume=500_000.0, resolution_date=resolves,
+                               resolution_source="x")]
+
+    def _forecast(market, **_kw):                     # 20c edge, full conviction
+        return ForecastResult(market_id=market.market_id, platform=market.platform,
+                              probability=0.60, confidence=0.8, market_probability=0.40,
+                              edge=0.20, composite_score=9, best_side="YES")
+
+    strategy = {                                      # pinned: Hermes rewrites the yaml
+        "market_filters": {"min_liquidity": 100, "min_volume_24h": 5,
+                           "min_hours_to_resolution": 48, "price_bounds": [0.10, 0.90],
+                           "max_spread_pct": 0.05, "max_markets_per_cycle": 20,
+                           "adverse_selection_edge": 0.40,
+                           "max_positions_same_category": 2},
+        "scoring": {"min_edge": 0.06, "min_composite_score": 4},
+        "markets": {"min_resolution_days": 1, "max_resolution_days": 60},
+    }
+    monkeypatch.setattr(ms, "_load_strategy", lambda: strategy)
+    monkeypatch.setattr(ms, "_load_settings", lambda: {})
+    monkeypatch.setattr(ms, "build_forecast_for_market", _forecast)
+
+    cands = ms.scan_all_markets([_Client()], llm_enabled=False, bankroll=1000.0)
+    assert not [e["details"] for e in au.get_recent_events(50)
+                if e["action"] == "forecast_error"]
+    assert [(c.market.market_id, c.skip_reason, c.rank) for c in cands] == [("M1", "", 1)]
+    assert cands[0].kelly_bet_usd > 0
+    sizing = next(s for s in cands[0].forecast.bayesian_chain
+                  if s["step"] == "slippage_sizing")
+    assert sizing["converged"] is True and sizing["iterations"] >= 1
 
 
 def test_slippage_shrinks_size_and_thin_markets_more():
