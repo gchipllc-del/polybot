@@ -134,6 +134,48 @@ def test_final_hours_backfill_fetches_minute_candles_for_the_last_hours(tmp_path
     assert out.exists() and not (tmp_path / "KXT.jsonl").exists()   # kept out of screen
 
 
+def test_final_hours_resume_refetches_a_shorter_stored_window(tmp_path, monkeypatch, capsys):
+    """--final-hours 1 then --final-hours 2 must not keep the 1h window: a ticker already on
+    file is not 'done' unless its recorded window covers the one asked for. A row written
+    before windows were recorded is unknown, so it is fetched again too; a market whose
+    window already reached its open has nothing older to fetch."""
+    import history_backfill as hb
+    from datetime import datetime, timezone
+    monkeypatch.setattr(ss, "SLEEVE_DIR", tmp_path)
+    monkeypatch.setattr(ss, "CATALOG", tmp_path / "catalog.json")
+    monkeypatch.setattr(hb, "SLEEP_S", 0)
+    long_, short_ = "KXT-26NOV16H19-T45", "KXT-26NOV16H19-T50"      # 14h and 1h of life
+    mk = [{"ticker": long_, "event_ticker": "KXT-26NOV16H19", "result": "no",
+           "open_time": "2026-11-16T10:00:00Z", "close_time": "2026-11-17T00:00:00Z"},
+          {"ticker": short_, "event_ticker": "KXT-26NOV16H19", "result": "yes",
+           "open_time": "2026-11-16T23:00:00Z", "close_time": "2026-11-17T00:00:00Z"}]
+    calls = []
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            return {"markets": mk, "cursor": None}
+        calls.append((url.split("/")[-2], params["start_ts"]))
+        return {"candlesticks": [{"end_period_ts": params["start_ts"] + 60,
+                                  "yes_bid": {"close": 40}, "yes_ask": {"close": 45}}]}
+
+    out = tmp_path / "final" / "KXT.jsonl"
+    out.parent.mkdir()
+    out.write_text(json.dumps({"t": "market", "series": "KXT", "ticker": long_,
+                               "result": "no", "open_time": mk[0]["open_time"],
+                               "close_time": mk[0]["close_time"]}) + "\n",
+                   encoding="utf-8")                  # legacy row: window not recorded
+    close = int(datetime(2026, 11, 17, tzinfo=timezone.utc).timestamp())
+    for hours, fetched in ((1, [(long_, close - 3600), (short_, close - 3600)]),
+                           (2, [(long_, close - 7200)]), (2, []), (1, [])):
+        del calls[:]
+        assert ss.cmd_backfill(["KXT"], 5, get=get, final_hours=hours) == 0
+        assert calls == fetched, hours
+    assert "1 stored with a window under 2h" in capsys.readouterr().out
+    rows = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
+    assert [(r["ticker"], r.get("final_hours")) for r in rows if r["t"] == "market"] == [
+        (long_, None), (long_, 1), (short_, 1), (long_, 2)]
+
+
 def test_candle_volume_reads_renamed_field():
     from sleeve_scan import candle_volume
     assert candle_volume({"volume": 5}) == 5

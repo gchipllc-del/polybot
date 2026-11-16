@@ -394,6 +394,31 @@ def cmd_find(text: str) -> int:
     return 0
 
 
+def _final_windows(path: Path) -> dict[str, float]:
+    """ticker -> how many hours before its close the stored --final-hours candles reach
+    (inf once a fetch began at the market's open: nothing older exists). Market rows
+    written before the window was recorded count as 0 - unknown, so they are re-fetched."""
+    out: dict[str, float] = {}
+    if not path.exists():
+        return out
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"market"' not in line:
+                continue                           # candle rows: the bulk of the file
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("t") != "market" or not d.get("ticker"):
+                continue
+            h = _num(d.get("final_hours")) or 0.0
+            o, c = hb._iso_to_ts(d.get("open_time")), hb._iso_to_ts(d.get("close_time"))
+            if h > 0 and o is not None and c is not None and c - h * 3600.0 <= o:
+                h = math.inf
+            out[d["ticker"]] = max(out.get(d["ticker"], 0.0), h)
+    return out
+
+
 def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
                  final_hours: float | None = None) -> int:
     """Most recent `events_per_series` settled events per sleeve, every market in them
@@ -402,7 +427,10 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
     final_hours: instead, 1-minute candles over only each market's last `final_hours`,
     into SLEEVE_DIR/final/ (kept out of the screen's files). A last-hour entry cannot be
     tested on hourly candles: the final bar ends AT the close, so its closing quote is
-    the settled price - the backtest would buy the answer."""
+    the settled price - the backtest would buy the answer. Each market row records its
+    final_hours, and a resume re-fetches a market whose stored window is SHORTER than the
+    one asked for (a ticker already on file is not enough): a first touch inside the
+    missing hours would otherwise be invisible, and the test would see survivors."""
     out_dir = SLEEVE_DIR / "final" if final_hours else SLEEVE_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     cats = {}
@@ -410,7 +438,12 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
         cats = {r["series"]: r.get("category") for r in json.loads(CATALOG.read_text(encoding="utf-8"))}
     for series in series_list:
         path = out_dir / f"{series}.jsonl"
-        done = hb._seen_tickers(path)
+        stored: dict[str, float] = {}
+        if final_hours:
+            stored = _final_windows(path)
+            done = {tk for tk, h in stored.items() if h >= final_hours}
+        else:
+            done = hb._seen_tickers(path)
         ms = hb.fetch_settled_markets(series, get=get,
                                       max_markets=events_per_series * MAX_MARKETS_PER_EVENT * 2)
         by_ev: dict[str, list] = {}
@@ -421,7 +454,9 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
                      reverse=True)[:events_per_series]
         todo = [m for _, group in evs for m in group[:MAX_MARKETS_PER_EVENT]
                 if m["ticker"] not in done]
-        print(f"{series}: {len(evs)} events, {len(todo)} markets to fetch -> {path.name}")
+        again = sum(m["ticker"] in stored for m in todo)
+        note = f" ({again} stored with a window under {final_hours:g}h)" if again else ""
+        print(f"{series}: {len(evs)} events, {len(todo)} markets to fetch{note} -> {path.name}")
         n = 0
         with open(path, "a", encoding="utf-8") as f:
             for m in todo:
@@ -438,12 +473,14 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
                     print(f"  [warn] {m['ticker']}: {type(e).__name__}")
                     continue
                 cs = d.get("candlesticks", []) or d.get("candles", []) or []
-                f.write(json.dumps({"t": "market", "series": series, "ticker": m["ticker"],
-                                    "event_ticker": m.get("event_ticker") or event_of(m),
-                                    "category": cats.get(series), "result": m.get("result"),
-                                    "open_time": m.get("open_time"),
-                                    "close_time": m.get("close_time"),
-                                    "volume": m.get("volume")}, separators=(",", ":")) + "\n")
+                row = {"t": "market", "series": series, "ticker": m["ticker"],
+                       "event_ticker": m.get("event_ticker") or event_of(m),
+                       "category": cats.get(series), "result": m.get("result"),
+                       "open_time": m.get("open_time"), "close_time": m.get("close_time"),
+                       "volume": m.get("volume")}
+                if final_hours:
+                    row["final_hours"] = final_hours      # the window this fetch covers
+                f.write(json.dumps(row, separators=(",", ":")) + "\n")
                 for cd in cs:
                     f.write(json.dumps({"t": "candle", "series": series,
                                         "ticker": m["ticker"], **cd},
