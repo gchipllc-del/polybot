@@ -25,10 +25,10 @@ Four independent votes, recomputed hourly (`PolybotNews` scheduled task):
 
 | vote | source | cautious when |
 |---|---|---|
-| calendar | `config/news_calendar.yaml` (you maintain it) | a `high`-impact release today (ET); otherwise it abstains — an unlisted day is not evidence of calm |
-| headlines | the curated macro + markets + crypto feeds | risk density > 2× its own trailing 14-day median (and score ≥ 6) |
+| calendar | `config/news_calendar.yaml` (you maintain it) | a `high`-impact release today (ET); otherwise it abstains — an unlisted day is not evidence of calm, so the calendar can only add caution |
+| headlines | the curated macro + markets + crypto feeds | risk density > 2× its own trailing 14-day median (and score ≥ 6). It abstains for its whole first week (no baseline yet) and on a partial sweep: fewer than 75% of the usual feeds or headlines |
 | volatility | the collector's own spot data — no network | 6h realized vol ≥ 1.5× its trailing 14-day median |
-| ai (optional) | Claude reads the top risk headlines + calendar + vol | it says so, with reasons (structured output) |
+| ai (optional) | Claude reads the top risk headlines + calendar + vol | it says so, with reasons (structured output). At most one billed call per 6h: a vote is reused that long, and after a billed failure it abstains for 6h instead of retrying hourly |
 
 **Any cautious vote wins; nothing can remove caution.** That makes the agent robust to
 its weakest part: a dead feed, a noisy word list, or a headline written to manipulate
@@ -39,8 +39,14 @@ an AI vote carried over from an earlier hour. If no live layer votes, the regime
 **unknown**, sized like cautious.
 
 Thresholds are frozen as of today (pre-registered, never tuned). The headline layer
-judges against its *own* history, so it abstains for its first week rather than act on
-a guessed number. It speaks earlier only if a day is extreme.
+judges against its *own* history, so it abstains for its whole first week rather than
+act on a guessed number. There is no "extreme day" exception: the raw risk score sums
+hundreds of headlines, so ordinary news flow clears any fixed bar. It also abstains
+when a sweep reaches fewer than 75% of the feeds, or keeps fewer than 75% of the
+headlines, that its trailing 14-day median does. Density shifts with *which* feeds
+answered (the Google News keyword searches run denser and share one host), so a
+partial sweep would be judged against the wrong baseline. A feed whose body parses to
+no items (an HTML block page, a truncated body) counts as failed, not quiet.
 
 ### Setup (Windows host)
 
@@ -54,10 +60,18 @@ py scripts\news_agent.py status       # what the traders see right now
 
 The AI vote is opt-in: put `ANTHROPIC_API_KEY` and `NEWS_AGENT_MODEL` (the Claude model
 to use) in `.env`. Without them the AI vote abstains and the other three carry on.
-Cost control: at most one AI call every 6 hours.
+Cost control: at most one billed AI call every 6 hours. A usable vote is reused for 6h.
+After a billed failure (a refusal, a truncated or unusable answer) the AI abstains for
+6h from that attempt rather than pay for the same failure every hour. Refusals cluster
+on war and violence headline days, which is exactly when they would repeat. Failures
+that cost nothing (network down, no key or model set) are simply tried again the next
+hour.
 
 **Keep `config/news_calendar.yaml` current**, from the Fed's FOMC calendar and the BLS
-release schedule. It is the one input the agent cannot discover for itself.
+release schedule. It is the one input the agent cannot discover for itself. Anything
+in it the agent cannot read (an unparseable date, an impact other than
+high/medium/low, a YAML error) is named in the calendar vote and WARNed by the
+healthcheck, never silently skipped.
 
 ## How it is judged — `py scripts\news_agent.py report`
 
@@ -68,14 +82,35 @@ Exactly like every rule in this project: forward, on the paper ledger.
   can't be traded.
 - The report compares $/window on good vs cautious days. The independent unit is the
   **day-cluster** (one ET day × regime), since windows inside one day share that day's
-  conditions.
+  conditions. A trade's day is the ET day it *opened* on; the ledger's timestamps are
+  UTC, and a UTC date would split every ET day at 19:00/20:00 ET into two clusters.
+  Each trade counts under its own stamp: a window that straddles the hourly regime
+  update (an early entry under the old regime, a late one under the new) is one
+  observation per regime.
 - It also computes the counterfactual the original trader tracked: **flat sizing vs
   regime sizing on the same trades** (total, per unit of exposure, max drawdown).
 
 **Pre-registered verdict:** the agent earns its keep only when, with ≥ 20 good-day and
 ≥ 20 cautious-day clusters, good days beat cautious days per window with a 95% interval
 clear of zero. Before that: COLLECTING. If cautious days come out *better*: INVERTED,
-meaning it is cutting size on the wrong days, and it gets switched off.
+meaning it is cutting size on the wrong days, and it gets switched off. Otherwise: NO
+DIFFERENCE.
+
+**It is evaluated once.** The evaluation point is fixed in advance: the first ET day by
+which both regimes have 20 clusters. Once that day is complete - a trade from a later ET
+day has settled and none of its own positions is still open - the next report applies
+the rule to the data through that day and freezes the result in
+`data/news_verdict.json` (a report run during that day says PENDING and writes nothing;
+a position still open two settled days later is counted as stuck and left out). Every
+later report prints that frozen verdict; the running table, interval and counterfactual
+it also prints are labelled *descriptive* and never re-test it. Re-checking a 95%
+interval on every report is many tests, not one: on null data with the report run
+daily, a decisive verdict showed up at some point in ~20% of runs instead of 5% (5% with
+the frozen verdict). The point depends on the ledger alone, not on when or how often the
+report runs, so a report first run months late, or after the file is lost, evaluates the
+same days. The file is never overwritten; if it is damaged, the report says so and shows
+the verdict recomputed at the same point. (This one-look rule was added after review on
+2026-11-16, the day the agent was registered, long before 20 cautious days could exist.)
 
 ## Kept deliberately out of scope
 

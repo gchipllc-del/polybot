@@ -583,7 +583,9 @@ FV_BINS = (("unstamped", None, None), ("fv < 0", -1e9, 0.0),
 
 def ledger_rows(rows: list[dict]) -> dict:
     """Join opens to closes; keep per-trade fv_edge/depth/version/regime stamps with
-    the outcome."""
+    the outcome. 'date' is the UTC date (this tool's own splits use it); 'open_ts' is
+    the open's full timestamp, for callers that need another calendar - the news
+    agent's verdict clusters on the ET day of the open."""
     opens = {(r.get("ticker"), r.get("rule")): r for r in rows if r.get("t") == "open"}
     out = []
     for r in rows:
@@ -593,7 +595,7 @@ def ledger_rows(rows: list[dict]) -> dict:
         out.append({"rule": r.get("rule"), "window": window_of(r.get("ticker")),
                     "pnl": float(r.get("pnl") or 0.0), "won": bool(r.get("won")),
                     "fv": o.get("fv_edge"), "depth": o.get("depth"), "v": o.get("v"),
-                    "regime": o.get("regime"),
+                    "regime": o.get("regime"), "open_ts": o.get("ts"),
                     "date": str(o.get("ts") or r.get("ts") or "")[:10]})
     return {"trades": out}
 
