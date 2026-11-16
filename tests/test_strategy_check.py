@@ -101,6 +101,18 @@ def test_one_per_event_keeps_each_events_first_entry_and_is_exact(tmp_path):
     assert not sc.summarize(every, 10)["exact"] and sc.summarize(first, 10)["exact"]
 
 
+def test_one_per_event_keeps_the_earliest_entry_not_a_later_one():
+    """Strike B1 first touches 18h before close and loses; strike B2 touches 0.5h before
+    close and wins. The forward trader's one bet on the event is B1, so the backtest must
+    keep B1 whatever order the trades arrive in - keeping B2 is look-ahead toward wins."""
+    t0 = 1_780_000_000
+    b1 = dict(_trade(0, won=False), ticker="E-B1", event="E", ts=t0, hours=18.0)
+    b2 = dict(_trade(1, won=True), ticker="E-B2", event="E", ts=t0 + 63000, hours=0.5)
+    other = dict(_trade(2, won=True), ticker="F-B1", event="F", ts=t0 + 30000, hours=9.0)
+    for trades in ([b1, b2, other], [b2, other, b1], [other, b2, b1]):
+        assert sc.first_per_event(trades) == [b1, other]
+
+
 def test_exact_tail_calls_three_losses_in_thirty_at_98c_negative():
     s = sc.summarize([_trade(i, won=i >= 3) for i in range(30)], 10)
     assert s["exact"] and s["p_neg"] < 0.025 and s["hi"] > 0     # interval alone: unsure
