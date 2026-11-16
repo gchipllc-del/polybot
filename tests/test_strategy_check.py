@@ -173,6 +173,15 @@ def test_hourly_candles_warn_before_a_last_hour_test(tmp_path, capsys):
     assert "HOURLY candles" not in capsys.readouterr().out    # no window: no warning
 
 
+def test_minute_candles_never_trigger_the_hourly_warning(tmp_path, capsys):
+    """The recommended last-hour test - --max-hours 1 on 1-minute final/ candles - must
+    not be told its data is hourly: that is exactly the data the warning asks for."""
+    p = _quote_file(tmp_path / "m.jsonl", lambda left: (2, 4))   # 1 minute apart, last 2h
+    assert sc.scan_many([p], 0.97, 0.99, 0.0, 1.0)["hourly_files"] == []
+    assert sc.cmd_favorites([p], 0.97, 0.99, 10, 0.0, 1.0) == 0
+    assert "HOURLY candles" not in capsys.readouterr().out
+
+
 def test_hourly_warning_votes_per_file_and_names_the_hourly_files(tmp_path, capsys):
     """A folder mixing resolutions (a short-life series fetched at 1 minute next to hourly
     ones) must still warn: one dense minute file outvotes any number of hourly files
