@@ -36,10 +36,11 @@ DASHBOARDS = [
 DASH_HOST = os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1")
 
 
-# What the dashboards actually import. Deliberately NOT `pip install -r
-# requirements.txt`: that file pins `tradingcore @ file:../tradingcore` (a sibling repo
-# from the original machine), and pip aborts the WHOLE install when the path is missing —
-# which bricked first-run on a fresh Windows box. The dashboards don't need tradingcore.
+# What the dashboards actually import - deliberately minimal and fast. (requirements.txt
+# once pinned `tradingcore @ file:../tradingcore`, a sibling repo from the original
+# machine, and pip aborted the WHOLE install when the path was missing - which bricked
+# first-run on a fresh Windows box. That pin is now commented out and lib/ falls back to
+# vendor/tradingcore, but the dashboards still only install what they import.)
 DASH_DEPS = ["flask>=3.0.0", "python-dotenv>=1.0.0", "requests>=2.31.0",
              "pyyaml>=6.0", "rich>=13.7.0"]
 
