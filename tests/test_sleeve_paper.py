@@ -182,6 +182,30 @@ def test_verdict_needs_events_and_the_family_correction(tmp_path):
     assert few["verdict"].startswith("collecting")
 
 
+def test_the_family_correction_decides_an_edge_verdict():
+    """The same 100-event record (85c, 8 losses: exact p = 0.049) is EDGE alone and not
+    as one of 31 forward rules - whether the other 30 are shown here or come in as
+    extra_stats (retired or crypto rules). The family, not the record, decides."""
+    rules = {n: {"name": n, "series": "S", "named_at": "2026-01-01T00:00:00+00:00"}
+             for n in ["M"] + [f"N{k}" for k in range(30)]}
+    rows = []
+    for name in rules:
+        for i in range(100):
+            won, tk = i >= (8 if name == "M" else 14), f"{name}-E{i}-A"
+            rows.append({"t": "open", "ticker": tk, "rule": name, "event": f"{name}-E{i}",
+                         "ts": "2026-02-01T00:00:00+00:00", "price": 0.85, "fee": 0.01,
+                         "depth": 5})
+            rows.append({"t": "close", "ticker": tk, "rule": name, "event": f"{name}-E{i}",
+                         "price": 0.85, "won": won, "pnl": 0.14 if won else -0.86})
+    only_m = {"M": rules["M"]}
+    alone = sp.evaluate(rows, only_m)[0]
+    assert alone["category"] == "edge" and alone["verdict"].startswith("EDGE")
+    res = {r["rule"]: r for r in sp.evaluate(rows, rules)}
+    assert res["M"]["p"] == alone["p"] and res["M"]["category"] == "positive_ns"
+    crowd = [sp.forward_stats(ts) for n, ts in sp.trades_of(rows, rules).items() if n != "M"]
+    assert sp.evaluate(rows, only_m, crowd)[0]["category"] == "positive_ns"
+
+
 def test_any_band_rule_trades_at_any_time(tmp_path):
     rp = tmp_path / "r.jsonl"
     sp.register([{"name": "F9799_KXHIGHNY", "series": "KXHIGHNY", "band": "any",

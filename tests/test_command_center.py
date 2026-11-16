@@ -44,17 +44,37 @@ def test_real_fill_checked_edge_is_recognised():
     assert rows[0]["status"] == "good" and rows[0]["verdict"].startswith("EDGE")
 
 
+def _hold(rule, event, won, era="v4 gated", venue="crypto", ask=0.85):
+    """A 1-lot held to settlement: a win pays 1-ask-fee, a loss costs ask+fee (1c at 85c)."""
+    pnl = (1 - ask - 0.01) if won else (-ask - 0.01)
+    return {"rule": rule, "venue": venue, "event": event, "pnl": pnl, "won": won,
+            "ask": ask, "ts": 1.0, "era": era}
+
+
 def test_one_family_correction_across_all_rules():
-    """The same 40-event marginal edge that passes alone must not pass when it is one of
-    many rules tested at once."""
-    marginal = [_t("M", f"M-E{i}", 0.14 if (i % 100) < 94 else -0.86) for i in range(40)]
+    """The family must DECIDE the verdict: a 100-event edge that passes alone (85c, 8
+    losses: exact p = 0.049 <= q = 0.10) must not pass as one of 31 rules tested at once
+    (BH rank-1 bar 0.10/31 = 0.0032). Same record, same p - only the family differs. (A
+    40-event fixture could never be EDGE, so it pinned the event floor, not the family.)"""
+    marginal = [_hold("M", f"M-E{i}", i >= 8) for i in range(100)]
     alone = cc.score_rules(marginal)[0]
-    crowd = marginal + [t for k in range(30) for t in
-                        [_t(f"N{k}", f"N{k}-E{i}", 0.02 if i % 2 else -0.03, ask=0.5)
-                         for i in range(40)]]
+    assert alone["verdict"].startswith("EDGE") and alone["status"] == "good"
+    crowd = marginal + [_hold(f"N{k}", f"N{k}-E{i}", i >= 14)
+                        for k in range(30) for i in range(100)]
     in_crowd = next(r for r in cc.score_rules(crowd) if r["rule"] == "M")
     assert alone["decision"]["p"] == pytest.approx(in_crowd["decision"]["p"])
-    assert not in_crowd["verdict"].startswith("EDGE")
+    assert in_crowd["status"] != "good" and in_crowd["verdict"] == "no edge yet"
+
+
+def test_the_family_takes_the_fill_checked_record_not_the_all_era_one():
+    """5,000 glowing PRE-FIX trades and 150 ordinary fill-checked ones: the all-era p is
+    tiny, the fill-checked one is not. Only the fill-checked record may enter the family
+    - or the live-money verdict rests on fills that never happened."""
+    pre = [_hold("H", f"H-P{i}", i % 100 < 94, era="pre-fix") for i in range(5000)]
+    gated = [_hold("H", f"H-G{i}", i >= 20) for i in range(150)]
+    r = cc.score_rules(pre + gated)[0]
+    assert r["all"]["p"] < 1e-6 and r["decision"]["n"] == 150 and r["decision"]["mean"] > 0
+    assert r["status"] != "good" and not r["verdict"].startswith("EDGE")
 
 
 def test_negative_rules_sort_last_and_edges_first():
