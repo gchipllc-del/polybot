@@ -11,10 +11,13 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import strategy_check as sc  # noqa: E402
 
 
-def _file(tmp_path, p_win, name="w", n_days=400):
+def _file(tmp_path, p_win, name="w", n_days=400, series="KXT"):
     p = tmp_path / f"{name}.jsonl"
     with open(p, "w", encoding="utf-8") as f:
         for r in sc._world(p_win, n_days=n_days):
+            for k in ("series", "ticker", "event_ticker"):        # another city's file
+                if k in r:
+                    r[k] = r[k].replace("KXT", series)
             f.write(json.dumps(r) + "\n")
     return p
 
@@ -128,11 +131,17 @@ def test_a_perfect_record_at_98c_is_not_proof():
 def test_folders_and_lists_of_files_merge(tmp_path):
     d = tmp_path / "final"
     d.mkdir()
-    a, b = _file(d, 0.995, "A"), _file(d, 0.995, "B")
+    a = _file(d, 0.995, "A", n_days=10, series="KXA")             # two cities, 40 markets
+    b = _file(d, 0.995, "B", n_days=10, series="KXB")             # and 40 entries each
     assert sc.expand_files(str(d)) == [a, b] == sc.expand_files(f"{a},{b}")
-    one, both = sc.scan(a, 0.97, 0.99), sc.scan_many([a, b], 0.97, 0.99)
-    # same synthetic tickers in both files: merged by ticker, nothing double counted
-    assert len(both["markets"]) == len(one["markets"]) and both["orphans"] == 0
+    both = sc.scan_many([a, b], 0.97, 0.99)
+    # every file is read, and every market and entry of each one is kept
+    assert len(both["markets"]) == len(both["entries"]) == 80 and both["orphans"] == 0
+    assert {tk.split("-")[0] for tk in both["entries"]} == {"KXA", "KXB"}
+    assert {t["series"] for t in sc.trades_from(both, 10)} == {"KXA", "KXB"}
+    # the same tickers twice: merged by ticker, nothing double counted
+    twice = sc.scan_many([a, a], 0.97, 0.99)
+    assert len(twice["markets"]) == len(twice["entries"]) == 40
 
 
 def test_a_ticker_in_two_files_keeps_its_earliest_touch(tmp_path):
