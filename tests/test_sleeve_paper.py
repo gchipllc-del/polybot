@@ -191,3 +191,26 @@ def test_any_band_rule_trades_at_any_time(tmp_path):
     for m in (early, late):
         fired = sp.candidates(m, NOW.timestamp(), rules)
         assert [c["rule"] for c in fired] == ["F9799_KXHIGHNY"] and fired[0]["price"] == 0.98
+
+
+def test_hours_before_close_window(tmp_path):
+    rp = tmp_path / "r.jsonl"
+    sp.register([{"name": "F9799L_KXHIGHNY", "series": "KXHIGHNY", "band": "any",
+                  "side": "favorite", "lo": 0.97, "hi": 0.995, "min_h": 6.0, "max_h": 12.0}],
+                rp, NOW - timedelta(days=1))
+    rules = list(sp.active_rules(rp).values())
+    in_window = mk("A", "E", 98, 96, opened_h=-30, closes_h=8)
+    too_early = mk("A", "E", 98, 96, opened_h=-10, closes_h=20)
+    too_late = mk("A", "E", 98, 96, opened_h=-30, closes_h=3)
+    assert [c["rule"] for c in sp.candidates(in_window, NOW.timestamp(), rules)] == \
+        ["F9799L_KXHIGHNY"]
+    assert sp.candidates(too_early, NOW.timestamp(), rules) == []
+    assert sp.candidates(too_late, NOW.timestamp(), rules) == []
+
+
+def test_rules_without_hours_fields_still_load(tmp_path):
+    """Rules registered before the hours window existed have no min_h/max_h."""
+    rp, _ = _setup(tmp_path)
+    assert all("min_h" not in r for r in sp.active_rules(rp).values())
+    assert sp.candidates(mk("A", "E", 88, 86), NOW.timestamp(),
+                         list(sp.active_rules(rp).values()))

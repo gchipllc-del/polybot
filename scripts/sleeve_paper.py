@@ -217,6 +217,7 @@ def candidates(m: dict, now_ts: float, rules: list[dict]) -> list[dict]:
     if o is None or c is None or not (o < now_ts < c):
         return []
     band = band_of((now_ts - o) / (c - o))
+    hours_left = (c - now_ts) / 3600.0
     yb, ya = price(m, "yes_bid"), price(m, "yes_ask")
     if band is None or yb is None or ya is None:
         return []
@@ -229,6 +230,8 @@ def candidates(m: dict, now_ts: float, rules: list[dict]) -> list[dict]:
     for r in rules:
         if r["band"] not in (band, "any"):        # "any": the rule trades at any time
             continue
+        if not (r.get("min_h", 0.0) <= hours_left <= r.get("max_h", 1e9)):
+            continue                              # optional hours-before-close window
         side, ask = {"favorite": fav, "longshot": lng, "yes": ("yes", ya),
                      "no": ("no", na)}.get(r["side"], (None, None))
         if side is None or not (r["lo"] <= ask < r["hi"]):
@@ -602,18 +605,24 @@ def main() -> int:
         if not prefix or side not in ("favorite", "longshot", "yes", "no"):
             print("usage: register-rule --name PREFIX (--series A,B | --series-prefix KXHIGH)"
                   " --side favorite|longshot|yes|no --lo 0.97 --hi 0.995 [--band any]"
-                  " [--thesis TEXT]")
+                  " [--min-hours 6 --max-hours 12] [--thesis TEXT]")
             return 1
         if opt("--series"):
             series = [x.strip() for x in opt("--series").split(",") if x.strip()]
-        elif opt("--series-prefix") and CATALOG.exists():
+        elif opt("--series-prefix"):
+            if not CATALOG.exists():
+                print("--series-prefix reads the series catalog, which does not exist yet.")
+                print("Run `py scripts/sleeve_scan.py discover` first, or name the series:")
+                print("  --series KXHIGHNY,KXHIGHCHI,KXHIGHMIA,...")
+                return 1
             series = [r["series"] for r in json.loads(CATALOG.read_text(encoding="utf-8"))
                       if r["series"].startswith(opt("--series-prefix"))]
         else:
-            print("give --series A,B, or run sleeve_scan.py discover and use --series-prefix")
+            print("give --series A,B (or --series-prefix after sleeve_scan.py discover)")
             return 1
         rules = [{"name": f"{prefix}_{s}", "series": s, "band": opt("--band", "any"),
                   "side": side, "lo": float(opt("--lo", 0.97)), "hi": float(opt("--hi", 0.995)),
+                  "min_h": float(opt("--min-hours", 0.0)), "max_h": float(opt("--max-hours", 1e9)),
                   "source": "named", "thesis": opt("--thesis", f"{prefix}: outside hypothesis")}
                  for s in series if s not in EXCLUDED_SERIES]
         added = register(rules)
