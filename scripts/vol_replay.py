@@ -582,7 +582,8 @@ FV_BINS = (("unstamped", None, None), ("fv < 0", -1e9, 0.0),
 
 
 def ledger_rows(rows: list[dict]) -> dict:
-    """Join opens to closes; keep per-trade fv_edge/depth stamps with the outcome."""
+    """Join opens to closes; keep per-trade fv_edge/depth/version/regime stamps with
+    the outcome."""
     opens = {(r.get("ticker"), r.get("rule")): r for r in rows if r.get("t") == "open"}
     out = []
     for r in rows:
@@ -591,9 +592,26 @@ def ledger_rows(rows: list[dict]) -> dict:
         o = opens.get((r.get("ticker"), r.get("rule"))) or {}
         out.append({"rule": r.get("rule"), "window": window_of(r.get("ticker")),
                     "pnl": float(r.get("pnl") or 0.0), "won": bool(r.get("won")),
-                    "fv": o.get("fv_edge"), "depth": o.get("depth"),
+                    "fv": o.get("fv_edge"), "depth": o.get("depth"), "v": o.get("v"),
+                    "regime": o.get("regime"),
                     "date": str(o.get("ts") or r.get("ts") or "")[:10]})
     return {"trades": out}
+
+
+def era_of(t: dict) -> str:
+    """Which fill-gate regime a trade was opened under.
+
+    Frozen rules are stamped v=4 from the 2026-09-25 depth-gate fix onward, so for
+    them v is the honest era marker (a depth NUMBER alone is not: pre-fix, the broken
+    parser returned numbers for legacy-shape books - counted from the wrong side).
+    Hermes overlay rules keep their own v=3 forever, so they cannot be era-classified
+    this way and are labelled as such rather than silently misfiled."""
+    v = t.get("v")
+    if isinstance(v, (int, float)) and v >= 4:
+        return "v4 ungated" if t.get("depth") is None else "v4 gated"
+    if v == 3:
+        return "hermes v3"
+    return "pre-fix"
 
 
 def _bin_of(fv) -> str:
@@ -670,6 +688,35 @@ def cmd_ledger() -> int:
             per_win = _per_window(sub)
             m, _, _ = mean_ci([p for _, p in per_win])
             print(f"  {rule:24} {view:14} {len(per_win):>8} {m:>+10.4f}")
+    print()
+    print("-" * 78)
+    print("FILL-GATE ERAS - the H5/H1b verdict column. Entries before 2026-09-25 were")
+    print("never fill-checked (the gate was a silent no-op), and the slice evidence says")
+    print("their 'edge' lived in unfillable quotes. 'v4 gated' is the only column whose")
+    print("entries are known to have had real size behind the price - an edge is only")
+    print("real if it survives THERE, at 100+ windows.")
+    eras = ("pre-fix", "v4 gated", "v4 ungated", "hermes v3")
+    if not any(era_of(t).startswith("v4") for t in trades):
+        print("  NO v4 ENTRIES YET - the fixed gate has not traded. Pull the branch and")
+        print("  restart PolybotPaper; this table stays empty until then.")
+    print(f"  {'rule':24} {'era':11} {'windows':>8} {'WR':>7} {'$/window':>10} "
+          f"{'CI95':>18}")
+    for rule in rules:
+        for era in eras:
+            sub = [t for t in trades if t["rule"] == rule and era_of(t) == era]
+            if not sub:
+                continue
+            pnls = [p for _, p in _per_window(sub)]
+            m, lo, hi = mean_ci(pnls)
+            wr = sum(1 for t in sub if t["won"]) / len(sub)
+            ci = f"[{lo:+.3f},{hi:+.3f}]" if len(pnls) >= 2 else "-"
+            print(f"  {rule:24} {era:11} {len(pnls):>8} {wr:>6.1%} {m:>+10.4f} {ci:>18}")
+    print("  A rule positive pre-fix but flat/negative in 'v4 gated' was phantom")
+    print("  liquidity, as the slices predicted. 'v4 ungated' (depth fetch failed at")
+    print("  entry) proves nothing either way and should stay rare - if it rivals the")
+    print("  gated count, check Kalshi auth. Intervals are uncorrected 95% monitoring")
+    print("  bands, not verdicts; the verdict rule is unchanged: positive AND")
+    print("  significant at 100+ gated windows before anything is promoted.")
     print()
     print("READ: the evidence is the WITHIN-RULE split - same rule, same side, does the")
     print("stamp separate winners? Monotone there = the model earning trust forward; flat")

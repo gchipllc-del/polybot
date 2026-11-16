@@ -238,6 +238,32 @@ def test_ledger_join_and_bins():
     assert [vr._bin_of(t["fv"]) for t in trades] == ["fv 3-8c", "fv < 0", "unstamped"]
 
 
+def test_fill_gate_era_classification():
+    """The v4 record is only separable if the classifier is right: v>=4 marks the
+    fixed-gate era for frozen rules; a depth NUMBER alone must NOT count as gated
+    (pre-fix, the broken parser produced numbers counted from the wrong side); and
+    Hermes v3 rows are labelled, never silently misfiled into an era."""
+    assert vr.era_of({"v": None, "depth": None}) == "pre-fix"
+    assert vr.era_of({"v": 2, "depth": 7}) == "pre-fix"       # wrong-side-era number
+    assert vr.era_of({"v": 4, "depth": 3}) == "v4 gated"
+    assert vr.era_of({"v": 4, "depth": 0}) == "v4 gated"      # gated and refusable
+    assert vr.era_of({"v": 4, "depth": None}) == "v4 ungated"
+    assert vr.era_of({"v": 5, "depth": 2}) == "v4 gated"      # future bumps stay gated
+    assert vr.era_of({"v": 3, "depth": 7}) == "hermes v3"
+    assert vr.era_of({"v": "4", "depth": 2}) == "pre-fix"     # malformed stamp: no claim
+
+
+def test_ledger_rows_carry_version_and_regime_stamps():
+    rows = [
+        {"t": "open", "ticker": "KXBTC15M-W1-T1", "rule": "R", "fv_edge": 0.05,
+         "depth": 3, "v": 4, "regime": "cautious", "ts": "2026-09-26T00:00:00+00:00"},
+        {"t": "close", "ticker": "KXBTC15M-W1-T1", "rule": "R", "won": True,
+         "pnl": 0.90},
+    ]
+    t = vr.ledger_rows(rows)["trades"][0]
+    assert t["v"] == 4 and vr.era_of(t) == "v4 gated" and t["regime"] == "cautious"
+
+
 def test_ledger_windows_collapse():
     """Two trades in one window are one bet in the per-window view."""
     rows = _ledger([(0.05, 0.9)])
