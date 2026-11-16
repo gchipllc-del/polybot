@@ -82,10 +82,15 @@ MIN_N_MEANINGFUL = 100
 
 
 def kalshi_taker_fee(price: float, contracts: int = 1) -> float:
-    """Kalshi taker fee, rounded UP to the cent: ceil(0.07 * C * P * (1-P))."""
+    """Kalshi taker fee, rounded UP to the cent: ceil(0.07 * C * P * (1-P)).
+
+    The -1e-9 (strategy_check.order_fee's guard): when the exact fee is a whole number of
+    cents, float noise must not ceil it up one (0.07*4*.5*.5*100 = 7.000000000000001 ->
+    8c for a 7c fee). It never moves a fee that is not a whole number of cents: on the
+    0.01c price grid those sit at least 1e-8 cent above one."""
     if not (0 < price < 1):
         return 0.0
-    return math.ceil(0.07 * contracts * price * (1.0 - price) * 100) / 100.0
+    return math.ceil(0.07 * contracts * price * (1.0 - price) * 100 - 1e-9) / 100.0
 
 
 def _band_of(mins_left) -> str | None:
@@ -277,8 +282,9 @@ def _load(p: Path) -> list[dict]:
 
 
 def _selftest() -> int:
-    # fee rounding
+    # fee rounding - and a fee that IS a whole number of cents is not rounded up a cent
     assert kalshi_taker_fee(0.90) == 0.01 and kalshi_taker_fee(0.50) == 0.02
+    assert kalshi_taker_fee(0.50, 4) == 0.07 and kalshi_taker_fee(0.20, 100) == 1.12
 
     rows = [
         # <2min favorite at 0.85 -> settles yes (side 'yes' is favorite) => WIN.

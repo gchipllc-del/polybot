@@ -332,6 +332,24 @@ def test_a_sized_order_needs_its_whole_size_at_the_ask_not_a_tick_worse(tmp_path
     assert opens(thin_no, no_fav) == [(1, 0.98, 54.0)]
 
 
+def test_the_fee_is_exact_at_every_order_size(tmp_path):
+    """Kalshi's fee is ceil(7 * C * P * (100-P) / 10000) cents. Where that is a whole number
+    of cents, float noise once rounded it up a cent: a 4-lot at 50c paid 8c, not 7c
+    (sizes 4, 8, 12, 25, 50, 100 ... at 10-80c), and the history check (order_fee)
+    disagreed with the forward ledger for the same rule."""
+    import strategy_check as sc
+    assert sp.kalshi_fee(0.50, 4) == 0.07
+    for c in range(1, 101):
+        for pc in range(1, 100):
+            exact = -(-7 * c * pc * (100 - pc) // 10000) / 100.0
+            assert sp.kalshi_fee(pc / 100, c) == exact == sc.order_fee(pc / 100, c), (c, pc)
+    rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"            # the ledger books it
+    sp.register([{"name": "MID4", "series": "KXINX", "band": "any", "side": "yes",
+                  "lo": 0.45, "hi": 0.55, "contracts": 4}], rp, NOW - timedelta(days=1))
+    _cycle(_getter([mk("KXINX-E1-A", "KXINX-E1", 50, 48)]), rp, lp)
+    assert [r["fee"] for r in sp._load_jsonl(lp) if r.get("t") == "open"] == [0.07]
+
+
 def test_one_rule_spans_many_series_and_is_one_test(tmp_path):
     rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
     sp.register([{"name": "F9799", "series": ["KXHIGHNY", "KXHIGHCHI"], "band": "any",
