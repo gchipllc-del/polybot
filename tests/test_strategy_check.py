@@ -23,9 +23,10 @@ def _iso(t):
     return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
 
 
-def _minute_file(path, quote, n=40, minutes=120, result="yes", series="KXT"):
-    """`final/`-style data: n daily events of one 20h market each, with 1-minute candles
-    over only the last `minutes`. quote(seconds_left) -> (yes_bid, yes_ask) in cents."""
+def _quote_file(path, quote, n=40, span_h=2.0, step_s=60, result="yes", series="KXT"):
+    """n daily events of one 20h market each, a candle every `step_s` seconds over only the
+    last `span_h` hours - by default the `final/` shape (1-minute bars, last 2h); span_h=20,
+    step_s=3600 is a full-life hourly file. quote(seconds_left) -> (yes_bid, yes_ask) in c."""
     t0 = 1_780_000_000
     with open(path, "w", encoding="utf-8") as f:
         for d in range(n):
@@ -35,8 +36,7 @@ def _minute_file(path, quote, n=40, minutes=120, result="yes", series="KXT"):
             f.write(json.dumps({"t": "market", "series": series, "ticker": tk,
                                 "event_ticker": f"{series}-D{d:04d}", "result": result,
                                 "open_time": _iso(o), "close_time": _iso(c)}) + "\n")
-            for k in range(minutes):
-                end = c - 60 * minutes + 60 * (k + 1)
+            for end in range(c - int(span_h * 3600) + step_s, c + 1, step_s):
                 yb, ya = quote(c - end)
                 f.write(json.dumps({"t": "candle", "series": series, "ticker": tk,
                                     "end_period_ts": end, "yes_bid": {"close": yb},
@@ -118,6 +118,27 @@ def test_folders_and_lists_of_files_merge(tmp_path):
     assert len(both["markets"]) == len(one["markets"]) and both["orphans"] == 0
 
 
+def test_a_ticker_in_two_files_keeps_its_earliest_touch(tmp_path):
+    """`--file data/sleeves,data/sleeves/final`: the same tickers, hourly over the whole
+    life and 1-minute over the last 2h. The merged entry must be each market's FIRST
+    touch - the one the forward trader takes - whatever order the files are read in.
+    Here YES sits at 97c 5h out (the real first touch, a loser) and NO at 98c 0.5h
+    out (a winner): keeping the later file's entry turns every loss into a win."""
+    hourly = _quote_file(tmp_path / "KXT.jsonl",
+                         lambda left: (95, 97) if left == 5 * 3600 else (40, 45),
+                         n=10, span_h=20, step_s=3600, result="no")
+    (tmp_path / "final").mkdir()
+    final = _quote_file(tmp_path / "final" / "KXT.jsonl",
+                        lambda left: (2, 4) if left == 1800 else (40, 45), n=10, result="no")
+    assert sc.expand_files(f"{tmp_path},{tmp_path / 'final'}") == [hourly, final]
+    for files in ([hourly, final], [final, hourly]):
+        res = sc.scan_many(files, 0.97, 0.99, 0.0, 12.0)
+        assert len(res["entries"]) == 10
+        assert {(e["hours"], e["side"], e["ask"]) for e in res["entries"].values()} == {
+            (5.0, "yes", 0.97)}
+        assert not any(t["won"] for t in sc.trades_from(res, 10))
+
+
 def test_hourly_candles_warn_before_a_last_hour_test(tmp_path, capsys):
     p = _file(tmp_path, 0.995)                       # candles 6 hours apart
     assert sc.cmd_favorites([p], 0.97, 0.99, 10, 0.0, 1.0) == 0
@@ -132,8 +153,8 @@ def test_hourly_warning_votes_per_file_and_names_the_hourly_files(tmp_path, caps
     when candle gaps are summed, so the vote is per FILE and the warning names them."""
     d = tmp_path / "mixed"
     d.mkdir()
-    _file(d, 0.995, "A_hourly", n_days=20)                   # 80 markets, 6h apart
-    _minute_file(d / "B_minute.jsonl", lambda left: (40, 45))  # 40 x 119 minute gaps
+    _file(d, 0.995, "A_hourly", n_days=20)                  # 80 markets, 6h apart
+    _quote_file(d / "B_minute.jsonl", lambda left: (40, 45))  # 40 x 119 minute gaps
     files = sc.expand_files(str(d))
     assert sc.cmd_favorites(files, 0.97, 0.99, 10, 0.0, 1.0) == 0
     warning = [ln for ln in capsys.readouterr().out.splitlines() if "HOURLY candles" in ln]
@@ -145,11 +166,11 @@ def test_no_entry_on_the_bar_ending_at_the_close(tmp_path):
     """The bar ending AT the close quotes the settled price, and the forward trader only
     buys while now < close. A market that shows the band only on that bar is never
     entered - in a last-hour window or with none - while one minute earlier still is."""
-    at_close = _minute_file(tmp_path / "c.jsonl",
-                            lambda left: (98, 99) if left <= 0 else (88, 90))
+    at_close = _quote_file(tmp_path / "c.jsonl",
+                           lambda left: (98, 99) if left <= 0 else (88, 90))
     for max_h in (1.0, 1e9):
         assert sc.scan(at_close, 0.97, 0.99, 0.0, max_h)["entries"] == {}
-    a_minute_before = _minute_file(tmp_path / "m.jsonl",
-                                   lambda left: (98, 99) if left <= 60 else (88, 90))
+    a_minute_before = _quote_file(tmp_path / "m.jsonl",
+                                  lambda left: (98, 99) if left <= 60 else (88, 90))
     e = sc.scan(a_minute_before, 0.97, 0.99, 0.0, 1.0)["entries"]
     assert len(e) == 40 and {x["hours"] for x in e.values()} == {1 / 60}

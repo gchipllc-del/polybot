@@ -137,15 +137,19 @@ def expand_files(spec: str) -> list[Path]:
 
 def scan_many(paths: list[Path], lo: float, hi: float, min_h: float = 0.0,
               max_h: float = 1e9) -> dict:
-    """scan() over several files (one per series), merged. Tickers never repeat across
-    series, and each file holds its own market rows before their candles.
+    """scan() over several files (one per series), merged. Each file holds its own market
+    rows before their candles. A ticker found in several files (`data/sleeves` hourly AND
+    `data/sleeves/final` 1-minute) keeps its EARLIEST entry - the first touch the forward
+    trader takes - whatever order the files are read in.
     hourly_files: the files whose OWN candles are mostly an hour or more apart - voted per
     file, because one dense 1-minute file would outvote any number of hourly ones."""
     res = {"markets": {}, "entries": {}, "orphans": 0, "gaps": [0, 0], "hourly_files": []}
     for path in paths:
         r = scan(path, lo, hi, min_h, max_h)
         res["markets"].update(r["markets"])
-        res["entries"].update(r["entries"])
+        for tk, e in r["entries"].items():
+            if tk not in res["entries"] or e["ts"] < res["entries"][tk]["ts"]:
+                res["entries"][tk] = e
         res["orphans"] += r["orphans"]
         res["gaps"] = [a + b for a, b in zip(res["gaps"], r["gaps"])]
         if r["gaps"][1] > r["gaps"][0]:
