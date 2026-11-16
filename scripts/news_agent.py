@@ -19,11 +19,20 @@ clusters (a cluster = one ET day x one regime - the ET day each trade OPENED on,
 its UTC date - so correlated windows inside a day are ONE observation), good-day
 $/window beats cautious-day $/window with a 95% interval clear of zero. Until then the
 honest word is COLLECTING.
+
+ONE LOOK (added after review on 2026-11-16, the day the rule was registered - weeks
+before any verdict is possible): the rule is evaluated ONCE, at a fixed evaluation
+point - the first ET day by which both regimes have MIN_CLUSTERS clusters - on the data
+through that day. The first `report` that reaches the point writes the result to
+data/news_verdict.json; every later report prints that frozen verdict, and its running
+numbers are descriptive only. A 95% interval re-checked on every report is not a 5%
+test: on null data checked daily it went decisive in ~20% of runs.
 """
 from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +45,9 @@ import lib  # noqa: E402,F401  (bootstraps the vendored tradingcore fallback)
 from lib import news_regime as nr  # noqa: E402
 
 MIN_CLUSTERS = 20
+# the frozen verdict: written ONCE, at the evaluation point, never rewritten
+VERDICT_PATH = Path(os.environ.get("NEWS_VERDICT_FILE")
+                    or (ROOT / "data" / "news_verdict.json"))
 
 
 # ── run / status ──────────────────────────────────────────────────────────────
@@ -174,17 +186,120 @@ def evaluate(trades: list[dict]) -> dict:
               "flat_dd": _max_drawdown(flat), "sized_dd": _max_drawdown(sized)}
 
     if len(cl_good) < MIN_CLUSTERS or len(cl_caut) < MIN_CLUSTERS:
-        verdict = (f"COLLECTING - {len(cl_good)} good-day and {len(cl_caut)} cautious-day "
-                   f"clusters (need {MIN_CLUSTERS} of each)")
+        verdict = _collecting(len(cl_good), len(cl_caut))
     elif diff and diff[1] > 0:
         verdict = "EARNS ITS KEEP - cautious days are measurably worse per window"
     elif diff and diff[2] < 0:
         verdict = "INVERTED - cautious days were BETTER; it is cutting size on the wrong days"
     else:
-        verdict = "NO DIFFERENCE - caution days and good days perform alike so far"
+        verdict = "NO DIFFERENCE - cautious days and good days performed alike per window"
+    # 'verdict' is the rule applied to exactly these trades. `report` applies it ONCE,
+    # at the evaluation point (freeze_verdict) - never to the running totals
     return {"n_stamped": len(stamped), "n_windows": len(windows), "table": table,
             "clusters": (len(cl_good), len(cl_caut)), "diff": diff, "cf": cf,
             "verdict": verdict}
+
+
+def _collecting(n_good: int, n_caut: int) -> str:
+    return (f"COLLECTING - {n_good} good-day and {n_caut} cautious-day clusters "
+            f"(need {MIN_CLUSTERS} of each)")
+
+
+def evaluation_cut(trades: list[dict]) -> tuple[str | None, list[dict]]:
+    """THE evaluation point: the first ET day by which both regimes have MIN_CLUSTERS
+    day-clusters. -> (that day, the stamped trades of every day up to and including
+    it), or (None, []) while collecting. A function of the ledger alone: it does not
+    move with when, or how often, `report` is run, so a report run late - or after the
+    verdict file is lost - evaluates the same days."""
+    stamped = [(cluster_day(t), t) for t in trades
+               if t.get("regime") in (nr.GOOD, nr.CAUTIOUS, nr.UNKNOWN)]
+    regimes: dict[str, set] = {}
+    for day, t in stamped:
+        regimes.setdefault(day, set()).add(t["regime"])
+    n_good = n_caut = 0
+    for day in sorted(regimes):
+        n_good += nr.GOOD in regimes[day]
+        n_caut += nr.CAUTIOUS in regimes[day]
+        if n_good >= MIN_CLUSTERS and n_caut >= MIN_CLUSTERS:
+            return day, [t for d, t in stamped if d <= day]
+    return None, []
+
+
+def load_verdict(path: Path | None = None) -> dict | None:
+    """The frozen verdict record, or None when there is none or it cannot be read."""
+    p = Path(path) if path is not None else VERDICT_PATH
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) and isinstance(rec.get("verdict"), str) else None
+
+
+def freeze_verdict(trades: list[dict], path: Path | None = None,
+                   now: datetime | None = None) -> dict | None:
+    """THE verdict: evaluated ONCE, at the pre-registered evaluation point, then frozen.
+
+    Re-testing a fixed 95% interval on every report is many looks, not one. So the
+    first call that finds the evaluation point (evaluation_cut) applies the rule to the
+    data through that day and writes the record to `path`; every later call returns
+    that record unchanged, whatever the running numbers do since. None while COLLECTING.
+
+    The record returned carries a 'state' that is not stored: 'stored' (read back),
+    'new' (written by this call) or 'unwritten' (it could not be written - e.g. a file
+    is there but unreadable, which is left untouched for a human to look at; the
+    verdict is recomputed at the same evaluation point, so it is not a second look)."""
+    p = Path(path) if path is not None else VERDICT_PATH
+    rec = load_verdict(p)
+    if rec is not None:
+        return dict(rec, state="stored")
+    day, upto = evaluation_cut(trades)
+    if day is None:
+        return None
+    ev = evaluate(upto)
+    now = now or datetime.now(timezone.utc)
+    rec = {"t": "news_verdict", "verdict": ev["verdict"], "eval_day_et": day,
+           "clusters": list(ev["clusters"]),
+           "diff": list(ev["diff"]) if ev["diff"] else None,
+           "windows": ev["n_windows"], "trades": ev["n_stamped"],
+           "min_clusters": MIN_CLUSTERS, "frozen_at": now.isoformat(timespec="seconds")}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "x", encoding="utf-8") as f:       # "x": never overwrite a verdict
+            f.write(json.dumps(rec, indent=2) + "\n")
+    except FileExistsError:
+        return dict(rec, state="unwritten",
+                    note=f"{p} exists but cannot be read - left as it is")
+    except OSError as e:
+        return dict(rec, state="unwritten", note=f"could not write {p} ({type(e).__name__})")
+    return dict(rec, state="new")
+
+
+def _verdict_lines(frozen: dict | None, ev: dict, path: Path) -> list[str]:
+    if frozen is None:
+        return [f"VERDICT: {_collecting(*ev['clusters'])}"]
+    lines = [f"VERDICT: {frozen['verdict']}"]
+    cl = frozen.get("clusters")
+    g, c = cl if isinstance(cl, list) and len(cl) == 2 else ("?", "?")
+    lines.append(f"  evaluated ONCE, at the pre-registered evaluation point: the data through "
+                 f"ET day {frozen.get('eval_day_et', '?')}")
+    d = frozen.get("diff")
+    if isinstance(d, list) and len(d) == 3 and all(isinstance(x, (int, float)) for x in d):
+        lines.append(f"  ({g} good-day / {c} cautious-day clusters; good minus cautious "
+                     f"{d[0]:+.4f} per window, 95% CI [{d[1]:+.4f}, {d[2]:+.4f}])")
+    else:
+        lines.append(f"  ({g} good-day / {c} cautious-day clusters)")
+    state = frozen.get("state")
+    if state == "new":
+        lines.append(f"  frozen NOW in {path} - later reports print this verdict and never "
+                     f"re-test it")
+    elif state == "stored":
+        lines.append(f"  frozen {frozen.get('frozen_at', '?')} in {path}; the running "
+                     f"numbers above do not re-test it")
+    else:
+        lines.append(f"  NOT FROZEN: {frozen.get('note', '?')}. Shown: the verdict "
+                     f"recomputed at the same evaluation point (fix or remove the file and "
+                     f"the next report freezes it)")
+    return lines
 
 
 def cmd_report() -> int:
@@ -224,12 +339,18 @@ def cmd_report() -> int:
             rows.append(json.loads(line))
         except json.JSONDecodeError:
             pass
-    ev = evaluate(vr.ledger_rows(rows)["trades"])
-    if ev["n_stamped"] == 0:
+    trades = vr.ledger_rows(rows)["trades"]
+    ev = evaluate(trades)
+    verdict_path = VERDICT_PATH
+    frozen = freeze_verdict(trades, verdict_path)  # writes it once, at the evaluation point
+    if ev["n_stamped"] == 0 and frozen is None:
         print("no regime-stamped closed trades yet. Stamps begin once the paper trader")
         print("restarts on this version AND the news agent is running (PolybotNews).")
         return 0
     print(f"{ev['n_stamped']} regime-stamped closed trades across {ev['n_windows']} windows")
+    print()
+    print("RUNNING NUMBERS - descriptive only: they move with every report and never")
+    print("re-test the verdict, which is evaluated once (see VERDICT below)")
     print()
     print(f"  {'regime':10} {'windows':>8} {'$/window':>10} {'95% CI':>20}")
     for reg, (n, m, lo, hi) in ev["table"].items():
@@ -249,7 +370,8 @@ def cmd_report() -> int:
         print(f"    regime sizing: total {cf['sized_total']:+8.2f}   per unit "
               f"{cf['sized_per_unit']:+.4f}   max drawdown {cf['sized_dd']:+.2f}")
     print()
-    print(f"VERDICT: {ev['verdict']}")
+    for line in _verdict_lines(frozen, ev, verdict_path):
+        print(line)
     good = ev["table"].get(nr.GOOD)
     if good and good[1] <= 0:
         print("NOTE: good-day $/window is not positive. The agent multiplies an edge; it")
@@ -446,6 +568,19 @@ def _selftest() -> int:
     mix = [{"window": "W", "regime": nr.GOOD, "pnl": 0.48, "date": "2026-12-01"},
            {"window": "W", "regime": nr.CAUTIOUS, "pnl": -0.90, "date": "2026-12-01"}]
     assert evaluate(mix)["clusters"] == (1, 1)
+
+    # ONE look: the verdict is evaluated at the evaluation point and frozen there
+    day, upto = evaluation_cut(trades)
+    assert day == "2026-12-20" and len(upto) == 44, (day, len(upto))
+    with tempfile.TemporaryDirectory() as td:
+        vp = Path(td) / "news_verdict.json"
+        assert freeze_verdict(trades[:10], vp) is None and not vp.exists()
+        first = freeze_verdict(trades, vp)
+        assert first["state"] == "new" and first["verdict"].startswith("EARNS ITS KEEP")
+        flipped = [dict(t, pnl=-t["pnl"]) for t in trades]     # later data says INVERTED
+        assert evaluate(flipped)["verdict"].startswith("INVERTED")
+        again = freeze_verdict(flipped, vp)
+        assert again["state"] == "stored" and again["verdict"] == first["verdict"]
     print("selftest OK")
     return 0
 

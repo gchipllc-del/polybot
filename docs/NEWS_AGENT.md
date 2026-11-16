@@ -79,7 +79,21 @@ Exactly like every rule in this project: forward, on the paper ledger.
 **Pre-registered verdict:** the agent earns its keep only when, with ≥ 20 good-day and
 ≥ 20 cautious-day clusters, good days beat cautious days per window with a 95% interval
 clear of zero. Before that: COLLECTING. If cautious days come out *better*: INVERTED,
-meaning it is cutting size on the wrong days, and it gets switched off.
+meaning it is cutting size on the wrong days, and it gets switched off. Otherwise: NO
+DIFFERENCE.
+
+**It is evaluated once.** The evaluation point is fixed in advance: the first ET day by
+which both regimes have 20 clusters. The first report that reaches it applies the rule
+to the data through that day and freezes the result in `data/news_verdict.json`. Every
+later report prints that frozen verdict; the running table, interval and counterfactual
+it also prints are labelled *descriptive* and never re-test it. Re-checking a 95%
+interval on every report is many tests, not one: on null data with the report run
+daily, a decisive verdict showed up at some point in ~20% of runs instead of 5% (5% with
+the frozen verdict). The point depends on the ledger alone, not on when or how often the
+report runs, so a report first run months late, or after the file is lost, evaluates the
+same days. The file is never overwritten; if it is damaged, the report says so and shows
+the verdict recomputed at the same point. (This one-look rule was added after review on
+2026-11-16, the day the agent was registered, long before 20 cautious days could exist.)
 
 ## Kept deliberately out of scope
 

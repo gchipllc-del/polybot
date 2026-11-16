@@ -6,6 +6,7 @@ per window over at least MIN_CLUSTERS clusters of each. These tests pin the plac
 review found the code drifting from that rule. Fixtures go through the real
 vol_replay.ledger_rows join, the way `report` reads the paper ledger.
 """
+import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -149,3 +150,126 @@ def test_same_regime_trades_in_a_window_stay_one_observation():
                               (at + timedelta(minutes=10), nr.GOOD, -0.2, "B", 64100)]))
     assert ev["n_windows"] == 1 and ev["clusters"] == (1, 0)
     assert abs(ev["table"][nr.GOOD][1] - 0.1) < 1e-12
+
+
+# ── ONE look: the verdict is evaluated once and frozen (review #10) ───────────
+
+D0 = date(2027, 1, 4)                    # 100 ET days from here stay on EST
+
+
+def _null_days(n: int = 40) -> list:
+    """n ET days alternating good / cautious with the SAME P&L pattern: 20 + 20
+    clusters after 40 days, good minus cautious exactly 0 -> NO DIFFERENCE."""
+    return [(_utc(D0 + timedelta(days=i), 10), nr.GOOD if i % 2 == 0 else nr.CAUTIOUS,
+             0.05 * ((i // 2) % 3 - 1)) for i in range(n)]
+
+
+def _diverging_days(start: int = 40, n: int = 60) -> list:
+    """Later days on which cautious days run far worse than good ones."""
+    out = []
+    for i in range(start, start + n):
+        caut = i % 2 == 1
+        out.append((_utc(D0 + timedelta(days=i), 10), nr.CAUTIOUS if caut else nr.GOOD,
+                    (-0.20 if caut else 0.10) + 0.01 * (i % 4)))
+    return out
+
+
+def _report(monkeypatch, tmp_path, capsys, spec) -> str:
+    led = tmp_path / "paper_crypto15.jsonl"
+    led.write_text("".join(json.dumps(r) + "\n" for r in _rows(spec)), encoding="utf-8")
+    monkeypatch.setattr(vr, "LEDGER", led)
+    monkeypatch.setattr(na, "VERDICT_PATH", tmp_path / "news_verdict.json", raising=False)
+    monkeypatch.setattr(nr, "load_history", lambda *a, **k: [])
+    assert na.cmd_report() == 0
+    return capsys.readouterr().out
+
+
+def _verdict(out: str) -> str:
+    return next(line for line in out.splitlines() if line.startswith("VERDICT:"))
+
+
+def test_the_rule_would_flip_on_the_running_totals():
+    """The fixture the tests below rely on: at the evaluation point the rule says NO
+    DIFFERENCE; applied to everything collected 60 days later it says EARNS ITS KEEP."""
+    assert na.evaluate(_trades(_null_days()))["verdict"].startswith("NO DIFFERENCE")
+    late = na.evaluate(_trades(_null_days() + _diverging_days()))
+    assert late["clusters"] == (50, 50) and late["verdict"].startswith("EARNS ITS KEEP")
+
+
+def test_verdict_is_evaluated_once_and_frozen(monkeypatch, tmp_path, capsys):
+    """The report re-tested a fixed 95% interval on every run, so the first time noise
+    cleared zero it printed EARNS ITS KEEP or INVERTED (~20% of null runs checked daily,
+    not 5%). Now the first report at the evaluation point freezes the verdict and later
+    reports print that one, with the running numbers labelled descriptive."""
+    first = _report(monkeypatch, tmp_path, capsys, _null_days())
+    assert _verdict(first).startswith("VERDICT: NO DIFFERENCE"), _verdict(first)
+    later = _report(monkeypatch, tmp_path, capsys, _null_days() + _diverging_days())
+    assert _verdict(later).startswith("VERDICT: NO DIFFERENCE"), _verdict(later)
+    assert "descriptive" in later and "frozen" in later
+    vfile = tmp_path / "news_verdict.json"
+    rec = json.loads(vfile.read_text(encoding="utf-8"))
+    assert rec["verdict"].startswith("NO DIFFERENCE") and rec["clusters"] == [20, 20]
+    assert rec["eval_day_et"] == (D0 + timedelta(days=39)).isoformat()
+
+
+def test_frozen_file_is_never_rewritten(monkeypatch, tmp_path, capsys):
+    _report(monkeypatch, tmp_path, capsys, _null_days())
+    vfile = tmp_path / "news_verdict.json"
+    frozen = vfile.read_bytes()
+    for extra in (20, 40, 60):
+        _report(monkeypatch, tmp_path, capsys, _null_days() + _diverging_days(n=extra))
+        assert vfile.read_bytes() == frozen
+
+
+def test_the_evaluation_point_does_not_move_with_when_report_runs(monkeypatch, tmp_path,
+                                                                  capsys):
+    """A report first run 60 days after the gate was met evaluates the data through the
+    first ET day both regimes had MIN_CLUSTERS clusters - not everything since. So how
+    often (or when) the operator runs the report cannot pick the evaluation point."""
+    out = _report(monkeypatch, tmp_path, capsys, _null_days() + _diverging_days())
+    assert _verdict(out).startswith("VERDICT: NO DIFFERENCE"), _verdict(out)
+    rec = json.loads((tmp_path / "news_verdict.json").read_text(encoding="utf-8"))
+    assert rec["eval_day_et"] == (D0 + timedelta(days=39)).isoformat()
+    assert rec["clusters"] == [20, 20] and rec["trades"] == 40
+
+
+def test_collecting_writes_no_verdict(monkeypatch, tmp_path, capsys):
+    out = _report(monkeypatch, tmp_path, capsys, _null_days(30))
+    assert _verdict(out) == ("VERDICT: COLLECTING - 15 good-day and 15 cautious-day "
+                             "clusters (need 20 of each)")
+    assert not (tmp_path / "news_verdict.json").exists()
+
+
+def test_an_unreadable_verdict_file_is_left_alone(monkeypatch, tmp_path, capsys):
+    """A frozen verdict is a record: a damaged file is reported, never overwritten. The
+    verdict shown is recomputed at the SAME evaluation point - not a second look."""
+    vfile = tmp_path / "news_verdict.json"
+    vfile.write_text("{not json", encoding="utf-8")
+    out = _report(monkeypatch, tmp_path, capsys, _null_days() + _diverging_days())
+    assert _verdict(out).startswith("VERDICT: NO DIFFERENCE"), _verdict(out)
+    assert "NOT FROZEN" in out and "cannot be read" in out
+    assert vfile.read_text(encoding="utf-8") == "{not json"
+
+
+def test_freeze_verdict_states(tmp_path):
+    vp = tmp_path / "v.json"
+    assert na.freeze_verdict(_trades(_null_days(38)), vp) is None
+    assert not vp.exists()
+    first = na.freeze_verdict(_trades(_null_days()), vp, now=datetime(2027, 2, 13,
+                                                                       tzinfo=timezone.utc))
+    assert first["state"] == "new" and first["frozen_at"] == "2027-02-13T00:00:00+00:00"
+    stored = na.freeze_verdict(_trades(_null_days() + _diverging_days()), vp)
+    assert stored["state"] == "stored"
+    assert {k: v for k, v in stored.items() if k != "state"} == \
+        {k: v for k, v in first.items() if k != "state"}
+    assert na.load_verdict(vp)["verdict"] == first["verdict"]
+    assert na.load_verdict(tmp_path / "missing.json") is None
+
+
+def test_evaluation_cut_is_the_first_day_both_regimes_reach_the_gate():
+    day, upto = na.evaluation_cut(_trades(_null_days() + _diverging_days()))
+    assert day == (D0 + timedelta(days=39)).isoformat() and len(upto) == 40
+    assert na.evaluation_cut(_trades(_null_days(39))) == (None, [])
+    # unknown-regime days count toward neither regime
+    unk = [(_utc(D0 + timedelta(days=100 + i), 10), nr.UNKNOWN, 0.0) for i in range(30)]
+    assert na.evaluation_cut(_trades(_null_days(38) + unk))[0] is None
