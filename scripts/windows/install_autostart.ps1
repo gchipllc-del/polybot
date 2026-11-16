@@ -25,7 +25,12 @@ $tasks = @(
     # Hermes: daily bounded-optimizer review. READ-ONLY - it can only write proposals;
     # activating one always requires a human running `hermes.py apply <name>`.
     @{ Name = "PolybotHermes";     Args = "scripts\hermes.py review";
-       Every = 1440 }
+       Every = 1440 },
+    # News agent: hourly good-day / cautious-day regime (lib/news_regime.py). Writes
+    # data\news_regime.jsonl; the paper trader stamps each entry with it. Runs and
+    # exits, so it reads "Ready" between runs - that is normal, like PolybotHealth.
+    @{ Name = "PolybotNews";       Args = "scripts\news_agent.py run --quiet";
+       Every = 60 }
 )
 
 if ($Uninstall) {
@@ -67,12 +72,13 @@ foreach ($t in $tasks) {
 }
 
 Write-Host ""
-Write-Host "Done. All three run now, at every logon, and self-heal every 10 min if they die."
+Write-Host "Done. Every task runs now, at every logon, and on its repeat timer if it dies."
 Write-Host "  dashboards : http://127.0.0.1:5153  and  http://127.0.0.1:5154"
 Write-Host "  collector  : py scripts\stage0_collector.py report"
 Write-Host "  paper      : py scripts\paper_trader.py report    (forward-only, no real orders)"
 Write-Host "  shadow     : py scripts\shadow_book.py report"
-Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper"
+Write-Host "  news       : py scripts\news_agent.py status      (report: does caution pay?)"
+Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper,PolybotNews"
 Write-Host "  health     : py scripts\healthcheck.py           (add --repair to fix)"
 Write-Host "  diagnose   : py scripts\run_dashboards.py --doctor"
 Write-Host "  remove     : rerun this script with -Uninstall"

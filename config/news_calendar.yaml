@@ -1,0 +1,18 @@
+# news_calendar.yaml - scheduled market-moving releases for the news regime agent.
+#
+# Any `impact: high` event dated TODAY (US/Eastern calendar day) makes the whole day
+# CAUTIOUS - half size. Times are US/Eastern and are informational (the vote is per day).
+#
+# KEEP THIS CURRENT. It is the one input the agent cannot discover on its own, and an
+# empty list means the calendar layer abstains (the other layers still vote). Sources:
+#   FOMC meetings      federalreserve.gov/monetarypolicy/fomccalendars.htm (decision day
+#                      is the 2nd day of each meeting, statement at 14:00 ET)
+#   CPI / jobs report  bls.gov/schedule/news_release/  (CPI 08:30 ET, jobs 08:30 ET)
+#   PCE / GDP          bea.gov/news/schedule
+#
+# Only add dates you have checked against the source - a wrong date silently halves a
+# normal day. The entry below is from the Fed's published 2026 schedule; verify it.
+events:
+  - {date: "2026-12-09", time_et: "14:00", event: "FOMC rate decision", impact: high}
+  # - {date: "YYYY-MM-DD", time_et: "08:30", event: "CPI release", impact: high}
+  # - {date: "YYYY-MM-DD", time_et: "08:30", event: "Jobs report (NFP)", impact: high}

@@ -292,10 +292,30 @@ def check_model_integrity() -> None:
                             f"(bounds, conservation, identities, edge cases)")
 
 
+def check_news_regime() -> None:
+    """The news agent (lib/news_regime.py) is a SOFT dependency: when it is down the
+    paper trader stamps 'unknown' and keeps trading, so this can WARN but never FAIL."""
+    try:
+        from lib.news_regime import REGIME_LOG, current_regime
+    except Exception as e:  # noqa: BLE001
+        record(WARN, "news", f"news agent unavailable: {type(e).__name__}")
+        return
+    if not REGIME_LOG.exists():
+        record(WARN, "news", "news agent has never run - rerun install_autostart.ps1 "
+                             "(adds the hourly PolybotNews task)")
+        return
+    r = current_regime()
+    if r["regime"] == "unknown":
+        record(WARN, "news", r["why"][:120])
+    else:
+        record(OK, "news", f"regime {r['regime'].upper()} (size x{r['mult']}) - "
+                           f"{r['why'][:80]}")
+
+
 def check_selftests() -> None:
     """Every module ships a selftest; run them all. This is the post-pull smoke test."""
     mods = ["stage0_collector.py", "shadow_book.py", "paper_trader.py",
-            "diagnostics.py"]
+            "diagnostics.py", "news_agent.py"]
     for m in mods:
         try:
             r = subprocess.run([sys.executable, str(ROOT / "scripts" / m), "selftest"],
@@ -340,6 +360,7 @@ def main() -> int:
     check_depth_coverage()
     check_ledger_integrity()
     check_model_integrity()
+    check_news_regime()
     check_disk()
     if "--fast" not in sys.argv:
         check_selftests()

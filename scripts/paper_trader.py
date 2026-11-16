@@ -221,7 +221,22 @@ def _edge_fetcher(series: str, stage0_log: Path):
         return None
 
 
-def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> dict:
+def _regime_now(now=None) -> dict:
+    """The news agent's current regime (lib/news_regime.py), or UNKNOWN on any failure.
+    A STAMP only: it never changes what this trader does. CONTRACTS is 1, so 'half size'
+    cannot be traded on paper; instead every entry records the regime in force when it
+    opened, and scripts/news_agent.py report computes regime sizing as a counterfactual
+    on the very same trades - which is exactly how the agent has to earn its place."""
+    try:
+        from lib.news_regime import current_regime
+        r = current_regime(now=now)
+        return {"regime": r["regime"], "mult": r["mult"]}
+    except Exception:  # noqa: BLE001 - a broken news agent must never stop trading
+        return {"regime": "unknown", "mult": 0.5}
+
+
+def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
+              regime_fn=None) -> dict:
     import stage0_collector as s0
     rules, bands, fee_fn = _rules()
     p = path or LEDGER
@@ -229,6 +244,7 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
     now = now or datetime.now(timezone.utc)
     if depth_fn is None:
         depth_fn = _depth_fetcher()
+    regime = (regime_fn or _regime_now)()
 
     rows = _load(p)
     live = open_positions(rows)
@@ -293,6 +309,8 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
             if len(live) + opened >= MAX_CONCURRENT:
                 skipped["max_concurrent"] = skipped.get("max_concurrent", 0) + 1
                 continue
+            entry["regime"] = regime["regime"]       # news-agent stamp (see _regime_now)
+            entry["regime_mult"] = regime["mult"]
             new_rows.append(entry)
             added.add(key)
             per_window[(window, rule)] = per_window.get((window, rule), 0) + 1
@@ -318,7 +336,8 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None) -> di
     new_rows.extend(closes)
     _append(new_rows, p)
     return {"opened": opened, "closed": len(closes), "skipped": skipped,
-            "ungated": ungated, "open_now": len(open_positions(_load(p)))}
+            "ungated": ungated, "regime": regime["regime"],
+            "open_now": len(open_positions(_load(p)))}
 
 
 def run_loop() -> int:
@@ -331,7 +350,7 @@ def run_loop() -> int:
             sk = " ".join(f"{k}={v}" for k, v in c["skipped"].items())
             ug = f" UNGATED={c['ungated']}" if c.get("ungated") else ""
             print(f"[{_now_iso()}] opened={c['opened']} closed={c['closed']} "
-                  f"open_now={c['open_now']} {sk}{ug}")
+                  f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}")
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001
@@ -477,13 +496,19 @@ def _selftest() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "paper.jsonl"
-        c1 = run_cycle(get=fake_get, now=now, path=p, depth_fn=lambda t, s, pr: 100)
+        c1 = run_cycle(get=fake_get, now=now, path=p, depth_fn=lambda t, s, pr: 100,
+                       regime_fn=lambda: {"regime": "cautious", "mult": 0.5})
         # both rules in the <2min band fire (favorite 0.88 + longshot 0.14); the
         # fixture serves the SAME ticker under both series, so in-cycle dedup must
         # collapse it to exactly 2 positions, not 4.
         assert c1["opened"] == 2, c1
         assert c1["open_now"] == 2, c1
         assert c1["ungated"] == 0, c1       # depth known -> the gate actually ran
+        # every entry carries the news-agent regime in force when it opened - a
+        # stamp only: the cautious regime did NOT change the size or the count
+        opens = [r for r in _load(p) if r.get("t") == "open"]
+        assert all(r["regime"] == "cautious" and r["regime_mult"] == 0.5 for r in opens)
+        assert all(r["contracts"] == CONTRACTS for r in opens)
         c2 = run_cycle(get=fake_get, now=now, path=p, depth_fn=lambda t, s, pr: 100)
         assert c2["opened"] == 0, c2        # no duplicate entries
 
