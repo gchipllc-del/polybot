@@ -44,17 +44,37 @@ def test_real_fill_checked_edge_is_recognised():
     assert rows[0]["status"] == "good" and rows[0]["verdict"].startswith("EDGE")
 
 
+def _hold(rule, event, won, era="v4 gated", venue="crypto", ask=0.85):
+    """A 1-lot held to settlement: a win pays 1-ask-fee, a loss costs ask+fee (1c at 85c)."""
+    pnl = (1 - ask - 0.01) if won else (-ask - 0.01)
+    return {"rule": rule, "venue": venue, "event": event, "pnl": pnl, "won": won,
+            "ask": ask, "ts": 1.0, "era": era}
+
+
 def test_one_family_correction_across_all_rules():
-    """The same 40-event marginal edge that passes alone must not pass when it is one of
-    many rules tested at once."""
-    marginal = [_t("M", f"M-E{i}", 0.14 if (i % 100) < 94 else -0.86) for i in range(40)]
+    """The family must DECIDE the verdict: a 100-event edge that passes alone (85c, 8
+    losses: exact p = 0.049 <= q = 0.10) must not pass as one of 31 rules tested at once
+    (BH rank-1 bar 0.10/31 = 0.0032). Same record, same p - only the family differs. (A
+    40-event fixture could never be EDGE, so it pinned the event floor, not the family.)"""
+    marginal = [_hold("M", f"M-E{i}", i >= 8) for i in range(100)]
     alone = cc.score_rules(marginal)[0]
-    crowd = marginal + [t for k in range(30) for t in
-                        [_t(f"N{k}", f"N{k}-E{i}", 0.02 if i % 2 else -0.03, ask=0.5)
-                         for i in range(40)]]
+    assert alone["verdict"].startswith("EDGE") and alone["status"] == "good"
+    crowd = marginal + [_hold(f"N{k}", f"N{k}-E{i}", i >= 14)
+                        for k in range(30) for i in range(100)]
     in_crowd = next(r for r in cc.score_rules(crowd) if r["rule"] == "M")
     assert alone["decision"]["p"] == pytest.approx(in_crowd["decision"]["p"])
-    assert not in_crowd["verdict"].startswith("EDGE")
+    assert in_crowd["status"] != "good" and in_crowd["verdict"] == "no edge yet"
+
+
+def test_the_family_takes_the_fill_checked_record_not_the_all_era_one():
+    """5,000 glowing PRE-FIX trades and 150 ordinary fill-checked ones: the all-era p is
+    tiny, the fill-checked one is not. Only the fill-checked record may enter the family
+    - or the live-money verdict rests on fills that never happened."""
+    pre = [_hold("H", f"H-P{i}", i % 100 < 94, era="pre-fix") for i in range(5000)]
+    gated = [_hold("H", f"H-G{i}", i >= 20) for i in range(150)]
+    r = cc.score_rules(pre + gated)[0]
+    assert r["all"]["p"] < 1e-6 and r["decision"]["n"] == 150 and r["decision"]["mean"] > 0
+    assert r["status"] != "good" and not r["verdict"].startswith("EDGE")
 
 
 def test_negative_rules_sort_last_and_edges_first():
@@ -121,6 +141,117 @@ def test_labels_are_inserted_as_text_never_html():
     assert "insertAdjacentHTML" not in cc._PAGE
 
 
+T0 = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+def _isolate(tmp_path, monkeypatch):
+    import sleeve_paper as sp
+    from lib import news_regime as nr
+    for mod, name, file in ((cc, "CRYPTO_LEDGER", "crypto.jsonl"), (cc, "HEALTH_LOG", "hc.log"),
+                            (cc, "SCREEN", "screen.json"), (sp, "RULES", "rules.jsonl"),
+                            (sp, "LEDGER", "ledger.jsonl"), (sp, "HEARTBEAT", "hb.json"),
+                            (nr, "REGIME_LOG", "regime.jsonl")):
+        monkeypatch.setattr(mod, name, tmp_path / file)
+    return sp
+
+
+def _sleeve_rule(sp, name, losses, n=100, ask=0.90, lots=10):
+    """A registered 10-lot favorite rule with n settled events after named_at."""
+    sp.register([{"name": name, "series": f"KX{name}", "band": "any", "side": "favorite",
+                  "lo": 0.85, "hi": 0.95, "contracts": lots}], sp.RULES, T0)
+    rows = []
+    for i in range(n):
+        o = {"t": "open", "ts": (T0 + timedelta(days=1, hours=i)).isoformat(),
+             "ticker": f"KX{name}-E{i:03d}-A", "rule": name, "event": f"KX{name}-E{i:03d}",
+             "series": f"KX{name}", "side": "yes", "price": ask, "contracts": lots,
+             "fee": sp.kalshi_fee(ask, lots), "depth": 40}
+        rows += [o, sp.settle(o, "yes" if i >= losses else "no")]
+    sp._append(sp.LEDGER, rows)
+
+
+def _crypto_ledger(path, rules=3, n=40, losses=7, glowing_prefix=0):
+    """Forward crypto rules with n fill-checked (v4 gated) windows each - ordinary records.
+    glowing_prefix adds that many PRE-FIX windows per rule, all wins - the real ledger's
+    shape, where the pre-fix era looked great on fills the book could not give."""
+    rows = []
+    for j in range(rules):
+        for i in range(glowing_prefix):
+            tk = f"KXBTC15M-26AUG{j:02d}{i:04d}-B{j}"
+            rows.append({"t": "open", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "contracts": 1, "fee": 0.01})       # no v: pre-fix
+            rows.append({"t": "close", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "won": True, "pnl": 0.14})
+        for i in range(n):
+            tk, won = f"KXBTC15M-26SEP{j:02d}{i:04d}-B{j}", i >= losses
+            rows.append({"t": "open", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "contracts": 1, "fee": 0.01, "v": 4, "depth": 20})
+            rows.append({"t": "close", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "won": won, "pnl": 0.14 if won else -0.86})
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _both_verdicts(sp, name, capsys):
+    """(the `sleeve_paper.py report` line, the command center's verdict) for one rule."""
+    sp.cmd_report()
+    line = next(l.strip() for l in capsys.readouterr().out.splitlines()
+                if l.strip().startswith(name + " "))
+    cc._CACHE.update(t=0.0, payload=None)
+    return line, next(r for r in cc.build_payload()["rules"] if r["rule"] == name)["verdict"]
+
+
+def test_report_and_command_center_correct_over_one_family(tmp_path, monkeypatch, capsys):
+    """The report once corrected over the sleeve rules alone and the command center over
+    crypto + sleeves, so the same trades read EDGE on one and 'no edge yet' on the other.
+    S_FAV90 (100 events at 90c, 4 losses: exact p = 0.039) is EDGE only on its own."""
+    sp = _isolate(tmp_path, monkeypatch)
+    _sleeve_rule(sp, "S_FAV90", losses=4)
+    line, verdict = _both_verdicts(sp, "S_FAV90", capsys)
+    assert line.endswith("EDGE - survives the forward family correction")      # m = 1
+    assert verdict.startswith("EDGE")
+    _crypto_ledger(cc.CRYPTO_LEDGER)                   # three more forward rules: m = 4
+    line, verdict = _both_verdicts(sp, "S_FAV90", capsys)
+    assert line.endswith("positive, not significant") and verdict == "no edge yet"
+    # the crypto members are judged on their FILL-CHECKED record on both surfaces: a
+    # glowing pre-fix era must not make them survive and loosen S_FAV90's threshold
+    _crypto_ledger(cc.CRYPTO_LEDGER, glowing_prefix=400)
+    line, verdict = _both_verdicts(sp, "S_FAV90", capsys)
+    assert line.endswith("positive, not significant") and verdict == "no edge yet"
+    cc._CACHE.update(t=0.0, payload=None)
+    dec = {r["rule"]: r["decision"] for r in cc.build_payload()["rules"]
+           if r["venue"] == "crypto"}
+    assert cc.crypto_family() == [dec[k] for k in sorted(dec)]
+
+
+def test_retiring_rules_never_raises_another_rules_verdict(tmp_path, monkeypatch, capsys):
+    """Retirement is decided after seeing results: dropping the retired rules' tests from
+    the family shrank m and turned R0 into EDGE with no new trade. Their records stay in
+    the family; they are just not shown."""
+    sp = _isolate(tmp_path, monkeypatch)
+    for j in range(5):                                 # R0 p = 0.039, R1-R4 ordinary
+        _sleeve_rule(sp, f"R{j}", losses=4 if j == 0 else 10)
+    before = _both_verdicts(sp, "R0", capsys)
+    assert before[0].endswith("positive, not significant") and before[1] == "no edge yet"
+    monkeypatch.setattr(sys, "argv", ["sleeve_paper.py", "retire", "R1", "R2", "R3", "R4"])
+    assert sp.main() == 0
+    capsys.readouterr()
+    assert _both_verdicts(sp, "R0", capsys) == before
+    cc._CACHE.update(t=0.0, payload=None)
+    assert [r["rule"] for r in cc.build_payload()["rules"]] == ["R0"]   # retired: not shown
+
+
+def test_dashboard_never_counts_a_trade_opened_before_named_at(tmp_path, monkeypatch):
+    sp = _isolate(tmp_path, monkeypatch)
+    sp.register([{"name": "R", "series": "KXA", "band": "any", "side": "favorite",
+                  "lo": 0.80, "hi": 0.90}], sp.RULES, T0)
+    o = {"t": "open", "ts": (T0 - timedelta(minutes=1)).isoformat(), "ticker": "KXA-E1-A",
+         "rule": "R", "event": "KXA-E1", "series": "KXA", "side": "yes", "price": 0.85,
+         "fee": 0.01, "depth": 5}
+    sp._append(sp.LEDGER, [o, sp.settle(o, "yes")])
+    cc._CACHE.update(t=0.0, payload=None)
+    p = cc.build_payload()
+    assert p["rules"][0]["decision"]["n"] == 0 and p["kpi"]["events"] == 0
+
+
 def test_a_rule_spanning_many_series_scores_and_counts(tmp_path, monkeypatch):
     """One hypothesis over seven cities is one rule: the payload must count its series
     and label it - a list-valued series once crashed the series count."""
@@ -151,3 +282,22 @@ def test_a_rule_spanning_many_series_scores_and_counts(tmp_path, monkeypatch):
     assert r["series"] == "KXHIGHNY +2 more" and r["decision"]["n"] == 3
     assert abs(r["decision"]["mean"] - 0.018) < 1e-9          # per contract: 2c - 0.2c fee
     assert abs(r["decision"]["p"] - 0.982 ** 3) < 1e-9          # exact: 3/3 is luck
+
+
+def test_scores_are_reused_until_a_record_changes(monkeypatch):
+    """The page rebuilds on every poll; exact tails are costly on long records. A record
+    is scored once until one of its trades settles, and a sleeve rule (whose decision
+    record IS its full record) is scored once, not twice."""
+    import sleeve_paper as sp
+    calls = []
+    real = sp.forward_stats
+    monkeypatch.setattr(sp, "forward_stats", lambda ts: calls.append(len(ts)) or real(ts))
+    cc._STATS_MEMO.clear()
+    trades = [dict(_t("S1", f"E{i}", 0.14 if i % 10 else -0.86, venue="sleeves"),
+                   pnl_pc=0.14 if i % 10 else -0.86, fee_pc=0.01) for i in range(60)]
+    first = cc.score_rules(trades)
+    assert len(calls) == 1                             # all == decision: scored once
+    assert cc.score_rules(trades) == first and len(calls) == 1      # reused
+    more = trades + [dict(trades[0], event="E999")]
+    cc.score_rules(more)
+    assert len(calls) == 2                             # a new settlement: rescored

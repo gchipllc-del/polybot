@@ -75,7 +75,12 @@ Forward paper is the only scoreboard. Each sleeve gets a small family of
 
 Every forward rule goes through the same fill-depth gate as the crypto paper trader, one
 bet per event, and the news regime stamp. The forward family is corrected with BH
-across *all* paper rules at verdict time, so adding sleeves never lowers the bar.
+across *all* paper rules at verdict time, so adding sleeves never lowers the bar. "All"
+means every sleeve rule, RETIRED ones included, plus the crypto rules on their
+fill-checked trades, and `sleeve_paper.py report` and the command center correct over
+that same family. Retirement is decided after seeing results, so a retired rule is no
+longer shown but its record stays in the correction: retiring rules can never raise
+another rule's verdict.
 
 ## Testing an outside method (e.g. a friend's 97-99c favorites)
 
@@ -93,16 +98,32 @@ events (one bet per city-day) and widen the false-discovery family seven-fold; t
 rule reaches 100 events in about two weeks. `report` still prints a per-series line, as
 description, never as a test.
 
+**Pooled series are assumed independent.** Each series' event counts as its own bet, and
+the exact p-value treats those bets as independent. That holds for series that settle on
+different things (cities far apart are close to it), and fails for series on one
+underlying: pool two S&P 500 series, or a BTC range series with a BTC above/below series,
+and one bust day counts as two losses while calm days count twice - p comes out too
+small. Never pool those; `register-rule` and `report` print this assumption whenever a
+rule spans more than one series.
+
 **Order size is part of the rule (default 10 contracts).** Kalshi rounds the fee per
 ORDER up to the cent. A 1-lot at 99c pays a 1c fee on a 1c win: it cannot profit even
 if it never loses. At 10 contracts the fee is about 0.1-0.2c per contract. Rules
-registered before sizes were stored keep their 1-lot definition.
+registered before sizes were stored keep their 1-lot definition. A sized order is booked
+entirely at the ask, so the fill gate needs all of its contracts offered AT the ask; size
+one tick worse does not count (the gate's one-tick tolerance for quote/book skew applies
+only to the legacy 1-lots).
 
 **Exact odds, not a normal approximation.** Under the house rule (one bet per event, held
 to settlement) every outcome is a win or a loss that differ by exactly $1 per contract,
 so a rule's record is decided by how many trades lost. With no edge, a trade at ask A and
 fee f loses with probability 1-(A+f); the p-value is the Poisson-binomial chance of a
-record this good anyway. For near-certain favorites this matters a great deal:
+record this good anyway, computed exactly (a dynamic program over the trades) for every
+favorite or longshot rule up to thousands of events. Only past that work budget -
+mid-price rules with thousands of events, whose loss count is nearly symmetric - is a
+normal limit used, corrected for skewness and within 1% of exact at p >= 0.002. (A plain
+normal is 15-45% off at p ~ 0.001 for favorites and longshots.) For near-certain
+favorites this matters a great deal:
 
 | forward record, 98c, 10-lot | chance with NO edge | verdict |
 |---|---|---|

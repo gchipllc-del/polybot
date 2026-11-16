@@ -18,8 +18,10 @@ count, and a rule is never edited - it can only be retired by a later row. Two s
 HOW IT TRADES - the house realism, shared code where it exists:
   * enter at the ASK on the rule's side, pay the real ceil-to-cent Kalshi fee
   * the fill gate: refuse when the captured order book has no liftable size behind the
-    quote (shadow_book.liftable_depth - the parser fixed 2026-09-25); entries whose depth
-    lookup failed are admitted but COUNTED as ungated, never hidden
+    quote (shadow_book.liftable_depth - the parser fixed 2026-09-25); a sized order needs
+    its whole size AT the ask, the price it is booked at (the book's one-tick skew
+    tolerance is for 1-lots only); entries whose depth lookup failed are admitted but
+    COUNTED as ungated, never hidden
   * ONE bet per (event, rule): every strike of an event resolves on one outcome
   * the rule's own ORDER SIZE (10 contracts for every rule registered since sizes were
     stored): Kalshi rounds the fee per order UP to the cent, so a 1-lot at 99c pays a 1c
@@ -29,12 +31,16 @@ HOW IT TRADES - the house realism, shared code where it exists:
 
 ONE HYPOTHESIS = ONE RULE = ONE TEST. A rule may span many series (a friend's method on
 seven weather cities is one rule); splitting it per series would multiply the tests and
-divide each one's sample.
+divide each one's sample. Pooling ASSUMES the series settle independently: each series'
+event is its own bet, so series on one underlying (two S&P 500 series) must never be
+pooled - a shared outcome would count twice and the exact p would be too small. `report`
+and `register-rule` say so whenever a rule spans several series.
 
 HOW IT IS JUDGED - `report`: per rule, the forward record after named_at, per EVENT and
 per CONTRACT, with EXACT p-values (forward_stats: a favorite that hasn't lost yet is not
-proof). Benjamini-Hochberg runs across ALL forward rules at once, so adding sleeves never
-lowers the bar.
+proof). Benjamini-Hochberg runs across ALL forward rules at once - the command center's
+family: every sleeve rule, RETIRED ones included, and the crypto rules on fill-checked
+trades - so adding sleeves never lowers the bar, and retiring one never raises another.
 
   py scripts/sleeve_paper.py register-probes [--top 20]   # after sleeve_scan discover
   py scripts/sleeve_paper.py register-nominations         # after sleeve_scan screen
@@ -188,6 +194,16 @@ def active_rules(path: Path = RULES) -> dict[str, dict]:
 
 def all_registered(path: Path = RULES) -> set[str]:
     return {r["name"] for r in _load_jsonl(path) if r.get("t") == "rule" and r.get("name")}
+
+
+def registered_rules(path: Path = RULES) -> dict[str, dict]:
+    """name -> rule for EVERY registered name, retired ones included (first registration
+    wins, as in active_rules)."""
+    rules: dict[str, dict] = {}
+    for r in _load_jsonl(path):
+        if r.get("t") == "rule" and r.get("name") and r["name"] not in rules:
+            rules[r["name"]] = r
+    return rules
 
 
 def series_of(rule: dict) -> list[str]:
@@ -445,27 +461,74 @@ def _norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
+PB_EXACT_STEPS = 3_000_000    # the exact DP's work budget, n * min(k, n-k): ~0.2 s
+
+
+def _pb_exact(n: int, k: int) -> bool:
+    """Whether the exact DP runs for P(K <= k) over n trades. It costs n * min(k, n-k)
+    steps: always up to 200 of the rarer outcome, and beyond that within PB_EXACT_STEPS -
+    favorite and longshot rules (a skewed K, where approximations go wrong) to thousands
+    of events. Past it, in practice mid-price rules with thousands of events (nearly
+    symmetric), the skewness-corrected normal is used and a refresh stays fast."""
+    r = min(k, n - k)
+    return r <= 200 or n * r <= PB_EXACT_STEPS
+
+
+def _pb_head(qs: list[float], m: int) -> list[float]:
+    """[P(K=0), ..., P(K=m)] exactly, by dynamic programming truncated at m."""
+    dp = [1.0] + [0.0] * m
+    for q in qs:
+        r = 1.0 - q
+        dp = [dp[0] * r] + [a * r + b * q for a, b in zip(dp[1:], dp)]
+    return dp
+
+
+def _pb_skew_cdf(qs: list[float], k: int) -> float:
+    """P(K <= k) by the normal limit with a continuity correction AND a skewness
+    correction (the first Edgeworth term). The plain normal is 15-45% off at p ~ 1e-3
+    for favorites and longshots, whose K is skewed (anti-conservative for longshots);
+    corrected, the error where _pb_exact hands over is under 1% at p >= 2e-3 and a few
+    percent at 5e-4."""
+    mu = sum(qs)
+    var = sum(q * (1.0 - q) for q in qs)
+    if var <= 0:
+        return 1.0 if k + 0.5 >= mu else 0.0
+    sd = math.sqrt(var)
+    g = sum(q * (1.0 - q) * (1.0 - 2.0 * q) for q in qs) / sd ** 3
+    x = (k + 0.5 - mu) / sd
+    phi = math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+    return min(1.0, max(0.0, _norm_cdf(x) + g * (1.0 - x * x) * phi / 6.0))
+
+
 def _pb_cdf(qs: list[float], k: int) -> float:
     """P(K <= k), K = the number of successes among independent Bernoulli(q_i): the
     Poisson-binomial CDF, exact by dynamic programming (truncated at k, or run from the
-    other side when that is shorter). Past 200 of each outcome the normal limit is used,
-    with a continuity correction - by then it is accurate and the exact sum is slow."""
+    other side when that is shorter) wherever _pb_exact allows; the skewness-corrected
+    normal past it."""
     n = len(qs)
     if k < 0:
         return 0.0
     if k >= n:
         return 1.0
-    if min(k, n - k) > 200:
-        var = sum(q * (1.0 - q) for q in qs)
-        return _norm_cdf((k + 0.5 - sum(qs)) / math.sqrt(var)) if var > 0 else 1.0
+    if not _pb_exact(n, k):
+        return _pb_skew_cdf(qs, k)
     if k > n - k:                       # P(K <= k) = 1 - P(n-K <= n-k-1)
         return min(1.0, max(0.0, 1.0 - _pb_cdf([1.0 - q for q in qs], n - k - 1)))
-    dp = [1.0] + [0.0] * k
-    for q in qs:
-        for j in range(k, 0, -1):
-            dp[j] = dp[j] * (1.0 - q) + dp[j - 1] * q
-        dp[0] *= 1.0 - q
-    return min(1.0, max(0.0, sum(dp)))
+    return min(1.0, max(0.0, sum(_pb_head(qs, k))))
+
+
+def _pb_tails(qs: list[float], k: int) -> tuple[float, float]:
+    """(P(K <= k), P(K >= k)) for 0 <= k <= n: forward_stats' p and p_neg, from ONE
+    exact pass (half the cost of two _pb_cdf calls - a refresh scores every rule)."""
+    n = len(qs)
+    if not _pb_exact(n, k):
+        return _pb_skew_cdf(qs, k), 1.0 - _pb_skew_cdf(qs, k - 1)
+    flip = k > n - k                    # run from the shorter side: W = n - K
+    head = _pb_head([1.0 - q for q in qs] if flip else qs, n - k if flip else k)
+    inner = sum(head[:-1])              # P(K <= k-1), or P(W <= n-k-1) = P(K >= k+1)
+    total = inner + head[-1]            # P(K <= k),   or P(W <= n-k)   = P(K >= k)
+    lo, hi = (1.0 - inner, total) if flip else (total, 1.0 - inner)
+    return min(1.0, max(0.0, lo)), min(1.0, max(0.0, hi))
 
 
 def _house_shaped(t: dict) -> bool:
@@ -485,7 +548,9 @@ def forward_stats(trades: list[dict]) -> dict:
     house rule - one bet per (event, rule), held to settlement - every outcome is a win or
     a loss that differ by exactly $1 per contract, so a rule's total is decided by HOW
     MANY trades lost. With no edge, a trade at ask A and fee f loses with probability
-    1-(A+f), so both p-values are exact Poisson-binomial tails:
+    1-(A+f), so both p-values are exact Poisson-binomial tails (_pb_tails; past the exact
+    DP's work budget - mid-price rules with thousands of events - a skewness-corrected
+    normal, within 1% of exact at p >= 0.002):
         p      = P(this few losses or fewer | no edge)   evidence the rule makes money
         p_neg  = P(this many losses or more | no edge)   evidence it loses money
     A normal approximation goes badly wrong on 97-99c favorites, where losses are rare and
@@ -507,9 +572,11 @@ def forward_stats(trades: list[dict]) -> dict:
     if n == 0:
         p = p_neg = 1.0
     elif all(len(v) == 1 for v in ev.values()) and all(_house_shaped(t) for t in rows):
-        qs = [1.0 - min(0.999, max(0.001, t["ask"] + t["fee_pc"])) for t in rows]
+        # [0, 1], not [0.001, 0.999]: a 1-lot at 99c pays a 1c fee, so with no edge it
+        # cannot lose (q = 0) - a 0.001 floor shrank p by 0.999 per such win, for nothing
+        qs = [1.0 - min(1.0, max(0.0, t["ask"] + t["fee_pc"])) for t in rows]
         k = sum(1 for t in rows if not t["won"])
-        p, p_neg = _pb_cdf(qs, k), 1.0 - _pb_cdf(qs, k - 1)
+        p, p_neg = _pb_tails(qs, k)
     elif n >= 2:
         from sleeve_scan import p_value
         se = (hi - m) / 1.96
@@ -565,13 +632,32 @@ def trades_of(rows: list[dict], rules: dict[str, dict]) -> dict[str, list[dict]]
     return out
 
 
-def evaluate(rows: list[dict], rules: dict[str, dict]) -> list[dict]:
+def retired_stats(rows: list[dict], path: Path = RULES) -> list[dict]:
+    """forward_stats of every RETIRED rule's record after its named_at. Never shown, but
+    kept in the false-discovery family: retiring is decided after seeing results, and
+    dropping those tests would loosen the bar for every rule still running."""
+    live = active_rules(path)
+    gone = {n: r for n, r in registered_rules(path).items() if n not in live}
+    return [forward_stats(ts) for _, ts in sorted(trades_of(rows, gone).items())]
+
+
+def family_extra(rows: list[dict], path: Path = RULES) -> list[dict]:
+    """The rest of the ONE forward family the command center corrects over: the retired
+    sleeve rules' records and the crypto rules' fill-checked records (built by the command
+    center's own code - a plain module; Flask loads only when its server starts)."""
+    from lib.command_center import crypto_family
+    return retired_stats(rows, path) + crypto_family()
+
+
+def evaluate(rows: list[dict], rules: dict[str, dict], extra_stats=()) -> list[dict]:
     """Per rule: closed trades after named_at, per EVENT and per CONTRACT, exact p-values
-    (forward_stats), BH across every rule with enough events."""
+    (forward_stats), BH across every rule with enough events - these rules plus
+    extra_stats, the forward_stats of every other member of the forward family (retired
+    and crypto rules: family_extra). Only `rules` are classified and returned."""
     by_rule = trades_of(rows, rules)
     names = sorted(rules)
     stats = [forward_stats(by_rule[nm]) for nm in names]
-    keep = survivors(stats)
+    keep = survivors(stats + list(extra_stats))     # rules come first: index i is names[i]
     out = []
     for i, name in enumerate(names):
         st, rule, ts = stats[i], rules[name], by_rule[name]
@@ -603,7 +689,8 @@ def cmd_report() -> int:
         print("no rules registered. Run: py scripts/sleeve_scan.py discover, then")
         print("py scripts/sleeve_paper.py register-probes")
         return 0
-    res = evaluate(rows, rules)
+    extra = family_extra(rows, RULES)
+    res = evaluate(rows, rules, extra)
     hb = json.loads(HEARTBEAT.read_text(encoding="utf-8")) if HEARTBEAT.exists() else {}
     print(f"{len(rules)} active rules on "
           f"{len({x for r in rules.values() for x in series_of(r)})} "
@@ -622,11 +709,25 @@ def cmd_report() -> int:
             print("      by series (descriptive, not tested): " + "  ".join(
                 f"{k} {n}ev {v:+.2f}" for k, (n, v) in r["by_series"].items()))
     print()
+    pooled = sorted(n for n, r in rules.items() if len(series_of(r)) > 1)
+    if pooled:
+        more = f" +{len(pooled) - 3} more" if len(pooled) > 3 else ""
+        print(f"POOLED SERIES ARE ASSUMED INDEPENDENT ({', '.join(pooled[:3])}{more}): a "
+              f"pooled rule counts")
+        print("each series' event as its own bet, so its p holds only if those series settle")
+        print("independently. Series on one underlying (two S&P 500 series, a BTC range and a")
+        print("BTC above/below series) share outcomes: one bust day counts twice, p too small.")
+        print()
+    testable = (sum(r["events"] >= MIN_TESTABLE_EVENTS for r in res)
+                + sum(s_["n"] >= MIN_TESTABLE_EVENTS for s_ in extra))
     print("c/ct = cents per contract per event, after fees. p = the EXACT chance of a")
     print("record this good with no edge (a favorite that hasn't lost yet is not proof).")
-    print("Benjamini-Hochberg runs across ALL forward rules - adding sleeves never lowers")
-    print("the bar. EDGE needs 100+ events AND survival of that correction. Live money")
-    print("stays off until a rule earns EDGE here.")
+    print("Benjamini-Hochberg runs across ALL forward rules, the command center's family:")
+    print("these, the retired rules' records and the crypto rules' fill-checked records -")
+    print(f"{testable} rules with {MIN_TESTABLE_EVENTS}+ events now. Adding sleeves never "
+          f"lowers the bar, and retiring")
+    print("a rule never raises another's verdict. EDGE needs 100+ events AND survival of")
+    print("that correction. Live money stays off until a rule earns EDGE here.")
     print("=" * 78)
     return 0
 
@@ -812,6 +913,10 @@ def main() -> int:
               f"{rule['lo']:g}-{rule['hi']:g}, band {rule['band']}{win}, "
               f"{rule['contracts']} contracts/order, on {len(series)} series: "
               f"{', '.join(series)}")
+        if len(series) > 1:
+            print("NOTE: each series' event is its own bet - the exact p ASSUMES these series")
+            print("settle independently. Never pool series on one underlying (e.g. two S&P 500")
+            print("series): their shared outcomes would count twice.")
         return 0
     if cmd == "retire" and len(args) > 1:
         live = active_rules(RULES)
