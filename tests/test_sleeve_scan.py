@@ -106,3 +106,29 @@ def test_calibration_summary_excludes_final_band(tmp_path):
     cal = ss.calibration_by_category(entries)
     total = sum(v[0] for buckets in cal.values() for v in buckets.values())
     assert total == sum(1 for e in entries if e["band"] != "final")
+
+
+def test_final_hours_backfill_fetches_minute_candles_for_the_last_hours(tmp_path, monkeypatch):
+    """A last-hour entry cannot be tested on hourly candles (the final bar's close IS the
+    settled price), so --final-hours asks for 1-minute candles over the last H hours."""
+    import history_backfill as hb
+    monkeypatch.setattr(ss, "SLEEVE_DIR", tmp_path)
+    monkeypatch.setattr(ss, "CATALOG", tmp_path / "catalog.json")
+    monkeypatch.setattr(hb, "SLEEP_S", 0)
+    calls = []
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            return {"markets": [{"ticker": "KXT-26NOV16H19-T45", "event_ticker": "KXT-26NOV16H19",
+                                 "result": "no", "open_time": "2026-11-16T10:00:00Z",
+                                 "close_time": "2026-11-17T00:00:00Z"}], "cursor": None}
+        calls.append(params)
+        return {"candlesticks": [{"end_period_ts": 1, "yes_bid": {"close": 1},
+                                  "yes_ask": {"close": 2}}]}
+
+    assert ss.cmd_backfill(["KXT"], 5, get=get, final_hours=2) == 0
+    from datetime import datetime, timezone
+    close = int(datetime(2026, 11, 17, tzinfo=timezone.utc).timestamp())
+    assert calls == [{"period_interval": 1, "start_ts": close - 7200, "end_ts": close}]
+    out = tmp_path / "final" / "KXT.jsonl"
+    assert out.exists() and not (tmp_path / "KXT.jsonl").exists()   # kept out of screen

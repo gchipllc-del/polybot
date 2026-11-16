@@ -20,12 +20,17 @@ running it would actually have lived through:
 
   py scripts/strategy_check.py favorites --lo 0.97 --hi 0.99 --contracts 10 \\
       --file data/backfill_weather.jsonl
+  py scripts/strategy_check.py favorites --lo 0.97 --hi 0.99 --max-hours 1 \\
+      --one-per-event --file data/sleeves/final          # a folder, or a,b,c files
   py scripts/strategy_check.py selftest
 
 Entry rule ("favorites"): the FIRST moment a side's ask sits in [lo, hi] (inclusive), on a
 formed book, buy `contracts` of that side at that ask; hold to settlement. One entry per
 market. Optional --min-hours / --max-hours restrict entries by time before close.
-Streams the file: a 3M-candle backfill never has to fit in memory.
+--one-per-event keeps only each event's FIRST entry - exactly what the forward paper
+trader does - and makes the p-values exact (sleeve_paper.forward_stats). Last-hour tests
+need 1-minute candles: `sleeve_scan.py backfill --final-hours 2` (it warns otherwise).
+Streams the files: a 3M-candle backfill never has to fit in memory.
 """
 from __future__ import annotations
 
@@ -60,6 +65,8 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
     markets: dict[str, dict] = {}
     entries: dict[str, dict] = {}
     orphans = 0
+    last: dict[str, float] = {}
+    gaps = [0, 0]                       # [under an hour, an hour or more] between candles
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             try:
@@ -84,6 +91,9 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
                     ts = float(ts)
                 except (TypeError, ValueError):
                     continue
+                if tk in last and ts > last[tk]:
+                    gaps[ts - last[tk] >= 3600] += 1
+                last[tk] = ts
                 if tk in entries and entries[tk]["ts"] <= ts:
                     continue                       # first touch already recorded
                 yb, ya = _ohlc(d, "yes_bid", "close"), _ohlc(d, "yes_ask", "close")
@@ -108,7 +118,43 @@ def scan(path: Path, lo: float, hi: float, min_h: float = 0.0, max_h: float = 1e
                     (side == "no" and t_hi is not None and t_hi >= yb - 1e-9))
                 entries[tk] = {"ts": ts, "side": side, "ask": ask, "hours": hours,
                                "trade_ok": traded}
-    return {"markets": markets, "entries": entries, "orphans": orphans}
+    return {"markets": markets, "entries": entries, "orphans": orphans, "gaps": gaps}
+
+
+def expand_files(spec: str) -> list[Path]:
+    """'a.jsonl,b.jsonl' or a folder (every *.jsonl in it) -> files, in order."""
+    out: list[Path] = []
+    for part in (x.strip() for x in spec.split(",")):
+        if not part:
+            continue
+        q = Path(part)
+        out += sorted(q.glob("*.jsonl")) if q.is_dir() else [q]
+    return out
+
+
+def scan_many(paths: list[Path], lo: float, hi: float, min_h: float = 0.0,
+              max_h: float = 1e9) -> dict:
+    """scan() over several files (one per series), merged. Tickers never repeat across
+    series, and each file holds its own market rows before their candles."""
+    res = {"markets": {}, "entries": {}, "orphans": 0, "gaps": [0, 0]}
+    for path in paths:
+        r = scan(path, lo, hi, min_h, max_h)
+        res["markets"].update(r["markets"])
+        res["entries"].update(r["entries"])
+        res["orphans"] += r["orphans"]
+        res["gaps"] = [a + b for a, b in zip(res["gaps"], r["gaps"])]
+    return res
+
+
+def first_per_event(trades: list[dict]) -> list[dict]:
+    """Each event's FIRST entry only - the forward paper trader's one bet per event."""
+    seen: set = set()
+    out = []
+    for t in sorted(trades, key=lambda x: (x["ts"], x["ticker"])):
+        if t["event"] not in seen:
+            seen.add(t["event"])
+            out.append(t)
+    return out
 
 
 def trades_from(scan_res: dict, contracts: int) -> list[dict]:
@@ -147,6 +193,14 @@ def summarize(trades: list[dict], contracts: int) -> dict:
                    for v in ev.values()) / len(ev)
     se = max((hi - m) / 1.96 if len(per_ev) > 1 else 0.0, math.sqrt(null_var / len(ev)))
     p = 1.0 - norm_cdf(m / se) if se > 0 else (0.0 if m > 0 else 1.0)
+    p_neg, exact = None, all(len(v) == 1 for v in ev.values())
+    if exact:
+        # one bet per event: the record is decided by the number of losses - exact tails
+        from sleeve_paper import forward_stats
+        st = forward_stats([{"event": t["event"], "won": t["won"], "ask": t["ask"],
+                             "fee_pc": t["fee"] / contracts, "pnl": t["pnl"],
+                             "pnl_pc": t["pnl"] / contracts} for t in trades])
+        p, p_neg = st["p"], st["p_neg"]
     cum = peak = dd = 0.0
     streak = best = 0
     for t in trades:
@@ -160,7 +214,8 @@ def summarize(trades: list[dict], contracts: int) -> dict:
     loss_cost = -sum(t["pnl"] for t in losses) / max(1, len(losses)) if losses else None
     return {"n": n, "events": len(ev), "wins": wins, "wr": wins / n, "breakeven": breakeven,
             "total": sum(t["pnl"] for t in trades), "per_order": sum(t["pnl"] for t in trades) / n,
-            "per_contract_event": m, "lo": lo, "hi": hi, "p": p, "max_dd": dd,
+            "per_contract_event": m, "lo": lo, "hi": hi, "p": p, "p_neg": p_neg,
+            "exact": exact, "max_dd": dd,
             "best_streak": best, "losses": len(losses),
             "wins_per_loss": (loss_cost / win_gain) if loss_cost and win_gain > 0 else None,
             "needed_events": (math.ceil((2.5 * math.sqrt(null_var) / m) ** 2)
@@ -177,22 +232,33 @@ def verdict(s: dict) -> str:
         return (f"POSITIVE BUT NOT PROVEN - the sample cannot tell this from luck "
                 f"(p={s['p']:.2f}). At this edge it needs ~{s['needed_events']} independent "
                 f"events to say.")
-    if s["hi"] < 0:
+    if (s["p_neg"] < 0.025) if s.get("p_neg") is not None else (s["hi"] < 0):
         return "NEGATIVE AND SIGNIFICANT - on this history the method loses money after fees."
     return "NEGATIVE - no evidence it makes money after fees."
 
 
-def cmd_favorites(path: Path, lo: float, hi: float, contracts: int,
-                  min_h: float, max_h: float) -> int:
+def cmd_favorites(paths: list[Path], lo: float, hi: float, contracts: int,
+                  min_h: float, max_h: float, one_per_event: bool = False) -> int:
     print("=" * 78)
     print(f"STRATEGY CHECK - buy {contracts} of any side priced {lo:.2f}-{hi:.2f}, hold to settlement")
-    print(f"data: {path}")
+    win = (f"; only {min_h:g}-{max_h:g}h before close" if max_h < 1e8 or min_h > 0 else "")
+    print(f"{'ONE bet per event (its first entry)' if one_per_event else 'every market'}{win}")
+    print(f"data: {', '.join(str(x) for x in paths[:4])}"
+          f"{f' +{len(paths) - 4} more' if len(paths) > 4 else ''}")
     print("=" * 78)
-    if not path.exists():
-        print("file not found.")
+    missing = [x for x in paths if not x.exists()]
+    if not paths or missing:
+        print(f"file not found: {', '.join(str(x) for x in missing) or '(none given)'}")
         return 1
-    res = scan(path, lo, hi, min_h, max_h)
+    res = scan_many(paths, lo, hi, min_h, max_h)
+    if max_h <= 3 and res["gaps"][1] > res["gaps"][0]:
+        print("WARNING: these are HOURLY candles. A last-hours test needs 1-minute candles -")
+        print("an hourly bar ends at the close, so its closing quote is the settled price.")
+        print("Run: py scripts/sleeve_scan.py backfill --series ... --final-hours 2")
+        print("and point --file at data/sleeves/final.")
     trades = trades_from(res, contracts)
+    if one_per_event:
+        trades = first_per_event(trades)
     print(f"{len(res['markets'])} settled markets read; {len(trades)} entered "
           f"({sum(t['side'] == 'no' for t in trades)} NO, "
           f"{sum(t['side'] == 'yes' for t in trades)} YES)")
@@ -211,7 +277,8 @@ def cmd_favorites(path: Path, lo: float, hi: float, contracts: int,
               f"(price + fee)")
         print(f"   P&L total ${s['total']:+.2f}   per order ${s['per_order']:+.3f}   "
               f"per contract per event {s['per_contract_event'] * 100:+.2f}c "
-              f"[{s['lo'] * 100:+.2f}c, {s['hi'] * 100:+.2f}c]   p={s['p']:.3f}")
+              f"[{s['lo'] * 100:+.2f}c, {s['hi'] * 100:+.2f}c]   "
+              f"p={s['p']:.3f}{' (exact)' if s['exact'] else ''}")
         wpl = f"{s['wins_per_loss']:.0f}" if s["wins_per_loss"] else "-"
         print(f"   max drawdown ${s['max_dd']:.2f}   longest win streak {s['best_streak']}   "
               f"one loss erases ~{wpl} wins")
@@ -321,10 +388,10 @@ def main() -> int:
     if a[0] == "favorites":
         def opt(name, default, cast=float):
             return cast(a[a.index(name) + 1]) if name in a else default
-        path = Path(opt("--file", str(ROOT / "data" / "backfill_weather.jsonl"), str))
-        return cmd_favorites(path, opt("--lo", 0.97), opt("--hi", 0.99),
+        paths = expand_files(opt("--file", str(ROOT / "data" / "backfill_weather.jsonl"), str))
+        return cmd_favorites(paths, opt("--lo", 0.97), opt("--hi", 0.99),
                              opt("--contracts", 10, int), opt("--min-hours", 0.0),
-                             opt("--max-hours", 1e9))
+                             opt("--max-hours", 1e9), one_per_event="--one-per-event" in a)
     print(__doc__)
     return 1
 

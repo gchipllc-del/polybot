@@ -28,6 +28,9 @@ FOUR GUARDS (each one paid for by an earlier mistake in this project):
   py scripts/sleeve_scan.py probe                        # what the API returns (paste me)
   py scripts/sleeve_scan.py discover [--pages 40]        # rank every series with settled events
   py scripts/sleeve_scan.py backfill [--top 20] [--events 60] [--series A,B]
+  py scripts/sleeve_scan.py backfill --series A,B --events 300 --final-hours 2
+                     # 1-MINUTE candles for each market's last 2 hours -> data/sleeves/final/
+                     # (to test a last-hour entry: an hourly candle's close IS the settle)
   py scripts/sleeve_scan.py screen [--files a.jsonl b.jsonl]
   py scripts/sleeve_scan.py selftest                     # fixtures only, no network
 
@@ -363,15 +366,22 @@ def cmd_discover(pages: int = 40, get=hb._get) -> int:
     return 0
 
 
-def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get) -> int:
+def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
+                 final_hours: float | None = None) -> int:
     """Most recent `events_per_series` settled events per sleeve, every market in them
-    (capped), candles at a resolution matched to market life. Resumable."""
-    SLEEVE_DIR.mkdir(parents=True, exist_ok=True)
+    (capped), candles at a resolution matched to market life. Resumable.
+
+    final_hours: instead, 1-minute candles over only each market's last `final_hours`,
+    into SLEEVE_DIR/final/ (kept out of the screen's files). A last-hour entry cannot be
+    tested on hourly candles: the final bar ends AT the close, so its closing quote is
+    the settled price - the backtest would buy the answer."""
+    out_dir = SLEEVE_DIR / "final" if final_hours else SLEEVE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     cats = {}
     if CATALOG.exists():
         cats = {r["series"]: r.get("category") for r in json.loads(CATALOG.read_text())}
     for series in series_list:
-        path = SLEEVE_DIR / f"{series}.jsonl"
+        path = out_dir / f"{series}.jsonl"
         done = hb._seen_tickers(path)
         ms = hb.fetch_settled_markets(series, get=get,
                                       max_markets=events_per_series * MAX_MARKETS_PER_EVENT * 2)
@@ -390,10 +400,12 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get) ->
                 o, c = hb._iso_to_ts(m.get("open_time")), hb._iso_to_ts(m.get("close_time"))
                 if o is None or c is None:
                     continue
+                start, every = o, candle_interval(o, c)
+                if final_hours:
+                    start, every = max(o, c - final_hours * 3600.0), 1
                 try:
                     d = get(f"{hb.KALSHI}/series/{series}/markets/{m['ticker']}/candlesticks",
-                            {"period_interval": candle_interval(o, c),
-                             "start_ts": o, "end_ts": c})
+                            {"period_interval": every, "start_ts": int(start), "end_ts": int(c)})
                 except Exception as e:  # noqa: BLE001
                     print(f"  [warn] {m['ticker']}: {type(e).__name__}")
                     continue
@@ -592,7 +604,9 @@ def main() -> int:
                 return 1
             series = [r["series"] for r in json.loads(CATALOG.read_text())][
                 :int(_arg(args, "--top", 20))]
-        return cmd_backfill(series, int(_arg(args, "--events", 60)))
+        fh = _arg(args, "--final-hours")
+        return cmd_backfill(series, int(_arg(args, "--events", 60)),
+                            final_hours=float(fh) if fh else None)
     if cmd == "screen":
         if "--files" in args:
             files = [Path(a) for a in args[args.index("--files") + 1:]]
