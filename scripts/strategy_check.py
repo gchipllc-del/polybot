@@ -138,14 +138,18 @@ def expand_files(spec: str) -> list[Path]:
 def scan_many(paths: list[Path], lo: float, hi: float, min_h: float = 0.0,
               max_h: float = 1e9) -> dict:
     """scan() over several files (one per series), merged. Tickers never repeat across
-    series, and each file holds its own market rows before their candles."""
-    res = {"markets": {}, "entries": {}, "orphans": 0, "gaps": [0, 0]}
+    series, and each file holds its own market rows before their candles.
+    hourly_files: the files whose OWN candles are mostly an hour or more apart - voted per
+    file, because one dense 1-minute file would outvote any number of hourly ones."""
+    res = {"markets": {}, "entries": {}, "orphans": 0, "gaps": [0, 0], "hourly_files": []}
     for path in paths:
         r = scan(path, lo, hi, min_h, max_h)
         res["markets"].update(r["markets"])
         res["entries"].update(r["entries"])
         res["orphans"] += r["orphans"]
         res["gaps"] = [a + b for a, b in zip(res["gaps"], r["gaps"])]
+        if r["gaps"][1] > r["gaps"][0]:
+            res["hourly_files"].append(path)
     return res
 
 
@@ -254,9 +258,13 @@ def cmd_favorites(paths: list[Path], lo: float, hi: float, contracts: int,
         print(f"file not found: {', '.join(str(x) for x in missing) or '(none given)'}")
         return 1
     res = scan_many(paths, lo, hi, min_h, max_h)
-    if max_h <= 3 and res["gaps"][1] > res["gaps"][0]:
-        print("WARNING: these are HOURLY candles. A last-hours test needs 1-minute candles -")
-        print("an hourly bar ends at the close, so its closing quote is the settled price.")
+    hourly = res["hourly_files"]
+    if max_h <= 3 and hourly:
+        print(f"WARNING: HOURLY candles in {len(hourly)} of {len(paths)} file(s): "
+              f"{', '.join(str(x) for x in hourly[:6])}"
+              f"{f' +{len(hourly) - 6} more' if len(hourly) > 6 else ''}")
+        print("A last-hours test needs 1-minute candles - an hourly bar ends at the close,")
+        print("so its closing quote is the settled price.")
         print("Run: py scripts/sleeve_scan.py backfill --series ... --final-hours 2")
         print("and point --file at data/sleeves/final.")
     trades = trades_from(res, contracts)

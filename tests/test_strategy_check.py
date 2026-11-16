@@ -11,10 +11,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import strategy_check as sc  # noqa: E402
 
 
-def _file(tmp_path, p_win, name="w"):
+def _file(tmp_path, p_win, name="w", n_days=400):
     p = tmp_path / f"{name}.jsonl"
     with open(p, "w", encoding="utf-8") as f:
-        for r in sc._world(p_win):
+        for r in sc._world(p_win, n_days=n_days):
             f.write(json.dumps(r) + "\n")
     return p
 
@@ -124,6 +124,21 @@ def test_hourly_candles_warn_before_a_last_hour_test(tmp_path, capsys):
     assert "HOURLY candles" in capsys.readouterr().out
     assert sc.cmd_favorites([p], 0.97, 0.99, 10, 0.0, 1e9) == 0
     assert "HOURLY candles" not in capsys.readouterr().out    # no window: no warning
+
+
+def test_hourly_warning_votes_per_file_and_names_the_hourly_files(tmp_path, capsys):
+    """A folder mixing resolutions (a short-life series fetched at 1 minute next to hourly
+    ones) must still warn: one dense minute file outvotes any number of hourly files
+    when candle gaps are summed, so the vote is per FILE and the warning names them."""
+    d = tmp_path / "mixed"
+    d.mkdir()
+    _file(d, 0.995, "A_hourly", n_days=20)                   # 80 markets, 6h apart
+    _minute_file(d / "B_minute.jsonl", lambda left: (40, 45))  # 40 x 119 minute gaps
+    files = sc.expand_files(str(d))
+    assert sc.cmd_favorites(files, 0.97, 0.99, 10, 0.0, 1.0) == 0
+    warning = [ln for ln in capsys.readouterr().out.splitlines() if "HOURLY candles" in ln]
+    assert len(warning) == 1
+    assert "A_hourly.jsonl" in warning[0] and "B_minute.jsonl" not in warning[0]
 
 
 def test_no_entry_on_the_bar_ending_at_the_close(tmp_path):
