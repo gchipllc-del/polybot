@@ -147,12 +147,14 @@ def test_headline_baseline_warmup_and_trigger():
     sw = _sweep()
     reading = nr.headline_reading(sw["headlines"], NOW)
     assert nr.headline_vote(reading, sw, [])["vote"] is None
-    assert nr.headline_vote(dict(reading, score=nr.HEADLINE_EXTREME), sw, [])["vote"] \
-        == nr.CAUTIOUS
-    hist = [{"votes": {"headlines": {"density": reading["density"] / 3, "n": 40}}}] \
+    # no warm-up exception (review finding #7): a huge raw score still abstains
+    assert nr.headline_vote(dict(reading, score=1000.0), sw, [])["vote"] is None
+    # the baseline must come from sweeps as complete as this one (review finding #4)
+    n = reading["n"]
+    hist = [{"votes": {"headlines": {"density": reading["density"] / 3, "n": n}}}] \
         * nr.HEADLINE_BASELINE_MIN_RUNS
     assert nr.headline_vote(dict(reading, score=10.0), sw, hist)["vote"] == nr.CAUTIOUS
-    calm_hist = [{"votes": {"headlines": {"density": reading["density"], "n": 40}}}] \
+    calm_hist = [{"votes": {"headlines": {"density": reading["density"], "n": n}}}] \
         * nr.HEADLINE_BASELINE_MIN_RUNS
     assert nr.headline_vote(reading, sw, calm_hist)["vote"] == nr.GOOD
 
@@ -417,3 +419,265 @@ def test_healthcheck_warns_when_no_live_data_layer_voted(tmp_path, monkeypatch):
     monkeypatch.setattr(hc, "record", lambda level, name, msg: seen.append((level, msg)))
     hc.check_news_regime()
     assert seen and seen[0][0] == hc.WARN and "no live data layer" in seen[0][1]
+
+
+# ── review findings #4-#7: partial sweeps, calendar format, AI backoff, warm-up ──
+
+def _macro_feed(name, n_items, hits, now=NOW):
+    """`n_items` recent headlines (ages 0..8h); the first `hits` carry one 2.0-weight
+    lexicon term ('Fed') - ordinary macro news flow, as the real sweep sees it."""
+    from email.utils import format_datetime
+    items = []
+    for i in range(n_items):
+        what = "officials weigh next Fed move" if i < hits else "ordinary market story"
+        when = format_datetime(now - timedelta(minutes=32 * i + 1), usegmt=True)
+        items.append(f"<item><title>{name}: {what} ({i})</title>"
+                     f"<pubDate>{when}</pubDate></item>")
+    return f"<rss><channel>{''.join(items)}</channel></rss>".encode()
+
+
+_FEEDS35 = [(f"F{i}", f"f{i}") for i in range(35)]   # the real sweep's feed count
+
+
+def test_warmup_abstains_on_a_busy_ordinary_day():
+    """Finding #7: during warm-up the headline layer abstains, full stop. The old
+    exception (raw score >= 30 -> CAUTIOUS) was an unnormalized sum over ~500 headlines:
+    35 feeds x 15 ordinary headlines with one Fed mention in ~1 of 30 cleared it."""
+    sw = nr.sweep_headlines(_FEEDS35, now=NOW, pause_s=0,
+                            fetch=lambda u: _macro_feed(u, 15, 1 if int(u[1:]) % 2 == 0 else 0))
+    reading = nr.headline_reading(sw["headlines"], NOW)
+    assert reading["n"] == 525 and reading["score"] > 30        # the old 'extreme' bar
+    v = nr.headline_vote(reading, sw, [])
+    assert v["vote"] is None and "warming up" in v["why"], v
+    assert nr.headline_vote(dict(reading, score=1e6), sw, [])["vote"] is None
+    assert not hasattr(nr, "HEADLINE_EXTREME")
+
+
+def _baseline(**headlines):
+    """A full warm baseline of history rows as run_once writes them: votes.headlines
+    carries density, n and the feed counts of each past sweep."""
+    return [{"t": "regime", "votes": {"headlines": dict(headlines)}}] \
+        * (nr.HEADLINE_BASELINE_MIN_RUNS + 24)
+
+
+def _google_split(google_hits, other_hits, google_down=False):
+    """F0-F13 stand for the 14 Google News feeds (one host, keyword searches built
+    from lexicon terms, so denser in hits); F14-F34 for the other 21."""
+    def fetch(u):
+        google = int(u[1:]) < 14
+        if google and google_down:
+            raise ConnectionError("429 Too Many Requests")
+        return _macro_feed(u, 15, google_hits if google else other_hits)
+    return fetch
+
+
+def test_partial_sweep_abstains_instead_of_reading_a_risky_day_good(tmp_path):
+    """Finding #4: one host throttling drops the 14 densest feeds together. Judged
+    against a full-sweep baseline, the risky day's partial sweep read GOOD (1.2x);
+    it must abstain - and with no other live layer the regime is UNKNOWN, not GOOD."""
+    base_sw = nr.sweep_headlines(_FEEDS35, fetch=_google_split(5, 1), now=NOW, pause_s=0)
+    base = nr.headline_reading(base_sw["headlines"], NOW)
+    hist = _baseline(density=base["density"], n=base["n"], feeds_ok=base_sw["feeds_ok"],
+                     feeds_failed=base_sw["feeds_failed"])
+    full = nr.sweep_headlines(_FEEDS35, fetch=_google_split(12, 3), now=NOW, pause_s=0)
+    assert nr.headline_vote(nr.headline_reading(full["headlines"], NOW), full, hist)["vote"] \
+        == nr.CAUTIOUS                       # every feed up: the risky day is seen
+    risky_partial = _google_split(12, 3, google_down=True)
+    part = nr.sweep_headlines(_FEEDS35, fetch=risky_partial, now=NOW, pause_s=0)
+    assert (part["feeds_ok"], part["feeds_failed"]) == (21, 14)
+    v = nr.headline_vote(nr.headline_reading(part["headlines"], NOW), part, hist)
+    assert v["vote"] is None and "partial sweep" in v["why"], v
+    row = nr.run_once(NOW, feeds=_FEEDS35, fetch=risky_partial, calendar=[], spots={},
+                      history=hist, ai=False, path=tmp_path / "r.jsonl", pause_s=0)
+    assert row["regime"] == nr.UNKNOWN and row["mult"] == 0.5, row["reasons"]
+
+
+def test_thin_sweep_abstains_even_when_every_feed_answers():
+    """Finding #4, the headline-count half: every feed answers, but with a third of
+    its usual recent items (a degraded or soft-throttled response)."""
+    base_sw = nr.sweep_headlines(_FEEDS35, fetch=lambda u: _macro_feed(u, 15, 1), now=NOW,
+                                 pause_s=0)
+    base = nr.headline_reading(base_sw["headlines"], NOW)
+    hist = _baseline(density=base["density"], n=base["n"], feeds_ok=35, feeds_failed=0)
+    thin = nr.sweep_headlines(_FEEDS35, fetch=lambda u: _macro_feed(u, 5, 0), now=NOW,
+                              pause_s=0)
+    assert thin["feeds_ok"] == 35
+    v = nr.headline_vote(nr.headline_reading(thin["headlines"], NOW), thin, hist)
+    assert v["vote"] is None and "headlines" in v["why"], v
+    # a sweep as complete as the baseline still votes
+    assert nr.headline_vote(base, base_sw, hist)["vote"] == nr.GOOD
+
+
+def test_a_non_feed_body_counts_as_a_failed_feed():
+    """Finding #4: a 200 whose body is not a feed (an HTML block page, an empty body,
+    a body over the 1MB parse cap) delivered no data - it is a FAILED feed, not an ok
+    one with zero headlines. Whitespace or a BOM before <?xml is a real feed."""
+    good = _macro_feed("X", 3, 0)
+    huge = good.replace(b"</channel>", b"<!--" + b"x" * 1_100_000 + b"--></channel>")
+    for body in (b"<html><body>Too many requests</body></html>", b"", huge):
+        sw = nr.sweep_headlines([("X", "x")], fetch=lambda u, b=body: b, now=NOW, pause_s=0)
+        assert (sw["feeds_ok"], sw["feeds_failed"]) == (0, 1), body[:40]
+    decl = b'<?xml version="1.0" encoding="utf-8"?>'
+    for body in (b"\n  " + decl + good, b"\xef\xbb\xbf\n" + decl + good):
+        sw = nr.sweep_headlines([("X", "x")], fetch=lambda u, b=body: b, now=NOW, pause_s=0)
+        assert (sw["feeds_ok"], len(sw["headlines"])) == (1, 3), body[:10]
+
+
+_EVENT_DAY = datetime(2027, 1, 13, 16, 0, tzinfo=timezone.utc)   # 11:00 ET, not listed
+                                                                  # in the shipped file
+
+
+def _cal_file(tmp_path, text, name="news_calendar.yaml"):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _calendar_vote_from_file(tmp_path, monkeypatch, text):
+    """The calendar vote exactly as the hourly run computes it: run_once reads the file."""
+    monkeypatch.setattr(nr, "CALENDAR_PATH", _cal_file(tmp_path, text))
+    row = nr.run_once(_EVENT_DAY, feeds=[], spots={}, history=[], ai=False,
+                      path=tmp_path / "r.jsonl", pause_s=0)
+    return row["votes"]["calendar"]
+
+
+def test_calendar_format_slips_still_mark_the_event_day(tmp_path, monkeypatch):
+    """Finding #5: dates and impact are normalized. An unpadded date, an unquoted YAML
+    date-time, a quoted date-time, ' High ' and a bare top-level list used to load as
+    values that never matched today (or crash the run): each must vote CAUTIOUS."""
+    for text in ("events:\n  - {date: 2027-1-13, time_et: '08:30', event: CPI, impact: high}\n",
+                 "events:\n  - {date: 2027-01-13 08:30:00, event: CPI, impact: high}\n",
+                 "events:\n  - {date: '2027-01-13T08:30', event: CPI, impact: high}\n",
+                 "events:\n  - {date: '2027-01-13', event: CPI, impact: ' High '}\n",
+                 "- {date: '2027-01-13', event: CPI, impact: high}\n"):
+        v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+        assert v["vote"] == nr.CAUTIOUS and "CPI" in v["why"], (text, v)
+    assert [e["date"] for e in nr.load_calendar(nr.CALENDAR_PATH)] == ["2027-01-13"]
+
+
+def test_unreadable_calendar_entries_are_reported_and_cost_only_themselves(
+        tmp_path, monkeypatch):
+    """Finding #5: an entry the vote cannot read is named in its why - never silently
+    dropped - and the readable entries still count."""
+    text = ("events:\n"
+            "  - {date: '2027-01-13', time_et: '08:30', event: CPI, impact: high}\n"
+            "  - {date: '01/14/2027', event: PPI, impact: high}\n"
+            "  - {date: '2027-01-15', event: Retail sales, impact: hgih}\n")
+    v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+    assert v["vote"] == nr.CAUTIOUS and "CPI" in v["why"], v
+    assert "calendar unreadable" in v["why"] and len(v["problems"]) == 2
+    events, problems = nr.read_calendar(nr.CALENDAR_PATH)
+    assert [e["event"] for e in events] == ["CPI"]
+    assert "01/14/2027" in problems[0] and "hgih" in problems[1]
+    off_day = nr.calendar_vote(events, "2027-01-20", problems)
+    assert off_day["vote"] is None and off_day["why"].startswith("calendar unreadable")
+
+
+def test_a_yaml_error_is_reported_not_read_as_an_empty_calendar(tmp_path, monkeypatch):
+    """Finding #5: one missing '}' made the whole file read as 'calendar empty - add
+    events', hiding the error behind advice to add what is already there."""
+    text = ("events:\n"
+            "  - {date: '2027-01-13', event: CPI, impact: high}\n"
+            "  - {date: '2027-01-14', event: PPI, impact: high\n")
+    v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+    assert v["vote"] is None and v["why"].startswith("calendar unreadable"), v
+    assert "YAML error at line 3" in v["why"], v
+
+
+def test_calendar_top_level_shapes_never_crash_the_run(tmp_path, monkeypatch):
+    """Finding #5: a top-level list reached data.get outside the try - AttributeError
+    killed run_once and no votes were written. A list now reads as the events; any
+    other shape is reported."""
+    listed = _cal_file(tmp_path, "- {date: '2027-01-13', event: CPI, impact: high}\n",
+                       "list.yaml")
+    assert [e["event"] for e in nr.load_calendar(listed)] == ["CPI"]
+    for text in ("just a sentence\n", "evnets:\n  - {date: '2027-01-13', event: CPI}\n",
+                 "events: {date: '2027-01-13', event: CPI}\n"):
+        v = _calendar_vote_from_file(tmp_path, monkeypatch, text)
+        assert v["vote"] is None and v["why"].startswith("calendar unreadable"), (text, v)
+
+
+def test_healthcheck_warns_on_an_unreadable_calendar(tmp_path, monkeypatch):
+    import healthcheck as hc
+    seen = []
+    monkeypatch.setattr(hc, "record", lambda level, name, msg: seen.append((level, msg)))
+    monkeypatch.setattr(nr, "CALENDAR_PATH", _cal_file(
+        tmp_path, "events:\n  - {date: '2027-01-13', event: CPI, impact: high\n"))
+    hc.check_news_calendar()
+    assert seen[-1][0] == hc.WARN and "calendar unreadable: YAML error" in seen[-1][1], seen
+    monkeypatch.setattr(nr, "CALENDAR_PATH", _cal_file(
+        tmp_path, "events:\n  - {date: '2027-01-13', event: CPI, impact: high}\n", "ok.yaml"))
+    hc.check_news_calendar()
+    assert seen[-1] == (hc.OK, "calendar readable (1 listed)")
+
+
+def _hourly_ai_runs(tmp_path, name, hours, factory):
+    """run_once at NOW + each hour, with the AI on, reading its own log back as
+    history - the PolybotNews task in miniature. Returns the rows written."""
+    p = tmp_path / f"{name}.jsonl"
+    for h in hours:
+        nr.run_once(NOW + timedelta(hours=h), feeds=[("A", "u1")], fetch=lambda u: na._RSS,
+                    calendar=[], spots={}, history=nr.load_history(p), ai=True,
+                    client_factory=factory, path=p, pause_s=0)
+    return nr.load_history(p)
+
+
+_BILLED_FAILURES = (("refusal", na._FakeResp({}, stop="refusal")),
+                    ("truncated", na._FakeResp({}, stop="max_tokens")),
+                    ("unusable", na._FakeResp({"regime": "maybe", "key_risk": "",
+                                               "reasons": []})))
+
+
+def test_a_billed_ai_failure_backs_off_instead_of_retrying_hourly(tmp_path):
+    """Finding #6: a refusal, a max_tokens truncation or an unusable answer is billed
+    (up to 16k output tokens). The next hourly runs must not pay for it again: one
+    call per AI_EVERY_H, anchored on the failed attempt, and the backoff abstains."""
+    for label, resp in _BILLED_FAILURES:
+        log = []
+        rows = _hourly_ai_runs(tmp_path, label, range(7),
+                               lambda resp=resp, log=log: na._FakeClient(resp, log))
+        ai = [r["votes"]["ai"] for r in rows]
+        assert len(log) == 2, (label, len(log))      # hour 0, then hour 6 = AI_EVERY_H
+        assert ai[0]["vote"] is None and ai[0]["billed"] is True
+        for a in ai[1:6]:
+            assert a["vote"] is None and a.get("backoff") is True, (label, a)
+            assert a["ts"] == ai[0]["ts"] and a["why"].count("backing off") == 1, a
+        assert not ai[6].get("backoff") and ai[6]["ts"] != ai[0]["ts"]
+
+
+def test_backoff_does_not_revive_an_older_good_vote(tmp_path):
+    """Finding #6: only SUCCESSFUL votes are reused. A GOOD at hour 0 is reused to hour
+    5; the hour-6 call is refused; hours 7-11 back off (abstain - the old GOOD is
+    neither reused nor re-bought); hour 12 calls again."""
+    good = na._FakeResp({"regime": "good", "key_risk": "none", "reasons": []})
+    replies = iter([good, na._FakeResp({}, stop="refusal"), good])
+    log = []
+    rows = _hourly_ai_runs(tmp_path, "mixed", range(13),
+                           lambda: na._FakeClient(next(replies), log))
+    ai = [r["votes"]["ai"] for r in rows]
+    assert len(log) == 3                               # hours 0, 6 and 12
+    assert all(a.get("reused") and a["vote"] == nr.GOOD for a in ai[1:6])
+    assert all(a.get("backoff") and a["vote"] is None for a in ai[7:12])
+    assert ai[12]["vote"] == nr.GOOD and not ai[12].get("reused")
+
+
+def test_unbilled_ai_failures_still_retry_every_hour(tmp_path):
+    """The backoff is for BILLED failures only: an API/network error or missing
+    credentials cost nothing, so the next hourly run simply tries again."""
+    log = []
+
+    class _Down:
+        def create(self, **kw):
+            log.append(kw)
+            raise ConnectionError("api unreachable")
+
+    down = type("C", (), {"messages": _Down(), "beta": type("B", (), {"messages": _Down()})()})
+    rows = _hourly_ai_runs(tmp_path, "down", range(3), lambda: down())
+    assert len(log) == 3 and all("call failed" in r["votes"]["ai"]["why"] for r in rows)
+    factory_calls = []
+
+    def no_credentials():
+        factory_calls.append(1)
+        raise RuntimeError("no credentials")
+    _hourly_ai_runs(tmp_path, "nocreds", range(3), no_credentials)
+    assert len(factory_calls) == 3

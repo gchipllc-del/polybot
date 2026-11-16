@@ -331,7 +331,7 @@ def _selftest() -> int:
     # headline baseline: warm-up abstains; a 3x density day votes cautious
     reading = nr.headline_reading(sw["headlines"], now)
     assert nr.headline_vote(reading, sw, [])["vote"] is None
-    hist = [{"votes": {"headlines": {"density": reading["density"] / 3, "n": 40}}}
+    hist = [{"votes": {"headlines": {"density": reading["density"] / 3, "n": reading["n"]}}}
             ] * nr.HEADLINE_BASELINE_MIN_RUNS
     hv = nr.headline_vote(dict(reading, score=10.0), sw, hist)
     assert hv["vote"] == nr.CAUTIOUS, hv

@@ -9,11 +9,12 @@ from turning red), rebuilt to this project's evidence standard.
 FOUR INDEPENDENT VOTES (each one fails safe on its own):
   calendar    a high-impact scheduled release today (FOMC decision, CPI, jobs report)
               from config/news_calendar.yaml. It can only ADD caution: a day the file
-              does not list is not evidence of calm, so otherwise it abstains
+              does not list is not evidence of calm, so otherwise it abstains. An
+              entry it cannot read is named in its why and WARNed by the healthcheck
   headlines   a sweep of the curated macro/markets/crypto feeds (lib/news_feeds.py),
               scored with a transparent risk lexicon, recency-weighted, and judged
-              against the agent's OWN trailing baseline - no magic threshold once a
-              week of history exists; until then it abstains unless the day is extreme
+              against the agent's OWN trailing baseline - no magic threshold: until a
+              week of history exists it abstains
   volatility  realized 1-minute spot volatility over the last 6h vs its trailing
               14-day median, from the collector's own stage0 log (no network at all)
   ai          optional (model named by NEWS_AGENT_MODEL in .env; unset = abstains):
@@ -64,7 +65,7 @@ HEADLINE_MAX_PER_SOURCE = 15  # one noisy feed cannot dominate the score
 HEADLINE_BASELINE_MIN_RUNS = 24 * 7   # a week of hourly runs before trusting the baseline
 HEADLINE_RATIO = 2.0         # cautious when risk density > 2x its trailing median...
 HEADLINE_FLOOR = 6.0         # ...and the raw score clears this floor
-HEADLINE_EXTREME = 30.0      # warm-up exception: a score this big is cautious anyway
+HEADLINE_MIN_COVERAGE = 0.75  # abstain when feeds answered or headlines < 75% of median
 VOL_WINDOW_H = 6
 VOL_HISTORY_DAYS = 14
 VOL_MIN_HISTORY_H = 72       # three days of hourly windows before the vol vote counts
@@ -72,7 +73,8 @@ VOL_RATIO = 1.5              # cautious when 6h realized vol > 1.5x its trailing
 VOL_DT_LO_S, VOL_DT_HI_S = 30.0, 180.0   # a 1-minute return must span ~1 minute
 AI_MODEL_ENV = "NEWS_AGENT_MODEL"   # which Claude model the AI vote uses - set in .env;
                                     # unset = the AI vote abstains, the rest still vote
-AI_EVERY_H = 6.0             # reuse the last AI vote for this long (cost control)
+AI_EVERY_H = 6.0             # cost control: at most one billed AI call per 6h - a vote
+                             # is reused that long, a billed failure waits it out
 AI_TOP_HEADLINES = 25
 
 # ── the risk lexicon: (category, weight, pattern). Word-bounded on purpose - "war"
@@ -182,10 +184,15 @@ def _parse_when(s: str | None) -> datetime | None:
 
 def parse_feed(xml_bytes: bytes, source: str) -> list[dict]:
     """RSS 2.0 <item> and Atom <entry> -> [{title, source, published}]. All content is
-    untrusted: capped, never executed, only titles and dates are kept."""
+    untrusted: capped, never executed, only titles and dates are kept. Whitespace (or a
+    BOM) before the XML declaration is tolerated: expat rejects a declaration that is
+    not at the very start, and some servers send a newline first."""
     import xml.etree.ElementTree as ET
+    body = xml_bytes.lstrip()
+    if body[:3] == b"\xef\xbb\xbf":
+        body = body[3:].lstrip()
     try:
-        root = ET.fromstring(xml_bytes[:1_000_000])
+        root = ET.fromstring(body[:1_000_000])
     except ET.ParseError:
         return []
     out = []
@@ -217,7 +224,8 @@ def _http_get_bytes(url: str, timeout: float = 8.0) -> bytes:
 def sweep_headlines(feeds: list | None = None, fetch=_http_get_bytes,
                     now: datetime | None = None, pause_s: float = 0.2) -> dict:
     """Fetch every feed once; keep recent, deduplicated headlines. Returns the
-    headlines plus feed health, so a dead network reads as 'no data', not 'calm'."""
+    headlines plus feed health, so a dead network reads as 'no data', not 'calm'. A
+    feed counts as ok only if its body parses to at least one item."""
     now = now or _utcnow()
     if feeds is None:
         from lib.news_feeds import feeds_by_category
@@ -229,10 +237,15 @@ def sweep_headlines(feeds: list | None = None, fetch=_http_get_bytes,
         name, url = (f.name, f.url) if hasattr(f, "url") else (f[0], f[1])
         try:
             items = parse_feed(fetch(url), name)
-            ok += 1
         except Exception:  # noqa: BLE001 - one dead feed must never stop the sweep
             failed += 1
             continue
+        if not items:
+            # a 200 that is not a feed (an HTML block page, a truncated or garbled
+            # body) delivered no data: a failed feed, not a quiet one
+            failed += 1
+            continue
+        ok += 1
         per_source = 0
         for it in sorted(items, key=lambda x: x["published"] or now, reverse=True):
             when = it["published"]
@@ -275,24 +288,35 @@ def headline_reading(headlines: list[dict], now: datetime | None = None) -> dict
 
 def headline_vote(reading: dict, sweep: dict, history: list[dict]) -> dict:
     """Judge today's density against the agent's own trailing median (prior runs
-    only - never the current one). Abstains when there is no data or no baseline."""
+    only - never the current one). Abstains when there is no data, no baseline, or a
+    PARTIAL sweep: density moves with which feeds answered (the Google News keyword
+    searches run denser than the rest and share one host), so a sweep that reached
+    far fewer feeds or headlines than usual is not comparable to the baseline."""
     if sweep.get("feeds_ok", 0) == 0 or reading["n"] == 0:
         return {"vote": None, "why": "no headlines (feeds unreachable)"}
-    # baseline = densities of past runs that actually SAW headlines; a run whose feeds
-    # were all down records density 0 and must not drag the median toward zero
+    # baseline = past runs that actually SAW headlines; a run whose feeds were all
+    # down records density 0 and must not drag the median toward zero
     past = []
     for r in history:
         h = r.get("votes", {}).get("headlines", {})
         if isinstance(h.get("density"), (int, float)) and (h.get("n") or 0) > 0:
-            past.append(h["density"])
+            past.append(h)
     if len(past) < HEADLINE_BASELINE_MIN_RUNS:
-        if reading["score"] >= HEADLINE_EXTREME:
-            return {"vote": CAUTIOUS, "why": f"extreme risk score {reading['score']:.1f} "
-                                             f"(baseline still warming up)"}
+        # no absolute-score exception: the raw score is an unnormalized sum over ~500
+        # headlines, so ordinary news flow clears any fixed bar - only a baseline can
+        # say what is unusual
         return {"vote": None, "why": f"baseline warming up ({len(past)}/"
                                      f"{HEADLINE_BASELINE_MIN_RUNS} runs)"}
-    past = sorted(past[-24 * 14:])
-    med = past[len(past) // 2]
+    past = past[-24 * 14:]
+    for key, label, cur in (("feeds_ok", "feeds answered", sweep.get("feeds_ok", 0)),
+                            ("n", "headlines", reading["n"])):
+        base = sorted(h[key] for h in past if isinstance(h.get(key), (int, float)))
+        if base and cur < HEADLINE_MIN_COVERAGE * base[len(base) // 2]:
+            return {"vote": None, "why": f"partial sweep - {cur} {label} vs a 14-day "
+                                         f"median of {base[len(base) // 2]:g} (abstains "
+                                         f"under {HEADLINE_MIN_COVERAGE:.0%})"}
+    dens = sorted(h["density"] for h in past)
+    med = dens[len(dens) // 2]
     ratio = reading["density"] / med if med > 0 else float("inf")
     if ratio > HEADLINE_RATIO and reading["score"] >= HEADLINE_FLOOR:
         return {"vote": CAUTIOUS, "why": f"risk density {ratio:.1f}x its 14-day median",
@@ -303,31 +327,109 @@ def headline_vote(reading: dict, sweep: dict, history: list[dict]) -> dict:
 
 # ── calendar ──────────────────────────────────────────────────────────────────
 
-def load_calendar(path: Path = CALENDAR_PATH) -> list[dict]:
+CALENDAR_IMPACTS = ("high", "medium", "low")
+
+
+def _calendar_event(e) -> dict:
+    """One entry normalized to {date: YYYY-MM-DD, time_et, event, impact}, or a
+    ValueError saying why it cannot be read. The vote compares date STRINGS, so
+    '2026-12-9' or a YAML date-time kept as written would never equal today's ET date
+    and the event day would pass for an unlisted one."""
+    if not isinstance(e, dict):
+        raise ValueError(f"not a mapping: {str(e)[:40]!r}")
+    name = str(e.get("event") or "").strip()[:120]
+    if not name:
+        raise ValueError("no event name")
+    d = e.get("date")
+    if isinstance(d, datetime):                  # an unquoted YAML date-time
+        d = d.date()
+    elif isinstance(d, str):
+        try:
+            d = datetime.strptime(d.strip(), "%Y-%m-%d").date()    # '2026-12-9' too
+        except ValueError:
+            try:
+                d = datetime.fromisoformat(d.strip()).date()        # a quoted date-time
+            except ValueError:
+                raise ValueError(f"{name}: date {d.strip()[:30]!r} is not YYYY-MM-DD") \
+                    from None
+    if not isinstance(d, date):
+        raise ValueError(f"{name}: no date" if d is None
+                         else f"{name}: date {d!r} is not YYYY-MM-DD")
+    impact = str(e.get("impact") or "high").strip().lower()
+    if impact not in CALENDAR_IMPACTS:
+        raise ValueError(f"{name}: impact {impact[:20]!r} is not high, medium or low")
+    return {"date": d.isoformat(), "time_et": str(e.get("time_et") or "").strip(),
+            "event": name, "impact": impact}
+
+
+def read_calendar(path: Path = CALENDAR_PATH) -> tuple[list[dict], list[str]]:
+    """(events, problems). A problem - a YAML error, a file without an events list,
+    an entry that cannot be read - is reported (the calendar vote's why, the
+    healthcheck), never swallowed: an unreadable FOMC line must not pass for an
+    unlisted day. A bad entry costs only itself; a YAML error costs the whole file."""
     if not path.exists():
-        return []
+        return [], []
     try:
         import yaml
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001 - a broken calendar file must not stop the agent
-        return []
-    out = []
-    for e in data.get("events") or []:
-        if isinstance(e, dict) and e.get("date") and e.get("event"):
-            out.append({"date": str(e["date"]), "time_et": str(e.get("time_et") or ""),
-                        "event": str(e["event"])[:120],
-                        "impact": str(e.get("impact") or "high").lower()})
-    return out
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 - a broken calendar file must not stop the agent
+        mark = getattr(e, "context_mark", None) or getattr(e, "problem_mark", None)
+        what = (getattr(e, "problem", None) or " ".join(str(e).split()))[:100]
+        if mark is not None:
+            return [], [f"YAML error at line {mark.line + 1}: {what} ({type(e).__name__})"]
+        return [], [f"{type(e).__name__}: {what}"]
+    if data is None or data == {}:
+        entries = []
+    elif isinstance(data, list):                 # a bare list of events reads the same
+        entries = data
+    elif isinstance(data, dict) and "events" in data:
+        entries = data["events"] or []
+    else:
+        shape = (f"keys: {', '.join(map(str, data))[:60]}" if isinstance(data, dict)
+                 else f"a {type(data).__name__}")
+        return [], [f"no 'events:' list ({shape})"]
+    if not isinstance(entries, list):
+        return [], [f"'events' is a {type(entries).__name__}, not a list"]
+    events, problems = [], []
+    for i, e in enumerate(entries, 1):
+        try:
+            events.append(_calendar_event(e))
+        except ValueError as err:
+            problems.append(f"entry {i}: {err}")
+    return events, problems
 
 
-def calendar_vote(events: list[dict], today_et: str) -> dict:
-    todays = [e for e in events if e["date"] == today_et]
+def load_calendar(path: Path = CALENDAR_PATH) -> list[dict]:
+    """The readable events only; read_calendar also says what could not be read."""
+    return read_calendar(path)[0]
+
+
+def calendar_vote(events: list[dict], today_et: str,
+                  problems: list[str] | None = None) -> dict:
+    """CAUTIOUS when a high-impact release is listed for today (ET), else abstain.
+    Entries are validated here too, and anything unreadable - here or in the file
+    (`problems`, from read_calendar) - is named in the why."""
+    problems = list(problems or [])
+    readable = []
+    for i, e in enumerate(events, 1):
+        try:
+            readable.append(_calendar_event(e))
+        except ValueError as err:
+            problems.append(f"entry {i}: {err}")
+    todays = [e for e in readable if e["date"] == today_et]
     high = [e for e in todays if e["impact"] == "high"]
+    unreadable = ""
+    if problems:
+        more = f" (+{len(problems) - 1} more)" if len(problems) > 1 else ""
+        unreadable = f"calendar unreadable: {problems[0]}{more}"
     if high:
         names = ", ".join(f"{e['event']} {e['time_et']}ET".strip() for e in high)
-        return {"vote": CAUTIOUS, "why": f"high-impact release today: {names}",
-                "events": high}
-    if not events:
+        why = f"high-impact release today: {names}" + (f"; {unreadable}" if problems else "")
+        return {"vote": CAUTIOUS, "why": why, "events": high,
+                **({"problems": problems} if problems else {})}
+    if problems:
+        return {"vote": None, "why": unreadable, "events": todays, "problems": problems}
+    if not readable:
         return {"vote": None, "why": "calendar empty - add events to config/news_calendar.yaml"}
     # an unlisted day is not evidence of calm (the file can be stale or incomplete):
     # the calendar can only ADD caution, so otherwise it abstains
@@ -479,10 +581,12 @@ def ai_vote(reading: dict, cal: dict, vol: dict, client_factory=_default_client)
     except Exception as e:  # noqa: BLE001 - API/network errors: abstain, never crash
         return {"vote": None, "why": f"ai call failed ({type(e).__name__})"}
     stop = getattr(resp, "stop_reason", None)
+    # from here on the call completed and was BILLED: a failure below sets
+    # billed=True, and run_once backs off instead of paying for it again every hour
     if stop == "refusal":
-        return {"vote": None, "why": "ai declined (refusal)"}
+        return {"vote": None, "why": "ai declined (refusal)", "billed": True}
     if stop == "max_tokens":
-        return {"vote": None, "why": "ai output truncated"}
+        return {"vote": None, "why": "ai output truncated", "billed": True}
     try:
         text = next(b.text for b in resp.content if getattr(b, "type", "") == "text")
         data = json.loads(text)
@@ -490,7 +594,8 @@ def ai_vote(reading: dict, cal: dict, vol: dict, client_factory=_default_client)
         if vote not in (GOOD, CAUTIOUS):
             raise ValueError(vote)
     except Exception as e:  # noqa: BLE001
-        return {"vote": None, "why": f"ai output unusable ({type(e).__name__})"}
+        return {"vote": None, "why": f"ai output unusable ({type(e).__name__})",
+                "billed": True}
     return {"vote": vote, "why": str(data.get("key_risk", ""))[:200],
             "reasons": [str(r)[:200] for r in (data.get("reasons") or [])][:5],
             "model": getattr(resp, "model", model)}
@@ -541,6 +646,22 @@ def load_history(path: Path = REGIME_LOG, max_bytes: int = 6_000_000) -> list[di
     return rows
 
 
+def _last_ai_attempt(history: list[dict], now: datetime) -> tuple[dict | None, float]:
+    """The newest AI vote that records a call, and its age in hours - the one anchor
+    for both reuse and backoff. A carried-over copy keeps its original ts, so it
+    stands for that call; a backoff entry is skipped, so waiting never extends the
+    wait. No usable ts = no anchor (the AI is called)."""
+    for r in reversed(history):
+        ai = (r.get("votes") or {}).get("ai")
+        if not isinstance(ai, dict) or ai.get("backoff"):
+            continue
+        try:
+            return ai, (now - datetime.fromisoformat(ai["ts"])).total_seconds() / 3600.0
+        except (KeyError, TypeError, ValueError):
+            return None, float("inf")
+    return None, float("inf")
+
+
 def run_once(now: datetime | None = None, *, feeds=None, fetch=_http_get_bytes,
              calendar: list[dict] | None = None, spots: dict | None = None,
              history: list[dict] | None = None, ai: bool | None = None,
@@ -556,19 +677,26 @@ def run_once(now: datetime | None = None, *, feeds=None, fetch=_http_get_bytes,
                "n": reading["n"], "feeds_ok": sweep["feeds_ok"],
                "feeds_failed": sweep["feeds_failed"]})
     today = et_date(now)
-    cv = calendar_vote(load_calendar() if calendar is None else calendar, today)
+    cal_problems: list[str] = []
+    if calendar is None:
+        calendar, cal_problems = read_calendar(CALENDAR_PATH)
+    cv = calendar_vote(calendar, today, cal_problems)
     vv = vol_vote(load_spots() if spots is None else spots, now.timestamp())
     votes = {"calendar": cv, "headlines": hv, "volatility": vv}
 
     use_ai = _ai_enabled() if ai is None else ai
     if use_ai:
-        last_ai = next((r["votes"].get("ai") for r in reversed(history)
-                        if r.get("votes", {}).get("ai", {}).get("vote")), None)
-        fresh = (last_ai is not None and last_ai.get("ts") and
-                 (now - datetime.fromisoformat(last_ai["ts"])).total_seconds()
-                 < AI_EVERY_H * 3600)
-        if fresh:
-            votes["ai"] = dict(last_ai, reused=True)
+        last, age_h = _last_ai_attempt(history, now)
+        recent = last is not None and age_h < AI_EVERY_H
+        if recent and last.get("vote") in (GOOD, CAUTIOUS):
+            votes["ai"] = dict(last, reused=True)      # cost control: reuse a real vote
+        elif recent and last.get("billed"):
+            # a refusal, truncation or unusable answer was paid for and would most
+            # likely repeat (refusals cluster on war/violence headline days): wait
+            # out AI_EVERY_H from that attempt instead of paying for it hourly
+            votes["ai"] = {"vote": None, "backoff": True, "ts": last["ts"],
+                           "why": f"ai backing off {AI_EVERY_H - age_h:.1f}h more after "
+                                  f"a billed failure ({last.get('why', '?')})"}
         else:
             av = ai_vote(reading, cv, vv, client_factory)
             av["ts"] = now.isoformat()
