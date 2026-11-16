@@ -30,6 +30,8 @@ Hochberg runs across ALL forward rules at once, so adding sleeves never lowers t
 
   py scripts/sleeve_paper.py register-probes [--top 20]   # after sleeve_scan discover
   py scripts/sleeve_paper.py register-nominations         # after sleeve_scan screen
+  py scripts/sleeve_paper.py register-rule --name F9799 --series-prefix KXHIGH \
+        --side favorite --lo 0.97 --hi 0.995 --band any   # an outside method, named now
   py scripts/sleeve_paper.py run                          # loop (PolybotSleeves task)
   py scripts/sleeve_paper.py cycle                        # one pass
   py scripts/sleeve_paper.py report
@@ -225,7 +227,7 @@ def candidates(m: dict, now_ts: float, rules: list[dict]) -> list[dict]:
     lng = ("no", na) if ya >= na else ("yes", ya)
     out = []
     for r in rules:
-        if r["band"] != band:
+        if r["band"] not in (band, "any"):        # "any": the rule trades at any time
             continue
         side, ask = {"favorite": fav, "longshot": lng, "yes": ("yes", ya),
                      "no": ("no", na)}.get(r["side"], (None, None))
@@ -590,6 +592,32 @@ def main() -> int:
             return 1
         added = register(nomination_rules(json.loads(SCREEN.read_text(encoding="utf-8"))))
         print(f"registered {len(added)} nomination rule(s): {', '.join(added) or '-'}")
+        return 0
+    if cmd == "register-rule":
+        # A named outside hypothesis (e.g. a friend's method), pre-registered NOW on each
+        # series given - or on every catalog series starting with --series-prefix.
+        def opt(name, default=None):
+            return args[args.index(name) + 1] if name in args else default
+        prefix, side = opt("--name"), opt("--side", "favorite")
+        if not prefix or side not in ("favorite", "longshot", "yes", "no"):
+            print("usage: register-rule --name PREFIX (--series A,B | --series-prefix KXHIGH)"
+                  " --side favorite|longshot|yes|no --lo 0.97 --hi 0.995 [--band any]"
+                  " [--thesis TEXT]")
+            return 1
+        if opt("--series"):
+            series = [x.strip() for x in opt("--series").split(",") if x.strip()]
+        elif opt("--series-prefix") and CATALOG.exists():
+            series = [r["series"] for r in json.loads(CATALOG.read_text(encoding="utf-8"))
+                      if r["series"].startswith(opt("--series-prefix"))]
+        else:
+            print("give --series A,B, or run sleeve_scan.py discover and use --series-prefix")
+            return 1
+        rules = [{"name": f"{prefix}_{s}", "series": s, "band": opt("--band", "any"),
+                  "side": side, "lo": float(opt("--lo", 0.97)), "hi": float(opt("--hi", 0.995)),
+                  "source": "named", "thesis": opt("--thesis", f"{prefix}: outside hypothesis")}
+                 for s in series if s not in EXCLUDED_SERIES]
+        added = register(rules)
+        print(f"registered {len(added)} rule(s) (named now): {', '.join(added) or '-'}")
         return 0
     if cmd == "retire" and len(args) > 1:
         if args[1] not in active_rules():

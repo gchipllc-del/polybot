@@ -179,3 +179,15 @@ def test_verdict_needs_events_and_the_family_correction(tmp_path):
     assert r["events"] == 150 and r["verdict"].startswith("EDGE"), r
     few = sp.evaluate(rows[:40], rules)[0]
     assert few["verdict"].startswith("collecting")
+
+
+def test_any_band_rule_trades_at_any_time(tmp_path):
+    rp = tmp_path / "r.jsonl"
+    sp.register([{"name": "F9799_KXHIGHNY", "series": "KXHIGHNY", "band": "any",
+                  "side": "favorite", "lo": 0.97, "hi": 0.995}], rp, NOW - timedelta(days=1))
+    rules = list(sp.active_rules(rp).values())
+    early = mk("A", "E", 98, 96, opened_h=-1, closes_h=19)      # life fraction 0.05
+    late = mk("A", "E", 98, 96, opened_h=-19, closes_h=0.5)     # life fraction 0.97
+    for m in (early, late):
+        fired = sp.candidates(m, NOW.timestamp(), rules)
+        assert [c["rule"] for c in fired] == ["F9799_KXHIGHNY"] and fired[0]["price"] == 0.98

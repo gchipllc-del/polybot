@@ -342,7 +342,8 @@ def check_sleeve_paper() -> None:
 def check_selftests() -> None:
     """Every module ships a selftest; run them all. This is the post-pull smoke test."""
     mods = ["stage0_collector.py", "shadow_book.py", "paper_trader.py",
-            "diagnostics.py", "news_agent.py", "sleeve_scan.py", "sleeve_paper.py"]
+            "diagnostics.py", "news_agent.py", "sleeve_scan.py", "sleeve_paper.py",
+            "strategy_check.py"]
     for m in mods:
         try:
             r = subprocess.run([sys.executable, str(ROOT / "scripts" / m), "selftest"],
