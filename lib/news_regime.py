@@ -73,7 +73,8 @@ VOL_RATIO = 1.5              # cautious when 6h realized vol > 1.5x its trailing
 VOL_DT_LO_S, VOL_DT_HI_S = 30.0, 180.0   # a 1-minute return must span ~1 minute
 AI_MODEL_ENV = "NEWS_AGENT_MODEL"   # which Claude model the AI vote uses - set in .env;
                                     # unset = the AI vote abstains, the rest still vote
-AI_EVERY_H = 6.0             # reuse the last AI vote for this long (cost control)
+AI_EVERY_H = 6.0             # cost control: at most one billed AI call per 6h - a vote
+                             # is reused that long, a billed failure waits it out
 AI_TOP_HEADLINES = 25
 
 # ── the risk lexicon: (category, weight, pattern). Word-bounded on purpose - "war"
@@ -580,10 +581,12 @@ def ai_vote(reading: dict, cal: dict, vol: dict, client_factory=_default_client)
     except Exception as e:  # noqa: BLE001 - API/network errors: abstain, never crash
         return {"vote": None, "why": f"ai call failed ({type(e).__name__})"}
     stop = getattr(resp, "stop_reason", None)
+    # from here on the call completed and was BILLED: a failure below sets
+    # billed=True, and run_once backs off instead of paying for it again every hour
     if stop == "refusal":
-        return {"vote": None, "why": "ai declined (refusal)"}
+        return {"vote": None, "why": "ai declined (refusal)", "billed": True}
     if stop == "max_tokens":
-        return {"vote": None, "why": "ai output truncated"}
+        return {"vote": None, "why": "ai output truncated", "billed": True}
     try:
         text = next(b.text for b in resp.content if getattr(b, "type", "") == "text")
         data = json.loads(text)
@@ -591,7 +594,8 @@ def ai_vote(reading: dict, cal: dict, vol: dict, client_factory=_default_client)
         if vote not in (GOOD, CAUTIOUS):
             raise ValueError(vote)
     except Exception as e:  # noqa: BLE001
-        return {"vote": None, "why": f"ai output unusable ({type(e).__name__})"}
+        return {"vote": None, "why": f"ai output unusable ({type(e).__name__})",
+                "billed": True}
     return {"vote": vote, "why": str(data.get("key_risk", ""))[:200],
             "reasons": [str(r)[:200] for r in (data.get("reasons") or [])][:5],
             "model": getattr(resp, "model", model)}
@@ -642,6 +646,22 @@ def load_history(path: Path = REGIME_LOG, max_bytes: int = 6_000_000) -> list[di
     return rows
 
 
+def _last_ai_attempt(history: list[dict], now: datetime) -> tuple[dict | None, float]:
+    """The newest AI vote that records a call, and its age in hours - the one anchor
+    for both reuse and backoff. A carried-over copy keeps its original ts, so it
+    stands for that call; a backoff entry is skipped, so waiting never extends the
+    wait. No usable ts = no anchor (the AI is called)."""
+    for r in reversed(history):
+        ai = (r.get("votes") or {}).get("ai")
+        if not isinstance(ai, dict) or ai.get("backoff"):
+            continue
+        try:
+            return ai, (now - datetime.fromisoformat(ai["ts"])).total_seconds() / 3600.0
+        except (KeyError, TypeError, ValueError):
+            return None, float("inf")
+    return None, float("inf")
+
+
 def run_once(now: datetime | None = None, *, feeds=None, fetch=_http_get_bytes,
              calendar: list[dict] | None = None, spots: dict | None = None,
              history: list[dict] | None = None, ai: bool | None = None,
@@ -666,13 +686,17 @@ def run_once(now: datetime | None = None, *, feeds=None, fetch=_http_get_bytes,
 
     use_ai = _ai_enabled() if ai is None else ai
     if use_ai:
-        last_ai = next((r["votes"].get("ai") for r in reversed(history)
-                        if r.get("votes", {}).get("ai", {}).get("vote")), None)
-        fresh = (last_ai is not None and last_ai.get("ts") and
-                 (now - datetime.fromisoformat(last_ai["ts"])).total_seconds()
-                 < AI_EVERY_H * 3600)
-        if fresh:
-            votes["ai"] = dict(last_ai, reused=True)
+        last, age_h = _last_ai_attempt(history, now)
+        recent = last is not None and age_h < AI_EVERY_H
+        if recent and last.get("vote") in (GOOD, CAUTIOUS):
+            votes["ai"] = dict(last, reused=True)      # cost control: reuse a real vote
+        elif recent and last.get("billed"):
+            # a refusal, truncation or unusable answer was paid for and would most
+            # likely repeat (refusals cluster on war/violence headline days): wait
+            # out AI_EVERY_H from that attempt instead of paying for it hourly
+            votes["ai"] = {"vote": None, "backoff": True, "ts": last["ts"],
+                           "why": f"ai backing off {AI_EVERY_H - age_h:.1f}h more after "
+                                  f"a billed failure ({last.get('why', '?')})"}
         else:
             av = ai_vote(reading, cv, vv, client_factory)
             av["ts"] = now.isoformat()

@@ -609,3 +609,75 @@ def test_healthcheck_warns_on_an_unreadable_calendar(tmp_path, monkeypatch):
         tmp_path, "events:\n  - {date: '2027-01-13', event: CPI, impact: high}\n", "ok.yaml"))
     hc.check_news_calendar()
     assert seen[-1] == (hc.OK, "calendar readable (1 listed)")
+
+
+def _hourly_ai_runs(tmp_path, name, hours, factory):
+    """run_once at NOW + each hour, with the AI on, reading its own log back as
+    history - the PolybotNews task in miniature. Returns the rows written."""
+    p = tmp_path / f"{name}.jsonl"
+    for h in hours:
+        nr.run_once(NOW + timedelta(hours=h), feeds=[("A", "u1")], fetch=lambda u: na._RSS,
+                    calendar=[], spots={}, history=nr.load_history(p), ai=True,
+                    client_factory=factory, path=p, pause_s=0)
+    return nr.load_history(p)
+
+
+_BILLED_FAILURES = (("refusal", na._FakeResp({}, stop="refusal")),
+                    ("truncated", na._FakeResp({}, stop="max_tokens")),
+                    ("unusable", na._FakeResp({"regime": "maybe", "key_risk": "",
+                                               "reasons": []})))
+
+
+def test_a_billed_ai_failure_backs_off_instead_of_retrying_hourly(tmp_path):
+    """Finding #6: a refusal, a max_tokens truncation or an unusable answer is billed
+    (up to 16k output tokens). The next hourly runs must not pay for it again: one
+    call per AI_EVERY_H, anchored on the failed attempt, and the backoff abstains."""
+    for label, resp in _BILLED_FAILURES:
+        log = []
+        rows = _hourly_ai_runs(tmp_path, label, range(7),
+                               lambda resp=resp, log=log: na._FakeClient(resp, log))
+        ai = [r["votes"]["ai"] for r in rows]
+        assert len(log) == 2, (label, len(log))      # hour 0, then hour 6 = AI_EVERY_H
+        assert ai[0]["vote"] is None and ai[0]["billed"] is True
+        for a in ai[1:6]:
+            assert a["vote"] is None and a.get("backoff") is True, (label, a)
+            assert a["ts"] == ai[0]["ts"] and a["why"].count("backing off") == 1, a
+        assert not ai[6].get("backoff") and ai[6]["ts"] != ai[0]["ts"]
+
+
+def test_backoff_does_not_revive_an_older_good_vote(tmp_path):
+    """Finding #6: only SUCCESSFUL votes are reused. A GOOD at hour 0 is reused to hour
+    5; the hour-6 call is refused; hours 7-11 back off (abstain - the old GOOD is
+    neither reused nor re-bought); hour 12 calls again."""
+    good = na._FakeResp({"regime": "good", "key_risk": "none", "reasons": []})
+    replies = iter([good, na._FakeResp({}, stop="refusal"), good])
+    log = []
+    rows = _hourly_ai_runs(tmp_path, "mixed", range(13),
+                           lambda: na._FakeClient(next(replies), log))
+    ai = [r["votes"]["ai"] for r in rows]
+    assert len(log) == 3                               # hours 0, 6 and 12
+    assert all(a.get("reused") and a["vote"] == nr.GOOD for a in ai[1:6])
+    assert all(a.get("backoff") and a["vote"] is None for a in ai[7:12])
+    assert ai[12]["vote"] == nr.GOOD and not ai[12].get("reused")
+
+
+def test_unbilled_ai_failures_still_retry_every_hour(tmp_path):
+    """The backoff is for BILLED failures only: an API/network error or missing
+    credentials cost nothing, so the next hourly run simply tries again."""
+    log = []
+
+    class _Down:
+        def create(self, **kw):
+            log.append(kw)
+            raise ConnectionError("api unreachable")
+
+    down = type("C", (), {"messages": _Down(), "beta": type("B", (), {"messages": _Down()})()})
+    rows = _hourly_ai_runs(tmp_path, "down", range(3), lambda: down())
+    assert len(log) == 3 and all("call failed" in r["votes"]["ai"]["why"] for r in rows)
+    factory_calls = []
+
+    def no_credentials():
+        factory_calls.append(1)
+        raise RuntimeError("no credentials")
+    _hourly_ai_runs(tmp_path, "nocreds", range(3), no_credentials)
+    assert len(factory_calls) == 3
