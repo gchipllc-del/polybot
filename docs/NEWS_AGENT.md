@@ -68,7 +68,8 @@ Exactly like every rule in this project: forward, on the paper ledger.
   can't be traded.
 - The report compares $/window on good vs cautious days. The independent unit is the
   **day-cluster** (one ET day × regime), since windows inside one day share that day's
-  conditions.
+  conditions. A trade's day is the ET day it *opened* on; the ledger's timestamps are
+  UTC, and a UTC date would split every ET day at 19:00/20:00 ET into two clusters.
 - It also computes the counterfactual the original trader tracked: **flat sizing vs
   regime sizing on the same trades** (total, per unit of exposure, max drawdown).
 

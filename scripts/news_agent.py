@@ -15,9 +15,10 @@ agent has to earn its place, the same way every rule in this project does.
 
 THE VERDICT RULE (pre-registered 2026-11-16, never tuned): the agent "earns its keep"
 only when, over at least MIN_CLUSTERS good-day clusters and MIN_CLUSTERS cautious-day
-clusters (a cluster = one ET day x one regime, so correlated windows inside a day are
-ONE observation), good-day $/window beats cautious-day $/window with a 95% interval
-clear of zero. Until then the honest word is COLLECTING.
+clusters (a cluster = one ET day x one regime - the ET day each trade OPENED on, not
+its UTC date - so correlated windows inside a day are ONE observation), good-day
+$/window beats cautious-day $/window with a 95% interval clear of zero. Until then the
+honest word is COLLECTING.
 """
 from __future__ import annotations
 
@@ -104,16 +105,41 @@ def _max_drawdown(series: list[float]) -> float:
     return worst
 
 
+def cluster_day(t: dict) -> str:
+    """The ET calendar day a trade OPENED on - the pre-registered cluster day.
+
+    vol_replay.ledger_rows carries the open's timestamp as 'open_ts' (the paper trader
+    writes it in UTC). Its 'date' is the UTC date, which cuts every ET day at 19:00/20:00
+    ET and books that evening into the next day's cluster: one cautious ET day became
+    two 'independent' clusters. 'date' is only the fallback for a trade that carries no
+    readable open_ts (a bare date has no time of day, so it cannot be moved to ET)."""
+    raw = str(t.get("open_ts") or "").strip()
+    if len(raw) > 10:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            dt = None
+        if dt is not None:
+            if dt.tzinfo is None:            # the paper trader writes UTC
+                dt = dt.replace(tzinfo=timezone.utc)
+            return nr.et_date(dt.astimezone(timezone.utc))
+    return str(t.get("date") or "")
+
+
 def evaluate(trades: list[dict]) -> dict:
     """trades: vol_replay.ledger_rows(...)['trades'] - each carries the regime stamp of
     its open. Unstamped trades predate the agent and are excluded entirely."""
     stamped = [t for t in trades if t.get("regime") in (nr.GOOD, nr.CAUTIOUS, nr.UNKNOWN)]
-    by_win: dict[str, list[dict]] = {}
+    # one observation per window, within the ET day each trade opened on: a cluster is
+    # one ET day x one regime, so every trade must land in the cluster of its own open
+    by_win: dict[tuple, list[dict]] = {}
     for t in stamped:
-        by_win.setdefault(t["window"], []).append(t)
+        by_win.setdefault((t["window"], cluster_day(t)), []).append(t)
     windows = []
-    for w, ts in by_win.items():
-        windows.append({"regime": ts[0]["regime"], "date": ts[0]["date"],
+    for (w, day), ts in by_win.items():
+        windows.append({"regime": ts[0]["regime"], "day": day,
                         "pnl": sum(x["pnl"] for x in ts) / len(ts)})
     table = {}
     for reg in (nr.GOOD, nr.CAUTIOUS, nr.UNKNOWN):
@@ -123,7 +149,7 @@ def evaluate(trades: list[dict]) -> dict:
 
     clusters: dict[tuple, list[float]] = {}
     for w in windows:
-        clusters.setdefault((w["date"], w["regime"]), []).append(w["pnl"])
+        clusters.setdefault((w["day"], w["regime"]), []).append(w["pnl"])
     cl_good = [sum(v) / len(v) for (d, r), v in clusters.items() if r == nr.GOOD]
     cl_caut = [sum(v) / len(v) for (d, r), v in clusters.items() if r == nr.CAUTIOUS]
     diff = None
@@ -206,7 +232,8 @@ def cmd_report() -> int:
     for reg, (n, m, lo, hi) in ev["table"].items():
         print(f"  {reg:10} {n:>8} {m:>+10.4f} {f'[{lo:+.3f},{hi:+.3f}]':>20}")
     g, c = ev["clusters"]
-    print(f"\n  day-clusters: {g} good, {c} cautious (a cluster = one ET day x regime)")
+    print(f"\n  day-clusters: {g} good, {c} cautious (a cluster = one ET day x regime; "
+          f"a trade's day is the ET day it opened)")
     if ev["diff"]:
         d, lo, hi = ev["diff"]
         print(f"  good minus cautious, per window: {d:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]")
@@ -405,6 +432,13 @@ def _selftest() -> int:
     assert ev["cf"]["sized_per_unit"] > ev["cf"]["flat_per_unit"]
     assert ev["verdict"].startswith("EARNS ITS KEEP"), ev["verdict"]
     assert evaluate(trades[:10])["verdict"].startswith("COLLECTING")
+    # a cluster is the ET day of the OPEN: 10:00 and 21:00 ET on one EST day are 15:00Z
+    # and 02:00Z the next UTC date - still ONE cautious day
+    eve = [{"window": "W1", "regime": nr.CAUTIOUS, "pnl": -0.5, "date": "2026-12-09",
+            "open_ts": "2026-12-09T15:00:00+00:00"},
+           {"window": "W2", "regime": nr.CAUTIOUS, "pnl": -0.5, "date": "2026-12-10",
+            "open_ts": "2026-12-10T02:00:00+00:00"}]
+    assert evaluate(eve)["clusters"] == (0, 1)
     print("selftest OK")
     return 0
 
