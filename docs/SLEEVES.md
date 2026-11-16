@@ -110,7 +110,12 @@ only to the legacy 1-lots).
 to settlement) every outcome is a win or a loss that differ by exactly $1 per contract,
 so a rule's record is decided by how many trades lost. With no edge, a trade at ask A and
 fee f loses with probability 1-(A+f); the p-value is the Poisson-binomial chance of a
-record this good anyway. For near-certain favorites this matters a great deal:
+record this good anyway, computed exactly (a dynamic program over the trades) for every
+favorite or longshot rule up to thousands of events. Only past that work budget -
+mid-price rules with thousands of events, whose loss count is nearly symmetric - is a
+normal limit used, corrected for skewness and within 1% of exact at p >= 0.002. (A plain
+normal is 15-45% off at p ~ 0.001 for favorites and longshots.) For near-certain
+favorites this matters a great deal:
 
 | forward record, 98c, 10-lot | chance with NO edge | verdict |
 |---|---|---|

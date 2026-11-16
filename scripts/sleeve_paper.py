@@ -458,27 +458,74 @@ def _norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
+PB_EXACT_STEPS = 3_000_000    # the exact DP's work budget, n * min(k, n-k): ~0.2 s
+
+
+def _pb_exact(n: int, k: int) -> bool:
+    """Whether the exact DP runs for P(K <= k) over n trades. It costs n * min(k, n-k)
+    steps: always up to 200 of the rarer outcome, and beyond that within PB_EXACT_STEPS -
+    favorite and longshot rules (a skewed K, where approximations go wrong) to thousands
+    of events. Past it, in practice mid-price rules with thousands of events (nearly
+    symmetric), the skewness-corrected normal is used and a refresh stays fast."""
+    r = min(k, n - k)
+    return r <= 200 or n * r <= PB_EXACT_STEPS
+
+
+def _pb_head(qs: list[float], m: int) -> list[float]:
+    """[P(K=0), ..., P(K=m)] exactly, by dynamic programming truncated at m."""
+    dp = [1.0] + [0.0] * m
+    for q in qs:
+        r = 1.0 - q
+        dp = [dp[0] * r] + [a * r + b * q for a, b in zip(dp[1:], dp)]
+    return dp
+
+
+def _pb_skew_cdf(qs: list[float], k: int) -> float:
+    """P(K <= k) by the normal limit with a continuity correction AND a skewness
+    correction (the first Edgeworth term). The plain normal is 15-45% off at p ~ 1e-3
+    for favorites and longshots, whose K is skewed (anti-conservative for longshots);
+    corrected, the error where _pb_exact hands over is under 1% at p >= 2e-3 and a few
+    percent at 5e-4."""
+    mu = sum(qs)
+    var = sum(q * (1.0 - q) for q in qs)
+    if var <= 0:
+        return 1.0 if k + 0.5 >= mu else 0.0
+    sd = math.sqrt(var)
+    g = sum(q * (1.0 - q) * (1.0 - 2.0 * q) for q in qs) / sd ** 3
+    x = (k + 0.5 - mu) / sd
+    phi = math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+    return min(1.0, max(0.0, _norm_cdf(x) + g * (1.0 - x * x) * phi / 6.0))
+
+
 def _pb_cdf(qs: list[float], k: int) -> float:
     """P(K <= k), K = the number of successes among independent Bernoulli(q_i): the
     Poisson-binomial CDF, exact by dynamic programming (truncated at k, or run from the
-    other side when that is shorter). Past 200 of each outcome the normal limit is used,
-    with a continuity correction - by then it is accurate and the exact sum is slow."""
+    other side when that is shorter) wherever _pb_exact allows; the skewness-corrected
+    normal past it."""
     n = len(qs)
     if k < 0:
         return 0.0
     if k >= n:
         return 1.0
-    if min(k, n - k) > 200:
-        var = sum(q * (1.0 - q) for q in qs)
-        return _norm_cdf((k + 0.5 - sum(qs)) / math.sqrt(var)) if var > 0 else 1.0
+    if not _pb_exact(n, k):
+        return _pb_skew_cdf(qs, k)
     if k > n - k:                       # P(K <= k) = 1 - P(n-K <= n-k-1)
         return min(1.0, max(0.0, 1.0 - _pb_cdf([1.0 - q for q in qs], n - k - 1)))
-    dp = [1.0] + [0.0] * k
-    for q in qs:
-        for j in range(k, 0, -1):
-            dp[j] = dp[j] * (1.0 - q) + dp[j - 1] * q
-        dp[0] *= 1.0 - q
-    return min(1.0, max(0.0, sum(dp)))
+    return min(1.0, max(0.0, sum(_pb_head(qs, k))))
+
+
+def _pb_tails(qs: list[float], k: int) -> tuple[float, float]:
+    """(P(K <= k), P(K >= k)) for 0 <= k <= n: forward_stats' p and p_neg, from ONE
+    exact pass (half the cost of two _pb_cdf calls - a refresh scores every rule)."""
+    n = len(qs)
+    if not _pb_exact(n, k):
+        return _pb_skew_cdf(qs, k), 1.0 - _pb_skew_cdf(qs, k - 1)
+    flip = k > n - k                    # run from the shorter side: W = n - K
+    head = _pb_head([1.0 - q for q in qs] if flip else qs, n - k if flip else k)
+    inner = sum(head[:-1])              # P(K <= k-1), or P(W <= n-k-1) = P(K >= k+1)
+    total = inner + head[-1]            # P(K <= k),   or P(W <= n-k)   = P(K >= k)
+    lo, hi = (1.0 - inner, total) if flip else (total, 1.0 - inner)
+    return min(1.0, max(0.0, lo)), min(1.0, max(0.0, hi))
 
 
 def _house_shaped(t: dict) -> bool:
@@ -498,7 +545,9 @@ def forward_stats(trades: list[dict]) -> dict:
     house rule - one bet per (event, rule), held to settlement - every outcome is a win or
     a loss that differ by exactly $1 per contract, so a rule's total is decided by HOW
     MANY trades lost. With no edge, a trade at ask A and fee f loses with probability
-    1-(A+f), so both p-values are exact Poisson-binomial tails:
+    1-(A+f), so both p-values are exact Poisson-binomial tails (_pb_tails; past the exact
+    DP's work budget - mid-price rules with thousands of events - a skewness-corrected
+    normal, within 1% of exact at p >= 0.002):
         p      = P(this few losses or fewer | no edge)   evidence the rule makes money
         p_neg  = P(this many losses or more | no edge)   evidence it loses money
     A normal approximation goes badly wrong on 97-99c favorites, where losses are rare and
@@ -522,7 +571,7 @@ def forward_stats(trades: list[dict]) -> dict:
     elif all(len(v) == 1 for v in ev.values()) and all(_house_shaped(t) for t in rows):
         qs = [1.0 - min(0.999, max(0.001, t["ask"] + t["fee_pc"])) for t in rows]
         k = sum(1 for t in rows if not t["won"])
-        p, p_neg = _pb_cdf(qs, k), 1.0 - _pb_cdf(qs, k - 1)
+        p, p_neg = _pb_tails(qs, k)
     elif n >= 2:
         from sleeve_scan import p_value
         se = (hi - m) / 1.96

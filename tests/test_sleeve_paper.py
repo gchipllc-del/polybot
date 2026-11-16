@@ -368,14 +368,53 @@ def test_poisson_binomial_tail_matches_brute_force():
                         pr *= q if o else 1.0 - q
                     brute += pr
             assert abs(sp._pb_cdf(qs, k) - brute) < 1e-12, (qs, k)
+            if 0 <= k <= n:                   # forward_stats' two tails, one pass
+                at_least = 1.0 - (sp._pb_cdf(qs, k - 1) if k else 0.0)
+                lo, hi = sp._pb_tails(qs, k)
+                assert abs(lo - brute) < 1e-12 and abs(hi - at_least) < 1e-12, (qs, k)
+
+
+def _binom_tails(n, q, k):
+    """Exact (P(K <= k), P(K >= k)) for K ~ Binomial(n, q), summed in log space."""
+    import math
+    lg, lq, lr = math.lgamma, math.log(q), math.log1p(-q)
+    pmf = [math.exp(lg(n + 1) - lg(j + 1) - lg(n - j + 1) + j * lq + (n - j) * lr)
+           for j in range(n + 1)]
+    return sum(pmf[:k + 1]), sum(pmf[k:])
 
 
 def test_poisson_binomial_normal_limit_is_accurate_where_used():
-    import math
-    n, q = 600, 0.4                      # min(k, n-k) > 200: the normal branch
-    for k in (220, 240, 260):
-        exact = sum(math.comb(n, j) * q ** j * (1 - q) ** (n - j) for j in range(k + 1))
-        assert abs(sp._pb_cdf([q] * n, k) - exact) < 0.005
+    """Past the exact DP's budget the skewness-corrected normal answers - for mid-price
+    rules, and for skewed ones only with hundreds of the rarer outcome. There it must hold
+    the BH-relevant tails to 1%: a 7c longshot rule over 12,000 events (the plain normal
+    is ~10% low at p ~ 2e-3 there, the anti-conservative way), and 40c 1-lots."""
+    q_long = 1 - (0.07 + sp.kalshi_fee(0.07, 10) / 10)
+    for n, q, ks in ((12000, q_long, (11017, 11033, 11045)), (8000, 0.4, (3076, 3100, 3118))):
+        qs = [q] * n
+        for k in ks:
+            exact = _binom_tails(n, q, k)[0]
+            assert not sp._pb_exact(n, k) and 1e-3 < exact < 0.05, (n, k, exact)
+            assert abs(sp._pb_cdf(qs, k) / exact - 1) < 0.01, (n, k)
+            assert abs(sp._pb_tails(qs, k)[0] / exact - 1) < 0.01, (n, k)
+
+
+def test_records_past_200_of_the_rarer_outcome_get_exact_tails():
+    """The normal limit used to take over at 200 of each outcome, whatever the skew - for
+    longshot rules it understated p by 15-45% exactly where BH thresholds sit. A 10-lot
+    rule on 7c longshots with 2600 events is well inside the exact DP's budget now."""
+    q = 1 - (0.07 + sp.kalshi_fee(0.07, 10) / 10)          # the no-edge loss chance
+    for wins in (226, 231, 236):                            # exact p ~ 1e-2 .. 2e-3
+        st = sp.forward_stats(_house(wins, 2600 - wins, ask=0.07))
+        assert abs(st["p"] / _binom_tails(2600, q, 2600 - wins)[0] - 1) < 1e-9, wins
+    # 231 wins (+1.4c/contract): exact p = 4.9e-3. Among 22 testable rules (BH rank-1 bar
+    # 0.10/22 = 0.0045) that is no edge; the normal limit's 4.1e-3 made it EDGE.
+    st = sp.forward_stats(_house(231, 2600 - 231, ask=0.07))
+    others = [{"n": 100, "p": 0.5, "p_neg": 0.5, "mean": 0.0}] * 21
+    assert sp.classify(st, 0 in sp.survivors([st] + others)) == "positive_ns"
+    # the NEGATIVE side too: 90c favorites, 2400 events, 260 losses
+    q90 = 1 - (0.90 + sp.kalshi_fee(0.90, 10) / 10)
+    st = sp.forward_stats(_house(2400 - 260, 260, ask=0.90))
+    assert abs(st["p_neg"] / _binom_tails(2400, q90, 260)[1] - 1) < 1e-9
 
 
 def _house(wins, losses, ask=0.98, lots=10):
