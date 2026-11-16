@@ -80,7 +80,9 @@ def kelly_bet_size_slippage_aware(bankroll: float, our_prob: float, market_prob:
                                   fraction: float = 0.25, max_per_market_pct: float = 0.05,
                                   **_ignored) -> dict:
     """Size on the price you will actually PAY. The stake moves the price and the price
-    moves the stake, so iterate to a fixed point; `converged` reports whether it did."""
+    moves the stake, so iterate to a fixed point; `converged` reports whether it did and
+    `iterations` how many passes it took (1-60). Both callers read both keys:
+    market_scanner.py:557-558 logs them, backtest.py:1045-1046 checks and prints them."""
     p, q = _p(our_prob), _p(market_prob)
     naive = kelly_bet_size(bankroll, p, q, fraction, max_per_market_pct)
     coef = _IMPACT_COEF.get(str(market_type).upper(), 1.0)
@@ -93,8 +95,8 @@ def kelly_bet_size_slippage_aware(bankroll: float, our_prob: float, market_prob:
             return _MAX_IMPACT                 # unknown liquidity: assume the worst
         return min(_MAX_IMPACT, coef * bet / vol)
 
-    bet, converged = naive, False
-    for _ in range(60):
+    bet, converged, iterations = naive, False, 0
+    for iterations in range(1, 61):
         eff = min(0.999, q + impact(bet))
         nxt = kelly_bet_size(bankroll, p, eff, fraction, max_per_market_pct)
         if abs(nxt - bet) < 1e-6:
@@ -104,7 +106,8 @@ def kelly_bet_size_slippage_aware(bankroll: float, our_prob: float, market_prob:
     eff = min(0.999, q + impact(bet))
     return {"bet_usd": bet, "naive_kelly_usd": naive, "effective_price": eff,
             "slippage_pct": (eff - q) / q if q > 0 else 0.0,
-            "edge_post_slip": p - eff, "converged": converged}
+            "edge_post_slip": p - eff, "converged": converged,
+            "iterations": iterations}
 
 
 def min_edge_for_trade(market_prob: float, fee_rate: float = 0.0) -> float:
