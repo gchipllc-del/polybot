@@ -70,6 +70,9 @@ Exactly like every rule in this project: forward, on the paper ledger.
   **day-cluster** (one ET day × regime), since windows inside one day share that day's
   conditions. A trade's day is the ET day it *opened* on; the ledger's timestamps are
   UTC, and a UTC date would split every ET day at 19:00/20:00 ET into two clusters.
+  Each trade counts under its own stamp: a window that straddles the hourly regime
+  update (an early entry under the old regime, a late one under the new) is one
+  observation per regime.
 - It also computes the counterfactual the original trader tracked: **flat sizing vs
   regime sizing on the same trades** (total, per unit of exposure, max drawdown).
 

@@ -114,3 +114,38 @@ def test_ledger_rows_carry_the_open_timestamp():
     t = _trades([(at, nr.GOOD, 0.1)])[0]
     assert t["open_ts"] == at.isoformat() and t["date"] == "2026-12-10"
     assert vr._per_window([t]) == [("2026-12-10", 0.1)]
+
+
+# ── a window straddling a regime update splits by regime (review #9) ──────────
+
+def test_window_straddling_a_regime_update_splits_by_regime():
+    """PolybotNews writes a new regime once an hour. The 15-minute window that
+    straddles it can hold an early entry under the old regime and a late one under the
+    new. Booked whole to the first trade's regime, the cautious -0.90 counted as GOOD
+    while the counterfactual halved it as cautious."""
+    rows = [
+        {"t": "open", "ts": "2026-12-01T15:16:00+00:00", "rule": "CONTROL_midprice",
+         "ticker": "KXBTC15M-26DEC011030-64000", "regime": nr.GOOD},
+        {"t": "open", "ts": "2026-12-01T15:29:00+00:00", "rule": "H1_settlement_lag",
+         "ticker": "KXBTC15M-26DEC011030-64100", "regime": nr.CAUTIOUS},
+        {"t": "close", "ts": "2026-12-01T15:31:00+00:00", "rule": "CONTROL_midprice",
+         "ticker": "KXBTC15M-26DEC011030-64000", "pnl": 0.48, "won": True},
+        {"t": "close", "ts": "2026-12-01T15:31:00+00:00", "rule": "H1_settlement_lag",
+         "ticker": "KXBTC15M-26DEC011030-64100", "pnl": -0.90, "won": False},
+    ]
+    trades = vr.ledger_rows(rows)["trades"]
+    assert len({t["window"] for t in trades}) == 1           # one window, two stamps
+    ev = na.evaluate(trades)
+    assert ev["clusters"] == (1, 1)
+    assert ev["table"][nr.GOOD][:2] == (1, 0.48)
+    assert ev["table"][nr.CAUTIOUS][:2] == (1, -0.90)
+    assert ev["n_windows"] == 2
+
+
+def test_same_regime_trades_in_a_window_stay_one_observation():
+    """The split is by regime only: same-stamp trades in a window are still ONE bet."""
+    at = _utc(date(2026, 12, 1), 10, 16)
+    ev = na.evaluate(_trades([(at, nr.GOOD, 0.4, "A", 64000),
+                              (at + timedelta(minutes=10), nr.GOOD, -0.2, "B", 64100)]))
+    assert ev["n_windows"] == 1 and ev["clusters"] == (1, 0)
+    assert abs(ev["table"][nr.GOOD][1] - 0.1) < 1e-12

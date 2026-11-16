@@ -132,14 +132,17 @@ def evaluate(trades: list[dict]) -> dict:
     """trades: vol_replay.ledger_rows(...)['trades'] - each carries the regime stamp of
     its open. Unstamped trades predate the agent and are excluded entirely."""
     stamped = [t for t in trades if t.get("regime") in (nr.GOOD, nr.CAUTIOUS, nr.UNKNOWN)]
-    # one observation per window, within the ET day each trade opened on: a cluster is
-    # one ET day x one regime, so every trade must land in the cluster of its own open
+    # one observation per window x regime, within the ET day each trade opened on: a
+    # cluster is one ET day x one regime, so every trade must land in the cluster of its
+    # own open AND its own stamp. A window that straddles the hourly regime update (an
+    # early entry under the old regime, a late one under the new) is one observation
+    # per regime - booking it whole to its first trade's regime moved P&L across.
     by_win: dict[tuple, list[dict]] = {}
     for t in stamped:
-        by_win.setdefault((t["window"], cluster_day(t)), []).append(t)
+        by_win.setdefault((t["window"], cluster_day(t), t["regime"]), []).append(t)
     windows = []
-    for (w, day), ts in by_win.items():
-        windows.append({"regime": ts[0]["regime"], "day": day,
+    for (w, day, reg), ts in by_win.items():
+        windows.append({"regime": reg, "day": day,
                         "pnl": sum(x["pnl"] for x in ts) / len(ts)})
     table = {}
     for reg in (nr.GOOD, nr.CAUTIOUS, nr.UNKNOWN):
@@ -439,6 +442,10 @@ def _selftest() -> int:
            {"window": "W2", "regime": nr.CAUTIOUS, "pnl": -0.5, "date": "2026-12-10",
             "open_ts": "2026-12-10T02:00:00+00:00"}]
     assert evaluate(eve)["clusters"] == (0, 1)
+    # a window straddling the hourly regime update is one observation PER regime
+    mix = [{"window": "W", "regime": nr.GOOD, "pnl": 0.48, "date": "2026-12-01"},
+           {"window": "W", "regime": nr.CAUTIOUS, "pnl": -0.90, "date": "2026-12-01"}]
+    assert evaluate(mix)["clusters"] == (1, 1)
     print("selftest OK")
     return 0
 
