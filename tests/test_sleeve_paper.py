@@ -93,7 +93,7 @@ def test_one_bet_per_event_per_rule_across_cycles(tmp_path):
     rp, lp = _setup(tmp_path)
     get = _getter([mk("KXINX-E1-A", "KXINX-E1", 88, 86), mk("KXINX-E1-B", "KXINX-E1", 90, 88)])
     for _ in range(3):
-        sp.run_cycle(get, NOW, rp, lp, depth_fn=lambda t, s, p: 5,
+        sp.run_cycle(get, NOW, rp, lp, depth_fn=lambda t, s, p: 50,
                      regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
     opens = [r for r in sp._load_jsonl(lp) if r.get("t") == "open"]
     assert sorted(r["rule"] for r in opens) == ["FLB_FAV_KXINX", "FLB_LONG_KXINX"]
@@ -114,7 +114,7 @@ def test_rules_named_after_the_trade_never_count(tmp_path):
     rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
     sp.register(sp.probe_rules(["KXINX"]), rp, NOW + timedelta(hours=1))   # named later
     s = sp.run_cycle(_getter([mk("KXINX-E1-A", "KXINX-E1", 88, 86)]), NOW, rp, lp,
-                     depth_fn=lambda t, s, p: 5,
+                     depth_fn=lambda t, s, p: 50,
                      regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
     assert s["opened"] == 0
 
@@ -124,13 +124,14 @@ def test_rules_named_after_the_trade_never_count(tmp_path):
 def test_settlement_pnl_includes_the_real_fee(tmp_path):
     rp, lp = _setup(tmp_path)
     get = _getter([mk("KXINX-E1-A", "KXINX-E1", 88, 86)], result="yes")
-    sp.run_cycle(get, NOW, rp, lp, depth_fn=lambda t, s, p: 5,
+    sp.run_cycle(get, NOW, rp, lp, depth_fn=lambda t, s, p: 50,
                  regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
-    sp.run_cycle(get, NOW + timedelta(hours=11), rp, lp, depth_fn=lambda t, s, p: 5,
+    sp.run_cycle(get, NOW + timedelta(hours=11), rp, lp, depth_fn=lambda t, s, p: 50,
                  regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
     closes = {c["rule"]: c for c in sp._load_jsonl(lp) if c.get("t") == "close"}
-    assert abs(closes["FLB_FAV_KXINX"]["pnl"] - 0.11) < 1e-9      # +0.12 - 1c fee
-    assert abs(closes["FLB_LONG_KXINX"]["pnl"] + 0.15) < 1e-9     # -0.14 - 1c fee
+    # probes are 10-lots: ONE order's fee, ceil to the cent - .08 at 88c, .09 at 14c
+    assert abs(closes["FLB_FAV_KXINX"]["pnl"] - (1.20 - 0.08)) < 1e-9
+    assert abs(closes["FLB_LONG_KXINX"]["pnl"] - (-1.40 - 0.09)) < 1e-9
 
 
 def test_markets_still_open_are_not_polled_for_settlement(tmp_path):
@@ -142,7 +143,7 @@ def test_markets_still_open_are_not_polled_for_settlement(tmp_path):
         if url.endswith("/markets"):
             return {"markets": [mk("KXINX-E1-A", "KXINX-E1", 88, 86)], "cursor": None}
         return {"market": {"result": "yes"}}
-    sp.run_cycle(get, NOW, rp, lp, depth_fn=lambda t, s, p: 5,
+    sp.run_cycle(get, NOW, rp, lp, depth_fn=lambda t, s, p: 50,
                  regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
     assert all(u.endswith("/markets") for u in calls)
 
@@ -154,7 +155,7 @@ def test_ledger_passes_the_integrity_checks(tmp_path):
     rp, lp = _setup(tmp_path)
     get = _getter([mk("KXINX-E1-A", "KXINX-E1", 88, 86)], result="no")
     for h in (0, 11):
-        sp.run_cycle(get, NOW + timedelta(hours=h), rp, lp, depth_fn=lambda t, s, p: 5,
+        sp.run_cycle(get, NOW + timedelta(hours=h), rp, lp, depth_fn=lambda t, s, p: 50,
                      regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
     rows = sp._load_jsonl(lp)
     for name, ok, detail in (("B1", *dg.check_b1_ledger_structure(rows)),
@@ -214,3 +215,154 @@ def test_rules_without_hours_fields_still_load(tmp_path):
     assert all("min_h" not in r for r in sp.active_rules(rp).values())
     assert sp.candidates(mk("A", "E", 88, 86), NOW.timestamp(),
                          list(sp.active_rules(rp).values()))
+
+
+# ── order size, one rule over many series, exact judging ──────────────────────
+
+def _getter_by_series(by_series, result="yes"):
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            return {"markets": by_series.get((params or {}).get("series_ticker"), []),
+                    "cursor": None}
+        return {"market": {"ticker": url.rsplit("/", 1)[-1], "result": result}}
+    return get
+
+
+def _cycle(get, rp, lp, at=NOW, depth=50):
+    return sp.run_cycle(get, at, rp, lp, depth_fn=lambda t, s, p: depth,
+                        regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
+
+
+def test_rules_registered_before_sizes_still_trade_one_contract(tmp_path):
+    """F9799_KXHIGHNY and the other per-city rules were registered without a size. They
+    keep trading exactly as defined: a 1-lot paying a 1-lot's fee."""
+    rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
+    sp.register([{"name": "OLD_KXINX", "series": "KXINX", "band": "any", "side": "favorite",
+                  "lo": 0.80, "hi": 0.95}], rp, NOW - timedelta(days=1))
+    get = _getter([mk("KXINX-E1-A", "KXINX-E1", 88, 86)], result="yes")
+    _cycle(get, rp, lp, depth=1)
+    _cycle(get, rp, lp, at=NOW + timedelta(hours=11), depth=1)
+    rows = sp._load_jsonl(lp)
+    o = next(r for r in rows if r.get("t") == "open")
+    c = next(r for r in rows if r.get("t") == "close")
+    assert o["contracts"] == 1 and o["fee"] == 0.01 and abs(c["pnl"] - 0.11) < 1e-9
+
+
+def test_a_ten_lot_needs_ten_deep_and_pays_one_orders_fee(tmp_path):
+    # why sizes matter: a 1-lot at 99c pays a 1c fee on a 1c win - it can never profit
+    assert sp.kalshi_fee(0.99, 1) == 0.01
+    rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
+    sp.register([{"name": "BIG", "series": "KXINX", "band": "any", "side": "favorite",
+                  "lo": 0.97, "hi": 0.995, "contracts": 10}], rp, NOW - timedelta(days=1))
+    get = _getter([mk("KXINX-E1-A", "KXINX-E1", 98, 96)])
+    s = _cycle(get, rp, lp, depth=9)
+    assert s["opened"] == 0 and s["skipped"]["no_depth"] == 1
+    assert _cycle(get, rp, lp, depth=10)["opened"] == 1
+    o = next(r for r in sp._load_jsonl(lp) if r.get("t") == "open")
+    assert o["contracts"] == 10 and o["fee"] == 0.02     # ceil(0.07*10*.98*.02) - not 10c
+
+
+def test_one_rule_spans_many_series_and_is_one_test(tmp_path):
+    rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
+    sp.register([{"name": "F9799", "series": ["KXHIGHNY", "KXHIGHCHI"], "band": "any",
+                  "side": "favorite", "lo": 0.97, "hi": 0.995, "contracts": 10}],
+                rp, NOW - timedelta(days=1))
+    get = _getter_by_series({
+        "KXHIGHNY": [mk("KXHIGHNY-26NOV20-B50", "KXHIGHNY-26NOV20", 3, 2)],     # NO fav, 98c
+        "KXHIGHCHI": [mk("KXHIGHCHI-26NOV20-B40", "KXHIGHCHI-26NOV20", 98, 96)]},  # YES fav
+        result="no")
+    s = _cycle(get, rp, lp)
+    assert s["opened"] == 2 and s["series"] == 2
+    _cycle(get, rp, lp, at=NOW + timedelta(hours=11))
+    res = sp.evaluate(sp._load_jsonl(lp), sp.active_rules(rp))
+    assert len(res) == 1                                       # ONE rule, ONE test
+    r = res[0]
+    assert r["rule"] == "F9799" and r["events"] == 2 and r["contracts"] == 10
+    assert r["series"] == "KXHIGHNY,KXHIGHCHI"
+    assert r["by_series"]["KXHIGHNY"][1] > 0 > r["by_series"]["KXHIGHCHI"][1]
+
+
+def test_poisson_binomial_tail_matches_brute_force():
+    import itertools
+    import random
+    rng = random.Random(7)
+    for _ in range(25):
+        n = rng.randint(1, 9)
+        qs = [rng.uniform(0.001, 0.7) for _ in range(n)]
+        for k in range(-1, n + 1):
+            brute = 0.0
+            for outcome in itertools.product((0, 1), repeat=n):
+                if sum(outcome) <= k:
+                    pr = 1.0
+                    for q, o in zip(qs, outcome):
+                        pr *= q if o else 1.0 - q
+                    brute += pr
+            assert abs(sp._pb_cdf(qs, k) - brute) < 1e-12, (qs, k)
+
+
+def test_poisson_binomial_normal_limit_is_accurate_where_used():
+    import math
+    n, q = 600, 0.4                      # min(k, n-k) > 200: the normal branch
+    for k in (220, 240, 260):
+        exact = sum(math.comb(n, j) * q ** j * (1 - q) ** (n - j) for j in range(k + 1))
+        assert abs(sp._pb_cdf([q] * n, k) - exact) < 0.005
+
+
+def _house(wins, losses, ask=0.98, lots=10):
+    fee = sp.kalshi_fee(ask, lots)
+    out = []
+    for i in range(wins + losses):
+        won = i < wins
+        pnl = (lots * (1 - ask) if won else -lots * ask) - fee
+        out.append({"event": f"E{i}", "won": won, "ask": ask, "fee_pc": fee / lots,
+                    "pnl": pnl, "pnl_pc": pnl / lots})
+    return out
+
+
+def test_a_hundred_straight_wins_at_98c_is_ordinary_luck():
+    """The 'it hasn't lost yet' trap, at the size the friend's method trades."""
+    st = sp.forward_stats(_house(100, 0))
+    assert abs(st["p"] - 0.982 ** 100) < 1e-9 and st["p"] > 0.15
+    assert sp.classify(st, False) == "positive_ns"
+    assert sp.classify(sp.forward_stats(_house(40, 0)), False) == "positive_ns"
+
+
+def test_three_losses_in_thirty_at_98c_is_significantly_negative():
+    """Where the normal interval still straddles zero, the exact tail is decisive."""
+    import math
+    st = sp.forward_stats(_house(27, 3))
+    q = 1 - 0.982
+    tail = 1 - sum(math.comb(30, j) * q ** j * (1 - q) ** (30 - j) for j in range(3))
+    assert abs(st["p_neg"] - tail) < 1e-9 and st["p_neg"] < 0.025
+    assert st["hi"] > 0                                # the old interval test would miss it
+    assert sp.classify(st, False) == "negative"
+
+
+def test_non_house_shaped_trades_fall_back_to_the_floored_test():
+    from sleeve_scan import p_value
+    rows = [{"event": f"E{i}", "won": i % 2 == 0, "ask": 0.5,
+             "pnl": 0.02 if i % 2 == 0 else -0.03} for i in range(40)]   # not hold-to-expiry
+    st = sp.forward_stats(rows)
+    se = (st["hi"] - st["mean"]) / 1.96
+    assert st["p"] == p_value(st["mean"], se, rows)
+
+
+def test_cli_one_rule_per_hypothesis_and_retire_by_prefix(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "RULES", tmp_path / "rules.jsonl")
+    sp.register([{"name": f"F9799_{c}", "series": c, "band": "any", "side": "favorite",
+                  "lo": 0.97, "hi": 0.995} for c in ("KXHIGHNY", "KXHIGHCHI")], sp.RULES, NOW)
+
+    def run(*argv):
+        monkeypatch.setattr(sys, "argv", ["sleeve_paper.py", *argv])
+        return sp.main()
+
+    assert run("retire", "F9799_KXHIGHNY", "NOPE") == 1          # all-or-nothing
+    assert set(sp.active_rules(sp.RULES)) == {"F9799_KXHIGHNY", "F9799_KXHIGHCHI"}
+    assert run("retire", "--prefix", "F9799_") == 0
+    assert sp.active_rules(sp.RULES) == {}
+    args = ("register-rule", "--name", "F9799", "--series", "KXHIGHNY,KXHIGHCHI,KXBTC15M",
+            "--side", "favorite", "--lo", "0.97", "--hi", "0.995", "--band", "any")
+    assert run(*args) == 0
+    r = sp.active_rules(sp.RULES)["F9799"]
+    assert r["series"] == ["KXHIGHNY", "KXHIGHCHI"] and r["contracts"] == 10
+    assert run(*args) == 1                                         # never redefined

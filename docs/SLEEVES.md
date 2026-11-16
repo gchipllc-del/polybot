@@ -77,6 +77,43 @@ Every forward rule goes through the same fill-depth gate as the crypto paper tra
 bet per event, and the news regime stamp. The forward family is corrected with BH
 across *all* paper rules at verdict time, so adding sleeves never lowers the bar.
 
+## Testing an outside method (e.g. a friend's 97-99c favorites)
+
+```
+py scripts/sleeve_paper.py register-rule --name F9799 --series KXHIGHNY,KXHIGHCHI,... \
+    --side favorite --lo 0.97 --hi 0.995 --band any [--contracts 10] \
+    [--min-hours 6 --max-hours 12] --thesis "..."
+```
+
+Three choices in that command decide whether the test is fair.
+
+**One hypothesis = one rule = one test.** A method run on seven cities is one rule over
+seven series, not seven rules. Seven per-city tests would each wait ~100 days for 100
+events (one bet per city-day) and widen the false-discovery family seven-fold; the pooled
+rule reaches 100 events in about two weeks. `report` still prints a per-series line, as
+description, never as a test.
+
+**Order size is part of the rule (default 10 contracts).** Kalshi rounds the fee per
+ORDER up to the cent. A 1-lot at 99c pays a 1c fee on a 1c win: it cannot profit even
+if it never loses. At 10 contracts the fee is about 0.1-0.2c per contract. Rules
+registered before sizes were stored keep their 1-lot definition.
+
+**Exact odds, not a normal approximation.** Under the house rule (one bet per event, held
+to settlement) every outcome is a win or a loss that differ by exactly $1 per contract,
+so a rule's record is decided by how many trades lost. With no edge, a trade at ask A and
+fee f loses with probability 1-(A+f); the p-value is the Poisson-binomial chance of a
+record this good anyway. For near-certain favorites this matters a great deal:
+
+| forward record, 98c, 10-lot | chance with NO edge | verdict |
+|---|---|---|
+| 40 wins, 0 losses | 0.48 | positive, not significant |
+| 100 wins, 0 losses | 0.16 | positive, not significant |
+| 27 wins, 3 losses | 0.016 of doing this badly | NEGATIVE (significant) |
+
+A 100% win rate on 97-99c favorites is what a no-edge method shows most of the time for
+its first few dozen trades. The question is never the win rate - it is whether the win
+rate beats ~98.2% (the break-even at 98c with fees) by enough, over enough events.
+
 ## The other route: conditional sleeves
 
 An unconditional screen asks "is this price wrong on average?". The edges that survive in

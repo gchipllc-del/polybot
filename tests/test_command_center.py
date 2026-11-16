@@ -119,3 +119,35 @@ def test_labels_are_inserted_as_text_never_html():
     must never build DOM from strings."""
     assert "innerHTML" not in cc._PAGE and "outerHTML" not in cc._PAGE
     assert "insertAdjacentHTML" not in cc._PAGE
+
+
+def test_a_rule_spanning_many_series_scores_and_counts(tmp_path, monkeypatch):
+    """One hypothesis over seven cities is one rule: the payload must count its series
+    and label it - a list-valued series once crashed the series count."""
+    import sleeve_paper as sp
+    from lib import news_regime as nr
+    monkeypatch.setattr(cc, "CRYPTO_LEDGER", tmp_path / "none.jsonl")
+    monkeypatch.setattr(cc, "HEALTH_LOG", tmp_path / "none.log")
+    monkeypatch.setattr(cc, "SCREEN", tmp_path / "none.json")
+    monkeypatch.setattr(sp, "RULES", tmp_path / "rules.jsonl")
+    monkeypatch.setattr(sp, "LEDGER", tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(nr, "REGIME_LOG", tmp_path / "regime.jsonl")
+    cities = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA"]
+    sp.register([{"name": "F9799", "series": cities, "band": "any", "side": "favorite",
+                  "lo": 0.97, "hi": 0.995, "contracts": 10}], sp.RULES,
+                datetime(2026, 11, 1, tzinfo=timezone.utc))
+    rows = []
+    for i, c in enumerate(cities):
+        tk, ev = f"{c}-26NOV0{i + 2}-B50", f"{c}-26NOV0{i + 2}"
+        o = {"t": "open", "ts": f"2026-11-0{i + 2}T12:00:00+00:00", "ticker": tk,
+             "rule": "F9799", "event": ev, "series": c, "side": "no", "price": 0.98,
+             "contracts": 10, "fee": 0.02, "depth": 40}
+        rows += [o, sp.settle(o, "no")]
+    sp._append(sp.LEDGER, rows)
+    cc._CACHE.update(t=0.0, payload=None)
+    p = cc.build_payload()
+    assert p["kpi"]["sleeves"] == 3 and p["kpi"]["events"] == 3
+    r = next(x for x in p["rules"] if x["rule"] == "F9799")
+    assert r["series"] == "KXHIGHNY +2 more" and r["decision"]["n"] == 3
+    assert abs(r["decision"]["mean"] - 0.018) < 1e-9          # per contract: 2c - 0.2c fee
+    assert abs(r["decision"]["p"] - 0.982 ** 3) < 1e-9          # exact: 3/3 is luck

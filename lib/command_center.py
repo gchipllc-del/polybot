@@ -41,7 +41,6 @@ CRYPTO_LEDGER = Path(os.environ.get("PAPER_CRYPTO_LEDGER") or (DATA / "paper_cry
 HEALTH_LOG = Path(os.environ.get("POLYBOT_HEALTH_LOG") or (ROOT / "logs" / "healthcheck.log"))
 SCREEN = Path(os.environ.get("SLEEVE_DIR") or (DATA / "sleeves")) / "screen.json"
 MIN_EVENTS = 100
-MIN_TESTABLE = 30
 _CACHE: dict = {"t": 0.0, "payload": None}
 
 
@@ -82,8 +81,12 @@ def crypto_trades(rows: list[dict]) -> list[dict]:
         if r.get("t") != "close":
             continue
         o = opens.get((r.get("ticker"), r.get("rule"))) or {}
+        n = max(1, int(o.get("contracts") or 1))
+        pnl = float(r.get("pnl") or 0.0)
         out.append({"rule": r.get("rule"), "venue": "crypto", "event": window_of(r.get("ticker")),
-                    "pnl": float(r.get("pnl") or 0.0), "won": bool(r.get("won")),
+                    "pnl": pnl, "pnl_pc": pnl / n,
+                    "fee_pc": float(o["fee"]) / n if o.get("fee") is not None else None,
+                    "won": bool(r.get("won")),
                     "ask": float(r.get("price") or o.get("price") or 0.5),
                     "ts": _ts(r.get("ts")) or _ts(o.get("ts")) or 0.0,
                     "era": era_of({"v": o.get("v"), "depth": o.get("depth")})})
@@ -91,49 +94,40 @@ def crypto_trades(rows: list[dict]) -> list[dict]:
 
 
 def sleeve_trades() -> tuple[list[dict], dict]:
+    """Trades the sleeve report counts, by the sleeve report's own code (trades_of: after
+    named_at, per contract), labelled for the table."""
     try:
         import sleeve_paper as sp
     except Exception:  # noqa: BLE001
         return [], {}
     rules = sp.active_rules(sp.RULES)          # explicit: the default arg binds at def time
-    rows = _load_jsonl(sp.LEDGER)
-    opens = {(r.get("ticker"), r.get("rule")): r for r in rows if r.get("t") == "open"}
     out = []
-    for r in rows:
-        if r.get("t") != "close" or r.get("rule") not in rules:
-            continue
-        o = opens.get((r.get("ticker"), r.get("rule"))) or {}
-        if (_ts(o.get("ts")) or 0) < (_ts(rules[r["rule"]].get("named_at")) or 0):
-            continue                                  # only trades after pre-registration
-        out.append({"rule": r["rule"], "venue": "sleeves",
-                    "series": rules[r["rule"]].get("series"),
-                    "event": r.get("event") or o.get("event"), "pnl": float(r["pnl"]),
-                    "won": bool(r.get("won")), "ask": float(r.get("price") or 0.5),
-                    "ts": _ts(r.get("ts")) or 0.0, "era": "v4 gated"
-                    if o.get("depth") is not None else "v4 ungated"})
+    for name, ts in sp.trades_of(_load_jsonl(sp.LEDGER), rules).items():
+        label = sp.series_label(rules[name])
+        out += [dict(t, venue="sleeves", series=label,
+                     era="v4 gated" if t["depth"] is not None else "v4 ungated") for t in ts]
     return out, rules
+
+
+def _series_count(srules: dict) -> int:
+    try:
+        import sleeve_paper as sp
+        return len({x for r in srules.values() for x in sp.series_of(r)})
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ── the one scoring family ────────────────────────────────────────────────────
 
 def _stats(trades: list[dict]) -> dict:
-    from forecast_replay import mean_ci
-    from sleeve_scan import p_value
-    ev: dict[str, list[float]] = {}
-    for t in trades:
-        ev.setdefault(str(t["event"]), []).append(t["pnl"])
-    per = [sum(v) / len(v) for v in ev.values()]
-    m, lo, hi = mean_ci(per)
-    p = p_value(m, (hi - m) / 1.96, trades) if len(per) >= 2 else 1.0
-    return {"n": len(per), "trades": len(trades), "mean": m, "lo": lo, "hi": hi, "p": p,
-            "wr": (sum(t["won"] for t in trades) / len(trades)) if trades else None,
-            "net": sum(t["pnl"] for t in trades)}
+    import sleeve_paper as sp
+    return sp.forward_stats(trades)
 
 
 def score_rules(trades: list[dict], sleeve_rule_names: set | None = None) -> list[dict]:
     """Every rule, one family. Crypto rules are judged on fill-checked (v4 gated) trades
     only; sleeve rules on everything after named_at. BH across all testable rules."""
-    from sleeve_scan import bh_select
+    import sleeve_paper as sp
     by_rule: dict[str, list] = {}
     for t in trades:
         by_rule.setdefault(t["rule"], []).append(t)
@@ -151,22 +145,17 @@ def score_rules(trades: list[dict], sleeve_rule_names: set | None = None) -> lis
         rows.append({"rule": name, "venue": venue,
                      "series": next((t.get("series") for t in ts if t.get("series")), None),
                      "all": s_all, "decision": s_dec, "spark": _downsample(cum)})
-    testable = [i for i, r in enumerate(rows) if r["decision"]["n"] >= MIN_TESTABLE]
-    keep = {testable[j] for j in bh_select([rows[i]["decision"]["p"] for i in testable])} \
-        if testable else set()
+    keep = sp.survivors([r["decision"] for r in rows])
     for i, r in enumerate(rows):
         d = r["decision"]
         basis = "fill-checked" if r["venue"] == "crypto" else "after registration"
-        if d["n"] < MIN_TESTABLE:
-            r["verdict"], r["status"] = f"collecting · {d['n']}/{MIN_EVENTS} {basis}", "neutral"
-        elif i in keep and d["mean"] > 0 and d["n"] >= MIN_EVENTS:
-            r["verdict"], r["status"] = "EDGE · survives the family correction", "good"
-        elif i in keep and d["mean"] > 0:
-            r["verdict"], r["status"] = f"promising · needs {MIN_EVENTS} events", "warning"
-        elif d["hi"] < 0:
-            r["verdict"], r["status"] = "negative · significant", "critical"
-        else:
-            r["verdict"], r["status"] = "no edge yet", "neutral"
+        cat = sp.classify(d, i in keep)
+        r["verdict"], r["status"] = {
+            "collecting": (f"collecting · {d['n']}/{MIN_EVENTS} {basis}", "neutral"),
+            "edge": ("EDGE · survives the family correction", "good"),
+            "promising": (f"promising · needs {MIN_EVENTS} events", "warning"),
+            "negative": ("negative · significant", "critical"),
+        }.get(cat, ("no edge yet", "neutral"))
     order = {"good": 0, "warning": 1, "neutral": 2, "critical": 3}
     rows.sort(key=lambda r: (order[r["status"]], -r["decision"]["n"], r["rule"]))
     return rows
@@ -260,7 +249,7 @@ def build_payload() -> dict:
                 "net_sleeves": round(sum(t["pnl"] for t in st), 2),
                 "windows": len({t["event"] for t in ct}),
                 "events": len({t["event"] for t in st}),
-                "sleeves": len({r.get("series") for r in srules.values()})},
+                "sleeves": _series_count(srules)},
         "rules": rules, "equity": equity_series(trades), "regime": regime_panel(),
         "health": health_panel(), "nominations": nominations_panel(),
     }
@@ -429,8 +418,9 @@ section { margin-top: 12px; }
 
   <section class="card">
     <div class="cardhead"><h2>Every rule, one standard</h2></div>
-    <p class="cap">Judged per independent window/event, against a fair price's variance,
-      with one false-discovery correction across all rules. Crypto rules count only
+    <p class="cap">Judged per independent window/event and per contract, by the exact odds
+      of the record with no edge (a favorite that hasn't lost yet is not proof), with one
+      false-discovery correction across all rules. Crypto rules count only
       fill-checked trades (the fill gate was a no-op before Sep 25). EDGE needs
       100 events and survival of the correction.</p>
     <div class="scroll"><table id="rules"></table></div>
@@ -688,7 +678,7 @@ function renderRules() {
   const rows = DATA.rules.filter(r => VENUE === "all" || r.venue === VENUE);
   const head = el("tr");
   for (const [h, cls] of [["Rule", ""], ["Verdict", ""], ["Events", "num"], ["Win rate", "num"],
-                          ["$/event", "num"], ["95% interval", ""], ["Net $", "num"],
+                          ["Edge/contract", "num"], ["95% interval", ""], ["Net $", "num"],
                           ["Trend", ""], ["All eras", "num"]]) head.appendChild(el("th", {class: cls}, h));
   t.appendChild(head);
   if (!rows.length) { const tr = el("tr"); const td = el("td", {colspan: 9, class: "empty"},
@@ -708,7 +698,7 @@ function renderRules() {
     tr.appendChild(el("td", {class: "num"}, d.wr === null ? "-" : (d.wr * 100).toFixed(0) + "%"));
     tr.appendChild(el("td", {class: "num"}, d.n ? cents(d.mean) : "-"));
     const ci = el("td"); ci.appendChild(ciBar(d, dom));
-    if (d.n >= 2) ci.title = `${cents(d.lo)} to ${cents(d.hi)} per event`;
+    if (d.n >= 2) ci.title = `${cents(d.lo)} to ${cents(d.hi)} per contract per event`;
     tr.appendChild(ci);
     tr.appendChild(el("td", {class: "num"}, usd(d.net)));
     const sp = el("td"); sp.appendChild(spark(r.spark)); tr.appendChild(sp);

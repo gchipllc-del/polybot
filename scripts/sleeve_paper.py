@@ -21,22 +21,31 @@ HOW IT TRADES - the house realism, shared code where it exists:
     quote (shadow_book.liftable_depth - the parser fixed 2026-09-25); entries whose depth
     lookup failed are admitted but COUNTED as ungated, never hidden
   * ONE bet per (event, rule): every strike of an event resolves on one outcome
+  * the rule's own ORDER SIZE (10 contracts for every rule registered since sizes were
+    stored): Kalshi rounds the fee per order UP to the cent, so a 1-lot at 99c pays a 1c
+    fee on a 1c win - a 1-lot test would judge the rounding, not the rule
   * each entry is stamped with the news regime (lib/news_regime.py) - a stamp only
   * settle only from Kalshi's own result
 
-HOW IT IS JUDGED - `report`: per rule, the forward record after named_at, per EVENT, with
-the null-variance floor (a favorite that hasn't lost yet is not proof). Benjamini-
-Hochberg runs across ALL forward rules at once, so adding sleeves never lowers the bar.
+ONE HYPOTHESIS = ONE RULE = ONE TEST. A rule may span many series (a friend's method on
+seven weather cities is one rule); splitting it per series would multiply the tests and
+divide each one's sample.
+
+HOW IT IS JUDGED - `report`: per rule, the forward record after named_at, per EVENT and
+per CONTRACT, with EXACT p-values (forward_stats: a favorite that hasn't lost yet is not
+proof). Benjamini-Hochberg runs across ALL forward rules at once, so adding sleeves never
+lowers the bar.
 
   py scripts/sleeve_paper.py register-probes [--top 20]   # after sleeve_scan discover
   py scripts/sleeve_paper.py register-nominations         # after sleeve_scan screen
-  py scripts/sleeve_paper.py register-rule --name F9799 --series-prefix KXHIGH \
-        --side favorite --lo 0.97 --hi 0.995 --band any   # an outside method, named now
+  py scripts/sleeve_paper.py register-rule --name F9799 --series KXHIGHNY,KXHIGHCHI \
+        --side favorite --lo 0.97 --hi 0.995 --band any [--contracts 10] \
+        [--min-hours 6 --max-hours 12]                    # an outside method, named now
   py scripts/sleeve_paper.py run                          # loop (PolybotSleeves task)
   py scripts/sleeve_paper.py cycle                        # one pass
   py scripts/sleeve_paper.py report
   py scripts/sleeve_paper.py rules
-  py scripts/sleeve_paper.py retire <NAME>
+  py scripts/sleeve_paper.py retire <NAME> [<NAME> ...] | --prefix F9799_
   py scripts/sleeve_paper.py selftest
 """
 from __future__ import annotations
@@ -62,7 +71,8 @@ CATALOG = Path(os.environ.get("SLEEVE_DIR") or (ROOT / "data" / "sleeves")) / "c
 SCREEN = CATALOG.parent / "screen.json"
 
 VERSION = 1
-CONTRACTS = 1
+CONTRACTS = 1             # the size of rules (and positions) from before sizes were stored
+NEW_RULE_CONTRACTS = 10   # stamped on every rule registered from now on - see contracts_of
 CYCLE_S = 120
 SLEEP_S = 0.35
 MAX_SPREAD = 0.15
@@ -76,6 +86,15 @@ PROBES = (("FLB_FAV", "favorite", 0.80, 0.95,
           ("FLB_LONG", "longshot", 0.05, 0.20,
            "mirror control: longshots overpriced - buying them at 5-20c should LOSE"))
 MIN_EVENTS_VERDICT = 100
+MIN_TESTABLE_EVENTS = 30
+VERDICT_TEXT = {
+    "collecting": "collecting ({n}/{need} events)",
+    "edge": "EDGE - survives the forward family correction",
+    "promising": "promising - significant, needs {need} events",
+    "negative": "NEGATIVE (significant)",
+    "positive_ns": "positive, not significant",
+    "negative_ns": "negative, not significant",
+}
 
 
 def _now() -> datetime:
@@ -171,6 +190,28 @@ def all_registered(path: Path = RULES) -> set[str]:
     return {r["name"] for r in _load_jsonl(path) if r.get("t") == "rule" and r.get("name")}
 
 
+def series_of(rule: dict) -> list[str]:
+    """The series a rule trades: one (older rules store a string) or many (a list). Either
+    way it is ONE hypothesis and ONE test."""
+    s = rule.get("series")
+    items = s if isinstance(s, list) else [s]
+    return list(dict.fromkeys(x for x in items if x))
+
+
+def series_label(rule: dict) -> str:
+    s = series_of(rule)
+    return ",".join(s) if len(s) <= 2 else f"{s[0]} +{len(s) - 1} more"
+
+
+def contracts_of(rule_or_pos: dict) -> int:
+    """Order size of a rule or a position. Absent on anything from before sizes were
+    stored, which traded CONTRACTS."""
+    try:
+        return max(1, int(rule_or_pos.get("contracts") or CONTRACTS))
+    except (TypeError, ValueError):
+        return CONTRACTS
+
+
 def register(rules: list[dict], path: Path = RULES, now: datetime | None = None) -> list[str]:
     """Append new rules (never re-register an existing name). Returns names added."""
     now = now or _now()
@@ -192,7 +233,8 @@ def probe_rules(series_list: list[str]) -> list[dict]:
             continue
         for tag, side, lo, hi, thesis in PROBES:
             out.append({"name": f"{tag}_{s}", "series": s, "band": "mid", "side": side,
-                        "lo": lo, "hi": hi, "source": "probe", "thesis": thesis})
+                        "lo": lo, "hi": hi, "contracts": NEW_RULE_CONTRACTS,
+                        "source": "probe", "thesis": thesis})
     return out
 
 
@@ -204,7 +246,8 @@ def nomination_rules(screen: dict) -> list[dict]:
         lo_c, hi_c = (int(x) for x in str(c["bucket"]).rstrip("c").split("-"))
         out.append({"name": f"NOM_{c['series']}_{c['band']}_{c['side']}_{c['bucket']}",
                     "series": c["series"], "band": c["band"], "side": c["side"],
-                    "lo": lo_c / 100.0, "hi": hi_c / 100.0, "source": "sleeve_scan",
+                    "lo": lo_c / 100.0, "hi": hi_c / 100.0, "contracts": NEW_RULE_CONTRACTS,
+                    "source": "sleeve_scan",
                     "thesis": f"scanner nomination, out-of-sample p={c.get('p_out'):.2g}"})
     return out
 
@@ -241,15 +284,16 @@ def candidates(m: dict, now_ts: float, rules: list[dict]) -> list[dict]:
     return out
 
 
-def kalshi_fee(p: float) -> float:
+def kalshi_fee(p: float, contracts: int = CONTRACTS) -> float:
+    """The real fee for ONE ORDER of `contracts` at price p (ceil to the cent per order)."""
     from shadow_book import kalshi_taker_fee
-    return kalshi_taker_fee(p, CONTRACTS)
+    return kalshi_taker_fee(p, contracts)
 
 
 def settle(pos: dict, result: str) -> dict:
     won = result == pos["side"]
-    fee = pos.get("fee", 0.0)
-    pnl = (CONTRACTS * (1.0 - pos["price"]) if won else -CONTRACTS * pos["price"]) - fee
+    n, fee = contracts_of(pos), pos.get("fee", 0.0)
+    pnl = (n * (1.0 - pos["price"]) if won else -n * pos["price"]) - fee
     return {"t": "close", "ts": _iso(_now()), "ticker": pos["ticker"], "rule": pos["rule"],
             "event": pos["event"], "series": pos["series"], "side": pos["side"],
             "price": pos["price"], "result": result, "won": won, "pnl": round(pnl, 4)}
@@ -328,7 +372,8 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
 
     by_series: dict[str, list] = {}
     for r in rules.values():
-        by_series.setdefault(r["series"], []).append(r)
+        for s_ in series_of(r):
+            by_series.setdefault(s_, []).append(r)
     named = {n: _ts(r["named_at"]) for n, r in rules.items()}
     for series, rs in sorted(by_series.items()):
         try:
@@ -351,14 +396,15 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
                 if per_rule_open.get(cand["rule"], 0) >= MAX_OPEN_PER_RULE:
                     skipped["open_cap"] = skipped.get("open_cap", 0) + 1
                     continue
+                n = contracts_of(rules[cand["rule"]])
                 depth = depth_fn(tk, cand["side"], cand["price"]) if depth_fn else None
-                if depth is not None and depth < CONTRACTS:
+                if depth is not None and depth < n:
                     skipped["no_depth"] = skipped.get("no_depth", 0) + 1
                     continue
                 if depth is None:
                     ungated += 1
                 entry = dict(cand, t="open", ts=_iso(now), ticker=tk, event=ev, series=series,
-                             contracts=CONTRACTS, fee=kalshi_fee(cand["price"]),
+                             contracts=n, fee=kalshi_fee(cand["price"], n),
                              depth=depth, close_time=m.get("close_time"),
                              regime=regime["regime"], regime_mult=regime["mult"], v=VERSION)
                 new.append(entry)
@@ -390,59 +436,160 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
 
 # ── report ────────────────────────────────────────────────────────────────────
 
-def evaluate(rows: list[dict], rules: dict[str, dict]) -> list[dict]:
-    """Per rule: closed trades after named_at, per EVENT, null-variance-floored p-value,
-    BH across every rule with enough events."""
-    from sleeve_scan import bh_select, p_value
+def _norm_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _pb_cdf(qs: list[float], k: int) -> float:
+    """P(K <= k), K = the number of successes among independent Bernoulli(q_i): the
+    Poisson-binomial CDF, exact by dynamic programming (truncated at k, or run from the
+    other side when that is shorter). Past 200 of each outcome the normal limit is used,
+    with a continuity correction - by then it is accurate and the exact sum is slow."""
+    n = len(qs)
+    if k < 0:
+        return 0.0
+    if k >= n:
+        return 1.0
+    if min(k, n - k) > 200:
+        var = sum(q * (1.0 - q) for q in qs)
+        return _norm_cdf((k + 0.5 - sum(qs)) / math.sqrt(var)) if var > 0 else 1.0
+    if k > n - k:                       # P(K <= k) = 1 - P(n-K <= n-k-1)
+        return min(1.0, max(0.0, 1.0 - _pb_cdf([1.0 - q for q in qs], n - k - 1)))
+    dp = [1.0] + [0.0] * k
+    for q in qs:
+        for j in range(k, 0, -1):
+            dp[j] = dp[j] * (1.0 - q) + dp[j - 1] * q
+        dp[0] *= 1.0 - q
+    return min(1.0, max(0.0, sum(dp)))
+
+
+def _house_shaped(t: dict) -> bool:
+    """A settled hold-to-expiry trade: a win paid 1-ask-fee per contract, a loss cost
+    ask+fee. Anything else (a test fixture, an early exit) gets the normal test."""
+    want = (1.0 - t["ask"] - t["fee_pc"]) if t["won"] else (-t["ask"] - t["fee_pc"])
+    return abs(t["pnl_pc"] - want) < 0.005
+
+
+def forward_stats(trades: list[dict]) -> dict:
+    """The one scorer for every forward ledger - this report and the command center.
+
+    trades: dicts with event, won, ask (price per contract) and pnl (dollars at the real
+    size); optional pnl_pc / fee_pc (per contract - default: a 1-lot).
+
+    Judged per EVENT and per CONTRACT, so order size never changes a verdict. Under the
+    house rule - one bet per (event, rule), held to settlement - every outcome is a win or
+    a loss that differ by exactly $1 per contract, so a rule's total is decided by HOW
+    MANY trades lost. With no edge, a trade at ask A and fee f loses with probability
+    1-(A+f), so both p-values are exact Poisson-binomial tails:
+        p      = P(this few losses or fewer | no edge)   evidence the rule makes money
+        p_neg  = P(this many losses or more | no edge)   evidence it loses money
+    A normal approximation goes badly wrong on 97-99c favorites, where losses are rare and
+    large: 100 straight wins at 98c (10-lot) has p = 0.982**100 = 0.16 - ordinary luck.
+    Any other shape falls back to sleeve_scan.p_value, the null-variance-floored test."""
     from forecast_replay import mean_ci
-    opens = {(r["ticker"], r["rule"]): r for r in rows if r.get("t") == "open"}
+    rows = []
+    for t in trades:
+        ask = float(t["ask"])
+        fee_pc = t.get("fee_pc")
+        rows.append(dict(t, ask=ask, pnl_pc=float(t.get("pnl_pc", t["pnl"])),
+                         fee_pc=float(kalshi_fee(ask, 1) if fee_pc is None else fee_pc)))
+    ev: dict[str, list[dict]] = {}
+    for t in rows:
+        ev.setdefault(str(t["event"]), []).append(t)
+    per = [sum(x["pnl_pc"] for x in v) / len(v) for v in ev.values()]
+    m, lo, hi = mean_ci(per)
+    n = len(per)
+    if n == 0:
+        p = p_neg = 1.0
+    elif all(len(v) == 1 for v in ev.values()) and all(_house_shaped(t) for t in rows):
+        qs = [1.0 - min(0.999, max(0.001, t["ask"] + t["fee_pc"])) for t in rows]
+        k = sum(1 for t in rows if not t["won"])
+        p, p_neg = _pb_cdf(qs, k), 1.0 - _pb_cdf(qs, k - 1)
+    elif n >= 2:
+        from sleeve_scan import p_value
+        se = (hi - m) / 1.96
+        p, p_neg = p_value(m, se, rows), p_value(-m, se, rows)
+    else:
+        p = p_neg = 1.0
+    return {"n": n, "trades": len(rows), "mean": m, "lo": lo, "hi": hi, "p": p,
+            "p_neg": p_neg,
+            "wr": (sum(t["won"] for t in rows) / len(rows)) if rows else None,
+            "net": sum(t["pnl"] for t in rows)}
+
+
+def survivors(stats: list[dict]) -> set[int]:
+    """Indices whose p survives Benjamini-Hochberg across every testable rule at once."""
+    from sleeve_scan import bh_select
+    testable = [i for i, s_ in enumerate(stats) if s_["n"] >= MIN_TESTABLE_EVENTS]
+    if not testable:
+        return set()
+    return {testable[j] for j in bh_select([stats[i]["p"] for i in testable])}
+
+
+def classify(st: dict, survives: bool) -> str:
+    """The verdict category - one standard for this report and the command center."""
+    if st["n"] < MIN_TESTABLE_EVENTS:
+        return "collecting"
+    if survives and st["mean"] > 0:
+        return "edge" if st["n"] >= MIN_EVENTS_VERDICT else "promising"
+    if st["p_neg"] < 0.025:
+        return "negative"
+    return "positive_ns" if st["mean"] > 0 else "negative_ns"
+
+
+def trades_of(rows: list[dict], rules: dict[str, dict]) -> dict[str, list[dict]]:
+    """rule -> its closed trades opened AFTER its named_at, in forward_stats' shape."""
+    opens = {(r.get("ticker"), r.get("rule")): r for r in rows if r.get("t") == "open"}
+    out: dict[str, list[dict]] = {name: [] for name in rules}
+    for r in rows:
+        name = r.get("rule")
+        if r.get("t") != "close" or name not in rules:
+            continue
+        o = opens.get((r.get("ticker"), name)) or {}
+        if (_ts(o.get("ts")) or 0) < (_ts(rules[name].get("named_at")) or 0):
+            continue                                  # only trades after pre-registration
+        n = contracts_of(o)
+        ask = float(r.get("price") or o.get("price") or 0.5)
+        fee = o.get("fee")
+        fee = float(kalshi_fee(ask, n) if fee is None else fee)
+        out[name].append({"rule": name, "event": r.get("event") or o.get("event"),
+                          "series": r.get("series") or o.get("series"),
+                          "won": bool(r.get("won")), "ask": ask, "pnl": float(r["pnl"]),
+                          "pnl_pc": float(r["pnl"]) / n, "fee_pc": fee / n,
+                          "depth": o.get("depth"), "ts": _ts(r.get("ts")) or 0.0})
+    return out
+
+
+def evaluate(rows: list[dict], rules: dict[str, dict]) -> list[dict]:
+    """Per rule: closed trades after named_at, per EVENT and per CONTRACT, exact p-values
+    (forward_stats), BH across every rule with enough events."""
+    by_rule = trades_of(rows, rules)
+    names = sorted(rules)
+    stats = [forward_stats(by_rule[nm]) for nm in names]
+    keep = survivors(stats)
     out = []
-    for name, rule in sorted(rules.items()):
-        na = _ts(rule.get("named_at")) or 0
-        trades = []
-        for r in rows:
-            if r.get("t") != "close" or r.get("rule") != name:
-                continue
-            o = opens.get((r["ticker"], name)) or {}
-            if (_ts(o.get("ts")) or 0) < na:
-                continue
-            trades.append({"event": r.get("event") or o.get("event"), "pnl": r["pnl"],
-                           "ask": r["price"], "won": r["won"], "day": str(o.get("ts"))[:10],
-                           "depth": o.get("depth")})
-        ev: dict[str, list] = {}
-        for t in trades:
-            ev.setdefault(t["event"], []).append(t)
-        per_ev = [sum(x["pnl"] for x in v) / len(v) for v in ev.values()]
-        m, lo, hi = mean_ci(per_ev)
-        p = p_value(m, (hi - m) / 1.96, trades) if len(per_ev) >= 2 else 1.0
-        out.append({"rule": name, "series": rule["series"], "source": rule.get("source"),
-                    "events": len(per_ev), "trades": len(trades),
-                    "wr": (sum(t["won"] for t in trades) / len(trades)) if trades else None,
-                    "net": round(sum(t["pnl"] for t in trades), 2), "mean": m,
-                    "lo": lo, "hi": hi, "p": p,
-                    "gated_share": (sum(1 for t in trades if t["depth"] is not None)
-                                    / len(trades)) if trades else None})
-    testable = [i for i, r in enumerate(out) if r["events"] >= 30]
-    keep = bh_select([out[i]["p"] for i in testable]) if testable else set()
-    survivors = {testable[j] for j in keep}
-    for i, r in enumerate(out):
-        if r["events"] < 30:
-            r["verdict"] = f"collecting ({r['events']}/{MIN_EVENTS_VERDICT} events)"
-        elif i in survivors and r["mean"] > 0 and r["events"] >= MIN_EVENTS_VERDICT:
-            r["verdict"] = "EDGE - survives the forward family correction"
-        elif i in survivors and r["mean"] > 0:
-            r["verdict"] = "promising - significant, needs 100 events"
-        elif r["hi"] < 0:
-            r["verdict"] = "NEGATIVE (significant)"
-        elif r["mean"] > 0:
-            r["verdict"] = "positive, not significant"
-        else:
-            r["verdict"] = "negative, not significant"
+    for i, name in enumerate(names):
+        st, rule, ts = stats[i], rules[name], by_rule[name]
+        cat = classify(st, i in keep)
+        per_series: dict[str, list] = {}
+        for t in ts:
+            b = per_series.setdefault(str(t["series"]), [0, 0.0])
+            b[0] += 1
+            b[1] += t["pnl"]
+        out.append({"rule": name, "series": series_label(rule), "source": rule.get("source"),
+                    "contracts": contracts_of(rule), "events": st["n"], "trades": st["trades"],
+                    "wr": st["wr"], "net": round(st["net"], 2), "mean": st["mean"],
+                    "lo": st["lo"], "hi": st["hi"], "p": st["p"], "p_neg": st["p_neg"],
+                    "category": cat,
+                    "verdict": VERDICT_TEXT[cat].format(n=st["n"], need=MIN_EVENTS_VERDICT),
+                    "by_series": {k: (v[0], round(v[1], 2)) for k, v in sorted(per_series.items())},
+                    "gated_share": (sum(1 for t in ts if t["depth"] is not None) / len(ts))
+                    if ts else None})
     return out
 
 
 def cmd_report() -> int:
-    rules = active_rules()
+    rules = active_rules(RULES)
     rows = _load_jsonl(LEDGER)
     print("=" * 78)
     print("SLEEVE PAPER - forward-only, out of sample, every sleeve. NO REAL ORDERS.")
@@ -453,20 +600,26 @@ def cmd_report() -> int:
         return 0
     res = evaluate(rows, rules)
     hb = json.loads(HEARTBEAT.read_text()) if HEARTBEAT.exists() else {}
-    print(f"{len(rules)} active rules on {len({r['series'] for r in rules.values()})} "
+    print(f"{len(rules)} active rules on "
+          f"{len({x for r in rules.values() for x in series_of(r)})} "
           f"sleeves | last cycle {str(hb.get('ts', 'never'))[:19]} | open now "
           f"{hb.get('open_now', 0)} | regime {hb.get('regime', '?')}")
     print()
-    print(f"  {'rule':34} {'events':>6} {'WR':>6} {'net$':>8} {'$/event':>8} "
-          f"{'95% CI':>17}  verdict")
+    print(f"  {'rule':30} {'events':>6} {'WR':>6} {'net$':>9} {'c/ct':>6} "
+          f"{'95% CI (c/ct)':>15} {'p':>6}  verdict")
     for r in sorted(res, key=lambda x: (-x["events"], x["rule"])):
-        wr = f"{r['wr']:.0%}" if r["wr"] is not None else "-"
-        ci = f"[{r['lo']:+.3f},{r['hi']:+.3f}]" if r["events"] >= 2 else "-"
-        print(f"  {r['rule'][:34]:34} {r['events']:>6} {wr:>6} {r['net']:>+8.2f} "
-              f"{r['mean']:>+8.3f} {ci:>17}  {r['verdict']}")
+        wr = f"{r['wr']:.1%}" if r["wr"] is not None else "-"
+        ci = f"[{100 * r['lo']:+.1f},{100 * r['hi']:+.1f}]" if r["events"] >= 2 else "-"
+        pv = f"{r['p']:.3f}" if r["events"] else "-"
+        print(f"  {r['rule'][:30]:30} {r['events']:>6} {wr:>6} {r['net']:>+9.2f} "
+              f"{100 * r['mean']:>+6.1f} {ci:>15} {pv:>6}  {r['verdict']}")
+        if len(r["by_series"]) > 1:
+            print("      by series (descriptive, not tested): " + "  ".join(
+                f"{k} {n}ev {v:+.2f}" for k, (n, v) in r["by_series"].items()))
     print()
-    print("Each rule is judged per EVENT, against the variance a fair price would produce,")
-    print("with Benjamini-Hochberg across ALL forward rules - adding sleeves never lowers")
+    print("c/ct = cents per contract per event, after fees. p = the EXACT chance of a")
+    print("record this good with no edge (a favorite that hasn't lost yet is not proof).")
+    print("Benjamini-Hochberg runs across ALL forward rules - adding sleeves never lowers")
     print("the bar. EDGE needs 100+ events AND survival of that correction. Live money")
     print("stays off until a rule earns EDGE here.")
     print("=" * 78)
@@ -474,12 +627,15 @@ def cmd_report() -> int:
 
 
 def cmd_rules() -> int:
-    rules = active_rules()
-    retired = all_registered() - set(rules)
+    rules = active_rules(RULES)
+    retired = all_registered(RULES) - set(rules)
     print(f"{len(rules)} active, {len(retired)} retired")
     for n, r in sorted(rules.items()):
-        print(f"  {n:34} {r['side']:8} {r['lo']:.2f}-{r['hi']:.2f} {r['band']:5} "
-              f"named {r['named_at'][:16]}  [{r.get('source')}]")
+        win = (f" {r['min_h']:g}-{r['max_h']:g}h" if r.get("max_h", 1e9) < 1e9 or
+               r.get("min_h", 0.0) > 0 else "")
+        print(f"  {n:30} {r['side']:8} {r['lo']:.2f}-{r['hi']:.3g} {r['band']:5}{win} "
+              f"x{contracts_of(r)} on {series_label(r)}  named {r['named_at'][:16]}"
+              f"  [{r.get('source')}]")
     return 0
 
 
@@ -529,28 +685,30 @@ def _selftest() -> int:
             return {"market": {"ticker": tk, "result": "yes"}}
 
         depth = {"KXINX-E2-A": 0}                    # E2's book is empty behind the quote
-        s = run_cycle(fake_get, now, rp, lp, depth_fn=lambda t, sd, p: depth.get(t, 5),
+        s = run_cycle(fake_get, now, rp, lp, depth_fn=lambda t, sd, p: depth.get(t, 50),
                       regime_fn=lambda: {"regime": "cautious", "mult": 0.5}, heartbeat=None)
         opens = [r for r in _load_jsonl(lp) if r.get("t") == "open"]
         assert s["opened"] == 2 and len(opens) == 2, s          # E1 FAV + E1 LONG only
         assert {(o["event"], o["rule"]) for o in opens} == {
             ("KXINX-E1", "FLB_FAV_KXINX"), ("KXINX-E1", "FLB_LONG_KXINX")}
         assert s["skipped"].get("no_depth") == 2                 # E2 refused, both rules
-        assert all(o["regime"] == "cautious" and o["contracts"] == 1 for o in opens)
-        s2 = run_cycle(fake_get, now, rp, lp, depth_fn=lambda t, sd, p: 5,
+        assert all(o["regime"] == "cautious" and o["contracts"] == 10 for o in opens)
+        assert all(o["fee"] == kalshi_fee(o["price"], 10) for o in opens)  # ONE order's fee
+        s2 = run_cycle(fake_get, now, rp, lp, depth_fn=lambda t, sd, p: 50,
                        regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
         assert {o["event"] for o in _load_jsonl(lp) if o.get("t") == "open"} == {
             "KXINX-E1", "KXINX-E2"} and s2["opened"] == 2        # E1 never re-entered
 
-        # settlement after close: YES won -> FAV (bought yes @.88) +0.11, LONG (no @.14) -0.15
+        # settlement after close, 10-lots: YES won -> FAV (yes @.88, fee .08) +1.12,
+        # LONG (no @.14, fee .09) -1.49
         later = now + timedelta(hours=11)
-        s3 = run_cycle(fake_get, later, rp, lp, depth_fn=lambda t, sd, p: 5,
+        s3 = run_cycle(fake_get, later, rp, lp, depth_fn=lambda t, sd, p: 50,
                        regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
         closes = {(c["ticker"], c["rule"]): c for c in _load_jsonl(lp) if c.get("t") == "close"}
         assert s3["closed"] == 4, s3
-        assert abs(closes[("KXINX-E1-A", "FLB_FAV_KXINX")]["pnl"] - (0.12 - 0.01)) < 1e-9
+        assert abs(closes[("KXINX-E1-A", "FLB_FAV_KXINX")]["pnl"] - (1.20 - 0.08)) < 1e-9
         long_row = closes[("KXINX-E1-A", "FLB_LONG_KXINX")]
-        assert long_row["side"] == "no" and abs(long_row["pnl"] - (-0.14 - 0.01)) < 1e-9
+        assert long_row["side"] == "no" and abs(long_row["pnl"] - (-1.40 - 0.09)) < 1e-9
         assert not open_positions(_load_jsonl(lp))
 
         # retire: append-only, and a retired rule stops trading
@@ -561,6 +719,16 @@ def _selftest() -> int:
         res = {r["rule"]: r for r in evaluate(_load_jsonl(lp), active_rules(rp))}
         assert res["FLB_FAV_KXINX"]["events"] == 2
         assert res["FLB_FAV_KXINX"]["verdict"].startswith("collecting")
+        # per CONTRACT: E1 won 1.12 on a 10-lot, E2 (yes @.85, fee .09) won 1.41
+        assert abs(res["FLB_FAV_KXINX"]["mean"] - (0.112 + 0.141) / 2) < 1e-9
+
+    # exact p: 100 straight wins on 98c 10-lots is ordinary luck under no edge
+    fee10 = kalshi_fee(0.98, 10)
+    wins = [{"event": f"E{i}", "won": True, "ask": 0.98, "fee_pc": fee10 / 10,
+             "pnl": 10 * 0.02 - fee10, "pnl_pc": (10 * 0.02 - fee10) / 10} for i in range(100)]
+    st = forward_stats(wins)
+    assert abs(st["p"] - (0.98 + fee10 / 10) ** 100) < 1e-9 and st["p"] > 0.15, st
+    assert classify(st, st["p"] < 0.05) == "positive_ns"
 
     # nominations: clean only, phantom-risk never registered
     noms = nomination_rules({"nominated": [
@@ -586,26 +754,26 @@ def main() -> int:
         top = int(args[args.index("--top") + 1]) if "--top" in args else 20
         cat = [r["series"] for r in json.loads(CATALOG.read_text(encoding="utf-8"))
                if r["series"] not in EXCLUDED_SERIES][:top]
-        added = register(probe_rules(cat))
+        added = register(probe_rules(cat), RULES)
         print(f"registered {len(added)} probe rules on {len(cat)} sleeves (named now)")
         return 0
     if cmd == "register-nominations":
         if not SCREEN.exists():
             print("run `py scripts/sleeve_scan.py screen` first")
             return 1
-        added = register(nomination_rules(json.loads(SCREEN.read_text(encoding="utf-8"))))
+        added = register(nomination_rules(json.loads(SCREEN.read_text(encoding="utf-8"))), RULES)
         print(f"registered {len(added)} nomination rule(s): {', '.join(added) or '-'}")
         return 0
     if cmd == "register-rule":
-        # A named outside hypothesis (e.g. a friend's method), pre-registered NOW on each
-        # series given - or on every catalog series starting with --series-prefix.
+        # A named outside hypothesis (e.g. a friend's method), pre-registered NOW as ONE
+        # rule over the series given - or every catalog series starting with --series-prefix.
         def opt(name, default=None):
             return args[args.index(name) + 1] if name in args else default
         prefix, side = opt("--name"), opt("--side", "favorite")
         if not prefix or side not in ("favorite", "longshot", "yes", "no"):
-            print("usage: register-rule --name PREFIX (--series A,B | --series-prefix KXHIGH)"
+            print("usage: register-rule --name NAME (--series A,B | --series-prefix KXHIGH)"
                   " --side favorite|longshot|yes|no --lo 0.97 --hi 0.995 [--band any]"
-                  " [--min-hours 6 --max-hours 12] [--thesis TEXT]")
+                  " [--contracts 10] [--min-hours 6 --max-hours 12] [--thesis TEXT]")
             return 1
         if opt("--series"):
             series = [x.strip() for x in opt("--series").split(",") if x.strip()]
@@ -620,20 +788,39 @@ def main() -> int:
         else:
             print("give --series A,B (or --series-prefix after sleeve_scan.py discover)")
             return 1
-        rules = [{"name": f"{prefix}_{s}", "series": s, "band": opt("--band", "any"),
-                  "side": side, "lo": float(opt("--lo", 0.97)), "hi": float(opt("--hi", 0.995)),
-                  "min_h": float(opt("--min-hours", 0.0)), "max_h": float(opt("--max-hours", 1e9)),
-                  "source": "named", "thesis": opt("--thesis", f"{prefix}: outside hypothesis")}
-                 for s in series if s not in EXCLUDED_SERIES]
-        added = register(rules)
-        print(f"registered {len(added)} rule(s) (named now): {', '.join(added) or '-'}")
+        series = [x for x in dict.fromkeys(series) if x not in EXCLUDED_SERIES]
+        if not series:
+            print("no series left to trade (the crypto 15-min series belong to paper_trader)")
+            return 1
+        rule = {"name": prefix, "series": series, "band": opt("--band", "any"),
+                "side": side, "lo": float(opt("--lo", 0.97)), "hi": float(opt("--hi", 0.995)),
+                "contracts": int(opt("--contracts", NEW_RULE_CONTRACTS)),
+                "min_h": float(opt("--min-hours", 0.0)), "max_h": float(opt("--max-hours", 1e9)),
+                "source": "named", "thesis": opt("--thesis", f"{prefix}: outside hypothesis")}
+        if not register([rule], RULES):
+            print(f"{prefix} is already registered - a rule is never redefined. "
+                  f"Pick a new name (`py scripts/sleeve_paper.py rules` lists them).")
+            return 1
+        win = (f", {rule['min_h']:g}-{rule['max_h']:g}h before close"
+               if rule["max_h"] < 1e9 or rule["min_h"] > 0 else "")
+        print(f"registered {prefix} (named now): ONE rule, ONE test - {side} "
+              f"{rule['lo']:g}-{rule['hi']:g}, band {rule['band']}{win}, "
+              f"{rule['contracts']} contracts/order, on {len(series)} series: "
+              f"{', '.join(series)}")
         return 0
     if cmd == "retire" and len(args) > 1:
-        if args[1] not in active_rules():
-            print(f"no active rule named {args[1]}")
+        live = active_rules(RULES)
+        if args[1] == "--prefix" and len(args) > 2:
+            names = sorted(n for n in live if n.startswith(args[2]))
+        else:
+            names = args[1:]
+        missing = [n for n in names if n not in live]
+        if not names or missing:
+            print(f"no active rule named {', '.join(missing) or args[-1]} - nothing retired "
+                  f"(`py scripts/sleeve_paper.py rules` lists them)")
             return 1
-        _append(RULES, [{"t": "retire", "name": args[1], "ts": _iso(_now())}])
-        print(f"retired {args[1]} (its record stays in the ledger)")
+        _append(RULES, [{"t": "retire", "name": n, "ts": _iso(_now())} for n in names])
+        print(f"retired {len(names)}: {', '.join(names)} (their records stay in the ledger)")
         return 0
     if cmd == "rules":
         return cmd_rules()
