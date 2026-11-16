@@ -31,7 +31,10 @@ HOW IT TRADES - the house realism, shared code where it exists:
 
 ONE HYPOTHESIS = ONE RULE = ONE TEST. A rule may span many series (a friend's method on
 seven weather cities is one rule); splitting it per series would multiply the tests and
-divide each one's sample.
+divide each one's sample. Pooling ASSUMES the series settle independently: each series'
+event is its own bet, so series on one underlying (two S&P 500 series) must never be
+pooled - a shared outcome would count twice and the exact p would be too small. `report`
+and `register-rule` say so whenever a rule spans several series.
 
 HOW IT IS JUDGED - `report`: per rule, the forward record after named_at, per EVENT and
 per CONTRACT, with EXACT p-values (forward_stats: a favorite that hasn't lost yet is not
@@ -706,6 +709,15 @@ def cmd_report() -> int:
             print("      by series (descriptive, not tested): " + "  ".join(
                 f"{k} {n}ev {v:+.2f}" for k, (n, v) in r["by_series"].items()))
     print()
+    pooled = sorted(n for n, r in rules.items() if len(series_of(r)) > 1)
+    if pooled:
+        more = f" +{len(pooled) - 3} more" if len(pooled) > 3 else ""
+        print(f"POOLED SERIES ARE ASSUMED INDEPENDENT ({', '.join(pooled[:3])}{more}): a "
+              f"pooled rule counts")
+        print("each series' event as its own bet, so its p holds only if those series settle")
+        print("independently. Series on one underlying (two S&P 500 series, a BTC range and a")
+        print("BTC above/below series) share outcomes: one bust day counts twice, p too small.")
+        print()
     testable = (sum(r["events"] >= MIN_TESTABLE_EVENTS for r in res)
                 + sum(s_["n"] >= MIN_TESTABLE_EVENTS for s_ in extra))
     print("c/ct = cents per contract per event, after fees. p = the EXACT chance of a")
@@ -901,6 +913,10 @@ def main() -> int:
               f"{rule['lo']:g}-{rule['hi']:g}, band {rule['band']}{win}, "
               f"{rule['contracts']} contracts/order, on {len(series)} series: "
               f"{', '.join(series)}")
+        if len(series) > 1:
+            print("NOTE: each series' event is its own bet - the exact p ASSUMES these series")
+            print("settle independently. Never pool series on one underlying (e.g. two S&P 500")
+            print("series): their shared outcomes would count twice.")
         return 0
     if cmd == "retire" and len(args) > 1:
         live = active_rules(RULES)

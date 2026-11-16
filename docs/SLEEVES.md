@@ -98,6 +98,14 @@ events (one bet per city-day) and widen the false-discovery family seven-fold; t
 rule reaches 100 events in about two weeks. `report` still prints a per-series line, as
 description, never as a test.
 
+**Pooled series are assumed independent.** Each series' event counts as its own bet, and
+the exact p-value treats those bets as independent. That holds for series that settle on
+different things (cities far apart are close to it), and fails for series on one
+underlying: pool two S&P 500 series, or a BTC range series with a BTC above/below series,
+and one bust day counts as two losses while calm days count twice - p comes out too
+small. Never pool those; `register-rule` and `report` print this assumption whenever a
+rule spans more than one series.
+
 **Order size is part of the rule (default 10 contracts).** Kalshi rounds the fee per
 ORDER up to the cent. A 1-lot at 99c pays a 1c fee on a 1c win: it cannot profit even
 if it never loses. At 10 contracts the fee is about 0.1-0.2c per contract. Rules

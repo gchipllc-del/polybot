@@ -444,7 +444,9 @@ section { margin-top: 12px; }
       of the record with no edge (a favorite that hasn't lost yet is not proof), with one
       false-discovery correction across all rules. Crypto rules count only
       fill-checked trades (the fill gate was a no-op before Sep 25). EDGE needs
-      100 events and survival of the correction.</p>
+      100 events and survival of the correction. A rule pooling several series counts
+      each series' event as its own bet, so it assumes those series settle
+      independently.</p>
     <div class="scroll"><table id="rules"></table></div>
   </section>
 

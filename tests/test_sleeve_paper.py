@@ -370,6 +370,30 @@ def test_one_rule_spans_many_series_and_is_one_test(tmp_path):
     assert r["by_series"]["KXHIGHNY"][1] > 0 > r["by_series"]["KXHIGHCHI"][1]
 
 
+def test_pooled_series_say_they_are_assumed_independent(tmp_path, monkeypatch, capsys):
+    """One bet per (event, rule) counts each pooled series' event as its own bet, so the
+    exact p assumes the series settle independently - false for two series on one
+    underlying (one bust day would count twice). Registration and the report must say so
+    for every rule that pools series, and only for those."""
+    import lib.command_center as cc
+    for name, file in (("RULES", "rules.jsonl"), ("LEDGER", "ledger.jsonl"),
+                       ("HEARTBEAT", "hb.json")):
+        monkeypatch.setattr(sp, name, tmp_path / file)
+    monkeypatch.setattr(cc, "CRYPTO_LEDGER", tmp_path / "crypto.jsonl")
+
+    def run(*argv):
+        monkeypatch.setattr(sys, "argv", ["sleeve_paper.py", *argv])
+        assert sp.main() == 0
+        return capsys.readouterr().out
+
+    assert "independent" not in run("register-rule", "--name", "SOLO", "--series", "KXHIGHNY")
+    assert "independent" not in run("report")
+    out = run("register-rule", "--name", "POOL", "--series", "KXINX,KXINXU")
+    assert "the exact p ASSUMES these series" in out and "settle independently" in out
+    line = next(l for l in run("report").splitlines() if l.startswith("POOLED SERIES"))
+    assert "ASSUMED INDEPENDENT (POOL)" in line and "SOLO" not in line
+
+
 def test_poisson_binomial_tail_matches_brute_force():
     import itertools
     import random
