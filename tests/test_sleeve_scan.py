@@ -140,3 +140,24 @@ def test_candle_volume_reads_renamed_field():
     assert candle_volume({"volume_fp": "12.00"}) == 12.0
     assert candle_volume({"volume_fp": "0.00"}) == 0.0
     assert candle_volume({}) == 0.0
+
+
+def test_find_searches_ticker_title_and_category_any_case(tmp_path, monkeypatch, capsys):
+    import json as _json
+    cat = tmp_path / "catalog.json"
+    cat.write_text(_json.dumps([
+        {"series": "KXTEMPNYCH", "category": "Climate and Weather", "events": 40,
+         "title": "Temperature in New York City on Nov 15 at 7pm EST?"},
+        {"series": "KXHIGHNY", "category": "Climate and Weather", "events": 9,
+         "title": "Highest temperature in NYC today?"},
+        {"series": "KXBTC15M", "category": "Crypto", "events": 54, "title": "BTC 15 min"},
+        {"series": "KXESOCCERGAME", "category": "Sports", "events": 299,
+         "title": "eSoccer: Stuttgart vs Mönchengladbach"}], indent=1), encoding="utf-8")
+    monkeypatch.setattr(ss, "CATALOG", cat)
+    assert ss.cmd_find("TEMPERATURE") == 0
+    out = capsys.readouterr().out
+    assert "2 series match" in out and "KXTEMPNYCH" in out and "KXHIGHNY" in out
+    assert "KXBTC15M" not in out
+    assert ss.cmd_find("mönchen") == 0 and "KXESOCCERGAME" in capsys.readouterr().out
+    monkeypatch.setattr(ss, "CATALOG", tmp_path / "missing.json")
+    assert ss.cmd_find("x") == 1
