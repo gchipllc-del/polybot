@@ -12,8 +12,8 @@ FOUR INDEPENDENT VOTES (each one fails safe on its own):
               does not list is not evidence of calm, so otherwise it abstains
   headlines   a sweep of the curated macro/markets/crypto feeds (lib/news_feeds.py),
               scored with a transparent risk lexicon, recency-weighted, and judged
-              against the agent's OWN trailing baseline - no magic threshold once a
-              week of history exists; until then it abstains unless the day is extreme
+              against the agent's OWN trailing baseline - no magic threshold: until a
+              week of history exists it abstains
   volatility  realized 1-minute spot volatility over the last 6h vs its trailing
               14-day median, from the collector's own stage0 log (no network at all)
   ai          optional (model named by NEWS_AGENT_MODEL in .env; unset = abstains):
@@ -64,7 +64,6 @@ HEADLINE_MAX_PER_SOURCE = 15  # one noisy feed cannot dominate the score
 HEADLINE_BASELINE_MIN_RUNS = 24 * 7   # a week of hourly runs before trusting the baseline
 HEADLINE_RATIO = 2.0         # cautious when risk density > 2x its trailing median...
 HEADLINE_FLOOR = 6.0         # ...and the raw score clears this floor
-HEADLINE_EXTREME = 30.0      # warm-up exception: a score this big is cautious anyway
 VOL_WINDOW_H = 6
 VOL_HISTORY_DAYS = 14
 VOL_MIN_HISTORY_H = 72       # three days of hourly windows before the vol vote counts
@@ -286,9 +285,9 @@ def headline_vote(reading: dict, sweep: dict, history: list[dict]) -> dict:
         if isinstance(h.get("density"), (int, float)) and (h.get("n") or 0) > 0:
             past.append(h["density"])
     if len(past) < HEADLINE_BASELINE_MIN_RUNS:
-        if reading["score"] >= HEADLINE_EXTREME:
-            return {"vote": CAUTIOUS, "why": f"extreme risk score {reading['score']:.1f} "
-                                             f"(baseline still warming up)"}
+        # no absolute-score exception: the raw score is an unnormalized sum over ~500
+        # headlines, so ordinary news flow clears any fixed bar - only a baseline can
+        # say what is unusual
         return {"vote": None, "why": f"baseline warming up ({len(past)}/"
                                      f"{HEADLINE_BASELINE_MIN_RUNS} runs)"}
     past = sorted(past[-24 * 14:])

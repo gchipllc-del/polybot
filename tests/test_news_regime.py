@@ -147,8 +147,8 @@ def test_headline_baseline_warmup_and_trigger():
     sw = _sweep()
     reading = nr.headline_reading(sw["headlines"], NOW)
     assert nr.headline_vote(reading, sw, [])["vote"] is None
-    assert nr.headline_vote(dict(reading, score=nr.HEADLINE_EXTREME), sw, [])["vote"] \
-        == nr.CAUTIOUS
+    # no warm-up exception (review finding #7): a huge raw score still abstains
+    assert nr.headline_vote(dict(reading, score=1000.0), sw, [])["vote"] is None
     hist = [{"votes": {"headlines": {"density": reading["density"] / 3, "n": 40}}}] \
         * nr.HEADLINE_BASELINE_MIN_RUNS
     assert nr.headline_vote(dict(reading, score=10.0), sw, hist)["vote"] == nr.CAUTIOUS
@@ -417,3 +417,35 @@ def test_healthcheck_warns_when_no_live_data_layer_voted(tmp_path, monkeypatch):
     monkeypatch.setattr(hc, "record", lambda level, name, msg: seen.append((level, msg)))
     hc.check_news_regime()
     assert seen and seen[0][0] == hc.WARN and "no live data layer" in seen[0][1]
+
+
+# ── review findings #4-#7: partial sweeps, calendar format, AI backoff, warm-up ──
+
+def _macro_feed(name, n_items, hits, now=NOW):
+    """`n_items` recent headlines (ages 0..8h); the first `hits` carry one 2.0-weight
+    lexicon term ('Fed') - ordinary macro news flow, as the real sweep sees it."""
+    from email.utils import format_datetime
+    items = []
+    for i in range(n_items):
+        what = "officials weigh next Fed move" if i < hits else "ordinary market story"
+        when = format_datetime(now - timedelta(minutes=32 * i + 1), usegmt=True)
+        items.append(f"<item><title>{name}: {what} ({i})</title>"
+                     f"<pubDate>{when}</pubDate></item>")
+    return f"<rss><channel>{''.join(items)}</channel></rss>".encode()
+
+
+_FEEDS35 = [(f"F{i}", f"f{i}") for i in range(35)]   # the real sweep's feed count
+
+
+def test_warmup_abstains_on_a_busy_ordinary_day():
+    """Finding #7: during warm-up the headline layer abstains, full stop. The old
+    exception (raw score >= 30 -> CAUTIOUS) was an unnormalized sum over ~500 headlines:
+    35 feeds x 15 ordinary headlines with one Fed mention in ~1 of 30 cleared it."""
+    sw = nr.sweep_headlines(_FEEDS35, now=NOW, pause_s=0,
+                            fetch=lambda u: _macro_feed(u, 15, 1 if int(u[1:]) % 2 == 0 else 0))
+    reading = nr.headline_reading(sw["headlines"], NOW)
+    assert reading["n"] == 525 and reading["score"] > 30        # the old 'extreme' bar
+    v = nr.headline_vote(reading, sw, [])
+    assert v["vote"] is None and "warming up" in v["why"], v
+    assert nr.headline_vote(dict(reading, score=1e6), sw, [])["vote"] is None
+    assert not hasattr(nr, "HEADLINE_EXTREME")
