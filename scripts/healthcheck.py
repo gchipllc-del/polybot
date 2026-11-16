@@ -36,7 +36,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 IS_WIN = sys.platform.startswith("win")
-TASKS = ["PolybotDashboards", "PolybotStage0", "PolybotPaper"]
+TASKS = ["PolybotDashboards", "PolybotStage0", "PolybotPaper", "PolybotSleeves"]
 PORTS = [("crypto dashboard", 5153), ("weather dashboard", 5154)]
 STAGE0_LOG = ROOT / "data" / "stage0_crypto.jsonl"
 PAPER_LOG = ROOT / "data" / "paper_crypto15.jsonl"
@@ -276,7 +276,8 @@ def check_model_integrity() -> None:
     ledger quietly stops conserving; this is the check that notices the same day."""
     try:
         import diagnostics as dg
-        results = dg.run_all(dg._load(dg.STAGE0), dg._load(dg.LEDGER))
+        results = (dg.run_all(dg._load(dg.STAGE0), dg._load(dg.LEDGER))
+                   + dg.run_sleeve_ledger(dg._load(dg.SLEEVE_LEDGER)))
     except Exception as e:  # noqa: BLE001
         record(FAIL, "model", f"diagnostics raised {type(e).__name__}: {str(e)[:70]}")
         return
@@ -312,10 +313,36 @@ def check_news_regime() -> None:
                            f"{r['why'][:80]}")
 
 
+def check_sleeve_paper() -> None:
+    """The multi-sleeve paper trader writes a heartbeat every cycle (2 min). Alive but
+    with no rules is a setup step, not a fault - say exactly what to run."""
+    hb = ROOT / "data" / "sleeve_paper_heartbeat.json"
+    if not hb.exists():
+        record(WARN, "sleeves", "sleeve paper trader has never cycled - rerun "
+                                "install_autostart.ps1 (adds PolybotSleeves)")
+        return
+    age = _age_min(hb)
+    try:
+        s = json.loads(hb.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        record(WARN, "sleeves", "heartbeat unreadable")
+        return
+    if age is not None and age > 10:
+        record(FAIL, "sleeves", f"sleeve paper heartbeat {age:.0f} min old (cycle is 2 min)"
+                                f" - alive but not cycling")
+    elif not s.get("rules"):
+        record(WARN, "sleeves", "no sleeve rules yet - run: py scripts\\sleeve_scan.py "
+                                "discover, then py scripts\\sleeve_paper.py register-probes")
+    else:
+        ug = f", {s['ungated']} ungated" if s.get("ungated") else ""
+        record(OK, "sleeves", f"{s['rules']} rules on {s['series']} sleeves, "
+                              f"{s.get('open_now', 0)} open{ug} (cycle {age:.0f} min ago)")
+
+
 def check_selftests() -> None:
     """Every module ships a selftest; run them all. This is the post-pull smoke test."""
     mods = ["stage0_collector.py", "shadow_book.py", "paper_trader.py",
-            "diagnostics.py", "news_agent.py"]
+            "diagnostics.py", "news_agent.py", "sleeve_scan.py", "sleeve_paper.py"]
     for m in mods:
         try:
             r = subprocess.run([sys.executable, str(ROOT / "scripts" / m), "selftest"],
@@ -361,6 +388,7 @@ def main() -> int:
     check_ledger_integrity()
     check_model_integrity()
     check_news_regime()
+    check_sleeve_paper()
     check_disk()
     if "--fast" not in sys.argv:
         check_selftests()

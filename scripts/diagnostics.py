@@ -65,6 +65,8 @@ from lib.binary_justify import fair_p_above, kalshi_taker_fee  # noqa: E402
 from shadow_book import liftable_depth  # noqa: E402
 
 STAGE0 = Path(os.environ.get("STAGE0_LOG") or (ROOT / "data" / "stage0_crypto.jsonl"))
+SLEEVE_LEDGER = Path(os.environ.get("PAPER_SLEEVE_LEDGER")
+                     or (ROOT / "data" / "paper_sleeves.jsonl"))
 LEDGER = Path(os.environ.get("PAPER_CRYPTO_LEDGER")
               or (ROOT / "data" / "paper_crypto15.jsonl"))
 
@@ -425,6 +427,19 @@ def run_all(stage0_rows: list[dict], ledger_rows: list[dict]) -> list[tuple[str,
     ]
 
 
+def run_sleeve_ledger(rows: list[dict]) -> list[tuple[str, bool, str]]:
+    """The multi-sleeve paper ledger (scripts/sleeve_paper.py) writes the same open/close
+    row shapes, so the same double-entry checks apply. Its markets settle on many series
+    the collector never sees, so the cross-file settle join has nothing to join: []."""
+    if not rows:
+        return []
+    return [
+        ("B1 sleeve ledger structure", *check_b1_ledger_structure(rows)),
+        ("B2 sleeve ledger conservation", *check_b2_ledger_conservation(rows)),
+        ("C2 sleeve field identity", *check_c2_ledger_field_identity(rows, [])),
+    ]
+
+
 def run_diagnostics() -> int:
     print("=" * 74)
     print("MODEL-INTEGRITY DIAGNOSTICS - A/B/C/D self-checks over the live files")
@@ -434,7 +449,7 @@ def run_diagnostics() -> int:
     print(f"PASS/FAIL judges the last {RECENT_HOURS:.0f}h of each file; older defects are")
     print("listed as 'history' - visible here, but they never turn the watchdog red.")
     print()
-    results = run_all(_load(STAGE0), _load(LEDGER))
+    results = run_all(_load(STAGE0), _load(LEDGER)) + run_sleeve_ledger(_load(SLEEVE_LEDGER))
     fails = 0
     for name, ok, detail in results:
         fails += 0 if ok else 1

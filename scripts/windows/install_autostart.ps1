@@ -30,7 +30,10 @@ $tasks = @(
     # data\news_regime.jsonl; the paper trader stamps each entry with it. Runs and
     # exits, so it reads "Ready" between runs - that is normal, like PolybotHealth.
     @{ Name = "PolybotNews";       Args = "scripts\news_agent.py run --quiet";
-       Every = 60 }
+       Every = 60 },
+    # Multi-sleeve forward paper trader (scripts\sleeve_paper.py): pre-registered rules on
+    # every sleeve worth watching, same fill gate as PolybotPaper. Long-running, like it.
+    @{ Name = "PolybotSleeves";    Args = "scripts\sleeve_paper.py run" }
 )
 
 if ($Uninstall) {
@@ -78,7 +81,8 @@ Write-Host "  collector  : py scripts\stage0_collector.py report"
 Write-Host "  paper      : py scripts\paper_trader.py report    (forward-only, no real orders)"
 Write-Host "  shadow     : py scripts\shadow_book.py report"
 Write-Host "  news       : py scripts\news_agent.py status      (report: does caution pay?)"
-Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper,PolybotNews"
+Write-Host "  sleeves    : py scripts\sleeve_paper.py report     (every sleeve, forward)"
+Write-Host "  status     : Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper,PolybotSleeves,PolybotNews"
 Write-Host "  health     : py scripts\healthcheck.py           (add --repair to fix)"
 Write-Host "  diagnose   : py scripts\run_dashboards.py --doctor"
 Write-Host "  remove     : rerun this script with -Uninstall"
