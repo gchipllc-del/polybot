@@ -599,7 +599,7 @@ def cmd_report() -> int:
         print("py scripts/sleeve_paper.py register-probes")
         return 0
     res = evaluate(rows, rules)
-    hb = json.loads(HEARTBEAT.read_text()) if HEARTBEAT.exists() else {}
+    hb = json.loads(HEARTBEAT.read_text(encoding="utf-8")) if HEARTBEAT.exists() else {}
     print(f"{len(rules)} active rules on "
           f"{len({x for r in rules.values() for x in series_of(r)})} "
           f"sleeves | last cycle {str(hb.get('ts', 'never'))[:19]} | open now "

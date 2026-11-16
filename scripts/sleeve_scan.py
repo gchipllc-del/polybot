@@ -27,6 +27,7 @@ FOUR GUARDS (each one paid for by an earlier mistake in this project):
 
   py scripts/sleeve_scan.py probe                        # what the API returns (paste me)
   py scripts/sleeve_scan.py discover [--pages 40]        # rank every series with settled events
+  py scripts/sleeve_scan.py find temperature            # search the catalog: ticker, title, category
   py scripts/sleeve_scan.py backfill [--top 20] [--events 60] [--series A,B]
   py scripts/sleeve_scan.py backfill --series A,B --events 300 --final-hours 2
                      # 1-MINUTE candles for each market's last 2 hours -> data/sleeves/final/
@@ -366,6 +367,23 @@ def cmd_discover(pages: int = 40, get=hb._get) -> int:
     return 0
 
 
+def cmd_find(text: str) -> int:
+    """Every catalog series whose ticker, sample title or category contains `text`, any
+    case. Titles are one sample event each - the app may show "today" where the API
+    title has a date - so search by the words that do not change: "temperature"."""
+    if not CATALOG.exists():
+        print("run `py scripts/sleeve_scan.py discover` first")
+        return 1
+    q = text.lower()
+    hits = [r for r in json.loads(CATALOG.read_text(encoding="utf-8"))
+            if any(q in str(r.get(k) or "").lower() for k in ("series", "title", "category"))]
+    print(f"{len(hits)} series match {text!r} (sample title per series)")
+    for r in hits:
+        print(f"  {r['series']:22} {str(r.get('category'))[:16]:16} {r.get('events', 0):>6}  "
+              f"{str(r.get('title') or '')[:60]}")
+    return 0
+
+
 def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
                  final_hours: float | None = None) -> int:
     """Most recent `events_per_series` settled events per sleeve, every market in them
@@ -379,7 +397,7 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
     out_dir.mkdir(parents=True, exist_ok=True)
     cats = {}
     if CATALOG.exists():
-        cats = {r["series"]: r.get("category") for r in json.loads(CATALOG.read_text())}
+        cats = {r["series"]: r.get("category") for r in json.loads(CATALOG.read_text(encoding="utf-8"))}
     for series in series_list:
         path = out_dir / f"{series}.jsonl"
         done = hb._seen_tickers(path)
@@ -595,6 +613,8 @@ def main() -> int:
         return cmd_probe()
     if cmd == "discover":
         return cmd_discover(int(_arg(args, "--pages", 40)))
+    if cmd == "find" and len(args) > 1:
+        return cmd_find(" ".join(args[1:]))
     if cmd == "backfill":
         if _arg(args, "--series"):
             series = [s.strip() for s in _arg(args, "--series").split(",") if s.strip()]
@@ -602,7 +622,7 @@ def main() -> int:
             if not CATALOG.exists():
                 print("run `discover` first (or pass --series A,B)")
                 return 1
-            series = [r["series"] for r in json.loads(CATALOG.read_text())][
+            series = [r["series"] for r in json.loads(CATALOG.read_text(encoding="utf-8"))][
                 :int(_arg(args, "--top", 20))]
         fh = _arg(args, "--final-hours")
         return cmd_backfill(series, int(_arg(args, "--events", 60)),
