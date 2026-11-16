@@ -70,7 +70,7 @@ HEARTBEAT = DATA / "sleeve_paper_heartbeat.json"
 CATALOG = Path(os.environ.get("SLEEVE_DIR") or (ROOT / "data" / "sleeves")) / "catalog.json"
 SCREEN = CATALOG.parent / "screen.json"
 
-VERSION = 1
+VERSION = 2                # 2: sized orders need all n contracts AT the ask (2026-11-16)
 CONTRACTS = 1             # the size of rules (and positions) from before sizes were stored
 NEW_RULE_CONTRACTS = 10   # stamped on every rule registered from now on - see contracts_of
 CYCLE_S = 120
@@ -397,7 +397,12 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
                     skipped["open_cap"] = skipped.get("open_cap", 0) + 1
                     continue
                 n = contracts_of(rules[cand["rule"]])
-                depth = depth_fn(tk, cand["side"], cand["price"]) if depth_fn else None
+                # liftable_depth counts resting size up to one tick PAST the price (a
+                # tolerance for quote-vs-book skew). Harmless for a 1-lot - a live quote
+                # always has 1 at the ask - but a sized order booked at the ask must find
+                # all n AT the ask: probe one tick inside it. 1-lots keep the old probe.
+                probe = cand["price"] if n == CONTRACTS else round(cand["price"] - 0.01, 4)
+                depth = depth_fn(tk, cand["side"], probe) if depth_fn else None
                 if depth is not None and depth < n:
                     skipped["no_depth"] = skipped.get("no_depth", 0) + 1
                     continue

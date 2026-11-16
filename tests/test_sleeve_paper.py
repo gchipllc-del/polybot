@@ -366,3 +366,22 @@ def test_cli_one_rule_per_hypothesis_and_retire_by_prefix(tmp_path, monkeypatch)
     r = sp.active_rules(sp.RULES)["F9799"]
     assert r["series"] == ["KXHIGHNY", "KXHIGHCHI"] and r["contracts"] == 10
     assert run(*args) == 1                                         # never redefined
+
+
+def test_a_sized_order_needs_every_contract_at_the_ask(tmp_path):
+    """Review finding: 4 contracts at 98c and 50 at 99c used to admit a 10-lot booked at
+    98c - a fill the book could not give. liftable_depth's one-tick tolerance stays for
+    1-lots (quote/book skew) but a sized order is probed one tick inside the ask."""
+    def book(t, side, price):          # liftable_depth semantics: levels <= price + 1c
+        return 54 if price >= 0.98 - 1e-9 else 4     # 4 at 98c, +50 at 99c
+    rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
+    sp.register([{"name": "BIG", "series": "KXINX", "band": "any", "side": "favorite",
+                  "lo": 0.97, "hi": 0.995, "contracts": 10},
+                 {"name": "ONE", "series": "KXINX", "band": "any", "side": "favorite",
+                  "lo": 0.97, "hi": 0.995}], rp, NOW - timedelta(days=1))
+    s = sp.run_cycle(_getter([mk("KXINX-E1-A", "KXINX-E1", 98, 96)]), NOW, rp, lp,
+                     depth_fn=book, regime_fn=lambda: {"regime": "good", "mult": 1.0},
+                     heartbeat=None)
+    opened = {r["rule"]: r for r in sp._load_jsonl(lp) if r.get("t") == "open"}
+    assert set(opened) == {"ONE"} and s["skipped"]["no_depth"] == 1    # the 10-lot refused
+    assert opened["ONE"]["v"] == sp.VERSION == 2
