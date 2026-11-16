@@ -96,7 +96,10 @@ description, never as a test.
 **Order size is part of the rule (default 10 contracts).** Kalshi rounds the fee per
 ORDER up to the cent. A 1-lot at 99c pays a 1c fee on a 1c win: it cannot profit even
 if it never loses. At 10 contracts the fee is about 0.1-0.2c per contract. Rules
-registered before sizes were stored keep their 1-lot definition.
+registered before sizes were stored keep their 1-lot definition. A sized order is booked
+entirely at the ask, so the fill gate needs all of its contracts offered AT the ask; size
+one tick worse does not count (the gate's one-tick tolerance for quote/book skew applies
+only to the legacy 1-lots).
 
 **Exact odds, not a normal approximation.** Under the house rule (one bet per event, held
 to settlement) every outcome is a win or a loss that differ by exactly $1 per contract,

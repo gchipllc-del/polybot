@@ -18,8 +18,10 @@ count, and a rule is never edited - it can only be retired by a later row. Two s
 HOW IT TRADES - the house realism, shared code where it exists:
   * enter at the ASK on the rule's side, pay the real ceil-to-cent Kalshi fee
   * the fill gate: refuse when the captured order book has no liftable size behind the
-    quote (shadow_book.liftable_depth - the parser fixed 2026-09-25); entries whose depth
-    lookup failed are admitted but COUNTED as ungated, never hidden
+    quote (shadow_book.liftable_depth - the parser fixed 2026-09-25); a sized order needs
+    its whole size AT the ask, the price it is booked at (the book's one-tick skew
+    tolerance is for 1-lots only); entries whose depth lookup failed are admitted but
+    COUNTED as ungated, never hidden
   * ONE bet per (event, rule): every strike of an event resolves on one outcome
   * the rule's own ORDER SIZE (10 contracts for every rule registered since sizes were
     stored): Kalshi rounds the fee per order UP to the cent, so a 1-lot at 99c pays a 1c
@@ -397,7 +399,12 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
                     skipped["open_cap"] = skipped.get("open_cap", 0) + 1
                     continue
                 n = contracts_of(rules[cand["rule"]])
-                depth = depth_fn(tk, cand["side"], cand["price"]) if depth_fn else None
+                # liftable_depth counts size up to one tick WORSE than the ask (snapshot-skew
+                # tolerance). A legacy 1-lot keeps that gate: a fresh quote always has 1 at
+                # the ask. A sized order is booked entirely AT the ask, so all n must be
+                # there: probing one tick inside the ask cancels the tolerance.
+                probe = cand["price"] if n == CONTRACTS else round(cand["price"] - 0.01, 4)
+                depth = depth_fn(tk, cand["side"], probe) if depth_fn else None
                 if depth is not None and depth < n:
                     skipped["no_depth"] = skipped.get("no_depth", 0) + 1
                     continue

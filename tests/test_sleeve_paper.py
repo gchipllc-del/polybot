@@ -262,6 +262,38 @@ def test_a_ten_lot_needs_ten_deep_and_pays_one_orders_fee(tmp_path):
     assert o["contracts"] == 10 and o["fee"] == 0.02     # ceil(0.07*10*.98*.02) - not 10c
 
 
+def test_a_sized_order_needs_its_whole_size_at_the_ask_not_a_tick_worse(tmp_path):
+    """liftable_depth tolerates one tick of quote/book skew. A 10-lot is booked entirely AT
+    the ask, so size one tick worse must not admit it: 4 at 98c + 50 at 99c really fills
+    4 @ .98 + 6 @ .99, not the 10 @ .98 the ledger would book. Legacy 1-lots keep the
+    tolerant gate. Real shadow_book depth on live-shaped books, both sides."""
+    import shadow_book as sb
+    thin_yes = {"orderbook_fp": {"yes_dollars": [["0.9600", "30.00"]],
+                                 "no_dollars": [["0.0100", "50.00"], ["0.0200", "4.00"]]}}
+    thin_no = {"orderbook_fp": {"yes_dollars": [["0.0100", "50.00"], ["0.0200", "4.00"]]}}
+    deep_yes = {"orderbook_fp": {"no_dollars": [["0.0100", "50.00"], ["0.0200", "12.00"]]}}
+    yes_fav, no_fav = mk("KXINX-E1-A", "KXINX-E1", 98, 96), mk("KXINX-E1-A", "KXINX-E1", 4, 2)
+    base = {"series": "KXINX", "band": "any", "side": "favorite", "lo": 0.97, "hi": 0.995}
+
+    def opens(book, quote, **size):
+        rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
+        for p in (rp, lp):
+            p.unlink(missing_ok=True)
+        sp.register([dict(base, name="R", **size)], rp, NOW - timedelta(days=1))
+        sp.run_cycle(_getter([quote]), NOW, rp, lp,
+                     depth_fn=lambda t, s, p: sb._depth_at(book, s, p),
+                     regime_fn=lambda: {"regime": "good", "mult": 1.0}, heartbeat=None)
+        return [(r["contracts"], r["price"], r["depth"]) for r in sp._load_jsonl(lp)
+                if r.get("t") == "open"]
+
+    assert sb.liftable_depth(thin_yes, "yes", 0.98) == 54        # the tolerant count
+    assert opens(thin_yes, yes_fav, contracts=10) == []           # only 4 at the ask
+    assert opens(thin_no, no_fav, contracts=10) == []             # same on the NO side
+    assert opens(deep_yes, yes_fav, contracts=10) == [(10, 0.98, 12.0)]   # 12 at the ask
+    assert opens(thin_yes, yes_fav) == [(1, 0.98, 54.0)]          # legacy 1-lot: unchanged
+    assert opens(thin_no, no_fav) == [(1, 0.98, 54.0)]
+
+
 def test_one_rule_spans_many_series_and_is_one_test(tmp_path):
     rp, lp = tmp_path / "r.jsonl", tmp_path / "l.jsonl"
     sp.register([{"name": "F9799", "series": ["KXHIGHNY", "KXHIGHCHI"], "band": "any",
