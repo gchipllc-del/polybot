@@ -157,7 +157,7 @@ def doctor() -> int:
     # 2. what is listening where
     print("\n[2] ports (is anything actually serving?)")
     host = DASH_HOST
-    watch = [("crypto NEW", host, 5153), ("weather NEW", host, 5154),
+    watch = [(name, host, port) for name, _, port in DASHBOARDS] + [
              ("crypto OLD", host, 5053), ("weather OLD", host, 5054),
              ("openclaw", "127.0.0.1", 5050), ("openclaw", "127.0.0.1", 5051)]
     for name, h, p in watch:
@@ -171,7 +171,8 @@ def doctor() -> int:
     print("\n[3] background tasks")
     if is_win:
         out = _run(["powershell", "-NoProfile", "-Command",
-                    "Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper "
+                    "Get-ScheduledTask PolybotDashboards,PolybotStage0,PolybotPaper,"
+                    "PolybotSleeves,PolybotNews,PolybotHealth "
                     "-ErrorAction SilentlyContinue | "
                     "Select-Object TaskName,State | Format-Table -AutoSize | Out-String"])
         print("\n".join(f"      {l}" for l in out.splitlines() if l.strip()) or "      (none found)")
@@ -186,12 +187,31 @@ def doctor() -> int:
 
     # 5. verdict
     print("\n[5] verdict")
-    serving_new = any(_port_listening(host, p) for p in (5153, 5154))
+    up = {name: _port_listening(host, port) for name, _, port in DASHBOARDS}
+    serving_new = any(up.values())
     serving_old = any(_port_listening(host, p) for p in (5053, 5054))
-    if serving_new:
-        print(f"      OK - dashboards are serving. Open http://{host}:5153 and :5154")
+    down = [n for n, ok in up.items() if not ok]
+    if serving_new and not down:
+        print("      OK - every dashboard is serving:")
+        for name, _, port in DASHBOARDS:
+            print(f"        {name:8} http://{host}:{port}")
         print("      If the browser still fails, it is browser-side: try a different")
         print("      browser, or check for a system/corporate proxy that hijacks localhost.")
+    elif serving_new:
+        # Some up, some down. The usual cause: the launcher running now started BEFORE
+        # the pull, so it only knows the dashboards that existed then (it reads its list
+        # once, at start). The other cause: that dashboard crashes at boot - its log in
+        # [4] shows the traceback, and the launcher retries it on its own.
+        print(f"      CAUSE: not serving: {', '.join(down)}. Either the running launcher")
+        print("      predates your last pull (it only starts the dashboards it knew about")
+        print("      when it started), or that dashboard crashes at boot - see [4].")
+        print("      FIX (run each line separately, then wait ~15 seconds):")
+        print("        Stop-ScheduledTask PolybotDashboards")
+        print("        Start-ScheduledTask PolybotDashboards")
+        print("      Still down? Run it in the foreground and read the error:")
+        for name, cmd, port in DASHBOARDS:
+            if name in down:
+                print(f"        py main.py {cmd} --port={port}")
     elif serving_old and not new_ports:
         print("      CAUSE: old code is running on 5053/5054 - you have not pulled yet.")
         print("      FIX (run each line separately):")
@@ -226,35 +246,55 @@ def main() -> int:
     # Windows: child stdout redirected to a file defaults to cp1252, so the dashboards'
     # unicode banners (─ → ▲) raise UnicodeEncodeError at boot -> exit 1. Force UTF-8.
     child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-    procs = []
-    for name, cmd, port in DASHBOARDS:
+    def spawn(name: str, cmd: str, port: int):
         log = open(ROOT / "logs" / f"dash_{name}.log", "a", encoding="utf-8")
-        p = subprocess.Popen([sys.executable, str(ROOT / "main.py"), cmd, f"--port={port}"],
-                             cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
-                             env=child_env)
-        procs.append((name, port, p))
+        return subprocess.Popen([sys.executable, str(ROOT / "main.py"), cmd, f"--port={port}"],
+                                cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+                                env=child_env)
+
+    # Each dashboard is supervised ON ITS OWN. This used to stop every dashboard when
+    # any one exited - harmless with two, but with three it meant a crash in a new page
+    # took the working ones down with it, and the scheduled task could not restart them
+    # while this launcher stayed alive. Now a dead dashboard is restarted with backoff
+    # (15s, 30s, ... capped at 5 min), the others keep serving, and the log says why.
+    procs = {}
+    for name, cmd, port in DASHBOARDS:
+        procs[name] = {"cmd": cmd, "port": port, "p": spawn(name, cmd, port),
+                       "fails": 0, "retry_at": 0.0, "started": time.time()}
         print(f"  {name:8} -> http://{DASH_HOST}:{port}   (log: logs/dash_{name}.log)")
 
-    print("\nboth dashboards running — open the links above in a browser ON THIS computer.")
-    print("press ctrl-c here to stop both.")
+    print(f"\n{len(procs)} dashboards running — open the links above in a browser ON THIS"
+          " computer.")
+    print("press ctrl-c here to stop them all.")
     try:
         while True:
             time.sleep(2)
-            for name, port, p in procs:
-                if p.poll() is not None:
-                    print(f"\n{name} dashboard exited (code {p.returncode}) — "
-                          f"see logs/dash_{name}.log. Stopping the other.")
-                    raise KeyboardInterrupt
+            now = time.time()
+            for name, st in procs.items():
+                p = st["p"]
+                if p is not None and p.poll() is not None:
+                    st["fails"] += 1
+                    delay = min(300, 15 * 2 ** (st["fails"] - 1))
+                    print(f"\n{name} dashboard exited (code {p.returncode}) — retrying in "
+                          f"{delay}s; the others keep running. See logs/dash_{name}.log")
+                    st["p"], st["retry_at"] = None, now + delay
+                elif p is None and now >= st["retry_at"]:
+                    st["p"], st["started"] = spawn(name, st["cmd"], st["port"]), now
+                    print(f"{name} dashboard restarted (attempt {st['fails'] + 1})")
+                elif p is not None and st["fails"] and now - st["started"] > 600:
+                    st["fails"] = 0                       # stable for 10 min: reset backoff
     except KeyboardInterrupt:
         print("\nstopping ...")
-        for _, _, p in procs:
-            if p.poll() is None:
-                p.terminate()
-        for _, _, p in procs:
+        for st in procs.values():
+            if st["p"] is not None and st["p"].poll() is None:
+                st["p"].terminate()
+        for st in procs.values():
+            if st["p"] is None:
+                continue
             try:
-                p.wait(timeout=5)
+                st["p"].wait(timeout=5)
             except subprocess.TimeoutExpired:
-                p.kill()
+                st["p"].kill()
     return 0
 
 
