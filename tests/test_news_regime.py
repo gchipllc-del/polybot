@@ -95,11 +95,12 @@ def test_per_source_cap():
 
 # ── votes ─────────────────────────────────────────────────────────────────────
 
-def test_calendar_vote():
+def test_calendar_vote_can_only_add_caution():
+    """An unlisted day is not evidence of calm: off an event day the calendar abstains."""
     assert nr.calendar_vote(CAL_TODAY, "2026-11-16")["vote"] == nr.CAUTIOUS
-    assert nr.calendar_vote(CAL_TODAY, "2026-11-17")["vote"] == nr.GOOD
+    assert nr.calendar_vote(CAL_TODAY, "2026-11-17")["vote"] is None
     low = [dict(CAL_TODAY[0], impact="low")]
-    assert nr.calendar_vote(low, "2026-11-16")["vote"] == nr.GOOD
+    assert nr.calendar_vote(low, "2026-11-16")["vote"] is None
     assert nr.calendar_vote([], "2026-11-16")["vote"] is None
 
 
@@ -250,14 +251,16 @@ def test_ai_old_sdk_falls_back_to_plain_create():
 
     c = _good_client(log)
     c.beta = type("B", (), {"messages": OldBeta()})()
-    av = nr.ai_vote(nr.headline_reading([], NOW), {}, {}, client_factory=lambda: c)
+    reading = nr.headline_reading([{"title": "Fed holds rates steady", "source": "A",
+                                    "published": NOW}], NOW)
+    av = nr.ai_vote(reading, {}, {}, client_factory=lambda: c)
     assert av["vote"] == nr.GOOD and "fallbacks" not in log[-1]
 
 
 def test_ai_vote_is_reused_within_its_window(tmp_path):
     p = tmp_path / "r.jsonl"
     log = []
-    kw = dict(feeds=[], fetch=lambda u: b"", calendar=[], spots={}, ai=True,
+    kw = dict(feeds=[("A", "u1")], fetch=lambda u: na._RSS, calendar=[], spots={}, ai=True,
               client_factory=lambda: _good_client(log), path=p, pause_s=0)
     nr.run_once(NOW, history=[], **kw)
     nr.run_once(NOW + timedelta(hours=2), history=nr.load_history(p), **kw)
@@ -352,3 +355,65 @@ def test_broken_news_agent_never_stops_the_paper_trader(monkeypatch):
         raise RuntimeError("corrupt regime log")
     monkeypatch.setattr(nr, "current_regime", broken)
     assert pt._regime_now() == {"regime": "unknown", "mult": 0.5}
+
+
+# ── total failure must read UNKNOWN (review finding: it read GOOD x1.0) ───────
+
+def _dead(u):
+    raise ConnectionError("feed down")
+
+
+def test_total_failure_reads_unknown_even_with_a_calendar(tmp_path):
+    """Every live layer down - feeds unreachable, collector dead, AI failing - and a
+    calendar that lists only some other day. That is no evidence of calm: UNKNOWN x0.5."""
+    def broken_client():
+        raise RuntimeError("no credentials")
+    row = nr.run_once(NOW, feeds=[("A", "u1"), ("B", "u2")], fetch=_dead,
+                      calendar=[{"date": "2026-12-09", "time_et": "14:00",
+                                 "event": "FOMC rate decision", "impact": "high"}],
+                      spots={}, history=[], ai=True, client_factory=broken_client,
+                      path=tmp_path / "r.jsonl", pause_s=0)
+    assert row["votes"]["calendar"]["vote"] is None
+    assert row["regime"] == nr.UNKNOWN and row["mult"] == 0.5
+    assert nr.current_regime(tmp_path / "r.jsonl", now=NOW)["regime"] == nr.UNKNOWN
+
+
+def test_a_carried_over_ai_good_cannot_unlock_full_size(tmp_path):
+    """An AI GOOD from 5.5 hours ago is not evidence about now - but a carried-over
+    CAUTIOUS still adds caution (a vote can add caution, never remove it)."""
+    earlier = (NOW - timedelta(hours=5.5)).isoformat()
+    for vote, want in ((nr.GOOD, nr.UNKNOWN), (nr.CAUTIOUS, nr.CAUTIOUS)):
+        hist = [{"t": "regime", "ts": earlier, "regime": vote,
+                 "votes": {"ai": {"vote": vote, "why": "earlier read", "ts": earlier}}}]
+        row = nr.run_once(NOW, feeds=[("A", "u1")], fetch=_dead, calendar=[], spots={},
+                          history=hist, ai=True,
+                          client_factory=lambda: (_ for _ in ()).throw(AssertionError),
+                          path=tmp_path / f"{vote}.jsonl", pause_s=0)
+        assert row["votes"]["ai"]["reused"] is True
+        assert row["regime"] == want, (vote, row["reasons"])
+
+
+def test_ai_abstains_without_headlines_and_is_not_billed():
+    calls = []
+    av = nr.ai_vote({"n": 0, "top": []}, {}, {},
+                    client_factory=lambda: calls.append(1) or _good_client([]))
+    assert av["vote"] is None and "no headlines" in av["why"] and not calls
+
+
+def test_live_good_still_reads_good():
+    regime, reasons = nr.combine({"calendar": {"vote": None, "why": "nothing listed"},
+                                  "volatility": {"vote": nr.GOOD, "why": "normal"}})
+    assert regime == nr.GOOD and reasons == ["volatility: normal"]
+
+
+def test_healthcheck_warns_when_no_live_data_layer_voted(tmp_path, monkeypatch):
+    import healthcheck as hc
+    p = tmp_path / "r.jsonl"
+    nr.run_once(NOW, feeds=[("A", "u1")], fetch=_dead, calendar=CAL_TODAY, spots={},
+                history=[], ai=False, path=p, pause_s=0)          # cautious by calendar
+    monkeypatch.setattr(nr, "REGIME_LOG", p)
+    monkeypatch.setattr(nr, "_utcnow", lambda: NOW + timedelta(minutes=5))
+    seen = []
+    monkeypatch.setattr(hc, "record", lambda level, name, msg: seen.append((level, msg)))
+    hc.check_news_regime()
+    assert seen and seen[0][0] == hc.WARN and "no live data layer" in seen[0][1]
