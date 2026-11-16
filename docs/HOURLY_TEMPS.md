@@ -8,8 +8,22 @@ with the temperature near 68: YES ">= 66", YES ">= 67", NO ">= 69" - 10 contract
 97-99c, for $0.09-0.30 profit each. ~34 positions seen, all wins; many fills had no fee
 (resting limit orders = maker).
 
-**Status of this file:** sections 1-3 are final. Section 4 (prices) is filled in when the
-candle backfill finishes - see the bottom of the file.
+**Bottom line (history, 300 most recent events per city = Nov 3-16, 2026):**
+* The method as seen - any 97-99c strike, near the current reading, any time in the hour,
+  several strikes per city-hour - **loses after fees**: 5,412 entries, 98.02% won vs a
+  98.52% break-even, -0.35c per contract (section 4a).
+* **Choosing the strike from the live reading does not fix it.** At every cell of the
+  pre-declared grid the reading-chosen bet is at best break-even, and requiring a BIGGER
+  margin makes it WORSE: a strike still offered at 97-99c despite sitting 3 degF on the
+  safe side is one the market expects the temperature to cross (section 4b).
+* One version did make money: **ONE bet per city-hour, the first strike quoted 97-99c**,
+  which in practice means buying the market's own opening favorite within ~10 minutes of
+  the open (median 6 minutes): 1,199 events, 4 losses, +0.96c per contract, exact p = 0.001 (trade-confirmed
+  only: 462 events, 1 loss, p = 0.015). It survives changes of tie-break (+0.65 to +0.96c,
+  p 0.001-0.024) and is positive in all four cities. It is two weeks of one season, quote
+  data not fills - a NOMINATION for a forward paper rule (section 6), nothing more.
+* Her 34-for-34 is no evidence either way: at 98c a break-even strategy wins 34 in a row
+  54% of the time (0.982^34).
 
 ---
 
@@ -156,4 +170,144 @@ offers 97-99c on the safe strikes (rather than 99c+, i.e. no entry) is section 4
 
 ## 4. History with prices
 
-(pending: candle backfill of the most recent events per series is running)
+**Data.** `sleeve_scan.py backfill --series KXTEMPNYCHS,KXTEMPCHIHS,KXTEMPMIAH,KXTEMPLAXHS
+--events 300 --final-hours 2`: 1-minute candles over each market's whole 1-hour life for
+the 300 most recent settled events per city = 12,185 markets, 1,199 events (with prices),
+2026-11-03 .. 11-16. (Run here through a retrying fetcher - Kalshi answered bursts with
+429; 2 markets failed.) 300 events per city was not cut; it took ~2.5 hours.
+Settlements for ALL ~6,350 events since Sep 6-10 come from `hourly_temps.py settlements`.
+
+### 4a. Unconditional - the simple proxy (strategy_check, 10-lot taker fee)
+
+`py scripts\strategy_check.py favorites --lo 0.97 --hi 0.99 --contracts 10 --max-hours 1
+[--one-per-event] --file data\sleeves\final` (and `--max-hours 0.5`, `--min-hours 0.5
+--max-hours 1`). Entry = the FIRST minute a side's ask sits in 97-99c on a formed book.
+
+| window | bets | events | losses | win % | break-even | c / contract / event [95% CI] | p | trade-confirmed: events, losses, c/ct, p |
+|---|---|---|---|---|---|---|---|---|
+| 0-1h, one per event | 1,199 | 1,199 | 4 | 99.67 | 98.71 | **+0.96 [+0.63, +1.29]** | **0.001** | 462, 1, +1.11, 0.015 |
+| 0-1h, every market | 5,412 | 1,199 | 107 | 98.02 | 98.52 | -0.35 [-0.71, +0.00] | 0.84 | 1,096, 64, -0.37, 0.83 |
+| 0.5-1h before, one per event | 1,197 | 1,197 | 4 | 99.67 | 98.71 | +0.96 [+0.63, +1.28] | 0.001 | 461, 1, +1.11, 0.015 |
+| 0.5-1h before, every market | 4,776 | 1,197 | 79 | 98.35 | 98.60 | -0.18 [-0.54, +0.18] | 0.70 | 1,020, 42, -0.13, 0.63 |
+| 0-0.5h before, one per event | 1,185 | 1,185 | 21 | 98.23 | 98.53 | -0.30 [-1.05, +0.45] | 0.84 | 460, 7, +0.15, 0.50 |
+| 0-0.5h before, every market | 2,967 | 1,185 | 72 | 97.57 | 98.40 | -0.42 [-0.91, +0.06] | 0.88 | 956, 47, -0.85, **0.975 (loses)** |
+
+("every market" counts each strike as an order but judges per event; p there is the
+null-variance test, the one-per-event p's are exact.)
+
+What the winning row actually buys: the first in-band quote per event comes 1-10 minutes
+after the open in 84% of events (median 6 minutes), later in 11%, and in 5% before the
+listed open_time (events whose markets were listed early). In 1-in-3 events several strikes are in band in that first minute;
+the reported row breaks ties by ticker - other tie-breaks: highest ticker +0.65c
+(p 0.024), random +0.79c (0.005), cheapest ask +0.89c (0.002), dearest +0.65c (0.019).
+It is NOT a far-away strike: vs the last published value its margin is 0-2 degF in 80%
+of picks, and in 163 of 1,176 picks the market's favorite is the side the last value
+does NOT favor - the market's opening ladder already prices the hour's trend (e.g. NYC
+5pm value 56.98, the 6pm market opened with NO on ">= 56" at 98c; it settled 54.05).
+
+| by city (one per event, 0-1h) | events | losses | c/contract | exact p |
+|---|---|---|---|---|
+| NYC | 298 | 2 | +0.64 | 0.25 |
+| Chicago | 299 | 1 | +0.89 | 0.12 |
+| Miami | 298 | 1 | +1.00 | 0.09 |
+| Coastal LA | 298 | 0 | +1.29 | 0.02 |
+| 5-10pm EST hours only | 308 | 1 | +0.98 | 0.09 |
+| all other hours | 885 | 3 | +0.95 | 0.003 |
+
+The four losses: NYC Nov 4 11pm YES ">= 59" @99 (last value 60.13, settled 58.40); Miami
+Nov 5 midnight NO ">= 76" @98 (76.28 -> 76.64); Chicago Nov 8 7pm YES ">= 52" @98 (55.76 ->
+51.80); NYC Nov 11 3am NO ">= 50" @98 (50.23 -> 50.23).
+
+### 4b. Conditional - her selection, using the reading (pre-declared grid, every cell)
+
+`py scripts\hourly_temps.py report`. Reading at entry: section 3 (60 min: the last
+published value, exact; 30 min: that value + the proxy stations' change, ~0.5 degF
+error). Bet: among strikes whose reading-favored side has margin >= D, the one quoted
+97-99c with the LARGEST margin; one per event; 10-lot. Quote read at settlement - 55 min
+(60m entry) or - 30 min. "priced >99c" = events where every strike meeting the margin was
+already 99c+ (no entry possible); "no reading" = first event of a run, or 1-minute
+station data not yet in the IEM archive (after Nov 15 ~17Z).
+
+| entry | D | N | wins | win % | break-even | taker c/ct | p | maker c/ct | p | trade-confirmed (N, wins) | priced >99c | no reading |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 60m | 1 | 310 | 274 | 88.4 | 98.5 | -10.10 | 1.000 | -9.93 | 1.000 | 81, 79 | 867 | 17 |
+| 60m | 2 | 197 | 182 | 92.4 | 98.6 | -6.18 | 1.000 | -6.03 | 1.000 | 64, 64 | 980 | 17 |
+| 60m | 3 | 96 | 91 | 94.8 | 98.6 | -3.82 | 0.998 | -3.67 | 0.996 | 32, 32 | 1,081 | 17 |
+| 30m | 1 | 532 | 526 | 98.9 | 98.7 | +0.17 | 0.46 | +0.32 | 0.35 | 302, 299 | 605 | 57 |
+| 30m | 2 | 189 | 186 | 98.4 | 98.7 | -0.28 | 0.77 | -0.14 | 0.71 | 115, 113 | 948 | 57 |
+| 30m | 3 | 40 | 38 | 95.0 | 98.7 | -3.67 | 0.98 | -3.52 | 0.98 | 24, 22 | 1,097 | 57 |
+
+By city (taker, wins/N, $/contract): 60m D=1 NYC 70/76 -0.065, CHI 58/74 -0.201, MIA
+78/80 -0.010, LA 68/80 -0.135 - 30m D=1 NYC 104/104 +0.013, CHI 131/134 -0.010, MIA
+141/143 -0.001, LA 150/151 +0.006 - 30m D=2 NYC 16/16, CHI 57/57, MIA 41/43, LA 72/73 -
+30m D=3 NYC 5/5, CHI 7/7, MIA 4/6, LA 22/22. Full output incl. every loss:
+`data/hourly/results/conditional.txt` on a re-run.
+
+**Reading it.** Most of the time the market has already priced the safe strikes at 99c+
+(867-1,097 of ~1,180 events, depending on the cell). What is left at 97-99c with a big
+reading margin is adversely selected: the market is pricing a move the last reading has
+not shown yet (morning warm-up, evening cool-down, fronts). The price-free table in
+section 3 says the same from the other side - at 60 minutes a 2-3 degF margin loses 4-8%
+of the time, far above a 1.5-3% price. No cell is a candidate; per the pre-declaration
+none is crowned, and the best (30m D=1, +0.17c, p 0.46) is indistinguishable from zero.
+
+## 5. Caveats
+
+* **Quotes are not fills.** Entries are candle CLOSE quotes. Trade-confirmed = a trade
+  printed at or through our price in the following minute (fixed tonight: the API renamed
+  `volume` to `volume_fp`, which had silently zeroed this check in strategy_check and
+  sleeve_scan). Depth behind the quote is unknown; a 10-lot may not fill at the quote.
+* **Maker vs taker.** Her fills often showed no fee - resting limit orders. A maker pays
+  no fee but gets filled preferentially when the price is moving against her (a resting
+  97c NO bid fills when someone wants to sell NO - often because the temperature is
+  heading toward the line). The maker columns above assume the same fills without the
+  fee; real maker fills are adversely selected, so treat them as an upper bound.
+* **Correlated strikes.** Strikes of one city-hour resolve on ONE value: 2-3 strikes on
+  both sides of the reading is one bet, and when it goes wrong two of them can lose
+  together. Every p here is per event. Cities on the same night share weather systems too.
+* **Small, one-season sample.** Prices cover 13 days of November. The one positive row
+  rests on 4 losses; 3 more would erase its significance. Settlements (no prices) cover
+  2+ months.
+* **The index is not reconstructable** from public data (multi-station, weekly offsets);
+  the 30-minute reading is a proxy with ~0.5 degF typical error. Her app shows the real
+  index (5 min delayed), so her 30-minute picks are a bit better informed than ours. The
+  60-minute reading is exact.
+* **History nominates, forward decides.** The positive row was found among ~12 cells
+  reported here (6 unconditional + 6 conditional); its p does not survive "it was the
+  best of several" without the forward test.
+
+## 6. Pre-register the forward rule (on the Windows host - not done here)
+
+`sleeve_paper` can express the unconditional rule exactly as tested (first in-band entry,
+one bet per event, 10-lot, real fee, depth-gated). It enters on its first cycle (every
+2 minutes) at which a market's favorite ask is 97c-99c; where several strikes qualify it
+takes the first in API order (history: tie-break moves the edge between +0.65c and
++0.96c, all positive). Run from the repo folder:
+
+```
+py scripts\sleeve_paper.py register-rule --name HOURLY_FAV --series KXTEMPNYCHS,KXTEMPCHIHS,KXTEMPMIAH,KXTEMPLAXHS --side favorite --lo 0.97 --hi 0.995 --band any --max-hours 1 --contracts 10 --thesis "Hourly city temperature, one bet per city-hour: buy the market's first 97-99c favorite (in practice its opening ladder, minutes after open), hold to settlement. History Nov 3-16 2026: 1,199 events, 4 losses, +0.96c/contract, exact p=0.001 (trade-confirmed 462 events, p=0.015). Any-strike/any-time and reading-margin versions lose (docs/HOURLY_TEMPS.md)."
+py scripts\sleeve_paper.py rules
+```
+
+(`--hi` is exclusive in sleeve_paper, so 0.995 admits a 99c ask.) Verdict bar, per
+CLAUDE.md: 100+ events after registration and surviving the false-discovery correction
+across all forward rules - at 24 events per city per day that is ~1 day of running.
+**Run it for at least 2-3 weeks anyway** - 100 events is one weather pattern.
+
+The conditional rules (reading margin) are NOT recommended for registration: no cell
+was positive beyond noise, and sleeve_paper cannot express a reading condition. If a
+forward check is still wanted, it needs a runner that reads the live index (the previous
+hour's settlement value + a live station feed) - not built.
+
+## 7. Reproduce
+
+```
+py scripts\hourly_temps.py settlements                       # all settled events -> data\hourly\
+py scripts\hourly_temps.py stations                          # IEM 1-minute ASOS proxy stations
+py scripts\sleeve_scan.py backfill --series KXTEMPNYCHS,KXTEMPCHIHS,KXTEMPMIAH,KXTEMPLAXHS --events 300 --final-hours 2
+py scripts\strategy_check.py favorites --lo 0.97 --hi 0.99 --contracts 10 --max-hours 1 --one-per-event --file data\sleeves\final
+py scripts\hourly_temps.py report                            # calibration, flip rates, conditional grid
+py scripts\hourly_temps.py selftest
+```
+
+If `sleeve_scan.py backfill` stops on `429 Too Many Requests`, re-run it (resumable).
