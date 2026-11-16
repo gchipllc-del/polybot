@@ -121,6 +121,87 @@ def test_labels_are_inserted_as_text_never_html():
     assert "insertAdjacentHTML" not in cc._PAGE
 
 
+T0 = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+def _isolate(tmp_path, monkeypatch):
+    import sleeve_paper as sp
+    from lib import news_regime as nr
+    for mod, name, file in ((cc, "CRYPTO_LEDGER", "crypto.jsonl"), (cc, "HEALTH_LOG", "hc.log"),
+                            (cc, "SCREEN", "screen.json"), (sp, "RULES", "rules.jsonl"),
+                            (sp, "LEDGER", "ledger.jsonl"), (sp, "HEARTBEAT", "hb.json"),
+                            (nr, "REGIME_LOG", "regime.jsonl")):
+        monkeypatch.setattr(mod, name, tmp_path / file)
+    return sp
+
+
+def _sleeve_rule(sp, name, losses, n=100, ask=0.90, lots=10):
+    """A registered 10-lot favorite rule with n settled events after named_at."""
+    sp.register([{"name": name, "series": f"KX{name}", "band": "any", "side": "favorite",
+                  "lo": 0.85, "hi": 0.95, "contracts": lots}], sp.RULES, T0)
+    rows = []
+    for i in range(n):
+        o = {"t": "open", "ts": (T0 + timedelta(days=1, hours=i)).isoformat(),
+             "ticker": f"KX{name}-E{i:03d}-A", "rule": name, "event": f"KX{name}-E{i:03d}",
+             "series": f"KX{name}", "side": "yes", "price": ask, "contracts": lots,
+             "fee": sp.kalshi_fee(ask, lots), "depth": 40}
+        rows += [o, sp.settle(o, "yes" if i >= losses else "no")]
+    sp._append(sp.LEDGER, rows)
+
+
+def _crypto_ledger(path, rules=3, n=40, losses=7):
+    """Forward crypto rules with n fill-checked (v4 gated) windows each - ordinary records."""
+    rows = []
+    for j in range(rules):
+        for i in range(n):
+            tk, won = f"KXBTC15M-26SEP{j:02d}{i:04d}-B{j}", i >= losses
+            rows.append({"t": "open", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "contracts": 1, "fee": 0.01, "v": 4, "depth": 20})
+            rows.append({"t": "close", "ts": T0.isoformat(), "ticker": tk, "rule": f"C{j}",
+                         "price": 0.85, "won": won, "pnl": 0.14 if won else -0.86})
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _both_verdicts(sp, name, capsys):
+    """(the `sleeve_paper.py report` line, the command center's verdict) for one rule."""
+    sp.cmd_report()
+    line = next(l.strip() for l in capsys.readouterr().out.splitlines()
+                if l.strip().startswith(name + " "))
+    cc._CACHE.update(t=0.0, payload=None)
+    return line, next(r for r in cc.build_payload()["rules"] if r["rule"] == name)["verdict"]
+
+
+def test_report_and_command_center_correct_over_one_family(tmp_path, monkeypatch, capsys):
+    """The report once corrected over the sleeve rules alone and the command center over
+    crypto + sleeves, so the same trades read EDGE on one and 'no edge yet' on the other.
+    S_FAV90 (100 events at 90c, 4 losses: exact p = 0.039) is EDGE only on its own."""
+    sp = _isolate(tmp_path, monkeypatch)
+    _sleeve_rule(sp, "S_FAV90", losses=4)
+    line, verdict = _both_verdicts(sp, "S_FAV90", capsys)
+    assert line.endswith("EDGE - survives the forward family correction")      # m = 1
+    assert verdict.startswith("EDGE")
+    _crypto_ledger(cc.CRYPTO_LEDGER)                   # three more forward rules: m = 4
+    line, verdict = _both_verdicts(sp, "S_FAV90", capsys)
+    assert line.endswith("positive, not significant") and verdict == "no edge yet"
+
+
+def test_retiring_rules_never_raises_another_rules_verdict(tmp_path, monkeypatch, capsys):
+    """Retirement is decided after seeing results: dropping the retired rules' tests from
+    the family shrank m and turned R0 into EDGE with no new trade. Their records stay in
+    the family; they are just not shown."""
+    sp = _isolate(tmp_path, monkeypatch)
+    for j in range(5):                                 # R0 p = 0.039, R1-R4 ordinary
+        _sleeve_rule(sp, f"R{j}", losses=4 if j == 0 else 10)
+    before = _both_verdicts(sp, "R0", capsys)
+    assert before[0].endswith("positive, not significant") and before[1] == "no edge yet"
+    monkeypatch.setattr(sys, "argv", ["sleeve_paper.py", "retire", "R1", "R2", "R3", "R4"])
+    assert sp.main() == 0
+    capsys.readouterr()
+    assert _both_verdicts(sp, "R0", capsys) == before
+    cc._CACHE.update(t=0.0, payload=None)
+    assert [r["rule"] for r in cc.build_payload()["rules"]] == ["R0"]   # retired: not shown
+
+
 def test_a_rule_spanning_many_series_scores_and_counts(tmp_path, monkeypatch):
     """One hypothesis over seven cities is one rule: the payload must count its series
     and label it - a list-valued series once crashed the series count."""

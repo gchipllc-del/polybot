@@ -75,7 +75,12 @@ Forward paper is the only scoreboard. Each sleeve gets a small family of
 
 Every forward rule goes through the same fill-depth gate as the crypto paper trader, one
 bet per event, and the news regime stamp. The forward family is corrected with BH
-across *all* paper rules at verdict time, so adding sleeves never lowers the bar.
+across *all* paper rules at verdict time, so adding sleeves never lowers the bar. "All"
+means every sleeve rule, RETIRED ones included, plus the crypto rules on their
+fill-checked trades, and `sleeve_paper.py report` and the command center correct over
+that same family. Retirement is decided after seeing results, so a retired rule is no
+longer shown but its record stays in the correction: retiring rules can never raise
+another rule's verdict.
 
 ## Testing an outside method (e.g. a friend's 97-99c favorites)
 

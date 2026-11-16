@@ -35,8 +35,9 @@ divide each one's sample.
 
 HOW IT IS JUDGED - `report`: per rule, the forward record after named_at, per EVENT and
 per CONTRACT, with EXACT p-values (forward_stats: a favorite that hasn't lost yet is not
-proof). Benjamini-Hochberg runs across ALL forward rules at once, so adding sleeves never
-lowers the bar.
+proof). Benjamini-Hochberg runs across ALL forward rules at once - the command center's
+family: every sleeve rule, RETIRED ones included, and the crypto rules on fill-checked
+trades - so adding sleeves never lowers the bar, and retiring one never raises another.
 
   py scripts/sleeve_paper.py register-probes [--top 20]   # after sleeve_scan discover
   py scripts/sleeve_paper.py register-nominations         # after sleeve_scan screen
@@ -190,6 +191,16 @@ def active_rules(path: Path = RULES) -> dict[str, dict]:
 
 def all_registered(path: Path = RULES) -> set[str]:
     return {r["name"] for r in _load_jsonl(path) if r.get("t") == "rule" and r.get("name")}
+
+
+def registered_rules(path: Path = RULES) -> dict[str, dict]:
+    """name -> rule for EVERY registered name, retired ones included (first registration
+    wins, as in active_rules)."""
+    rules: dict[str, dict] = {}
+    for r in _load_jsonl(path):
+        if r.get("t") == "rule" and r.get("name") and r["name"] not in rules:
+            rules[r["name"]] = r
+    return rules
 
 
 def series_of(rule: dict) -> list[str]:
@@ -567,13 +578,32 @@ def trades_of(rows: list[dict], rules: dict[str, dict]) -> dict[str, list[dict]]
     return out
 
 
-def evaluate(rows: list[dict], rules: dict[str, dict]) -> list[dict]:
+def retired_stats(rows: list[dict], path: Path = RULES) -> list[dict]:
+    """forward_stats of every RETIRED rule's record after its named_at. Never shown, but
+    kept in the false-discovery family: retiring is decided after seeing results, and
+    dropping those tests would loosen the bar for every rule still running."""
+    live = active_rules(path)
+    gone = {n: r for n, r in registered_rules(path).items() if n not in live}
+    return [forward_stats(ts) for _, ts in sorted(trades_of(rows, gone).items())]
+
+
+def family_extra(rows: list[dict], path: Path = RULES) -> list[dict]:
+    """The rest of the ONE forward family the command center corrects over: the retired
+    sleeve rules' records and the crypto rules' fill-checked records (built by the command
+    center's own code - a plain module; Flask loads only when its server starts)."""
+    from lib.command_center import crypto_family
+    return retired_stats(rows, path) + crypto_family()
+
+
+def evaluate(rows: list[dict], rules: dict[str, dict], extra_stats=()) -> list[dict]:
     """Per rule: closed trades after named_at, per EVENT and per CONTRACT, exact p-values
-    (forward_stats), BH across every rule with enough events."""
+    (forward_stats), BH across every rule with enough events - these rules plus
+    extra_stats, the forward_stats of every other member of the forward family (retired
+    and crypto rules: family_extra). Only `rules` are classified and returned."""
     by_rule = trades_of(rows, rules)
     names = sorted(rules)
     stats = [forward_stats(by_rule[nm]) for nm in names]
-    keep = survivors(stats)
+    keep = survivors(stats + list(extra_stats))     # rules come first: index i is names[i]
     out = []
     for i, name in enumerate(names):
         st, rule, ts = stats[i], rules[name], by_rule[name]
@@ -605,7 +635,8 @@ def cmd_report() -> int:
         print("no rules registered. Run: py scripts/sleeve_scan.py discover, then")
         print("py scripts/sleeve_paper.py register-probes")
         return 0
-    res = evaluate(rows, rules)
+    extra = family_extra(rows, RULES)
+    res = evaluate(rows, rules, extra)
     hb = json.loads(HEARTBEAT.read_text(encoding="utf-8")) if HEARTBEAT.exists() else {}
     print(f"{len(rules)} active rules on "
           f"{len({x for r in rules.values() for x in series_of(r)})} "
@@ -624,11 +655,16 @@ def cmd_report() -> int:
             print("      by series (descriptive, not tested): " + "  ".join(
                 f"{k} {n}ev {v:+.2f}" for k, (n, v) in r["by_series"].items()))
     print()
+    testable = (sum(r["events"] >= MIN_TESTABLE_EVENTS for r in res)
+                + sum(s_["n"] >= MIN_TESTABLE_EVENTS for s_ in extra))
     print("c/ct = cents per contract per event, after fees. p = the EXACT chance of a")
     print("record this good with no edge (a favorite that hasn't lost yet is not proof).")
-    print("Benjamini-Hochberg runs across ALL forward rules - adding sleeves never lowers")
-    print("the bar. EDGE needs 100+ events AND survival of that correction. Live money")
-    print("stays off until a rule earns EDGE here.")
+    print("Benjamini-Hochberg runs across ALL forward rules, the command center's family:")
+    print("these, the retired rules' records and the crypto rules' fill-checked records -")
+    print(f"{testable} rules with {MIN_TESTABLE_EVENTS}+ events now. Adding sleeves never "
+          f"lowers the bar, and retiring")
+    print("a rule never raises another's verdict. EDGE needs 100+ events AND survival of")
+    print("that correction. Live money stays off until a rule earns EDGE here.")
     print("=" * 78)
     return 0
 

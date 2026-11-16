@@ -12,9 +12,11 @@ or changes state:
 ONE STANDARD FOR EVERY RULE. All rules - crypto and sleeves - are scored in one family:
 per independent window/event, against the variance a fair price would produce, with
 Benjamini-Hochberg across every rule at once (the same machinery as sleeve_paper and
-sleeve_scan). Crypto rules are judged ONLY on fill-checked (v4 gated) trades: before
-2026-09-25 the fill gate was a silent no-op, and the slice evidence says the late-
-longshot record lived in quotes nobody could fill. The all-era record is still shown.
+sleeve_scan). Retired sleeve rules are not shown, but their records stay in the family,
+and `sleeve_paper.py report` corrects over this same family (crypto_family). Crypto
+rules are judged ONLY on fill-checked (v4 gated) trades: before 2026-09-25 the fill gate
+was a silent no-op, and the slice evidence says the late-longshot record lived in quotes
+nobody could fill. The all-era record is still shown.
 
 Design follows the dataviz method: the headline is a number (rules that earned an edge),
 color is reserved for identity (two series) and status (good/bad, always with an icon
@@ -93,20 +95,22 @@ def crypto_trades(rows: list[dict]) -> list[dict]:
     return out
 
 
-def sleeve_trades() -> tuple[list[dict], dict]:
+def sleeve_trades() -> tuple[list[dict], dict, list[dict]]:
     """Trades the sleeve report counts, by the sleeve report's own code (trades_of: after
-    named_at, per contract), labelled for the table."""
+    named_at, per contract), labelled for the table - plus the RETIRED rules' records
+    (sleeve_paper.retired_stats): not shown, but they stay in the family correction."""
     try:
         import sleeve_paper as sp
     except Exception:  # noqa: BLE001
-        return [], {}
+        return [], {}, []
     rules = sp.active_rules(sp.RULES)          # explicit: the default arg binds at def time
+    rows = _load_jsonl(sp.LEDGER)
     out = []
-    for name, ts in sp.trades_of(_load_jsonl(sp.LEDGER), rules).items():
+    for name, ts in sp.trades_of(rows, rules).items():
         label = sp.series_label(rules[name])
         out += [dict(t, venue="sleeves", series=label,
                      era="v4 gated" if t["depth"] is not None else "v4 ungated") for t in ts]
-    return out, rules
+    return out, rules, sp.retired_stats(rows, sp.RULES)
 
 
 def _series_count(srules: dict) -> int:
@@ -124,9 +128,27 @@ def _stats(trades: list[dict]) -> dict:
     return sp.forward_stats(trades)
 
 
-def score_rules(trades: list[dict], sleeve_rule_names: set | None = None) -> list[dict]:
+def _decision_basis(ts: list[dict], venue: str) -> list[dict]:
+    """The trades a verdict is decided on: a crypto rule's fill-checked (v4 gated) trades
+    only; a sleeve rule's every trade after named_at."""
+    return [t for t in ts if t["era"] == "v4 gated"] if venue == "crypto" else ts
+
+
+def crypto_family(path: Path | None = None) -> list[dict]:
+    """The crypto rules' members of the one forward family: each rule's decision stats,
+    built exactly as score_rules builds them. The sleeve report corrects over these too,
+    so both surfaces judge a sleeve rule against the same family."""
+    by_rule: dict[str, list] = {}
+    for t in crypto_trades(_load_jsonl(path or CRYPTO_LEDGER)):
+        by_rule.setdefault(t["rule"], []).append(t)
+    return [_stats(_decision_basis(ts, "crypto")) for _, ts in sorted(by_rule.items())]
+
+
+def score_rules(trades: list[dict], sleeve_rule_names: set | None = None,
+                extra_stats=()) -> list[dict]:
     """Every rule, one family. Crypto rules are judged on fill-checked (v4 gated) trades
-    only; sleeve rules on everything after named_at. BH across all testable rules."""
+    only; sleeve rules on everything after named_at. BH across all testable rules - the
+    rules shown plus extra_stats (the retired sleeve rules' records, never shown)."""
     import sleeve_paper as sp
     by_rule: dict[str, list] = {}
     for t in trades:
@@ -136,7 +158,7 @@ def score_rules(trades: list[dict], sleeve_rule_names: set | None = None) -> lis
     rows = []
     for name, ts in by_rule.items():
         venue = ts[0]["venue"] if ts else "sleeves"
-        basis = [t for t in ts if t["era"] == "v4 gated"] if venue == "crypto" else ts
+        basis = _decision_basis(ts, venue)
         s_all, s_dec = _stats(ts), _stats(basis)
         cum, acc = [], 0.0
         for t in sorted(ts, key=lambda x: x["ts"]):
@@ -145,8 +167,8 @@ def score_rules(trades: list[dict], sleeve_rule_names: set | None = None) -> lis
         rows.append({"rule": name, "venue": venue,
                      "series": next((t.get("series") for t in ts if t.get("series")), None),
                      "all": s_all, "decision": s_dec, "spark": _downsample(cum)})
-    keep = sp.survivors([r["decision"] for r in rows])
-    for i, r in enumerate(rows):
+    keep = sp.survivors([r["decision"] for r in rows] + list(extra_stats))
+    for i, r in enumerate(rows):                  # rows come first: index i is rows[i]
         d = r["decision"]
         basis = "fill-checked" if r["venue"] == "crypto" else "after registration"
         cat = sp.classify(d, i in keep)
@@ -237,9 +259,9 @@ def build_payload() -> dict:
     if _CACHE["payload"] is not None and now - _CACHE["t"] < 30:
         return _CACHE["payload"]
     ct = crypto_trades(_load_jsonl(CRYPTO_LEDGER))
-    st, srules = sleeve_trades()
+    st, srules, retired = sleeve_trades()
     trades = ct + st
-    rules = score_rules(trades, set(srules))
+    rules = score_rules(trades, set(srules), retired)
     payload = {
         "generated": datetime.now(timezone.utc).isoformat(),
         "live_money": "OFF",
