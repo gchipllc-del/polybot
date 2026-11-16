@@ -447,6 +447,28 @@ def test_three_losses_in_thirty_at_98c_is_significantly_negative():
     assert sp.classify(st, False) == "negative"
 
 
+def test_a_one_lot_at_99c_is_no_evidence_under_no_edge():
+    """A 1-lot at 99c pays a 1c fee: its win nets exactly 0, so with no edge it cannot
+    lose (ask + fee = $1.00, loss chance 0). A 0.001 floor on that chance shrank p by
+    0.999 per such win for nothing: 200 wins at 99c + 140 at 97c (a pre-size per-city
+    rule) read p = 0.048 - EDGE at a 0.05 bar - where the null gives 0.98**140 = 0.059."""
+    named = "2026-09-01T00:00:00+00:00"
+    rules = {"F9799_KXHIGHNY": {"name": "F9799_KXHIGHNY", "series": "KXHIGHNY",
+                                "named_at": named},             # no size: a 1-lot rule
+             "OTHER": {"name": "OTHER", "series": "KXX", "named_at": named}}
+    rows = []
+    for i, (rule, price, won) in enumerate(
+            [("F9799_KXHIGHNY", 0.99, True)] * 200 + [("F9799_KXHIGHNY", 0.97, True)] * 140
+            + [("OTHER", 0.85, j >= 14) for j in range(100)]):
+        o = {"t": "open", "ts": "2026-09-02T00:00:00+00:00", "ticker": f"{rule}-E{i}-A",
+             "rule": rule, "event": f"{rule}-E{i}", "series": "S", "side": "yes",
+             "price": price, "contracts": 1, "fee": sp.kalshi_fee(price, 1)}
+        rows += [o, sp.settle(o, "yes" if won else "no")]
+    r = {x["rule"]: x for x in sp.evaluate(rows, rules)}["F9799_KXHIGHNY"]
+    assert r["events"] == 340 and abs(r["p"] / 0.98 ** 140 - 1) < 1e-9, r["p"]
+    assert r["verdict"] == "positive, not significant"           # 2 rules: BH bar 0.05
+
+
 def test_non_house_shaped_trades_fall_back_to_the_floored_test():
     from sleeve_scan import p_value
     rows = [{"event": f"E{i}", "won": i % 2 == 0, "ask": 0.5,

@@ -569,7 +569,9 @@ def forward_stats(trades: list[dict]) -> dict:
     if n == 0:
         p = p_neg = 1.0
     elif all(len(v) == 1 for v in ev.values()) and all(_house_shaped(t) for t in rows):
-        qs = [1.0 - min(0.999, max(0.001, t["ask"] + t["fee_pc"])) for t in rows]
+        # [0, 1], not [0.001, 0.999]: a 1-lot at 99c pays a 1c fee, so with no edge it
+        # cannot lose (q = 0) - a 0.001 floor shrank p by 0.999 per such win, for nothing
+        qs = [1.0 - min(1.0, max(0.0, t["ask"] + t["fee_pc"])) for t in rows]
         k = sum(1 for t in rows if not t["won"])
         p, p_neg = _pb_tails(qs, k)
     elif n >= 2:
