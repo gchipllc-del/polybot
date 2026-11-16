@@ -34,7 +34,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -225,6 +225,34 @@ def evaluation_cut(trades: list[dict]) -> tuple[str | None, list[dict]]:
     return None, []
 
 
+FREEZE_GRACE_DAYS = 2      # a position still open this many settled ET days on is stuck
+
+
+def freeze_ready(trades: list[dict], day: str,
+                 unsettled_days=()) -> tuple[bool, str, int]:
+    """Is the evaluation day COMPLETE? -> (ready, why not, positions left out as stuck).
+
+    A report run DURING the evaluation day would freeze only part of it, and the same
+    ledger reported later would freeze a different record. So the day must be over: a
+    stamped trade opened on a LATER ET day has already settled (15-minute windows settle
+    in order), and no position opened on or before it is still open. A position still
+    open once trades from FREEZE_GRACE_DAYS later ET days have settled is stuck (e.g. a
+    voided market): it is left out and counted, never waited on forever. A function of
+    the ledger alone - it never reads the clock."""
+    later = sorted({cluster_day(t) for t in trades
+                    if t.get("regime") in (nr.GOOD, nr.CAUTIOUS, nr.UNKNOWN)
+                    and cluster_day(t) > day})
+    if not later:
+        return False, f"ET day {day} is not over yet - its trades are still coming in", 0
+    pending = [d for d in unsettled_days if d <= day]
+    if pending:
+        grace = (date.fromisoformat(day) + timedelta(days=FREEZE_GRACE_DAYS)).isoformat()
+        if later[-1] < grace:
+            return False, (f"{len(pending)} position(s) opened on or before ET day {day} "
+                           f"have not settled yet"), 0
+    return True, "", len(pending)
+
+
 def load_verdict(path: Path | None = None) -> dict | None:
     """The frozen verdict record, or None when there is none or it cannot be read."""
     p = Path(path) if path is not None else VERDICT_PATH
@@ -236,13 +264,15 @@ def load_verdict(path: Path | None = None) -> dict | None:
 
 
 def freeze_verdict(trades: list[dict], path: Path | None = None,
-                   now: datetime | None = None) -> dict | None:
+                   now: datetime | None = None, unsettled_days=()) -> dict | None:
     """THE verdict: evaluated ONCE, at the pre-registered evaluation point, then frozen.
 
     Re-testing a fixed 95% interval on every report is many looks, not one. So the
-    first call that finds the evaluation point (evaluation_cut) applies the rule to the
-    data through that day and writes the record to `path`; every later call returns
-    that record unchanged, whatever the running numbers do since. None while COLLECTING.
+    first call that finds the evaluation point (evaluation_cut) AND finds that day
+    complete (freeze_ready) applies the rule to the data through that day and writes the
+    record to `path`; every later call returns that record unchanged, whatever the
+    running numbers do since. None while COLLECTING; state 'pending' (nothing written)
+    while the evaluation day is still in progress.
 
     The record returned carries a 'state' that is not stored: 'stored' (read back),
     'new' (written by this call) or 'unwritten' (it could not be written - e.g. a file
@@ -255,13 +285,17 @@ def freeze_verdict(trades: list[dict], path: Path | None = None,
     day, upto = evaluation_cut(trades)
     if day is None:
         return None
+    ready, why, stuck = freeze_ready(trades, day, unsettled_days)
+    if not ready:
+        return {"t": "news_verdict", "state": "pending", "eval_day_et": day, "note": why}
     ev = evaluate(upto)
     now = now or datetime.now(timezone.utc)
     rec = {"t": "news_verdict", "verdict": ev["verdict"], "eval_day_et": day,
            "clusters": list(ev["clusters"]),
            "diff": list(ev["diff"]) if ev["diff"] else None,
            "windows": ev["n_windows"], "trades": ev["n_stamped"],
-           "min_clusters": MIN_CLUSTERS, "frozen_at": now.isoformat(timespec="seconds")}
+           "min_clusters": MIN_CLUSTERS, "unsettled_left_out": stuck,
+           "frozen_at": now.isoformat(timespec="seconds")}
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "x", encoding="utf-8") as f:       # "x": never overwrite a verdict
@@ -277,6 +311,11 @@ def freeze_verdict(trades: list[dict], path: Path | None = None,
 def _verdict_lines(frozen: dict | None, ev: dict, path: Path) -> list[str]:
     if frozen is None:
         return [f"VERDICT: {_collecting(*ev['clusters'])}"]
+    if frozen.get("state") == "pending":
+        return [f"VERDICT: PENDING - the evaluation point is reached (ET day "
+                f"{frozen.get('eval_day_et', '?')}); the verdict is evaluated and frozen "
+                f"once that day is complete",
+                f"  waiting: {frozen.get('note', '?')}"]
     lines = [f"VERDICT: {frozen['verdict']}"]
     cl = frozen.get("clusters")
     g, c = cl if isinstance(cl, list) and len(cl) == 2 else ("?", "?")
@@ -342,7 +381,15 @@ def cmd_report() -> int:
     trades = vr.ledger_rows(rows)["trades"]
     ev = evaluate(trades)
     verdict_path = VERDICT_PATH
-    frozen = freeze_verdict(trades, verdict_path)  # writes it once, at the evaluation point
+    still_open = {(r.get("ticker"), r.get("rule")): r for r in rows if r.get("t") == "open"}
+    for r in rows:
+        if r.get("t") == "close":
+            still_open.pop((r.get("ticker"), r.get("rule")), None)
+    unsettled = {cluster_day({"open_ts": o.get("ts"), "date": str(o.get("ts") or "")[:10]})
+                 for o in still_open.values()
+                 if o.get("regime") in (nr.GOOD, nr.CAUTIOUS, nr.UNKNOWN)}
+    # writes it once, at the evaluation point, once that day is complete
+    frozen = freeze_verdict(trades, verdict_path, unsettled_days=unsettled)
     if ev["n_stamped"] == 0 and frozen is None:
         print("no regime-stamped closed trades yet. Stamps begin once the paper trader")
         print("restarts on this version AND the news agent is running (PolybotNews).")

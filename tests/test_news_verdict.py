@@ -201,7 +201,7 @@ def test_verdict_is_evaluated_once_and_frozen(monkeypatch, tmp_path, capsys):
     cleared zero it printed EARNS ITS KEEP or INVERTED (~20% of null runs checked daily,
     not 5%). Now the first report at the evaluation point freezes the verdict and later
     reports print that one, with the running numbers labelled descriptive."""
-    first = _report(monkeypatch, tmp_path, capsys, _null_days())
+    first = _report(monkeypatch, tmp_path, capsys, _null_days(41))   # + 1 later day
     assert _verdict(first).startswith("VERDICT: NO DIFFERENCE"), _verdict(first)
     later = _report(monkeypatch, tmp_path, capsys, _null_days() + _diverging_days())
     assert _verdict(later).startswith("VERDICT: NO DIFFERENCE"), _verdict(later)
@@ -213,7 +213,7 @@ def test_verdict_is_evaluated_once_and_frozen(monkeypatch, tmp_path, capsys):
 
 
 def test_frozen_file_is_never_rewritten(monkeypatch, tmp_path, capsys):
-    _report(monkeypatch, tmp_path, capsys, _null_days())
+    _report(monkeypatch, tmp_path, capsys, _null_days(41))
     vfile = tmp_path / "news_verdict.json"
     frozen = vfile.read_bytes()
     for extra in (20, 40, 60):
@@ -255,8 +255,8 @@ def test_freeze_verdict_states(tmp_path):
     vp = tmp_path / "v.json"
     assert na.freeze_verdict(_trades(_null_days(38)), vp) is None
     assert not vp.exists()
-    first = na.freeze_verdict(_trades(_null_days()), vp, now=datetime(2027, 2, 13,
-                                                                       tzinfo=timezone.utc))
+    first = na.freeze_verdict(_trades(_null_days(41)), vp, now=datetime(2027, 2, 13,
+                                                                         tzinfo=timezone.utc))
     assert first["state"] == "new" and first["frozen_at"] == "2027-02-13T00:00:00+00:00"
     stored = na.freeze_verdict(_trades(_null_days() + _diverging_days()), vp)
     assert stored["state"] == "stored"
@@ -273,3 +273,35 @@ def test_evaluation_cut_is_the_first_day_both_regimes_reach_the_gate():
     # unknown-regime days count toward neither regime
     unk = [(_utc(D0 + timedelta(days=100 + i), 10), nr.UNKNOWN, 0.0) for i in range(30)]
     assert na.evaluation_cut(_trades(_null_days(38) + unk))[0] is None
+
+
+# ── the evaluation day must be COMPLETE before the verdict freezes (verifier) ─
+
+def test_a_report_during_the_evaluation_day_freezes_nothing(monkeypatch, tmp_path, capsys):
+    """A report run on the evaluation day itself saw only part of it: it froze one
+    verdict, and the same ledger reported after the day froze another. Now it says
+    PENDING and writes nothing; after the day, it freezes exactly what a fresh
+    recomputation (a lost file) freezes."""
+    vfile = tmp_path / "news_verdict.json"
+    out = _report(monkeypatch, tmp_path, capsys, _null_days())          # D is the last day
+    assert _verdict(out).startswith("VERDICT: PENDING"), _verdict(out)
+    assert not vfile.exists()
+    _report(monkeypatch, tmp_path, capsys, _null_days(41))               # D is over
+    frozen = json.loads(vfile.read_text(encoding="utf-8"))
+    vfile.unlink()                                                       # file lost
+    _report(monkeypatch, tmp_path, capsys, _null_days() + _diverging_days())
+    again = json.loads(vfile.read_text(encoding="utf-8"))
+    drop = ("frozen_at",)
+    assert {k: v for k, v in frozen.items() if k not in drop} == \
+        {k: v for k, v in again.items() if k not in drop}
+
+
+def test_an_unsettled_position_holds_the_freeze_until_it_is_stuck(tmp_path):
+    vp = tmp_path / "v.json"
+    day = (D0 + timedelta(days=39)).isoformat()
+    hold = na.freeze_verdict(_trades(_null_days(41)), vp, unsettled_days={day})
+    assert hold["state"] == "pending" and "not settled" in hold["note"] and not vp.exists()
+    # trades from two later ET days have settled: the position is stuck - counted, not awaited
+    done = na.freeze_verdict(_trades(_null_days(42)), vp, unsettled_days={day})
+    assert done["state"] == "new" and done["unsettled_left_out"] == 1
+    assert done["eval_day_et"] == day and done["clusters"] == [20, 20]

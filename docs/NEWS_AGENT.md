@@ -97,8 +97,11 @@ meaning it is cutting size on the wrong days, and it gets switched off. Otherwis
 DIFFERENCE.
 
 **It is evaluated once.** The evaluation point is fixed in advance: the first ET day by
-which both regimes have 20 clusters. The first report that reaches it applies the rule
-to the data through that day and freezes the result in `data/news_verdict.json`. Every
+which both regimes have 20 clusters. Once that day is complete - a trade from a later ET
+day has settled and none of its own positions is still open - the next report applies
+the rule to the data through that day and freezes the result in
+`data/news_verdict.json` (a report run during that day says PENDING and writes nothing;
+a position still open two settled days later is counted as stuck and left out). Every
 later report prints that frozen verdict; the running table, interval and counterfactual
 it also prints are labelled *descriptive* and never re-test it. Re-checking a 95%
 interval on every report is many tests, not one: on null data with the report run
