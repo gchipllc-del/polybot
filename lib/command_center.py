@@ -5,9 +5,14 @@ It reads the same files everything else writes - nothing here trades, fetches ma
 or changes state:
   data/paper_crypto15.jsonl     crypto 15-min forward paper ledger
   data/paper_sleeves.jsonl      multi-sleeve forward paper ledger (+ data/sleeve_rules.jsonl)
+  data/sleeve_paper_heartbeat.json  the sleeve trader's last cycle
   data/news_regime.jsonl        the news agent's hourly regime
   data/sleeves/screen.json      sleeve scanner nominations
   logs/healthcheck.log          the watchdog's last verdict
+
+LIVE, NOT JUST SETTLED: a rule's record moves only when a bet settles, so beside it the
+page shows the paper positions still open per rule and when each trader last showed
+signs of life - a rule with bets open and none settled yet is working, not idle.
 
 ONE STANDARD FOR EVERY RULE. All rules - crypto and sleeves - are scored in one family:
 per independent window/event, against the variance a fair price would produce, with
@@ -95,16 +100,17 @@ def crypto_trades(rows: list[dict]) -> list[dict]:
     return out
 
 
-def sleeve_trades() -> tuple[list[dict], dict, list[dict]]:
+def sleeve_trades(rows: list[dict] | None = None) -> tuple[list[dict], dict, list[dict]]:
     """Trades the sleeve report counts, by the sleeve report's own code (trades_of: after
     named_at, per contract), labelled for the table - plus the RETIRED rules' records
-    (sleeve_paper.retired_stats): not shown, but they stay in the family correction."""
+    (sleeve_paper.retired_stats): not shown, but they stay in the family correction.
+    rows: the sleeve ledger, when the caller has read it already (read it once a build)."""
     try:
         import sleeve_paper as sp
     except Exception:  # noqa: BLE001
         return [], {}, []
     rules = sp.active_rules(sp.RULES)          # explicit: the default arg binds at def time
-    rows = _load_jsonl(sp.LEDGER)
+    rows = _load_jsonl(sp.LEDGER) if rows is None else rows
     out = []
     for name, ts in sp.trades_of(rows, rules).items():
         label = sp.series_label(rules[name])
@@ -119,6 +125,62 @@ def _series_count(srules: dict) -> int:
         return len({x for r in srules.values() for x in sp.series_of(r)})
     except Exception:  # noqa: BLE001
         return 0
+
+
+# ── live activity: bets still open, and is each trader still cycling ──────────
+
+# The sleeve trader stamps a heartbeat every cycle (2 min); the watchdog FAILs it past 10.
+SLEEVE_LATE_MIN = 10.0
+# The crypto trader keeps no heartbeat, so its newest ledger row stands in - and a row is
+# written only when a bet opens or settles. At its concurrency cap a healthy trader goes
+# ~11-15 min from its last entry in a 15-min window to the next settlement, so a 10-min
+# bar would flag it every window. 20 = a whole window with neither, plus settlement lag.
+CRYPTO_QUIET_MIN = 20.0
+
+
+def _open_by_rule(rows: list[dict], open_positions) -> dict[str, int]:
+    """rule -> paper positions entered and not yet settled, by the trader's OWN
+    open_positions: an open row with no close for the same (ticker, rule)."""
+    out: dict[str, int] = {}
+    for _, rule in open_positions([r for r in rows if r.get("ticker") and r.get("rule")]):
+        out[rule] = out.get(rule, 0) + 1
+    return out
+
+
+def _freshness(venue: str, name: str, what: str, t: float | None, limit_min: float,
+               now: float, late: str, missing: str) -> dict:
+    out = {"venue": venue, "name": name, "what": what, "ts": None, "age_min": None,
+           "limit_min": limit_min, "status": "missing", "note": missing}
+    if t is None:
+        return out
+    age = max(0.0, (now - t) / 60.0)
+    return dict(out, ts=datetime.fromtimestamp(t, tz=timezone.utc).isoformat(timespec="seconds"),
+                age_min=round(age, 1), status="good" if age < limit_min else "warning",
+                note=None if age < limit_min else late)
+
+
+def trader_freshness(crypto_rows: list[dict], now: float | None = None) -> list[dict]:
+    """When each paper trader last showed signs of life: the sleeve trader's heartbeat
+    (written every cycle) and the crypto trader's newest ledger row."""
+    import sleeve_paper as sp
+    now = time.time() if now is None else now
+    hb, missing = None, "no heartbeat yet - it has never cycled"
+    if sp.HEARTBEAT.exists():                   # read at call time: tests and env move it
+        try:
+            hb = _ts(json.loads(sp.HEARTBEAT.read_text(encoding="utf-8")).get("ts"))
+        except (OSError, ValueError, AttributeError):
+            hb = None
+        missing = "heartbeat unreadable" if hb is None else missing
+    newest = next((t for t in (_ts(r.get("ts")) for r in reversed(crypto_rows))
+                   if t is not None), None)          # append-only: the last row is newest
+    return [
+        _freshness("sleeves", "Sleeve paper trader", "last cycle", hb, SLEEVE_LATE_MIN, now,
+                   "late - it cycles every 2 min", missing),
+        _freshness("crypto", "Crypto paper trader", "newest ledger row", newest,
+                   CRYPTO_QUIET_MIN, now,
+                   "quiet - a row is written only when a bet opens or settles",
+                   "no ledger rows yet"),
+    ]
 
 
 # ── the one scoring family ────────────────────────────────────────────────────
@@ -169,20 +231,35 @@ def crypto_family(path: Path | None = None) -> list[dict]:
     return [_stats(_decision_basis(ts, "crypto")) for _, ts in sorted(by_rule.items())]
 
 
-def score_rules(trades: list[dict], sleeve_rule_names: set | None = None,
-                extra_stats=()) -> list[dict]:
+def score_rules(trades: list[dict], sleeve_rules=None, extra_stats=(),
+                open_now: dict | None = None) -> list[dict]:
     """Every rule, one family. Crypto rules are judged on fill-checked (v4 gated) trades
     only; sleeve rules on everything after named_at. BH across all testable rules - the
-    rules shown plus extra_stats (the retired sleeve rules' records, never shown)."""
+    rules shown plus extra_stats (the retired sleeve rules' records, never shown).
+
+    sleeve_rules: the active sleeve rules, name -> registration (a bare set of names also
+    works). Each is shown from registration on, LABELLED FROM ITS REGISTRATION: a rule
+    with nothing settled has no trade to take a label from. open_now: (venue, rule) ->
+    paper positions not settled yet; a crypto rule whose first bets are all still open is
+    listed too (nothing settled, nothing tested: n = 0, so the family is unchanged)."""
     import sleeve_paper as sp
+    regs = sleeve_rules if isinstance(sleeve_rules, dict) else dict.fromkeys(sleeve_rules or ())
+    open_now = open_now or {}
     by_rule: dict[str, list] = {}
+    venue_of: dict[str, str] = {}
     for t in trades:
         by_rule.setdefault(t["rule"], []).append(t)
-    for name in sleeve_rule_names or ():
+        venue_of.setdefault(t["rule"], t["venue"])
+    for name in regs:
         by_rule.setdefault(name, [])
+        venue_of.setdefault(name, "sleeves")
+    for venue, name in open_now:
+        if venue == "crypto":                    # sleeve rules are listed by registration
+            by_rule.setdefault(name, [])
+            venue_of.setdefault(name, "crypto")
     rows = []
     for name, ts in by_rule.items():
-        venue = ts[0]["venue"] if ts else "sleeves"
+        venue = venue_of[name]
         basis = _decision_basis(ts, venue)
         s_all = _stats(ts)
         s_dec = dict(s_all) if basis is ts else _stats(basis)   # sleeves: the same list
@@ -190,8 +267,11 @@ def score_rules(trades: list[dict], sleeve_rule_names: set | None = None,
         for t in sorted(ts, key=lambda x: x["ts"]):
             acc += t["pnl"]
             cum.append(round(acc, 4))
+        reg = regs.get(name)
         rows.append({"rule": name, "venue": venue,
-                     "series": next((t.get("series") for t in ts if t.get("series")), None),
+                     "series": sp.series_label(reg) if reg else
+                     next((t.get("series") for t in ts if t.get("series")), None),
+                     "open": open_now.get((venue, name), 0),
                      "all": s_all, "decision": s_dec, "spark": _downsample(cum)})
     keep = sp.survivors([r["decision"] for r in rows] + list(extra_stats))
     for i, r in enumerate(rows):                  # rows come first: index i is rows[i]
@@ -284,10 +364,19 @@ def build_payload() -> dict:
     now = time.time()
     if _CACHE["payload"] is not None and now - _CACHE["t"] < 30:
         return _CACHE["payload"]
-    ct = crypto_trades(_load_jsonl(CRYPTO_LEDGER))
-    st, srules, retired = sleeve_trades()
+    import paper_trader as pt
+    import sleeve_paper as sp
+    crows, srows = _load_jsonl(CRYPTO_LEDGER), _load_jsonl(sp.LEDGER)   # each read once
+    ct = crypto_trades(crows)
+    st, srules, retired = sleeve_trades(srows)
     trades = ct + st
-    rules = score_rules(trades, set(srules), retired)
+    c_open = _open_by_rule(crows, pt.open_positions)
+    s_open = _open_by_rule(srows, sp.open_positions)
+    open_now = {("crypto", r): n for r, n in c_open.items()}
+    open_now.update({("sleeves", r): n for r, n in s_open.items() if r in srules})
+    rules = score_rules(trades, srules, retired, open_now)
+    n_crypto = sum(c_open.values())
+    n_sleeves = sum(n for (venue, _), n in open_now.items() if venue == "sleeves")
     payload = {
         "generated": datetime.now(timezone.utc).isoformat(),
         "live_money": "OFF",
@@ -297,9 +386,12 @@ def build_payload() -> dict:
                 "net_sleeves": round(sum(t["pnl"] for t in st), 2),
                 "windows": len({t["event"] for t in ct}),
                 "events": len({t["event"] for t in st}),
-                "sleeves": _series_count(srules)},
-        "rules": rules, "equity": equity_series(trades), "regime": regime_panel(),
-        "health": health_panel(), "nominations": nominations_panel(),
+                "sleeves": _series_count(srules),
+                # the rules shown; a retired rule's bets still settle, into its record
+                "open": n_crypto + n_sleeves, "open_crypto": n_crypto,
+                "open_sleeves": n_sleeves, "open_retired": sum(s_open.values()) - n_sleeves},
+        "rules": rules, "traders": trader_freshness(crows, now), "equity": equity_series(trades),
+        "regime": regime_panel(), "health": health_panel(), "nominations": nominations_panel(),
     }
     _CACHE.update(t=now, payload=payload)
     return payload
@@ -388,9 +480,16 @@ h1 { font-size: 20px; font-weight: 600; margin: 0; }
               font: inherit; cursor: pointer; }
 .seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
 .grid { display: grid; gap: 12px; }
-.kpis { grid-template-columns: 2fr repeat(4, 1fr); }
-@media (max-width: 900px) { .kpis { grid-template-columns: repeat(2, 1fr); }
-                            .kpis .hero { grid-column: 1 / -1; } }
+.kpis { grid-template-columns: minmax(0, 1.6fr) repeat(5, minmax(0, 1fr)); }
+@media (max-width: 1100px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 900px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                            .kpis .hero, .kpis .wide { grid-column: 1 / -1; } }
+.traders { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.chip { display: inline-flex; align-items: flex-start; gap: 6px; max-width: 100%;
+        border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px;
+        background: var(--surface); font-size: 12px; color: var(--ink-2); }
+.chip strong { color: var(--ink); font-weight: 600; }
+.opencount { color: var(--ink-2); font-weight: 600; }
 .two { grid-template-columns: 1fr 1fr; align-items: start; }
 @media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
 .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
@@ -454,6 +553,7 @@ section { margin-top: 12px; }
   </div>
 
   <div class="grid kpis" id="kpis"></div>
+  <div class="traders" id="traders" role="group" aria-label="Paper traders, live"></div>
 
   <section class="card" id="equity-card">
     <div class="cardhead"><h2>Paper P&amp;L, cumulative</h2>
@@ -540,6 +640,9 @@ function icon(kind, color) {
 const usd = (v) => (v < 0 ? "-$" : "+$") + Math.abs(v).toFixed(2);
 const cents = (v) => (v >= 0 ? "+" : "") + (v * 100).toFixed(1) + "¢";
 const compact = (n) => n >= 10000 ? (n / 1000).toFixed(1) + "K" : n.toLocaleString();
+const ago = (m) => m === null || m === undefined ? "at an unknown time"
+  : m < 1 ? "under a minute ago" : m < 120 ? `${Math.round(m)} min ago`
+  : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`;
 
 // ── tooltip ──
 const tip = document.getElementById("tip");
@@ -564,7 +667,8 @@ function hideTip() { tip.style.display = "none"; }
 
 // ── KPI row ──
 function tile(label, value, note, opts) {
-  const c = el("div", {class: "card" + (opts && opts.hero ? " hero" : "")});
+  const c = el("div", {class: "card" + (opts && opts.hero ? " hero" : "")
+                                      + (opts && opts.wide ? " wide" : "")});
   c.appendChild(el("div", {class: "label"}, label));
   const v = el("div", {class: "value"});
   if (opts && opts.node) v.appendChild(opts.node); else v.textContent = value;
@@ -584,6 +688,9 @@ function renderKpis() {
     `crypto ${usd(k.net_crypto)} · sleeves ${usd(k.net_sleeves)}`));
   box.appendChild(tile("Evidence collected", compact(k.windows + k.events),
     `${compact(k.windows)} crypto windows · ${compact(k.events)} sleeve events`));
+  box.appendChild(tile("Open bets", String(k.open),
+    `crypto ${k.open_crypto} · sleeves ${k.open_sleeves}`
+    + (k.open_retired ? ` (+${k.open_retired} on retired rules)` : "") + " - not settled yet"));
   const rg = DATA.regime.current, meta = REGIME[rg.regime] || REGIME.unknown;
   const st = el("span", {class: "status"});
   st.appendChild(icon(meta.icon, meta.color));
@@ -597,7 +704,24 @@ function renderKpis() {
   hs.appendChild(document.createTextNode(ok ? "Healthy" : hl.state === "stale" ? "Stale"
                                          : hl.state === "unknown" ? "Unknown" : "Unhealthy"));
   box.appendChild(tile("System health", "", hl.ts ? `watchdog ${hl.ts.slice(0, 16)}Z` : "",
-                       {node: hs}));
+                       {node: hs, wide: true}));
+}
+
+// ── is each paper trader still working? (live - not the watchdog's 15-min verdict) ──
+const FRESH = {good: ["check", "var(--good)"], warning: ["alert", "var(--warning)"],
+               missing: ["alert", "var(--warning)"]};
+function renderTraders() {
+  const box = document.getElementById("traders"); box.replaceChildren();
+  for (const t of DATA.traders || []) {
+    const [kind, color] = FRESH[t.status] || ["dash", "var(--neutral-cell)"];
+    const chip = el("div", {class: "chip"}), txt = el("span");
+    chip.appendChild(icon(kind, color));
+    txt.appendChild(el("strong", {}, t.name));
+    txt.appendChild(document.createTextNode(" · " + (t.status === "missing" ? t.note
+      : `${t.what} ${ago(t.age_min)}` + (t.status === "warning" ? ` · ${t.note}` : ""))));
+    chip.appendChild(txt);
+    box.appendChild(chip);
+  }
 }
 
 // ── equity chart: 2 series, one axis, crosshair tooltip ──
@@ -737,7 +861,12 @@ function renderRules() {
   for (const r of rows) {
     const d = r.decision, a = r.all, tr = el("tr");
     const name = el("td"); name.appendChild(el("div", {class: "rule"}, r.rule));
-    name.appendChild(el("div", {class: "venue"}, r.venue === "crypto" ? "crypto 15-min" : (r.series || "sleeve")));
+    const sub = el("div", {class: "venue"}, r.venue === "crypto" ? "crypto 15-min" : (r.series || "sleeve"));
+    if (r.open) {         // bets placed and not settled yet: working, not idle
+      sub.appendChild(document.createTextNode(" · "));
+      sub.appendChild(el("span", {class: "opencount"}, `${r.open} open`));
+    }
+    name.appendChild(sub);
     tr.appendChild(name);
     const vd = el("td"), vs = el("span", {class: "status", style: "font-weight:500"});
     const meta = STATUS[r.status];
@@ -850,7 +979,8 @@ function render() {
   live.appendChild(icon("dash", "var(--neutral-cell)"));
   live.appendChild(document.createTextNode(`Live money ${DATA.live_money} - paper only`));
   document.getElementById("gen").textContent = `updated ${DATA.generated.slice(11, 19)}Z · refreshes every minute`;
-  renderKpis(); renderEquity(); renderRules(); renderRegime(); renderHealth(); renderNoms();
+  renderKpis(); renderTraders(); renderEquity(); renderRules(); renderRegime(); renderHealth();
+  renderNoms();
 }
 async function load() {
   const app = document.getElementById("app");
