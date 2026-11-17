@@ -738,7 +738,9 @@ function renderKpis() {
   const fail1 = hl.lines.find((l) => l.startsWith("[FAIL]")), stale = hl.state === "stale";
   const reason = hl.state === "unknown" ? (hl.lines[0] || "no watchdog verdict yet")
     : stale ? `the watchdog last ran ${ago(hl.age_min)} - it runs every 15 min`
-    : fail1 ? fail1.replace(/^\[FAIL\]\s*/, "") : hl.warns ? "nothing failing" : "every check passed";
+    : fail1 ? fail1.replace(/^\[FAIL\]\s*/, "")
+    : hl.state === "unhealthy" ? "unhealthy, but no failing check was logged - see logs/healthcheck.log"
+    : hl.warns ? "nothing failing" : "every check passed";
   const rn = el("div", {class: "reason"}, reason);
   rn.title = reason;
   ht.appendChild(rn);

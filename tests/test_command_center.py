@@ -449,3 +449,26 @@ def test_health_puts_the_reason_for_unhealthy_first(tmp_path, monkeypatch):
     assert len(h["lines"]) == 20 and h["lines"][0].startswith("[FAIL] sleeves:")
     assert h["lines"][1].startswith("[FAIL] data:") and h["failing"] == ["sleeves", "data"]
     assert (h["fails"], h["warns"]) == (2, 22)
+
+
+def test_open_bets_match_on_ticker_and_rule(tmp_path, monkeypatch):
+    """Two rules can hold the same market (H1 and H5 both buy late in one window). One
+    rule's settlement must not clear the other rule's open bet."""
+    _isolate(tmp_path, monkeypatch)
+    tk, at = "KXBTC15M-26NOV170330-B7", (T0 + timedelta(hours=1)).isoformat()
+    rows = [{"t": "open", "ts": at, "ticker": tk, "rule": r, "price": 0.9, "contracts": 1,
+             "fee": 0.01, "v": 4, "depth": 20} for r in ("H1", "H5")]
+    rows.append({"t": "close", "ts": at, "ticker": tk, "rule": "H1", "price": 0.9,
+                 "won": True, "pnl": 0.09})
+    cc.CRYPTO_LEDGER.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    cc._CACHE.update(t=0.0, payload=None)
+    shown = {r["rule"]: r for r in cc.build_payload()["rules"]}
+    assert shown["H1"]["open"] == 0 and shown["H5"]["open"] == 1
+
+
+def test_an_unhealthy_verdict_never_reads_as_all_clear():
+    """A truncated log can carry an UNHEALTHY header with no [FAIL] line under it; the
+    tile once fell through to 'every check passed'."""
+    assert "no failing check was logged" in cc._PAGE
+    i = cc._PAGE.index('hl.state === "unhealthy" ? "unhealthy, but no failing')
+    assert i < cc._PAGE.index('"every check passed"')
