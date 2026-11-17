@@ -414,3 +414,38 @@ def test_trader_freshness_fresh_late_and_missing(tmp_path, monkeypatch):
     t = traders()
     assert t["sleeves"]["status"] == "missing" and "unreadable" in t["sleeves"]["note"]
 
+
+def test_health_puts_the_reason_for_unhealthy_first(tmp_path, monkeypatch):
+    """healthcheck.py --log writes its lines in CHECK order, so a warning from an early
+    check sat above the failure that made the run unhealthy - and past the 20-line cap a
+    failure was cut entirely. FAIL first, then WARN, OK last, and the tile is told which
+    checks failed. The lines below are the watchdog's own format."""
+    log = tmp_path / "hc.log"
+    monkeypatch.setattr(cc, "HEALTH_LOG", log)
+    now = datetime.now(timezone.utc)
+    earlier = (now - timedelta(minutes=20)).isoformat(timespec="seconds")
+    latest = now.isoformat(timespec="seconds")
+    log.write_text("\n".join([
+        f"{earlier} UNHEALTHY fails=1 warns=0",
+        "    [FAIL] ports: command center NOT listening on 5155",      # an older run
+        f"{latest} UNHEALTHY fails=1 warns=2",
+        "    [WARN] tasks: PolybotPaper was 'Ready' (dead) - REPAIRED, restarted",
+        "    [OK  ] deps: all dashboard/collector imports resolve",
+        "    [FAIL] data: stage0 log STALE 18 min (cycle is 60s) - collector alive but "
+        "not collecting",
+        "    [WARN] news: calendar unreadable: line 4 - fix news_calendar.yaml"]) + "\n")
+    h = cc.health_panel()
+    assert h["state"] == "unhealthy"
+    assert [l.split("]")[0] + "]" for l in h["lines"]] == ["[FAIL]", "[WARN]", "[WARN]", "[OK  ]"]
+    assert h["lines"][0].startswith("[FAIL] data: stage0 log STALE")
+    assert h["lines"][1].startswith("[WARN] tasks:")            # the watchdog's order within
+    assert (h["fails"], h["warns"], h["failing"]) == (1, 2, ["data"])
+    # 22 warnings ahead of two failures: the cap keeps the failures, not the warnings
+    log.write_text("\n".join([f"{latest} UNHEALTHY fails=2 warns=22"]
+                             + [f"    [WARN] news: warning {i}" for i in range(22)]
+                             + ["    [FAIL] sleeves: sleeve paper heartbeat 14 min old",
+                                "    [FAIL] data: stage0 log STALE 18 min"]) + "\n")
+    h = cc.health_panel()
+    assert len(h["lines"]) == 20 and h["lines"][0].startswith("[FAIL] sleeves:")
+    assert h["lines"][1].startswith("[FAIL] data:") and h["failing"] == ["sleeves", "data"]
+    assert (h["fails"], h["warns"]) == (2, 22)

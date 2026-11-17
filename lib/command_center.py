@@ -327,24 +327,44 @@ def regime_panel(days: int = 14) -> dict:
             "cells": [{"d": d, "h": h, "r": v} for (d, h), v in sorted(cells.items())]}
 
 
+# healthcheck.py --log writes "<ts> healthy|UNHEALTHY fails=N warns=N", then one indented
+# "    [STATUS] section: message" line per check that did not pass (STATUS is FAIL, WARN or
+# a padded "OK  ", which --log skips). It writes them in CHECK order, so a warning from an
+# early check (auth, tasks) sat above the failure that made the run unhealthy.
+_HEALTH_RANK = {"FAIL": 0, "WARN": 1, "OK": 3}       # an untagged note sits at 2
+
+
+def _health_tag(line: str) -> str:
+    return line[1:line.index("]")].strip() if line.startswith("[") and "]" in line else ""
+
+
 def health_panel() -> dict:
+    """The watchdog's last verdict with its reasons first: FAIL lines, then WARN, then any
+    other note, OK last - sorted before the 20-line cap, so a failure is never cut."""
+    out = {"state": "unknown", "ts": None, "age_min": None, "lines": [], "fails": 0,
+           "warns": 0, "failing": []}
     if not HEALTH_LOG.exists():
-        return {"state": "unknown", "ts": None, "lines": ["the watchdog has not run yet"]}
+        return dict(out, lines=["the watchdog has not run yet"])
     try:
         lines = HEALTH_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
     except OSError:
-        return {"state": "unknown", "ts": None, "lines": ["watchdog log unreadable"]}
+        return dict(out, lines=["watchdog log unreadable"])
     head = max((i for i, l in enumerate(lines) if l and not l[0].isspace()), default=None)
     if head is None:
-        return {"state": "unknown", "ts": None, "lines": []}
+        return out
     parts = lines[head].split()
     state = "healthy" if len(parts) > 1 and parts[1] == "healthy" else "unhealthy"
     detail = [l.strip() for l in lines[head + 1:] if l.startswith(" ")]
+    detail.sort(key=lambda l: _HEALTH_RANK.get(_health_tag(l), 2))   # stable within a tag
+    fails = [l for l in detail if _health_tag(l) == "FAIL"]
     age = (time.time() - (_ts(parts[0]) or 0)) / 60.0
     if age > 30:
         state = "stale"
         detail.insert(0, f"last watchdog run was {age:.0f} min ago (it runs every 15)")
-    return {"state": state, "ts": parts[0], "lines": detail[:20]}
+    return dict(out, state=state, ts=parts[0], age_min=round(age, 1), lines=detail[:20],
+                fails=len(fails), warns=sum(_health_tag(l) == "WARN" for l in detail),
+                failing=list(dict.fromkeys(l.split("]", 1)[1].split(":", 1)[0].strip()[:24]
+                                           for l in fails)))
 
 
 def nominations_panel() -> list[dict]:
@@ -488,8 +508,12 @@ h1 { font-size: 20px; font-weight: 600; margin: 0; }
 .chip { display: inline-flex; align-items: flex-start; gap: 6px; max-width: 100%;
         border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px;
         background: var(--surface); font-size: 12px; color: var(--ink-2); }
-.chip strong { color: var(--ink); font-weight: 600; }
+.chip strong, .health strong { color: var(--ink); font-weight: 600; }
+.note a, .note a:visited { color: var(--ink-2); }
 .opencount { color: var(--ink-2); font-weight: 600; }
+.reason { color: var(--ink); font-size: 12px; margin-top: 6px; overflow-wrap: anywhere;
+          display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+          overflow: hidden; }
 .two { grid-template-columns: 1fr 1fr; align-items: start; }
 @media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
 .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
@@ -532,8 +556,12 @@ td.num, th.num { text-align: right; }
 .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
 svg text { fill: var(--muted); font-size: 11px; }
 .health li { margin: 4px 0; display: flex; gap: 8px; align-items: flex-start; }
+.health li span { min-width: 0; overflow-wrap: anywhere; }
 .health ul { list-style: none; padding: 0; margin: 0; font-size: 12px; color: var(--ink-2); }
+.health details { margin-top: 8px; font-size: 12px; color: var(--ink-2); }
+.health summary { cursor: pointer; color: var(--muted); }
 section { margin-top: 12px; }
+#health { scroll-margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -585,10 +613,11 @@ section { margin-top: 12px; }
       <div id="rg-chart"></div>
       <div id="rg-table" hidden class="scroll"></div>
     </section>
-    <section class="card health">
+    <section class="card health" id="health">
       <h2>System health</h2>
       <p class="cap" id="hl-cap"></p>
       <ul id="hl"></ul>
+      <details id="hl-ok" hidden><summary id="hl-ok-sum"></summary><ul id="hl-ok-list"></ul></details>
     </section>
   </div>
 
@@ -643,6 +672,7 @@ const compact = (n) => n >= 10000 ? (n / 1000).toFixed(1) + "K" : n.toLocaleStri
 const ago = (m) => m === null || m === undefined ? "at an unknown time"
   : m < 1 ? "under a minute ago" : m < 120 ? `${Math.round(m)} min ago`
   : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`;
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 // ── tooltip ──
 const tip = document.getElementById("tip");
@@ -696,6 +726,7 @@ function renderKpis() {
   st.appendChild(icon(meta.icon, meta.color));
   st.appendChild(document.createTextNode(meta.label));
   box.appendChild(tile("News regime now", "", `size ×${rg.mult ?? 0.5}`, {node: st}));
+  // the verdict AND its reason: the first failing check is the first thing the tile says
   const hl = DATA.health, ok = hl.state === "healthy";
   const hs = el("span", {class: "status"});
   hs.appendChild(icon(ok ? "check" : (hl.state === "unknown" ? "dash" : "cross"),
@@ -703,8 +734,25 @@ function renderKpis() {
                                                                     : "var(--critical)")));
   hs.appendChild(document.createTextNode(ok ? "Healthy" : hl.state === "stale" ? "Stale"
                                          : hl.state === "unknown" ? "Unknown" : "Unhealthy"));
-  box.appendChild(tile("System health", "", hl.ts ? `watchdog ${hl.ts.slice(0, 16)}Z` : "",
-                       {node: hs, wide: true}));
+  const ht = tile("System health", "", null, {node: hs, wide: true});
+  const fail1 = hl.lines.find((l) => l.startsWith("[FAIL]")), stale = hl.state === "stale";
+  const reason = hl.state === "unknown" ? (hl.lines[0] || "no watchdog verdict yet")
+    : stale ? `the watchdog last ran ${ago(hl.age_min)} - it runs every 15 min`
+    : fail1 ? fail1.replace(/^\[FAIL\]\s*/, "") : hl.warns ? "nothing failing" : "every check passed";
+  const rn = el("div", {class: "reason"}, reason);
+  rn.title = reason;
+  ht.appendChild(rn);
+  const facts = [];
+  if (hl.fails && (stale || hl.fails > 1)) facts.push(`${hl.fails} failing: ${hl.failing.join(", ")}`);
+  if (hl.warns) facts.push(plural(hl.warns, "warning"));
+  if (hl.ts && !stale) facts.push(`watchdog ${hl.ts.slice(11, 16)}Z, ${ago(hl.age_min)}`);
+  const hn = el("div", {class: "note"}, facts.join(" · "));
+  if (hl.lines.length && hl.state !== "unknown") {
+    if (facts.length) hn.appendChild(document.createTextNode(" · "));
+    hn.appendChild(el("a", {href: "#health"}, "details"));
+  }
+  ht.appendChild(hn);
+  box.appendChild(ht);
 }
 
 // ── is each paper trader still working? (live - not the watchdog's 15-min verdict) ──
@@ -936,18 +984,31 @@ function renderRegime() {
 }
 
 // ── health + nominations ──
+// the payload lists FAIL lines first, then WARN, then notes (the stale warning), OK last
+const CHECK = {FAIL: ["cross", "var(--critical)", "Fail"], WARN: ["alert", "var(--warning)", "Warn"],
+               OK: ["check", "var(--good)", "OK"], "": ["alert", "var(--warning)", ""]};
+function checkItem(text, tag) {
+  const [kind, color, word] = CHECK[tag], li = el("li"), s = el("span");
+  li.appendChild(icon(kind, color));
+  if (word) s.appendChild(el("strong", {}, word + " "));
+  s.appendChild(document.createTextNode(text));
+  li.appendChild(s);
+  return li;
+}
 function renderHealth() {
   const h = DATA.health;
-  document.getElementById("hl-cap").textContent = h.ts ? `Watchdog verdict at ${h.ts.slice(0, 16)}Z` : "";
-  const ul = document.getElementById("hl"); ul.replaceChildren();
-  const lines = h.lines.length ? h.lines : (h.state === "healthy" ? ["Every check passed."] : []);
-  for (const line of lines) {
-    const li = el("li"), fail = line.includes("[FAIL]"), warn = line.includes("[WARN]");
-    li.appendChild(icon(fail ? "cross" : warn ? "alert" : "check",
-                        fail ? "var(--critical)" : warn ? "var(--warning)" : "var(--good)"));
-    li.appendChild(el("span", {}, line.replace(/^\[(FAIL|WARN|OK  )\]\s*/, "")));
-    ul.appendChild(li);
+  document.getElementById("hl-cap").textContent = h.ts
+    ? `Watchdog verdict at ${h.ts.slice(0, 16)}Z (${ago(h.age_min)}); it runs every 15 min.` : "";
+  const ul = document.getElementById("hl"), okList = document.getElementById("hl-ok-list");
+  ul.replaceChildren(); okList.replaceChildren();
+  for (const line of h.lines) {
+    const m = line.match(/^\[(FAIL|WARN|OK)\s*\]\s*/), tag = m ? m[1] : "";
+    (tag === "OK" ? okList : ul).appendChild(checkItem(m ? line.slice(m[0].length) : line, tag));
   }
+  if (!h.lines.length && h.state === "healthy") ul.appendChild(checkItem("Every check passed.", "OK"));
+  const passing = okList.children.length, det = document.getElementById("hl-ok");
+  det.hidden = !passing;
+  document.getElementById("hl-ok-sum").textContent = plural(passing, "passing check");
 }
 function renderNoms() {
   const t = document.getElementById("noms"); t.replaceChildren();
