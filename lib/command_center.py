@@ -189,6 +189,14 @@ _STATS_MEMO: dict[str, dict] = {}
 _STATS_MEMO_MAX = 512
 
 
+def _money(trades: list[dict]) -> dict:
+    """What a record actually paid and cost: the net alone hides the shape - a 97-99c
+    favorite wins $0.10-0.30 at a time and loses ~$9.80 when it loses."""
+    return {"won": round(sum(t["pnl"] for t in trades if t["pnl"] > 0), 2),
+            "lost": round(-sum(t["pnl"] for t in trades if t["pnl"] < 0), 2),
+            "losses": sum(1 for t in trades if not t["won"])}
+
+
 def _record_key(trades: list[dict]) -> str:
     """A fingerprint of everything forward_stats reads. A rule's record only changes when
     one of its trades settles, so the exact tails are reused across dashboard rebuilds."""
@@ -272,7 +280,8 @@ def score_rules(trades: list[dict], sleeve_rules=None, extra_stats=(),
                      "series": sp.series_label(reg) if reg else
                      next((t.get("series") for t in ts if t.get("series")), None),
                      "open": open_now.get((venue, name), 0),
-                     "all": s_all, "decision": s_dec, "spark": _downsample(cum)})
+                     "all": s_all, "decision": s_dec, "money": _money(basis),
+                     "spark": _downsample(cum)})
     keep = sp.survivors([r["decision"] for r in rows] + list(extra_stats))
     for i, r in enumerate(rows):                  # rows come first: index i is rows[i]
         d = r["decision"]
@@ -402,6 +411,7 @@ def build_payload() -> dict:
         "live_money": "OFF",
         "kpi": {"rules": len(rules), "edge": sum(r["status"] == "good" for r in rules),
                 "net": round(sum(t["pnl"] for t in trades), 2),
+                **{k: v for k, v in _money(trades).items() if k in ("won", "lost")},
                 "net_crypto": round(sum(t["pnl"] for t in ct), 2),
                 "net_sleeves": round(sum(t["pnl"] for t in st), 2),
                 "windows": len({t["event"] for t in ct}),
@@ -667,6 +677,7 @@ function icon(kind, color) {
   return s;
 }
 const usd = (v) => (v < 0 ? "-$" : "+$") + Math.abs(v).toFixed(2);
+const dollars = (v) => "$" + Math.abs(v || 0).toFixed(2);
 const cents = (v) => (v >= 0 ? "+" : "") + (v * 100).toFixed(1) + "¢";
 const compact = (n) => n >= 10000 ? (n / 1000).toFixed(1) + "K" : n.toLocaleString();
 const ago = (m) => m === null || m === undefined ? "at an unknown time"
@@ -715,7 +726,8 @@ function renderKpis() {
            : "None yet. That is the honest number, and the reason live money stays off.",
     {hero: true, of: ` of ${k.rules}`}));
   box.appendChild(tile("Paper P&L, all rules", usd(k.net),
-    `crypto ${usd(k.net_crypto)} · sleeves ${usd(k.net_sleeves)}`));
+    `crypto ${usd(k.net_crypto)} · sleeves ${usd(k.net_sleeves)} · won ${dollars(k.won)}, `
+    + `lost ${dollars(k.lost)}`));
   box.appendChild(tile("Evidence collected", compact(k.windows + k.events),
     `${compact(k.windows)} crypto windows · ${compact(k.events)} sleeve events`));
   box.appendChild(tile("Open bets", String(k.open),
@@ -929,7 +941,15 @@ function renderRules() {
     const ci = el("td"); ci.appendChild(ciBar(d, dom));
     if (d.n >= 2) ci.title = `${cents(d.lo)} to ${cents(d.hi)} per contract per event`;
     tr.appendChild(ci);
-    tr.appendChild(el("td", {class: "num"}, usd(d.net)));
+    const net = el("td", {class: "num"}, usd(d.net));
+    const m = r.money;
+    if (m && (m.won || m.lost)) {                  // the shape the net hides, stacked narrow
+      net.appendChild(el("div", {class: "sub"}, `won ${dollars(m.won)}`));
+      const lost = el("div", {class: "sub"}, `lost ${dollars(m.lost)}`);
+      lost.title = `${m.losses} losing bet${m.losses === 1 ? "" : "s"}`;   // the table has no room
+      net.appendChild(lost);
+    }
+    tr.appendChild(net);
     const sp = el("td"); sp.appendChild(spark(r.spark)); tr.appendChild(sp);
     tr.appendChild(el("td", {class: "num"}, a.n ? `${cents(a.mean)} · ${a.n}` : "-"));
     t.appendChild(tr);

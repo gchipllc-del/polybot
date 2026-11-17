@@ -472,3 +472,26 @@ def test_an_unhealthy_verdict_never_reads_as_all_clear():
     assert "no failing check was logged" in cc._PAGE
     i = cc._PAGE.index('hl.state === "unhealthy" ? "unhealthy, but no failing')
     assert i < cc._PAGE.index('"every check passed"')
+
+
+def test_each_rule_shows_what_it_won_and_what_it_lost(tmp_path, monkeypatch):
+    """The net hides the shape: 97-99c favorites win dimes and lose ~$9.80. Each rule
+    carries won / lost / number of losses on its decision record, and the KPI totals."""
+    sp = _isolate(tmp_path, monkeypatch)
+    _register(sp, "F9799", ["KXHIGHNY"])
+    at = T0 + timedelta(hours=1)
+    rows = (_sleeve_bet(sp, "F9799", "KXHIGHNY", 0, at, "yes")
+            + _sleeve_bet(sp, "F9799", "KXHIGHNY", 1, at, "yes")
+            + _sleeve_bet(sp, "F9799", "KXHIGHNY", 2, at, "no"))
+    sp._append(sp.LEDGER, rows)
+    closes = [r for r in rows if r.get("t") == "close"]
+    won = round(sum(r["pnl"] for r in closes if r["pnl"] > 0), 2)
+    lost = round(-sum(r["pnl"] for r in closes if r["pnl"] < 0), 2)
+    assert won > 0 and lost > 0
+    cc._CACHE.update(t=0.0, payload=None)
+    p = cc.build_payload()
+    r = next(x for x in p["rules"] if x["rule"] == "F9799")
+    assert r["money"] == {"won": won, "lost": lost, "losses": 1}
+    assert round(r["money"]["won"] - r["money"]["lost"], 2) == round(r["decision"]["net"], 2)
+    assert (p["kpi"]["won"], p["kpi"]["lost"]) == (won, lost)
+    assert "`won ${dollars(m.won)}`" in cc._PAGE and "`lost ${dollars(m.lost)}`" in cc._PAGE
