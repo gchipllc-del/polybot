@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jesse.polybot.kalshi_15min</string>
+    <!--
+        Kalshi 15-min crypto (BTC) sleeve — fires every 60s.
+
+        Each cycle samples the live KXBTC15M markets, computes the
+        composite signal (RSI + Greeks theo-gap + market-agreement +
+        whale flow), records Phase 2 paper trades when confidence clears
+        the per-asset bar, runs intra-window TP/SL, and settles resolved
+        ones. Persists to data/kalshi_15min_signal.jsonl +
+        data/kalshi_15min_paper.jsonl.
+
+        60s cadence (vs btc_arb's 120s) so the 30-300s pre-close entry
+        window is reliably caught.
+
+        Read-only: never places real orders. Phase 3 (real execution)
+        stays gated behind live_migration_approved.
+
+        HOST SETUP: edit the cd path + python path below to match this
+        machine, then:
+            cp scripts/launchd/com.jesse.polybot.kalshi_15min.plist \
+               ~/Library/LaunchAgents/
+            launchctl load ~/Library/LaunchAgents/com.jesse.polybot.kalshi_15min.plist
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/jesse/Desktop/projects/polybot &amp;&amp; set -a &amp;&amp; source .env &amp;&amp; set +a &amp;&amp; /Users/jesse/anaconda3/bin/python main.py kalshi-15min-monitor 2&gt;&amp;1</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_kalshi_15min.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_kalshi_15min_err.log</string>
+</dict>
+</plist>

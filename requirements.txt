@@ -2,11 +2,15 @@
 # POLYBOT Dependencies
 # ============================================================
 
-# --- Shared core (sibling repo) ---
-# Install with:  pip install -e ../tradingcore
-# Provides: audit log, Kelly sizing, calibration scoring. See
-# ../tradingcore/README.md.
-tradingcore @ file:../tradingcore
+# --- Shared core ---
+# The original `tradingcore` is a sibling repo that only ever existed on the first dev
+# machine. It is NOT required: lib/__init__.py falls back to the tested shim in
+# vendor/tradingcore whenever the real package is absent (pinned by
+# tests/test_tradingcore_fallback.py). A live `tradingcore @ file:../tradingcore` line
+# here made `pip install -r requirements.txt` abort on every fresh machine - including
+# scripts/launchd/install_dashboards.sh - so it stays commented out. If you DO have the
+# sibling repo, install it separately:  pip install -e ../tradingcore
+# tradingcore @ file:../tradingcore
 
 # --- Prediction Market APIs ---
 kalshi-python>=0.3.0

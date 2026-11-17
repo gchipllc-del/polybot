@@ -61,3 +61,24 @@ these attributions are retained for provenance.
        - Structured LLM output (Pydantic validation + auto-retry) in
          lib/llm_analyst.py, replacing hand-rolled regex parsing of
          superforecaster responses.
+
+--------------------------------------------------------------------------------
+2. jackson-cmd/risk-aware-trading-agents
+   https://github.com/jackson-cmd/risk-aware-trading-agents (commit 3cf41fb)
+   Copyright (c) 2026 Risk-Aware Trading Agents contributors
+   Licensed under the MIT License
+
+   USED FOR:
+       - The FOMC decision dates and BLS CPI / jobs report / PPI release dates in
+         config/news_calendar.yaml, taken from src/riskaware/data/_events_data.py
+         (dates as published by the Federal Reserve and the BLS)
+
+   WHAT WE DID NOT COPY:
+       - No code. Rule-estimated dates and the repo's hand-set event weights were
+         deliberately left out; impact levels here are ours, to be measured forward.
+
+   MIT notice: Permission is hereby granted, free of charge, to any person
+   obtaining a copy of this software and associated documentation files, to deal
+   in the Software without restriction, subject to including the above copyright
+   notice and this permission notice in all copies or substantial portions. THE
+   SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
