@@ -234,6 +234,142 @@ def doctor() -> int:
     return 0
 
 
+# ── a dashboard must never outlive its supervisor ─────────────────────────────
+#
+# Stop-ScheduledTask terminates this supervisor outright (no Ctrl-C, no cleanup), and on
+# Windows the dashboards it started survived it: they kept their ports with OLD code,
+# and every restart's fresh dashboards failed to bind and retried forever - which is why
+# pulled dashboard fixes never showed up. Two guards:
+#   * a Job Object with KILL_ON_JOB_CLOSE: the OS kills every dashboard when this
+#     process dies, however it dies;
+#   * a startup sweep: leftovers from a supervisor that predates the job object are
+#     stopped before spawning - only processes whose command line is OUR dashboard.
+
+DASH_CMDS = tuple(cmd for _, cmd, _ in DASHBOARDS)
+
+
+def _kill_on_close_job():
+    """A Windows Job Object that kills its processes when this supervisor exits. None on
+    other systems, or if Windows refuses (then dashboards behave as before)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOps", "WriteOps", "OtherOps", "ReadBytes", "WriteBytes", "OtherBytes")]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class _EXTENDED(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BASIC), ("IoInfo", _IO),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                ctypes.c_void_p, wintypes.DWORD]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _EXTENDED()
+        info.BasicLimitInformation.LimitFlags = 0x2000     # KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info),   # ExtendedLimit
+                                           ctypes.sizeof(info)):
+            return None
+        return job
+    except Exception:  # noqa: BLE001 - never stop the dashboards over this
+        return None
+
+
+def _adopt(job, proc) -> bool:
+    """Put a freshly spawned dashboard into the job (Windows only)."""
+    if job is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        return bool(k32.AssignProcessToJobObject(job, int(proc._handle)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _listening_pids(netstat_out: str, ports) -> set:
+    """PIDs listening on any of `ports`, from `netstat -ano` output. The state column is
+    localized on non-English Windows, so a listener is recognized by its foreign
+    address (0.0.0.0:0 / [::]:0) as well as by the word LISTENING."""
+    pids = set()
+    for line in netstat_out.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if parts[3].upper() != "LISTENING" and parts[2] not in ("0.0.0.0:0", "[::]:0"):
+            continue
+        try:
+            port, pid = int(parts[1].rsplit(":", 1)[1]), int(parts[-1])
+        except (ValueError, IndexError):
+            continue
+        if port in ports and pid > 0:
+            pids.add(pid)
+    return pids
+
+
+def _stale_dashboards(ports, run=subprocess.run, windows: bool | None = None) -> list:
+    """[(pid, command line)] of OUR dashboards already holding our ports - leftovers of
+    an earlier supervisor. Anything else on those ports is left alone."""
+    if not (os.name == "nt" if windows is None else windows):
+        return []
+    try:
+        out = run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
+                  timeout=20).stdout
+    except Exception:  # noqa: BLE001
+        return []
+    found = []
+    for pid in sorted(_listening_pids(out or "", ports)):
+        try:
+            cmd = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                       f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+                      capture_output=True, text=True, timeout=30).stdout.strip()
+        except Exception:  # noqa: BLE001
+            continue
+        if "main.py" in cmd and any(c in cmd.split() for c in DASH_CMDS):
+            found.append((pid, cmd))
+    return found
+
+
+def _sweep_stale(run=subprocess.run, windows: bool | None = None) -> int:
+    ports = {port for _, _, port in DASHBOARDS}
+    stale = _stale_dashboards(ports, run=run, windows=windows)
+    for pid, cmd in stale:
+        print(f"  stopping a leftover dashboard from an earlier run: pid {pid} ({cmd[-60:]})")
+        try:
+            run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=20)
+        except Exception:  # noqa: BLE001
+            pass
+    if stale:
+        time.sleep(2)                                  # let Windows release the ports
+    return len(stale)
+
+
 def main() -> int:
     if "--check" in sys.argv:
         return check()
@@ -246,11 +382,16 @@ def main() -> int:
     # Windows: child stdout redirected to a file defaults to cp1252, so the dashboards'
     # unicode banners (─ → ▲) raise UnicodeEncodeError at boot -> exit 1. Force UTF-8.
     child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    _sweep_stale()
+    job = _kill_on_close_job()           # kept open for this process's whole life
+
     def spawn(name: str, cmd: str, port: int):
         log = open(ROOT / "logs" / f"dash_{name}.log", "a", encoding="utf-8")
-        return subprocess.Popen([sys.executable, str(ROOT / "main.py"), cmd, f"--port={port}"],
-                                cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
-                                env=child_env)
+        p = subprocess.Popen([sys.executable, str(ROOT / "main.py"), cmd, f"--port={port}"],
+                             cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+                             env=child_env)
+        _adopt(job, p)
+        return p
 
     # Each dashboard is supervised ON ITS OWN. This used to stop every dashboard when
     # any one exited - harmless with two, but with three it meant a crash in a new page
