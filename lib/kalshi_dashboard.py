@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -297,6 +299,74 @@ def _trading_status_payload() -> dict:
     }
 
 
+# ── /api/all snapshot: serve the last one at once, rebuild it in the background ─
+#
+# Every panel used to be recomputed on every request - including a full read of the
+# collector log (190k+ rows) and the paper ledger (70k+) - which grew past the
+# healthcheck's 8 s budget and made every page refresh wait as long. Stale-while-
+# revalidate: a request gets the last snapshot immediately; one older than ALL_TTL_S
+# triggers ONE background rebuild. Only the first request after a start waits.
+
+ALL_TTL_S = 30.0
+_ALL: dict = {"payload": None, "t": 0.0, "busy": False}
+_ALL_LOCK = threading.Lock()
+
+
+def _build_all() -> dict:
+    # Each section is independently guarded: one broken payload (missing sibling
+    # repo, network egress, bad data file) must degrade to an error string in ITS
+    # panel, never 500 the whole page (which froze every panel at "loading...").
+    def safe(fn):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)[:200]}
+    return {
+        "live": safe(_live_markets_payload),
+        "paper": safe(_paper_payload),
+        "account": safe(_account_payload),
+        "cron": safe(_cron_health_payload),
+        "stage0": safe(_stage0_payload),
+        "shadow": safe(_shadow_payload),
+        "trading": safe(_trading_status_payload),
+        "paper_crypto": safe(_paper_crypto_payload),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _refresh_all() -> None:
+    try:
+        payload = _build_all()
+        with _ALL_LOCK:
+            _ALL.update(payload=payload, t=time.monotonic())
+    finally:
+        with _ALL_LOCK:
+            _ALL["busy"] = False
+
+
+def _all_payload(wait_s: float = 6.0) -> dict:
+    """The /api/all body: the last snapshot, rebuilt in the background once it is older
+    than ALL_TTL_S (one rebuild at a time). The very first request waits up to wait_s
+    for the first build; if that is still running, it gets a one-panel 'warming' body."""
+    with _ALL_LOCK:
+        fresh = _ALL["payload"] is not None and time.monotonic() - _ALL["t"] < ALL_TTL_S
+        start = not fresh and not _ALL["busy"]
+        if start:
+            _ALL["busy"] = True
+    if start:
+        threading.Thread(target=_refresh_all, name="api-all-refresh", daemon=True).start()
+    deadline = time.monotonic() + wait_s
+    while _ALL["payload"] is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    with _ALL_LOCK:
+        payload, t = _ALL["payload"], _ALL["t"]
+    if payload is None:
+        return {"warming": {"error": "first snapshot still building - refresh in a few "
+                                     "seconds"},
+                "ts": datetime.now(timezone.utc).isoformat()}
+    return dict(payload, age_s=round(time.monotonic() - t, 1))
+
+
 def make_app():
     from flask import Flask, jsonify, render_template_string
 
@@ -324,26 +394,9 @@ def make_app():
 
     @app.route("/api/all")
     def api_all():
-        """One-shot fetch — used by the page on every refresh."""
-        # Each section is independently guarded: one broken payload (missing sibling
-        # repo, network egress, bad data file) must degrade to an error string in ITS
-        # panel, never 500 the whole page (which froze every panel at "loading...").
-        def safe(fn):
-            try:
-                return fn()
-            except Exception as e:  # noqa: BLE001
-                return {"error": str(e)[:200]}
-        return jsonify({
-            "live": safe(_live_markets_payload),
-            "paper": safe(_paper_payload),
-            "account": safe(_account_payload),
-            "cron": safe(_cron_health_payload),
-            "stage0": safe(_stage0_payload),
-            "shadow": safe(_shadow_payload),
-            "trading": safe(_trading_status_payload),
-            "paper_crypto": safe(_paper_crypto_payload),
-            "ts": datetime.now(timezone.utc).isoformat(),
-        })
+        """One-shot fetch — used by the page on every refresh. Served from the
+        background-rebuilt snapshot (see _all_payload), never computed inline."""
+        return jsonify(_all_payload())
 
     return app
 
@@ -366,6 +419,7 @@ def run_dashboard(port: int = 5153):
     s.close()
 
     app = make_app()
+    _all_payload(wait_s=0)          # start the first snapshot while the server boots
     print(f"Kalshi dashboard → http://localhost:{port}")
     app.run(host=os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
 
