@@ -42,7 +42,7 @@ proof). Benjamini-Hochberg runs across ALL forward rules at once - the command c
 family: every sleeve rule, RETIRED ones included, and the crypto rules on fill-checked
 trades - so adding sleeves never lowers the bar, and retiring one never raises another.
 
-  py scripts/sleeve_paper.py register-probes [--top 20]   # after sleeve_scan discover
+  py scripts/sleeve_paper.py register-probes [--top 20 | --series A,B]   # the FLB probe pair
   py scripts/sleeve_paper.py register-nominations         # after sleeve_scan screen
   py scripts/sleeve_paper.py register-rule --name F9799 --series KXHIGHNY,KXHIGHCHI \
         --side favorite --lo 0.97 --hi 0.995 --band any [--contracts 10] \
@@ -854,14 +854,24 @@ def main() -> int:
     if cmd == "selftest":
         return _selftest()
     if cmd == "register-probes":
-        if not CATALOG.exists():
-            print("run `py scripts/sleeve_scan.py discover` first")
-            return 1
-        top = int(args[args.index("--top") + 1]) if "--top" in args else 20
-        cat = [r["series"] for r in json.loads(CATALOG.read_text(encoding="utf-8"))
-               if r["series"] not in EXCLUDED_SERIES][:top]
+        # --series A,B,C: the probe pair on sleeves YOU chose (pick ones that settle often
+        # and are still listing events). Otherwise the catalog's top N by recent settled
+        # events - which can be one-off elections that will never list another event.
+        if "--series" in args and args.index("--series") + 1 < len(args):
+            cat = list(dict.fromkeys(x.strip() for x in
+                                     args[args.index("--series") + 1].split(",") if x.strip()))
+        else:
+            if not CATALOG.exists():
+                print("run `py scripts/sleeve_scan.py discover` first (or pass --series A,B)")
+                return 1
+            top = int(args[args.index("--top") + 1]) if "--top" in args else 20
+            cat = [r["series"] for r in json.loads(CATALOG.read_text(encoding="utf-8"))
+                   if r["series"] not in EXCLUDED_SERIES][:top]
+        skipped = [x for x in cat if x in EXCLUDED_SERIES]
+        cat = [x for x in cat if x not in EXCLUDED_SERIES]
         added = register(probe_rules(cat), RULES)
-        print(f"registered {len(added)} probe rules on {len(cat)} sleeves (named now)")
+        print(f"registered {len(added)} probe rules on {len(cat)} sleeves (named now)"
+              + (f"; skipped {', '.join(skipped)} (traded by paper_trader)" if skipped else ""))
         return 0
     if cmd == "register-nominations":
         if not SCREEN.exists():

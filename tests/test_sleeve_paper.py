@@ -558,3 +558,19 @@ def test_a_sized_order_needs_every_contract_at_the_ask(tmp_path):
     opened = {r["rule"]: r for r in sp._load_jsonl(lp) if r.get("t") == "open"}
     assert set(opened) == {"ONE"} and s["skipped"]["no_depth"] == 1    # the 10-lot refused
     assert opened["ONE"]["v"] == sp.VERSION == 2
+
+
+def test_register_probes_on_chosen_series(tmp_path, monkeypatch, capsys):
+    """--series picks the sleeves (ones that settle often), never the catalog's top-N
+    one-off elections; the crypto 15-min series stay with paper_trader."""
+    monkeypatch.setattr(sp, "RULES", tmp_path / "rules.jsonl")
+    monkeypatch.setattr(sp, "CATALOG", tmp_path / "missing.json")
+    monkeypatch.setattr(sys, "argv", ["sleeve_paper.py", "register-probes",
+                                      "--series", "KXSOL15M,KXBTC15M,KXSOL15M,KXESOCCERGAME"])
+    assert sp.main() == 0
+    assert sorted(sp.active_rules(sp.RULES)) == [
+        "FLB_FAV_KXESOCCERGAME", "FLB_FAV_KXSOL15M", "FLB_LONG_KXESOCCERGAME", "FLB_LONG_KXSOL15M"]
+    out = capsys.readouterr().out
+    assert "registered 4 probe rules on 2 sleeves" in out and "skipped KXBTC15M" in out
+    assert all(r["contracts"] == sp.NEW_RULE_CONTRACTS
+               for r in sp.active_rules(sp.RULES).values())
