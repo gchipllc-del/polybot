@@ -301,3 +301,174 @@ def test_scores_are_reused_until_a_record_changes(monkeypatch):
     more = trades + [dict(trades[0], event="E999")]
     cc.score_rules(more)
     assert len(calls) == 2                             # a new settlement: rescored
+
+
+# ── live activity: registration labels, open bets, trader freshness, the reason ──
+
+def _sleeve_bet(sp, rule, series, i, at, result=None, ask=0.97, lots=10):
+    """One sleeve paper bet opened at `at`: still open, or settled when result is given."""
+    o = {"t": "open", "ts": at.isoformat(), "ticker": f"{series}-E{i:03d}-B1", "rule": rule,
+         "event": f"{series}-E{i:03d}", "series": series, "side": "yes", "price": ask,
+         "contracts": lots, "fee": sp.kalshi_fee(ask, lots), "depth": 40}
+    return [o] if result is None else [o, sp.settle(o, result)]
+
+
+TEMPS = ["KXTEMPNYCHS", "KXTEMPCHIHS", "KXTEMPMIAHS", "KXTEMPLAXHS"]
+
+
+def _register(sp, name, series, at=T0):
+    sp.register([{"name": name, "series": series, "band": "any", "side": "favorite",
+                  "lo": 0.90, "hi": 0.99, "contracts": 10}], sp.RULES, at)
+
+
+def test_every_sleeve_rule_is_labelled_from_its_registration(tmp_path, monkeypatch):
+    """A rule with nothing settled has no trade to take a label from, so HOURLY_FAV (four
+    temperature series, bets open, none settled) read just 'sleeve'. Every sleeve rule is
+    labelled from its registration, traded or not; crypto rules keep their venue."""
+    sp = _isolate(tmp_path, monkeypatch)
+    _register(sp, "HOURLY_FAV", TEMPS)
+    _register(sp, "SOLO", "KXHIGHNY")             # older rules store one series as a string
+    sp._append(sp.LEDGER, _sleeve_bet(sp, "HOURLY_FAV", "KXTEMPNYCHS", 0, T0 + timedelta(hours=1)))
+    _crypto_ledger(cc.CRYPTO_LEDGER, rules=1, n=3)
+    cc._CACHE.update(t=0.0, payload=None)
+    rules = {r["rule"]: r for r in cc.build_payload()["rules"]}
+    assert rules["HOURLY_FAV"]["decision"]["n"] == 0
+    assert rules["HOURLY_FAV"]["series"] == "KXTEMPNYCHS +3 more"
+    assert rules["SOLO"]["series"] == "KXHIGHNY"
+    assert rules["C0"]["venue"] == "crypto"           # the page labels it "crypto 15-min"
+
+
+def test_open_bets_are_counted_per_rule_and_in_total(tmp_path, monkeypatch):
+    """A record moves only when a bet settles, so a rule with bets open and none settled
+    looked idle. Open = an open row with no close for the same (ticker, rule): shown per
+    rule and in total for both venues. A retired rule's open bets are no shown rule's,
+    and a crypto rule whose first bets are all still open is listed (n = 0)."""
+    sp = _isolate(tmp_path, monkeypatch)
+    _register(sp, "F9799", ["KXHIGHNY", "KXHIGHCHI"])
+    _register(sp, "HOURLY_FAV", TEMPS)
+    _register(sp, "F9799_MIA", "KXHIGHMIA")
+    sp._append(sp.RULES, [{"t": "retire", "name": "F9799_MIA", "ts": T0.isoformat()}])
+    at = T0 + timedelta(hours=1)
+    rows = (_sleeve_bet(sp, "F9799", "KXHIGHNY", 0, at, "yes")
+            + _sleeve_bet(sp, "F9799", "KXHIGHCHI", 1, at, "no")
+            + _sleeve_bet(sp, "F9799", "KXHIGHNY", 2, at)
+            + _sleeve_bet(sp, "F9799", "KXHIGHCHI", 3, at)
+            + [r for i in range(3) for r in _sleeve_bet(sp, "HOURLY_FAV", TEMPS[i], i, at)]
+            + _sleeve_bet(sp, "F9799_MIA", "KXHIGHMIA", 4, at))
+    sp._append(sp.LEDGER, rows)
+    _crypto_ledger(cc.CRYPTO_LEDGER, rules=2, n=40)       # C0, C1: every bet settled
+    with cc.CRYPTO_LEDGER.open("a", encoding="utf-8") as f:
+        for rule, tk in (("C0", "KXBTC15M-26NOV170315-B1"), ("NEW", "KXBTC15M-26NOV170315-B2"),
+                         ("NEW", "KXETH15M-26NOV170315-B3")):
+            f.write(json.dumps({"t": "open", "ts": at.isoformat(), "ticker": tk, "rule": rule,
+                                "price": 0.9, "contracts": 1, "fee": 0.01, "v": 4,
+                                "depth": 20}) + "\n")
+    cc._CACHE.update(t=0.0, payload=None)
+    p = cc.build_payload()
+    shown = {r["rule"]: r for r in p["rules"]}
+    assert {k: shown[k]["open"] for k in ("F9799", "HOURLY_FAV", "C0", "C1", "NEW")} == {
+        "F9799": 2, "HOURLY_FAV": 3, "C0": 1, "C1": 0, "NEW": 2}
+    assert shown["F9799"]["decision"]["n"] == 2 and "F9799_MIA" not in shown
+    assert shown["NEW"]["venue"] == "crypto" and shown["NEW"]["decision"]["n"] == 0
+    k = p["kpi"]
+    assert (k["open"], k["open_crypto"], k["open_sleeves"], k["open_retired"]) == (8, 3, 5, 1)
+
+
+def test_trader_freshness_fresh_late_and_missing(tmp_path, monkeypatch):
+    """Is each paper trader still working? The sleeve trader's heartbeat (a 2-min cycle;
+    late past the watchdog's 10-min bar) and the crypto trader's newest ledger row (it
+    keeps no heartbeat; a row lands only when a bet opens or settles, so quiet past 20).
+    A trader that never ran says so instead of looking fine."""
+    sp = _isolate(tmp_path, monkeypatch)
+
+    def traders():
+        cc._CACHE.update(t=0.0, payload=None)
+        return {t["venue"]: t for t in cc.build_payload()["traders"]}
+
+    t = traders()                                              # a machine with neither
+    assert t["sleeves"]["status"] == t["crypto"]["status"] == "missing"
+    assert "never cycled" in t["sleeves"]["note"] and "no ledger rows" in t["crypto"]["note"]
+    now = datetime.now(timezone.utc)
+
+    def at(minutes_ago, rows=1):
+        """Heartbeat and newest crypto row `minutes_ago`; older rows an hour apart."""
+        stamp = lambda m: (now - timedelta(minutes=m)).isoformat()  # noqa: E731
+        sp.HEARTBEAT.write_text(json.dumps({"ts": stamp(minutes_ago), "rules": 2}))
+        cc.CRYPTO_LEDGER.write_text("".join(json.dumps(
+            {"t": "open", "ts": stamp(minutes_ago + 60 * (rows - 1 - i)),
+             "ticker": f"KXBTC15M-26NOV17{i:04d}-B1", "rule": "C0", "price": 0.9,
+             "contracts": 1, "fee": 0.01, "v": 4, "depth": 20}) + "\n" for i in range(rows)))
+        return traders()
+
+    t = at(2, rows=3)                                         # the newest row counts
+    assert (t["sleeves"]["status"], t["crypto"]["status"]) == ("good", "good")
+    assert 1.5 < t["sleeves"]["age_min"] < 3 and 1.5 < t["crypto"]["age_min"] < 3
+    assert t["sleeves"]["what"] == "last cycle" and t["crypto"]["what"] == "newest ledger row"
+    t = at(14)                       # a stalled sleeve trader; a gap between crypto bets
+    assert (t["sleeves"]["status"], t["crypto"]["status"]) == ("warning", "good")
+    assert "late" in t["sleeves"]["note"]
+    t = at(45)
+    assert (t["sleeves"]["status"], t["crypto"]["status"]) == ("warning", "warning")
+    assert 44 < t["sleeves"]["age_min"] < 47 and "quiet" in t["crypto"]["note"]
+    sp.HEARTBEAT.write_text("{not json")
+    t = traders()
+    assert t["sleeves"]["status"] == "missing" and "unreadable" in t["sleeves"]["note"]
+
+
+def test_health_puts_the_reason_for_unhealthy_first(tmp_path, monkeypatch):
+    """healthcheck.py --log writes its lines in CHECK order, so a warning from an early
+    check sat above the failure that made the run unhealthy - and past the 20-line cap a
+    failure was cut entirely. FAIL first, then WARN, OK last, and the tile is told which
+    checks failed. The lines below are the watchdog's own format."""
+    log = tmp_path / "hc.log"
+    monkeypatch.setattr(cc, "HEALTH_LOG", log)
+    now = datetime.now(timezone.utc)
+    earlier = (now - timedelta(minutes=20)).isoformat(timespec="seconds")
+    latest = now.isoformat(timespec="seconds")
+    log.write_text("\n".join([
+        f"{earlier} UNHEALTHY fails=1 warns=0",
+        "    [FAIL] ports: command center NOT listening on 5155",      # an older run
+        f"{latest} UNHEALTHY fails=1 warns=2",
+        "    [WARN] tasks: PolybotPaper was 'Ready' (dead) - REPAIRED, restarted",
+        "    [OK  ] deps: all dashboard/collector imports resolve",
+        "    [FAIL] data: stage0 log STALE 18 min (cycle is 60s) - collector alive but "
+        "not collecting",
+        "    [WARN] news: calendar unreadable: line 4 - fix news_calendar.yaml"]) + "\n")
+    h = cc.health_panel()
+    assert h["state"] == "unhealthy"
+    assert [l.split("]")[0] + "]" for l in h["lines"]] == ["[FAIL]", "[WARN]", "[WARN]", "[OK  ]"]
+    assert h["lines"][0].startswith("[FAIL] data: stage0 log STALE")
+    assert h["lines"][1].startswith("[WARN] tasks:")            # the watchdog's order within
+    assert (h["fails"], h["warns"], h["failing"]) == (1, 2, ["data"])
+    # 22 warnings ahead of two failures: the cap keeps the failures, not the warnings
+    log.write_text("\n".join([f"{latest} UNHEALTHY fails=2 warns=22"]
+                             + [f"    [WARN] news: warning {i}" for i in range(22)]
+                             + ["    [FAIL] sleeves: sleeve paper heartbeat 14 min old",
+                                "    [FAIL] data: stage0 log STALE 18 min"]) + "\n")
+    h = cc.health_panel()
+    assert len(h["lines"]) == 20 and h["lines"][0].startswith("[FAIL] sleeves:")
+    assert h["lines"][1].startswith("[FAIL] data:") and h["failing"] == ["sleeves", "data"]
+    assert (h["fails"], h["warns"]) == (2, 22)
+
+
+def test_open_bets_match_on_ticker_and_rule(tmp_path, monkeypatch):
+    """Two rules can hold the same market (H1 and H5 both buy late in one window). One
+    rule's settlement must not clear the other rule's open bet."""
+    _isolate(tmp_path, monkeypatch)
+    tk, at = "KXBTC15M-26NOV170330-B7", (T0 + timedelta(hours=1)).isoformat()
+    rows = [{"t": "open", "ts": at, "ticker": tk, "rule": r, "price": 0.9, "contracts": 1,
+             "fee": 0.01, "v": 4, "depth": 20} for r in ("H1", "H5")]
+    rows.append({"t": "close", "ts": at, "ticker": tk, "rule": "H1", "price": 0.9,
+                 "won": True, "pnl": 0.09})
+    cc.CRYPTO_LEDGER.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    cc._CACHE.update(t=0.0, payload=None)
+    shown = {r["rule"]: r for r in cc.build_payload()["rules"]}
+    assert shown["H1"]["open"] == 0 and shown["H5"]["open"] == 1
+
+
+def test_an_unhealthy_verdict_never_reads_as_all_clear():
+    """A truncated log can carry an UNHEALTHY header with no [FAIL] line under it; the
+    tile once fell through to 'every check passed'."""
+    assert "no failing check was logged" in cc._PAGE
+    i = cc._PAGE.index('hl.state === "unhealthy" ? "unhealthy, but no failing')
+    assert i < cc._PAGE.index('"every check passed"')
