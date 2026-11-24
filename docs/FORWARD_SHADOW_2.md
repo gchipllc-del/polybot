@@ -184,7 +184,7 @@ Notes on HOURLY_FAV:
   before the 00:36Z registration. All 4 first touches settled as wins. The live trader may
   still have taken them later in that hour.
 - 9 of the 10 losses are the same 9 the first shadow replay listed; the new one is
-  KXTEMPLAXHS-26NOV2210. There have been no losses in the 249 kept events since then.
+  KXTEMPLAXHS-26NOV2210. There have been no losses in the 212 kept events since it.
 - Three in-scope events have 16 strikes on Kalshi, one more than the backfill's 15-market
   cap (KXTEMPNYCHS-26NOV2010, KXTEMPCHIHS-26NOV1710, -26NOV1810, -26NOV2011). I fetched
   the four omitted strikes separately: none was ever in band, so no result changes.
