@@ -18,8 +18,9 @@ settled up to the replay times below.
   the band on a formed book; one bet per event. p-values are exact
   (`sleeve_paper.forward_stats`). Kept only events that have settled and whose entry time
   is after the rule's registration.
-- **Neither rule can be judged from this.** EDGE needs 100+ post-registration events and
-  survival of the false-discovery correction, on the official ledger.
+- **Neither rule shows an edge here.** F9799 is 49-0 but has only 49 events. HOURLY_FAV
+  has 738 events and is break-even. EDGE needs 100+ post-registration events and survival
+  of the false-discovery correction, and only the official ledger can award it.
 
 ## F9799 (registered 2026-11-16T04:55Z)
 
@@ -67,7 +68,7 @@ Event accounting:
 - 49 were entered after registration (the table above).
 - 0 never had a 97-99c favorite in the window.
 - 14 were dropped because their first in-band candle is at or before registration (KXHIGHAUS-26NOV15, KXHIGHAUS-26NOV16, KXHIGHCHI-26NOV15, KXHIGHCHI-26NOV16, KXHIGHDEN-26NOV15, KXHIGHDEN-26NOV16, KXHIGHLAX-26NOV15, KXHIGHLAX-26NOV16, KXHIGHMIA-26NOV15, KXHIGHMIA-26NOV16, KXHIGHNY-26NOV15, KXHIGHNY-26NOV16, KXHIGHPHIL-26NOV15, KXHIGHPHIL-26NOV16).
-- Ties: 26 kept entries had more than one strike in band in the entry candle; in 0 the tied strikes settled differently:
+- Ties: 26 kept entries had more than one strike in band in the entry candle; in 0 the tied strikes settled differently.
 
 Data coverage:
 
@@ -100,8 +101,96 @@ Notes on F9799:
 
 ## HOURLY_FAV (registered 2026-11-17T00:36Z)
 
-Not in this push. Its 1-minute backfill (4 series, about 190 city-hours each) takes several
-hours against Kalshi's rate limit and is added in a second push.
+Hourly temperature (KXTEMPNYCHS, KXTEMPCHIHS, KXTEMPMIAH, KXTEMPLAXHS). Each market lives
+one hour; the entry is the first 1-minute candle whose ask sits at 97-99c, one bet per
+city-hour.
+
+- Replay time: **2026-11-24 22:19Z** (data fetched 2026-11-24 21:11Z - 22:19Z).
+- Result: **738 settled city-hours entered, 728 won, 10 lost, net +$4.76** at 10 contracts
+  (+0.06c per contract). That is break-even: the win rate is 98.64% against 98.58%
+  needed, and the exact p is 0.52 for "makes money" and 0.60 for "loses money".
+- On the trade-confirmed subset it is slightly negative: 295 bets, 6 lost, net -$14.19.
+- Miami carries the losses: 5 of the 10, net -$18.86. No city is significant either way.
+
+| | events | wins | losses | win rate | break-even | net $ (10-lot) | won $ | lost $ | edge c/contract | exact p (makes money) | p (loses money) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| All entries (quote-based) | 738 | 728 | 10 | 98.64% | 98.58% | +4.76 | +102.96 | -98.20 | +0.06 | 0.523 | 0.602 |
+| Trade-confirmed only | 295 | 289 | 6 | 97.97% | 98.45% | -14.19 | +44.46 | -58.65 | -0.48 | 0.822 | 0.310 |
+
+Fees paid: $11.64. Entry mix: 103 at 97c, 220 at 98c, 415 at 99c. Sides: 305 YES, 433 NO.
+
+Per city (all entries, then the trade-confirmed subset):
+
+| series | events | wins | losses | win rate | break-even | net $ (10-lot) | won $ | lost $ | edge c/contract | exact p (makes money) | p (loses money) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| KXTEMPNYCHS | 183 | 181 | 2 | 98.91% | 98.68% | +4.21 | +23.85 | -19.64 | +0.23 | 0.563 | 0.699 |
+| KXTEMPNYCHS (trade-confirmed) | 88 | 87 | 1 | 98.86% | 98.63% | +2.06 | +11.88 | -9.82 | +0.23 | 0.660 | 0.704 |
+| KXTEMPCHIHS | 185 | 183 | 2 | 98.92% | 98.64% | +5.20 | +24.84 | -19.64 | +0.28 | 0.538 | 0.719 |
+| KXTEMPCHIHS (trade-confirmed) | 66 | 65 | 1 | 98.48% | 98.54% | -0.37 | +9.36 | -9.73 | -0.06 | 0.750 | 0.621 |
+| KXTEMPMIAH | 185 | 180 | 5 | 97.30% | 98.32% | -18.86 | +30.15 | -49.01 | -1.02 | 0.906 | 0.203 |
+| KXTEMPMIAH (trade-confirmed) | 83 | 79 | 4 | 95.18% | 98.06% | -23.89 | +15.21 | -39.10 | -2.88 | 0.977 | 0.078 |
+| KXTEMPLAXHS | 185 | 184 | 1 | 99.46% | 98.69% | +14.21 | +24.12 | -9.91 | +0.77 | 0.301 | 0.913 |
+| KXTEMPLAXHS (trade-confirmed) | 58 | 58 | 0 | 100.00% | 98.62% | +8.01 | +8.01 | 0.00 | +1.38 | 0.446 | 1.000 |
+
+Every loss (10):
+
+| ticker | side | entry | entry time (UTC) | hours before close | settled | trade-confirmed | P&L $ |
+|---|---|---|---|---|---|---|---|
+| KXTEMPMIAH-26NOV1804-T71.99 | YES | 0.97 | 2026-11-18 08:09 | 0.85 | NO | yes | -9.73 |
+| KXTEMPNYCHS-26NOV1906-T39.99 | NO | 0.98 | 2026-11-19 10:08 | 0.87 | YES | no | -9.82 |
+| KXTEMPCHIHS-26NOV1906-T47.99 | NO | 0.99 | 2026-11-19 10:11 | 0.82 | YES | no | -9.91 |
+| KXTEMPMIAH-26NOV1911-T77.99 | NO | 0.98 | 2026-11-19 15:04 | 0.93 | YES | yes | -9.82 |
+| KXTEMPMIAH-26NOV1916-T78.99 | NO | 0.98 | 2026-11-19 20:08 | 0.87 | YES | yes | -9.82 |
+| KXTEMPMIAH-26NOV2010-T73.99 | YES | 0.97 | 2026-11-20 14:31 | 0.48 | NO | yes | -9.73 |
+| KXTEMPNYCHS-26NOV2015-T67.99 | YES | 0.98 | 2026-11-20 19:06 | 0.90 | NO | yes | -9.82 |
+| KXTEMPCHIHS-26NOV2104-T51.99 | NO | 0.97 | 2026-11-21 08:03 | 0.95 | YES | yes | -9.73 |
+| KXTEMPMIAH-26NOV2113-T77.99 | NO | 0.99 | 2026-11-21 17:09 | 0.85 | YES | no | -9.91 |
+| KXTEMPLAXHS-26NOV2210-T47.99 | YES | 0.99 | 2026-11-22 14:10 | 0.83 | NO | no | -9.91 |
+
+Event accounting:
+
+- 743 settled events on file close after registration (2026-11-17T00:36Z).
+- 738 were entered after registration (the table above).
+- 1 never had a 97-99c favorite in the window: KXTEMPNYCHS-26NOV2009.
+- 4 were dropped because their first in-band candle is at or before registration (KXTEMPCHIHS-26NOV1620, KXTEMPLAXHS-26NOV1620, KXTEMPMIAH-26NOV1620, KXTEMPNYCHS-26NOV1620).
+- Ties: 108 kept entries had more than one strike in band in the entry candle; in 5 the tied strikes settled differently:
+  - KXTEMPMIAH-26NOV1819 at 2026-11-18 23:11: took KXTEMPMIAH-26NOV1819-T73.99 (win). Tied: KXTEMPMIAH-26NOV1819-T73.99 YES @ 0.97 -> win; KXTEMPMIAH-26NOV1819-T74.99 NO @ 0.98 -> LOSS
+  - KXTEMPNYCHS-26NOV1903 at 2026-11-19 07:07: took KXTEMPNYCHS-26NOV1903-T37.99 (win). Tied: KXTEMPNYCHS-26NOV1903-T37.99 YES @ 0.98 -> win; KXTEMPNYCHS-26NOV1903-T39.99 NO @ 0.99 -> LOSS
+  - KXTEMPCHIHS-26NOV1906 at 2026-11-19 10:11: took KXTEMPCHIHS-26NOV1906-T47.99 (LOSS). Tied: KXTEMPCHIHS-26NOV1906-T47.99 NO @ 0.99 -> LOSS; KXTEMPCHIHS-26NOV1906-T48.99 NO @ 0.98 -> win
+  - KXTEMPLAXHS-26NOV1920 at 2026-11-20 00:11: took KXTEMPLAXHS-26NOV1920-T61.99 (win). Tied: KXTEMPLAXHS-26NOV1920-T61.99 YES @ 0.98 -> win; KXTEMPLAXHS-26NOV1920-T63.99 NO @ 0.97 -> LOSS
+  - KXTEMPNYCHS-26NOV2005 at 2026-11-20 09:06: took KXTEMPNYCHS-26NOV2005-T39.99 (win). Tied: KXTEMPNYCHS-26NOV2005-T39.99 YES @ 0.98 -> win; KXTEMPNYCHS-26NOV2005-T40.99 YES @ 0.99 -> LOSS
+
+Data coverage:
+
+| series | settled events on file | first event | last event | first kept | last kept | markets | candles spacing |
+|---|---|---|---|---|---|---|---|
+| KXTEMPNYCHS | 200 | KXTEMPNYCHS-26NOV1605 (closes 2026-11-16 10:00) | KXTEMPNYCHS-26NOV2415 (closes 2026-11-24 20:00) | KXTEMPNYCHS-26NOV1621 | KXTEMPNYCHS-26NOV2415 | 2068 | 1-minute |
+| KXTEMPCHIHS | 200 | KXTEMPCHIHS-26NOV1606 (closes 2026-11-16 11:00) | KXTEMPCHIHS-26NOV2415 (closes 2026-11-24 20:00) | KXTEMPCHIHS-26NOV1621 | KXTEMPCHIHS-26NOV2415 | 2059 | 1-minute |
+| KXTEMPMIAH | 200 | KXTEMPMIAH-26NOV1606 (closes 2026-11-16 11:00) | KXTEMPMIAH-26NOV2415 (closes 2026-11-24 20:00) | KXTEMPMIAH-26NOV1621 | KXTEMPMIAH-26NOV2415 | 2009 | 1-minute |
+| KXTEMPLAXHS | 200 | KXTEMPLAXHS-26NOV1606 (closes 2026-11-16 11:00) | KXTEMPLAXHS-26NOV2415 (closes 2026-11-24 20:00) | KXTEMPLAXHS-26NOV1621 | KXTEMPLAXHS-26NOV2415 | 2057 | 1-minute |
+
+Entry time before close: min 0.27h, median 0.90h, max 0.98h. Orphan candles: 0. Late-data warnings: 0 markets.
+
+Notes on HOURLY_FAV:
+
+- Kept events run from the hour closing 2026-11-17 02:00Z (suffix 26NOV1621 is the ET
+  date and hour the market opens) to the hour closing 2026-11-24 20:00Z. Later hours had
+  not settled when the market list was fetched.
+- 752 city-hours fall in that span (4 cities x 188 closes, 01:00Z Nov 17 to 20:00Z
+  Nov 24). 743 are on file. The other 9 do not exist on Kalshi: the hours closing 09:00Z
+  and 10:00Z on Nov 19 in all four cities, and NYC's hour closing 01:00Z on Nov 20
+  (asking the API for those events returns no markets).
+- The 4 dropped events are the 20:00 ET hour on Nov 16, first in band at 00:03-00:13Z,
+  before the 00:36Z registration. All 4 first touches settled as wins. The live trader may
+  still have taken them later in that hour.
+- 9 of the 10 losses are the same 9 the first shadow replay listed; the new one is
+  KXTEMPLAXHS-26NOV2210. There have been no losses in the 249 kept events since then.
+- Three in-scope events have 16 strikes on Kalshi, one more than the backfill's 15-market
+  cap (KXTEMPNYCHS-26NOV2010, KXTEMPCHIHS-26NOV1710, -26NOV1810, -26NOV2011). I fetched
+  the four omitted strikes separately: none was ever in band, so no result changes.
+- No failed fetches, no orphan candles, no late-data warnings. Kalshi does not return a
+  candle for every minute, so a first touch inside a missing minute shows up at the next
+  candle.
 
 ## How this differs from the paper trader on the PC
 
@@ -125,7 +214,8 @@ hours against Kalshi's rate limit and is added in a second push.
 6. **Outages are not modelled.** The trader misses events whenever the PC, network or
    process is down; this replay never does.
 7. **At most 15 markets per event** are fetched (the repo backfill's cap). The daily
-   events have 6 markets each, so the cap does not bind for F9799.
+   events have 6 markets each. Three in-scope hourly events have 16; the omitted strikes
+   were checked by hand and change nothing (see the HOURLY_FAV notes).
 
 Reproduce: helper scripts were kept outside the repo (`/tmp/replay/`): a thin wrapper
 around `sleeve_scan.cmd_backfill` that waits and retries on Kalshi 429s, and a report
