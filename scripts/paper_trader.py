@@ -23,6 +23,13 @@ order path stays closed until an out-of-sample rule earns it.
   py scripts/paper_trader.py run        # loop every 60s
   py scripts/paper_trader.py report
   py scripts/paper_trader.py selftest
+
+`run` and `cycle` are single-instance: while one is alive a second prints "not starting"
+and exits 1, because two traders on one ledger enter every market twice. Each completed
+cycle also replaces data/paper_crypto_heartbeat.json - what the cycle did, how many
+requests failed, the PC clock against Kalshi's, and positions stranded past their close -
+which is what the watchdog reads; the ledger alone cannot tell a stalled trader from a
+quiet market.
 """
 from __future__ import annotations
 
@@ -30,15 +37,25 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from lib.jsonl_io import append_lines  # noqa: E402 - needs ROOT on sys.path
+from lib.single_instance import AlreadyRunning, hold  # noqa: E402
+
 LEDGER = Path(os.environ.get("PAPER_CRYPTO_LEDGER")
               or (ROOT / "data" / "paper_crypto15.jsonl"))
+# What the last COMPLETED cycle did, for the watchdog and the dashboards (written by the
+# run loop and by `cycle`, never by a bare run_cycle). The ledger alone cannot tell them:
+# it changes only when a bet opens or settles, so a trader whose every request fails, or
+# whose slots are all stuck, looks exactly like a quiet market. Readers look in data/;
+# the env override is for an experiment that must not touch the live file.
+HEARTBEAT = Path(os.environ.get("PAPER_CRYPTO_HEARTBEAT")
+                 or (ROOT / "data" / "paper_crypto_heartbeat.json"))
 
 CONTRACTS = 1              # sizing is not the question under test
 MAX_CONCURRENT = 8
@@ -63,6 +80,13 @@ MAX_PER_WINDOW = 1
 STRATEGY_VERSION = 4
 CYCLE_S = 60
 START_BANKROLL = 500.0     # paper only, for a readable equity number
+# A 15-minute market has its result within minutes of its close. A position still open
+# an hour past it is not waiting, it is STRANDED: the settle step only sees the newest
+# 200 settled markets per series (about 50 hours), so after a longer outage the result
+# is never offered again, and the position holds one of the MAX_CONCURRENT slots for
+# good. The heartbeat counts them so the watchdog can say so; settling them is a
+# separate, owner-approved change (it alters which later entries are taken).
+OVERDUE_AFTER_H = 1.0
 
 
 def _now_iso() -> str:
@@ -98,12 +122,68 @@ def _load(path: Path) -> list[dict]:
 
 
 def _append(rows: list[dict], path: Path) -> None:
+    """A cycle's rows in ONE write, and never onto a torn line: if a crash or power cut
+    left the ledger without its final newline, a newline goes first. Without it the next
+    row - the re-entry of the very bet whose row was torn - was glued to the fragment and
+    both were unreadable, so that bet was recorded a cycle later still, or never."""
     if not rows:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, separators=(",", ":")) + "\n")
+    append_lines(path, [json.dumps(r, separators=(",", ":")) for r in rows])
+
+
+def _utc_iso(dt: datetime) -> str:
+    return (dt.astimezone(timezone.utc) if dt.tzinfo else dt).isoformat()
+
+
+def _endpoint(url) -> str:
+    """'/events' or '/v2/prices/BTC-USD/spot' - enough to say which call failed."""
+    path = str(url).split("://", 1)[-1].split("?", 1)[0]
+    path = path[path.find("/"):] if "/" in path else path
+    return path.replace("/trade-api/v2", "", 1)[:80]
+
+
+def _request_error(what: str, e: BaseException) -> str:
+    return f"{what}: {type(e).__name__}: {str(e)[:160]}"
+
+
+def _clock_skew(s0, since_mono: float) -> float | None:
+    """Kalshi's clock minus the PC clock (seconds) as this cycle's own Kalshi responses
+    showed it, or None when it could not be measured (an injected network, no answer, an
+    older collector module). For the heartbeat only - nothing is ever corrected by it."""
+    try:
+        return s0.clock_skew_since(since_mono)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _overdue(live: dict, now: datetime) -> dict | None:
+    """overdue_positions for the heartbeat; None (unknown) if it cannot be worked out.
+    A status figure must never be able to fail a cycle whose rows are already written."""
+    try:
+        return overdue_positions(live, now)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_heartbeat(path: Path, hb: dict) -> bool:
+    """Replace the status file atomically (temp file + os.replace), so a reader never
+    sees half of it. A failure is printed and swallowed: the ledger is already written
+    and a status file must never cost a cycle."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")    # stays git-ignored
+        tmp.write_text(json.dumps(hb), encoding="utf-8")
+        for attempt in (1, 2, 3):
+            try:
+                os.replace(tmp, path)
+                return True
+            except PermissionError:      # Windows: a reader has it open at this instant
+                if attempt == 3:
+                    raise
+                time.sleep(0.05)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] heartbeat not written: {type(e).__name__}: {str(e)[:80]}")
+    return False
 
 
 def open_positions(rows: list[dict]) -> dict:
@@ -162,6 +242,37 @@ def evaluate_market(m: dict, mins_left: float, rules, bands, fee_fn,
     return out
 
 
+def _window_close(pos: dict) -> datetime | None:
+    """When this position's market closed, from its own entry row: the entry stamp plus
+    the minutes that were left at that moment. None if the row carries neither."""
+    try:
+        ts = datetime.fromisoformat(str(pos["ts"]).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts + timedelta(minutes=float(pos["mins_left"]))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def overdue_positions(live: dict, now: datetime) -> dict:
+    """Open positions more than OVERDUE_AFTER_H past their window's close, for the
+    heartbeat: how many, and the one waiting longest with its hours past close.
+    READ-ONLY: it settles nothing and frees no slot. A row whose close time cannot be
+    worked out is left out (unknown is not overdue)."""
+    n, oldest, oldest_h = 0, None, None
+    for (ticker, _rule), pos in live.items():
+        close = _window_close(pos)
+        if close is None:
+            continue
+        hours = (now - close).total_seconds() / 3600.0
+        if hours > OVERDUE_AFTER_H:
+            n += 1
+            if oldest_h is None or hours > oldest_h:
+                oldest, oldest_h = ticker, hours
+    return {"n": n, "oldest": oldest,
+            "oldest_h": None if oldest_h is None else round(oldest_h, 2)}
+
+
 def settle_positions(rows: list[dict], results: dict) -> list[dict]:
     """Close any open position whose market has a settlement result."""
     closes = []
@@ -180,9 +291,12 @@ def settle_positions(rows: list[dict], results: dict) -> list[dict]:
 
 # ── live cycle ───────────────────────────────────────────────────────────────
 
-def _depth_fetcher():
+def _depth_fetcher(on_error=None):
     """Order-book depth lookup, when Kalshi auth is configured. Returns
-    fn(ticker, side, price) -> contracts available at <= price, or None."""
+    fn(ticker, side, price) -> contracts available at <= price, or None.
+    on_error(text), if given, is told about every lookup that raised. The lookup still
+    answers None ("the gate did not run") exactly as before; the caller can now COUNT
+    the failed requests instead of never hearing of them."""
     try:
         from lib.envload import load_env
         load_env()
@@ -196,7 +310,12 @@ def _depth_fetcher():
                 ob = signed_get(f"/markets/{ticker}/orderbook", params={"depth": 5})
                 book = ob.get("orderbook") or ob
                 return sb._depth_at(book, side, price)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                if on_error is not None:
+                    try:
+                        on_error(_request_error(f"orderbook {ticker}", e))
+                    except Exception:  # noqa: BLE001 - counting must never break a lookup
+                        pass
                 return None
         return fn
     except Exception:
@@ -236,14 +355,36 @@ def _regime_now(now=None) -> dict:
 
 
 def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
-              regime_fn=None) -> dict:
+              regime_fn=None, heartbeat: Path | None = None) -> dict:
+    """One pass: open what the rules call for, settle what Kalshi has resolved.
+    heartbeat: where to leave the cycle's status file (the run loop and `cycle` pass
+    HEARTBEAT). None writes none, so tests and the selftest never touch the live one."""
     import stage0_collector as s0
+    t_start = time.monotonic()
     rules, bands, fee_fn = _rules()
     p = path or LEDGER
-    get = get or s0._get
+    raw_get = get or s0._get
     now = now or datetime.now(timezone.utc)
+    t_clock = time.monotonic()           # the instant `now` was read; mins_left hangs on it
+
+    # Every failed request of this cycle, newest last. Until now each one was a console
+    # line (or swallowed outright) and the cycle looked the same as a healthy quiet one.
+    # COUNTING ONLY: every call below is made, and fails, exactly as before.
+    errs: list[str] = []
+
+    def get(*a, **k):                    # the caller's get, with its failures counted
+        try:
+            return raw_get(*a, **k)
+        except Exception as e:  # noqa: BLE001 - recorded, then raised unchanged
+            try:
+                where = _endpoint(a[0] if a else k.get("url"))
+                errs.append(_request_error(f"GET {where}", e))
+            except Exception:  # noqa: BLE001 - the count must never replace the error
+                errs.append("request failed")
+            raise
+
     if depth_fn is None:
-        depth_fn = _depth_fetcher()
+        depth_fn = _depth_fetcher(on_error=errs.append)
     regime = (regime_fn or _regime_now)()
 
     rows = _load(p)
@@ -260,12 +401,17 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
     # PASS 1: gather every candidate. Nothing is committed here, because choosing the
     # best strike in a window requires seeing all of that window's strikes first.
     candidates = []
+    quote_lag: dict[str, float] = {}     # series -> seconds from the clock to its quotes
     for series in s0.SERIES:
         try:
             markets = s0.fetch_open_markets(series, get=get)
         except Exception as e:  # noqa: BLE001
             print(f"[warn] discovery failed {series}: {e}")
             continue
+        # MEASURED ONLY. `now` was read once, above; these quotes arrived this much
+        # later and are still banded by it. Re-reading the clock here would move
+        # entries between bands, which is not this code's call to make.
+        quote_lag[series] = round(time.monotonic() - t_clock, 3)
         spot = s0.fetch_spot(s0.SPOT_SYMBOL[series], get=get)
         edge_fn = _edge_fetcher(series, s0.LOG)
         for m in markets:
@@ -335,9 +481,24 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
     closes = settle_positions(rows + new_rows, results)
     new_rows.extend(closes)
     _append(new_rows, p)
-    return {"opened": opened, "closed": len(closes), "skipped": skipped,
-            "ungated": ungated, "regime": regime["regime"],
-            "open_now": len(open_positions(_load(p)))}
+    still_open = open_positions(_load(p))        # the ledger as it now stands on disk
+    summary = {"opened": opened, "closed": len(closes), "skipped": skipped,
+               "ungated": ungated, "regime": regime["regime"],
+               "open_now": len(still_open),
+               "errors": len(errs), "last_error": errs[-1] if errs else None,
+               "clock_skew_s": _clock_skew(s0, t_start), "quote_lag_s": quote_lag,
+               "overdue": _overdue(still_open, now),
+               "took_s": round(time.monotonic() - t_start, 3)}
+    if heartbeat is not None:           # after the ledger, and never able to fail a cycle
+        hb = {"ts": _utc_iso(now), "took_s": summary["took_s"],
+              "opened": opened, "closed": len(closes), "open_now": summary["open_now"],
+              "skipped": skipped, "ungated": ungated,
+              "errors": summary["errors"], "last_error": summary["last_error"],
+              "clock_skew_s": summary["clock_skew_s"], "quote_lag_s": quote_lag}
+        if summary["overdue"] is not None:   # readers take a missing key as "unknown";
+            hb["overdue"] = summary["overdue"]   # a null block would only trip them up
+        _write_heartbeat(heartbeat, hb)
+    return summary
 
 
 def run_loop() -> int:
@@ -346,11 +507,14 @@ def run_loop() -> int:
     while True:
         t0 = time.time()
         try:
-            c = run_cycle()
+            c = run_cycle(heartbeat=HEARTBEAT)
             sk = " ".join(f"{k}={v}" for k, v in c["skipped"].items())
             ug = f" UNGATED={c['ungated']}" if c.get("ungated") else ""
+            er = f" ERRORS={c['errors']}" if c.get("errors") else ""
+            n_od = (c.get("overdue") or {}).get("n")
+            od = f" OVERDUE={n_od}" if n_od else ""
             print(f"[{_now_iso()}] opened={c['opened']} closed={c['closed']} "
-                  f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}")
+                  f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}{er}{od}")
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001
@@ -496,14 +660,28 @@ def _selftest() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "paper.jsonl"
+        hbp = Path(td) / "heartbeat.json"
         c1 = run_cycle(get=fake_get, now=now, path=p, depth_fn=lambda t, s, pr: 100,
-                       regime_fn=lambda: {"regime": "cautious", "mult": 0.5})
+                       regime_fn=lambda: {"regime": "cautious", "mult": 0.5},
+                       heartbeat=hbp)
         # both rules in the <2min band fire (favorite 0.88 + longshot 0.14); the
         # fixture serves the SAME ticker under both series, so in-cycle dedup must
         # collapse it to exactly 2 positions, not 4.
         assert c1["opened"] == 2, c1
         assert c1["open_now"] == 2, c1
         assert c1["ungated"] == 0, c1       # depth known -> the gate actually ran
+        # the cycle left its status file: what it did, and that no request failed
+        hb = json.loads(hbp.read_text(encoding="utf-8"))
+        assert hb["ts"] == now.isoformat() and hb["opened"] == 2, hb
+        assert hb["open_now"] == 2 and hb["closed"] == 0 and hb["ungated"] == 0, hb
+        assert hb["errors"] == 0 and hb["last_error"] is None, hb
+        assert [f.name for f in Path(td).iterdir() if "tmp" in f.name] == []
+        # measured, never corrected: how long after the clock reading each series'
+        # quotes arrived; the clock itself cannot be judged against a fake network
+        assert sorted(hb["quote_lag_s"]) == sorted(s0.SERIES), hb
+        assert all(v >= 0 for v in hb["quote_lag_s"].values()), hb
+        assert hb["clock_skew_s"] is None, hb
+        assert sorted(hb["overdue"]) == ["n", "oldest", "oldest_h"], hb
         # every entry carries the news-agent regime in force when it opened - a
         # stamp only: the cautious regime did NOT change the size or the count
         opens = [r for r in _load(p) if r.get("t") == "open"]
@@ -518,6 +696,34 @@ def _selftest() -> int:
         pu = Path(td) / "ungated.jsonl"
         cu = run_cycle(get=fake_get, now=now, path=pu, depth_fn=lambda t, s, pr: None)
         assert cu["opened"] == 2 and cu["ungated"] == 2, cu
+
+    # a position still open long after its window closed is STRANDED (its result left
+    # the settled sweep): counted for the heartbeat - detection only, it keeps its slot
+    stranded = {("KXBTC15M-OLD-1", "H1_settlement_lag"):
+                {"t": "open", "ts": (now - timedelta(hours=66)).isoformat(),
+                 "ticker": "KXBTC15M-OLD-1", "rule": "H1_settlement_lag", "mins_left": 0.0},
+                ("KXBTC15M-NEW-1", "H1_settlement_lag"):
+                {"t": "open", "ts": (now - timedelta(minutes=20)).isoformat(),
+                 "ticker": "KXBTC15M-NEW-1", "rule": "H1_settlement_lag", "mins_left": 1.0}}
+    od = overdue_positions(stranded, now)
+    assert od == {"n": 1, "oldest": "KXBTC15M-OLD-1", "oldest_h": 66.0}, od
+
+    # every request failing must not look like a quiet market: the cycle completes,
+    # writes no row, and its status file says how many requests failed and why
+    def dead_get(url, params=None):
+        raise ConnectionError("exchange unreachable")
+
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as td:
+        pd_, hbd = Path(td) / "dead.jsonl", Path(td) / "heartbeat.json"
+        with contextlib.redirect_stdout(io.StringIO()):     # the [warn] lines it prints
+            cd = run_cycle(get=dead_get, now=now, path=pd_,
+                           depth_fn=lambda t, s, pr: 100, heartbeat=hbd)
+        assert cd["opened"] == 0 and cd["errors"] == 4 and not pd_.exists(), cd
+        hb = json.loads(hbd.read_text(encoding="utf-8"))
+        assert hb["errors"] == 4 and "exchange unreachable" in hb["last_error"], hb
+        assert hb["quote_lag_s"] == {} and hb["clock_skew_s"] is None, hb   # unknown
     # PER-WINDOW CAP: 6 strikes in ONE window must collapse to MAX_PER_WINDOW per rule,
     # and the survivor must be the one the volatility model ranked most mispriced.
     def fake_get_many(url, params=None):
@@ -579,8 +785,19 @@ def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
     if cmd == "selftest":
         return _selftest()
+    if cmd in ("cycle", "run"):
+        # ONE trader per ledger. A second copy - a hand-run cycle beside the scheduled
+        # task, or a restart that left the old python alive - reads the same ledger,
+        # decides the same entries and appends them again, and the ledger is
+        # append-only. The lock is taken here and never inside run_cycle: tests and the
+        # selftest (which the watchdog runs) call that directly and must not be blocked.
+        try:
+            hold("paper_trader")
+        except AlreadyRunning as e:
+            print(f"not starting: {e}; a second copy would enter every market twice")
+            return 1
     if cmd == "cycle":
-        c = run_cycle()
+        c = run_cycle(heartbeat=HEARTBEAT)
         print(f"opened={c['opened']} closed={c['closed']} open_now={c['open_now']} "
               f"skipped={c['skipped']} -> {LEDGER}")
         return 0

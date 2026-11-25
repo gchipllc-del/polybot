@@ -21,6 +21,9 @@ only). Network calls are injectable for the selftest.
   py scripts/stage0_collector.py once             # single cycle (cron/Task Scheduler)
   py scripts/stage0_collector.py report
   py scripts/stage0_collector.py selftest
+
+`collect` and `once` are single-instance: while one is alive a second prints "not
+starting" and exits 1, because two collectors on one log write every row twice.
 """
 from __future__ import annotations
 
@@ -28,10 +31,17 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:          # lib/ must resolve however this file was started
+    sys.path.insert(0, str(ROOT))
+
+from lib.jsonl_io import append_lines  # noqa: E402 - needs ROOT on sys.path
+from lib.single_instance import AlreadyRunning, hold  # noqa: E402
+
 LOG = Path(os.environ.get("STAGE0_LOG") or (ROOT / "data" / "stage0_crypto.jsonl"))
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -51,11 +61,64 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── the PC clock against Kalshi's: MEASURED, never used to correct anything ──
+# Every row's minutes-to-close, and so the time band a rule fires in, comes from the PC
+# clock. If that clock is off by seconds, entries land a cycle early or late and nothing
+# says so. Each Kalshi response carries a Date header; we keep what it implies about the
+# PC clock so the paper trader can put it in its heartbeat. Correcting mins_left with it
+# would change which band entries land in - that is the owner's decision, not this code's.
+CLOCK_SAMPLE_MAX_RTT_S = 4.0     # a slower answer says too little about a 5 s question
+_CLOCK_SAMPLES: deque = deque(maxlen=64)    # (monotonic at receipt, skew_s, round_trip_s)
+
+
+def _note_server_clock(url, response, sent_wall: float, got_wall: float) -> None:
+    """Record one clock sample from a Kalshi response. Never raises: a measurement must
+    not be able to fail a request (test doubles for requests carry no headers at all).
+
+    skew = server - PC. The Date header is in whole seconds, so the server's reading sits
+    on average half a second after it; the PC's matching reading is taken as the middle
+    of the request. That is good to about +-(0.5 s + half the round trip). Responses a
+    cache held for a while (Age > 0) are skipped: their Date may be the stored one."""
+    try:
+        if not str(url).startswith(KALSHI):
+            return
+        rtt = got_wall - sent_wall
+        if not (0.0 <= rtt <= CLOCK_SAMPLE_MAX_RTT_S):
+            return
+        headers = response.headers
+        try:
+            if float(headers.get("Age") or 0) > 0:
+                return
+        except (TypeError, ValueError):
+            pass
+        from email.utils import parsedate_to_datetime
+        server = parsedate_to_datetime(headers.get("Date"))
+        if server.tzinfo is None:
+            server = server.replace(tzinfo=timezone.utc)
+        skew = (server.timestamp() + 0.5) - (sent_wall + got_wall) / 2.0
+        _CLOCK_SAMPLES.append((time.monotonic(), skew, rtt))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def clock_skew_since(mono: float) -> float | None:
+    """Kalshi's clock minus the PC clock, in seconds, from the quickest Kalshi response
+    received since `mono` (a time.monotonic() reading); None when there was none.
+    Positive = the PC clock is BEHIND Kalshi's. A measurement only."""
+    best = None
+    for at, skew, rtt in list(_CLOCK_SAMPLES):
+        if at >= mono and (best is None or rtt < best[1]):
+            best = (skew, rtt)
+    return None if best is None else round(best[0], 3)
+
+
 # ── network (thin, injectable) ───────────────────────────────────────────────
 
 def _get(url: str, params: dict | None = None) -> dict:
     import requests
+    sent = time.time()
     r = requests.get(url, params=params or {}, timeout=15)
+    _note_server_clock(url, r, sent, time.time())      # reads a header; changes nothing
     r.raise_for_status()
     return r.json()
 
@@ -136,15 +199,20 @@ def _mins_left(close_iso: str, now: datetime) -> float | None:
 
 
 def _seen_settles(path: Path) -> set:
+    """Tickers whose settlement is already in the log. This is the first thing every
+    cycle does, so it must survive a damaged file: undecodable bytes are replaced (the
+    line then fails json.loads and is skipped like a torn one) and a line that is JSON
+    but not a row is skipped too. One stray byte from a disk fault or another writer
+    used to raise here on every cycle and stop collection until a hand repair."""
     if not path.exists():
         return set()
     seen = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if d.get("t") == "settle":
+        if isinstance(d, dict) and d.get("t") == "settle":
             seen.add(d.get("ticker"))
     return seen
 
@@ -196,10 +264,9 @@ def run_cycle(get=_get, now: datetime | None = None, path: Path | None = None,
         except Exception as e:  # noqa: BLE001
             print(f"[warn] settle sweep failed for {series}: {e}")
 
-    if rows:
-        with open(p, "a", encoding="utf-8") as f:
-            for r in rows:
-                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+    # One write per cycle, and never onto a torn line: after a crash mid-append the next
+    # row used to be glued to the fragment and lost with it (lib/jsonl_io.append_lines).
+    append_lines(p, [json.dumps(r, separators=(",", ":")) for r in rows])
     return {"obs": n_obs, "settles": n_settle}
 
 
@@ -210,7 +277,7 @@ def write_snapshot(path: Path | None = None, history: Path | None = None) -> Non
     lp = path or LOG
     rows = []
     if lp.exists():
-        for line in lp.read_text(encoding="utf-8").splitlines():
+        for line in lp.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
@@ -222,10 +289,8 @@ def write_snapshot(path: Path | None = None, history: Path | None = None) -> Non
             cells.append({"band": band, "bucket": bucket, "n": c["n"],
                           "gap": round(c["wins"] / c["n"] - c["cost"] / c["n"], 4),
                           "fee": round(c["fee"] / c["n"], 3)})
-    hp.parent.mkdir(parents=True, exist_ok=True)
-    with open(hp, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": _now_iso(), "joined": rep["joined"],
-                            "cells": cells}, separators=(",", ":")) + "\n")
+    append_lines(hp, [json.dumps({"ts": _now_iso(), "joined": rep["joined"],
+                                  "cells": cells}, separators=(",", ":"))])
 
 
 def collect_loop() -> int:
@@ -363,7 +428,7 @@ def print_trend(history: Path | None = None, min_n: int = 20) -> None:
         print("collect loop (after this update; restart the collector task once).")
         return
     snaps = []
-    for line in hp.read_text(encoding="utf-8").splitlines():
+    for line in hp.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             snaps.append(json.loads(line))
         except json.JSONDecodeError:
@@ -466,6 +531,17 @@ def _selftest() -> int:
         assert no_cell and no_cell["wins"] == no_cell["n"]  # NO @95c won
     assert kalshi_taker_fee(0.07) == 0.01
 
+    # the clock measurement: Kalshi's Date header (whole seconds, so centred half a
+    # second on) minus the PC clock at the middle of the request. Never raises.
+    class _Answer:
+        headers = {"Date": "Thu, 01 Jan 2026 00:00:10 GMT"}
+    pc = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+    mark = time.monotonic()
+    _note_server_clock(KALSHI + "/events", _Answer(), pc, pc + 0.2)
+    assert abs(clock_skew_since(mark) - 10.4) < 1e-6, clock_skew_since(mark)
+    _note_server_clock(KALSHI + "/events", object(), pc, pc)      # no headers: ignored
+    assert clock_skew_since(time.monotonic() + 1) is None
+
     # trajectory classifier: holds -> stable; shrinks toward 0 as n grows -> fading
     assert classify_trajectory([(20, 0.15), (60, 0.14), (120, 0.15)]) == "stable"
     assert classify_trajectory([(20, 0.15), (60, 0.06), (120, 0.02)]) == "fading"
@@ -490,6 +566,15 @@ def _selftest() -> int:
 
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd in ("collect", "once"):
+        # ONE collector per log: a second copy logs every observation and every
+        # settlement twice. Taken here, never inside run_cycle - tests, the selftest
+        # and the paper trader call the cycle functions directly.
+        try:
+            hold("stage0_collector")
+        except AlreadyRunning as e:
+            print(f"not starting: {e}; a second copy would log every row twice")
+            return 1
     if cmd == "collect":
         return collect_loop()
     if cmd == "once":
@@ -499,7 +584,7 @@ def main() -> int:
     if cmd == "report":
         rows = []
         if LOG.exists():
-            for line in LOG.read_text(encoding="utf-8").splitlines():
+            for line in LOG.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
