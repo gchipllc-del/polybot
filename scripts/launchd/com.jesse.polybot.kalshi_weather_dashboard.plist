@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jesse.polybot.kalshi_weather_dashboard</string>
+    <!--
+        Always-on Kalshi hourly-weather dashboard at http://localhost:5054.
+        Long-running Flask app; KeepAlive restarts it on any exit (a
+        read-only dashboard, so auto-restart is safe and losing visibility
+        is the worse outcome).
+
+        Reads local JSONL state + hits public Kalshi/weather endpoints; the
+        only signed call is the account balance, which degrades gracefully.
+
+        HOST SETUP: edit the paths in run_weather_dashboard.sh to match this
+        machine, then:
+            chmod +x scripts/launchd/run_weather_dashboard.sh
+            cp scripts/launchd/com.jesse.polybot.kalshi_weather_dashboard.plist \
+               ~/Library/LaunchAgents/
+            launchctl load ~/Library/LaunchAgents/com.jesse.polybot.kalshi_weather_dashboard.plist
+        Then open http://localhost:5054.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/jesse/Desktop/projects/polybot/scripts/launchd/run_weather_dashboard.sh</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_kalshi_weather_dashboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jesse/Desktop/projects/polybot/logs/launchd_kalshi_weather_dashboard_err.log</string>
+</dict>
+</plist>
