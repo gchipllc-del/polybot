@@ -32,6 +32,7 @@ data/forecastbench/
 # Logs
 logs/*.jsonl
 logs/*.log
+logs/*.json
 
 # IDE
 .idea/
