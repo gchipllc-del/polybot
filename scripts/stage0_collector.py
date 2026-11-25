@@ -36,6 +36,7 @@ if str(ROOT) not in sys.path:          # lib/ must resolve however this file was
     sys.path.insert(0, str(ROOT))
 
 from lib.jsonl_io import append_lines  # noqa: E402 - needs ROOT on sys.path
+from lib.single_instance import AlreadyRunning, hold  # noqa: E402
 
 LOG = Path(os.environ.get("STAGE0_LOG") or (ROOT / "data" / "stage0_crypto.jsonl"))
 
@@ -497,6 +498,15 @@ def _selftest() -> int:
 
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd in ("collect", "once"):
+        # ONE collector per log: a second copy logs every observation and every
+        # settlement twice. Taken here, never inside run_cycle - tests, the selftest
+        # and the paper trader call the cycle functions directly.
+        try:
+            hold("stage0_collector")
+        except AlreadyRunning as e:
+            print(f"not starting: {e}; a second copy would log every row twice")
+            return 1
     if cmd == "collect":
         return collect_loop()
     if cmd == "once":

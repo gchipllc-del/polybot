@@ -1,5 +1,7 @@
 """paper_trader - the crypto forward trader's safety net: what a crash, a second copy or a
 stalled cycle may cost, each pinned. No test here changes what a frozen rule trades."""
+import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import paper_trader as pt  # noqa: E402
 import shadow_book as sb  # noqa: E402
 import stage0_collector as s0  # noqa: E402
+from lib import single_instance as si  # noqa: E402
 
 T0 = datetime(2026, 11, 25, 12, 0, 20, tzinfo=timezone.utc)
 CLOSE = datetime(2026, 11, 25, 12, 15, tzinfo=timezone.utc)
@@ -90,3 +93,94 @@ def test_append_writes_whole_lf_rows_and_nothing_for_no_rows(tmp_path):
     assert not p.exists()                            # an idle cycle creates nothing
     pt._append([{"t": "open", "ticker": "T", "rule": "R"}, {"t": "close"}], p)
     assert p.read_bytes() == b'{"t":"open","ticker":"T","rule":"R"}\n{"t":"close"}\n'
+
+
+# ── one trader per ledger ─────────────────────────────────────────────────────
+
+HOLDER = """
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from lib import single_instance as si
+si.hold(sys.argv[2])
+print("HOLDING", flush=True)
+time.sleep(60)
+"""
+
+
+@pytest.fixture
+def lock_dir(tmp_path, monkeypatch):
+    d = tmp_path / "locks"
+    monkeypatch.setenv("POLYBOT_LOCK_DIR", str(d))
+    yield d
+    si.release("paper_trader")
+
+
+def live_twin(lock_dir):
+    """Another OS process that holds the trader's lock, as the scheduled task does."""
+    twin = subprocess.Popen([sys.executable, "-c", HOLDER, str(ROOT), "paper_trader"],
+                            env=dict(os.environ, POLYBOT_LOCK_DIR=str(lock_dir)),
+                            stdout=subprocess.PIPE, text=True)
+    assert twin.stdout.readline().strip() == "HOLDING"
+    return twin
+
+
+@pytest.mark.parametrize("cmd", ["cycle", "run"])
+def test_a_second_trader_stands_down_before_it_trades(cmd, lock_dir, monkeypatch, capsys):
+    """Two overlapping cycles both read the ledger before either appends, so both book
+    the same entries: 4 open rows for 2 positions with two real processes."""
+    def never(*a, **k):
+        raise AssertionError("a second copy must not trade")
+    monkeypatch.setattr(pt, "run_cycle", never)
+    monkeypatch.setattr(pt, "run_loop", never)
+    monkeypatch.setattr(sys, "argv", ["paper_trader.py", cmd])
+    twin = live_twin(lock_dir)
+    try:
+        assert pt.main() == 1
+    finally:
+        twin.kill()
+        twin.wait(timeout=10)
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 1 and out[0].startswith("not starting: paper_trader is already "
+                                               f"running (pid {twin.pid})")
+
+
+def test_the_only_trader_takes_the_lock_and_a_real_second_process_exits_nonzero(
+        lock_dir, tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(pt, "run_cycle", lambda **kw: ran.append(kw) or {
+        "opened": 0, "closed": 0, "open_now": 0, "skipped": {}})
+    monkeypatch.setattr(sys, "argv", ["paper_trader.py", "cycle"])
+    assert pt.main() == 0 and len(ran) == 1
+    assert "paper_trader" in si._HELD                 # held until this process exits
+    # the real command line, as Task Scheduler or a second console would start it. If it
+    # did NOT stand down it would trade: so it gets a scratch ledger and a dead proxy.
+    env = dict(os.environ, POLYBOT_LOCK_DIR=str(lock_dir),
+               PAPER_CRYPTO_LEDGER=str(tmp_path / "twin_ledger.jsonl"),
+               PAPER_CRYPTO_HEARTBEAT=str(tmp_path / "twin_heartbeat.json"),
+               STAGE0_LOG=str(tmp_path / "twin_stage0.jsonl"),
+               HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9",
+               NO_PROXY="")
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "paper_trader.py"), "cycle"],
+                       env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1 and "already running" in r.stdout, (r.stdout, r.stderr)
+    assert not (tmp_path / "twin_ledger.jsonl").exists()
+
+
+def test_the_lock_never_blocks_a_cycle_function_a_report_or_the_selftest(
+        lock_dir, tmp_path, monkeypatch, capsys):
+    """Tests, the selftest the watchdog runs every 15 minutes and the read-only report
+    must all work beside the live trader: the lock lives in main() for run/cycle only."""
+    twin = live_twin(lock_dir)
+    try:
+        assert cycle(tmp_path / "p.jsonl", 0.55)["opened"] == 2      # run_cycle itself
+        monkeypatch.setattr(pt, "LEDGER", tmp_path / "p.jsonl")
+        monkeypatch.setattr(sys, "argv", ["paper_trader.py", "report"])
+        assert pt.main() == 0
+        assert "PAPER TRADER" in capsys.readouterr().out
+        monkeypatch.setattr(pt, "_selftest", lambda: 0)
+        monkeypatch.setattr(sys, "argv", ["paper_trader.py", "selftest"])
+        assert pt.main() == 0
+    finally:
+        twin.kill()
+        twin.wait(timeout=10)
+    assert "paper_trader" not in si._HELD

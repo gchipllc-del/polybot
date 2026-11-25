@@ -1,15 +1,20 @@
 """stage0_collector - one damaged line, one crash or one second copy must not stop or
 corrupt collection. What is collected is frozen; these pin only how it survives faults."""
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import stage0_collector as s0  # noqa: E402
+from lib import single_instance as si  # noqa: E402
 
 T0 = datetime(2026, 11, 25, 12, 0, 20, tzinfo=timezone.utc)
 CLOSE = datetime(2026, 11, 25, 12, 15, tzinfo=timezone.utc)
@@ -133,3 +138,98 @@ def test_a_line_that_is_json_but_not_a_row_does_not_stop_collection(tmp_path):
     with open(p, "ab") as f:
         f.write(b'null\n123\n"text"\n[1,2]\n\n')
     assert collect(p, 0.58, 1, [(BTC, "yes")]) == {"obs": 2, "settles": 0}
+
+
+# ── one collector per log ─────────────────────────────────────────────────────
+
+HOLDER = """
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from lib import single_instance as si
+si.hold(sys.argv[2])
+print("HOLDING", flush=True)
+time.sleep(60)
+"""
+
+
+@pytest.fixture
+def lock_dir(tmp_path, monkeypatch):
+    d = tmp_path / "locks"
+    monkeypatch.setenv("POLYBOT_LOCK_DIR", str(d))
+    yield d
+    si.release("stage0_collector")
+
+
+def live_twin(lock_dir):
+    """Another OS process that holds the collector's lock, as the scheduled task does."""
+    twin = subprocess.Popen([sys.executable, "-c", HOLDER, str(ROOT), "stage0_collector"],
+                            env=dict(os.environ, POLYBOT_LOCK_DIR=str(lock_dir)),
+                            stdout=subprocess.PIPE, text=True)
+    assert twin.stdout.readline().strip() == "HOLDING"
+    return twin
+
+
+@pytest.mark.parametrize("cmd", ["collect", "once"])
+def test_a_second_collector_stands_down_before_it_collects(cmd, lock_dir, monkeypatch,
+                                                           capsys):
+    """Two collectors on one log write every observation and every settlement twice
+    (4 settle rows for 2 settlements with two real processes)."""
+    def never(*a, **k):
+        raise AssertionError("a second copy must not collect")
+    monkeypatch.setattr(s0, "run_cycle", never)
+    monkeypatch.setattr(s0, "collect_loop", never)
+    monkeypatch.setattr(sys, "argv", ["stage0_collector.py", cmd])
+    twin = live_twin(lock_dir)
+    try:
+        assert s0.main() == 1
+    finally:
+        twin.kill()
+        twin.wait(timeout=10)
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 1 and out[0].startswith("not starting: stage0_collector is already "
+                                               f"running (pid {twin.pid})")
+
+
+def test_the_only_collector_takes_the_lock_and_a_real_second_process_exits_nonzero(
+        lock_dir, tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(s0, "run_cycle", lambda **kw: ran.append(kw) or {"obs": 0,
+                                                                         "settles": 0})
+    monkeypatch.setattr(sys, "argv", ["stage0_collector.py", "once"])
+    assert s0.main() == 0 and len(ran) == 1
+    assert "stage0_collector" in si._HELD             # held until this process exits
+    # the real command line. If it did NOT stand down it would collect: so it gets a
+    # scratch log and a dead proxy.
+    env = dict(os.environ, POLYBOT_LOCK_DIR=str(lock_dir),
+               STAGE0_LOG=str(tmp_path / "twin_stage0.jsonl"),
+               STAGE0_HISTORY=str(tmp_path / "twin_hist.jsonl"),
+               HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9",
+               NO_PROXY="")
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "stage0_collector.py"),
+                        "once"], env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1 and "already running" in r.stdout, (r.stdout, r.stderr)
+    assert not (tmp_path / "twin_stage0.jsonl").exists()
+
+
+def test_the_lock_never_blocks_a_cycle_function_or_a_read_only_command(
+        lock_dir, tmp_path, monkeypatch, capsys):
+    """Tests, the selftest the watchdog runs and the report must all work beside the
+    live collector: the lock lives in main() for collect/once only."""
+    twin = live_twin(lock_dir)
+    try:
+        p = tmp_path / "s0.jsonl"
+        assert collect(p, 0.55) == {"obs": 2, "settles": 0}          # run_cycle itself
+        monkeypatch.setattr(s0, "LOG", p)
+        monkeypatch.setattr(s0, "HISTORY", tmp_path / "hist.jsonl")
+        for cmd, said in (("report", "stage0 report"), ("trend", "no trajectory history"),
+                          ("snapshot", "snapshot appended")):
+            monkeypatch.setattr(sys, "argv", ["stage0_collector.py", cmd])
+            assert s0.main() == 0
+            assert said in capsys.readouterr().out
+        monkeypatch.setattr(s0, "_selftest", lambda: 0)
+        monkeypatch.setattr(sys, "argv", ["stage0_collector.py", "selftest"])
+        assert s0.main() == 0
+    finally:
+        twin.kill()
+        twin.wait(timeout=10)
+    assert "stage0_collector" not in si._HELD

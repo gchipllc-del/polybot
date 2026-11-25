@@ -38,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from lib.jsonl_io import append_lines  # noqa: E402 - needs ROOT on sys.path
+from lib.single_instance import AlreadyRunning, hold  # noqa: E402
 
 LEDGER = Path(os.environ.get("PAPER_CRYPTO_LEDGER")
               or (ROOT / "data" / "paper_crypto15.jsonl"))
@@ -582,6 +583,17 @@ def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
     if cmd == "selftest":
         return _selftest()
+    if cmd in ("cycle", "run"):
+        # ONE trader per ledger. A second copy - a hand-run cycle beside the scheduled
+        # task, or a restart that left the old python alive - reads the same ledger,
+        # decides the same entries and appends them again, and the ledger is
+        # append-only. The lock is taken here and never inside run_cycle: tests and the
+        # selftest (which the watchdog runs) call that directly and must not be blocked.
+        try:
+            hold("paper_trader")
+        except AlreadyRunning as e:
+            print(f"not starting: {e}; a second copy would enter every market twice")
+            return 1
     if cmd == "cycle":
         c = run_cycle()
         print(f"opened={c['opened']} closed={c['closed']} open_now={c['open_now']} "
