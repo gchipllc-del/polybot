@@ -42,6 +42,12 @@ proof). Benjamini-Hochberg runs across ALL forward rules at once - the command c
 family: every sleeve rule, RETIRED ones included, and the crypto rules on fill-checked
 trades - so adding sleeves never lowers the bar, and retiring one never raises another.
 
+HOW IT RUNS - `run` loops every 120 s (the PolybotSleeves task), `cycle` is one pass.
+Both hold a single-instance lock - one trader per ledger - and append what they print to
+logs/sleeve_paper.log. Every cycle writes data/sleeve_paper_heartbeat.json, ALSO a cycle
+that raises (`cycle_error` then holds the exception), with the failed list calls and
+settlement polls counted and their streaks: alive must never read as trading.
+
   py scripts/sleeve_paper.py register-probes [--top 20 | --series A,B]   # the FLB probe pair
   py scripts/sleeve_paper.py register-nominations         # after sleeve_scan screen
   py scripts/sleeve_paper.py register-rule --name F9799 --series KXHIGHNY,KXHIGHCHI \
@@ -63,6 +69,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -73,6 +80,10 @@ DATA = Path(os.environ.get("SLEEVE_PAPER_DIR") or (ROOT / "data"))
 RULES = DATA / "sleeve_rules.jsonl"
 LEDGER = DATA / "paper_sleeves.jsonl"
 HEARTBEAT = DATA / "sleeve_paper_heartbeat.json"
+# What `run` and `cycle` print is also appended here (see _log_path): the scheduled task
+# runs in a hidden window with nothing redirected, so until this file existed a warning
+# was gone the moment it was printed.
+LOG = Path(os.environ.get("SLEEVE_PAPER_LOG") or (ROOT / "logs" / "sleeve_paper.log"))
 CATALOG = Path(os.environ.get("SLEEVE_DIR") or (ROOT / "data" / "sleeves")) / "catalog.json"
 SCREEN = CATALOG.parent / "screen.json"
 
@@ -372,33 +383,166 @@ def _default_regime():
 
 # ── one cycle ─────────────────────────────────────────────────────────────────
 
-def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
-              ledger: Path = LEDGER, depth_fn=None, regime_fn=None,
-              heartbeat: Path | None = HEARTBEAT) -> dict:
-    now = now or _now()
+def _log_line(log: Path | None, msg: str) -> None:
+    """Append one UTC-stamped line to the trader's log. Never raises: a locked or
+    unwritable log file is no reason to stop trading."""
+    if log is None:
+        return
+    try:
+        from lib.jsonl_io import append_lines
+        append_lines(log, [f"{_iso(_now())[:19]}Z {msg}"])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _say(msg: str, log: Path | None = None) -> None:
+    """Print a line and, when a log is given, append it there too. The scheduled task's
+    console is a hidden window nobody reads, so the file is the only lasting record of
+    what the trader said. Neither half may ever stop a cycle."""
+    try:
+        print(msg, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+    _log_line(log, msg)
+
+
+def cycle_line(s: dict) -> str:
+    """One cycle on one line. A healthy line reads as it always did, plus how long the
+    cycle took; every failure count that is not zero is named, so six hours of failed
+    requests no longer print the same line as six healthy hours."""
+    parts = [f"[{s['ts'][:19]}]", f"rules={s['rules']}", f"opened={s['opened']}",
+             f"closed={s['closed']}", f"open_now={s['open_now']}", f"regime={s['regime']}"]
+    parts += [f"{k}={v}" for k, v in s["skipped"].items()]
+    if s["ungated"]:
+        parts.append(f"UNGATED={s['ungated']}")
+    if s.get("errors"):
+        parts.append(f"errors={s['errors']}/{s['series']}")
+    if s.get("all_failed_streak"):
+        parts.append(f"all_failed_streak={s['all_failed_streak']}")
+    if s.get("poll_errors"):
+        parts.append(f"poll_errors={s['poll_errors']}")
+    if s.get("took_s") is not None:
+        parts.append(f"took={s['took_s']:.1f}s")
+    return " ".join(parts)
+
+
+def _write_heartbeat(path: Path, summary: dict, log: Path | None = None) -> None:
+    """Write the heartbeat whole or not at all (a temp file, then os.replace), so a
+    reader never finds half a file. Where the swap is refused - Windows, while a reader
+    has the file open - write it in place as before. A heartbeat that cannot be written
+    is a warning, never a failed cycle: the rows are already in the ledger."""
+    data = json.dumps(summary)
+    tmp = path.with_name(path.stem + ".tmp" + path.suffix)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, path)
+        return
+    except OSError:
+        pass
+    try:
+        path.write_text(data, encoding="utf-8")
+    except OSError as e:
+        _say(f"[warn] heartbeat not written: {type(e).__name__}: {str(e)[:80]}", log)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+
+
+def _last_heartbeat(state: dict, heartbeat: Path | None) -> dict:
+    """The previous heartbeat: this process's last one, else the file's."""
+    last = state.get("last")
+    if isinstance(last, dict):
+        return last
+    try:
+        d = json.loads(heartbeat.read_text(encoding="utf-8")) if heartbeat else {}
+    except (OSError, ValueError):
+        d = {}
+    return d if isinstance(d, dict) else {}
+
+
+def _heartbeat_of(c: SimpleNamespace, now: datetime, state: dict, error: Exception | None,
+                  took_s: float, heartbeat: Path | None) -> dict:
+    """What this cycle did, as the heartbeat. Readers (the watchdog, the command center,
+    `report`) index the first ten keys, so ALL of them are ALWAYS there with the meaning
+    they always had - also after a cycle that raised: whatever that cycle did not get far
+    enough to learn is carried over from the last heartbeat, never reported as zero
+    ("0 rules" would send the owner off to register rules he already has)."""
+    prev = _last_heartbeat(state, heartbeat) if error is not None else {}
+    new, closes = (c.new, c.closes) if c.appended else ([], [])
+    regime = c.regime.get("regime") if isinstance(c.regime, dict) else None
+    open_now = None
+    if c.rows is not None:
+        try:
+            open_now = len(open_positions(c.rows + new + closes))
+        except Exception:  # noqa: BLE001 - the cycle already failed; report what we can
+            pass
+    # consecutive failed list calls, per series and for all of them at once. A cycle that
+    # raised before it had asked every series says nothing about the ones it never asked.
+    fails = state.setdefault("series_fail", {})
+    for series, ok in c.listed.items():
+        if ok:
+            fails.pop(series, None)
+        else:
+            fails[series] = fails.get(series, 0) + 1
+    if c.list_done:
+        for series in [k for k in fails if k not in c.listed]:
+            del fails[series]                           # no longer traded
+    if any(c.listed.values()) or (c.list_done and not c.listed):
+        state["all_failed"] = 0
+    elif c.list_done:
+        state["all_failed"] = state.get("all_failed", 0) + 1
+    state["failed_cycles"] = state.get("failed_cycles", 0) + 1 if error is not None else 0
+    return {
+        "ts": _iso(now),
+        "rules": c.rules if c.rules is not None else prev.get("rules", 0),
+        "series": c.series if c.series is not None else prev.get("series", 0),
+        "opened": len(new), "closed": len(closes), "skipped": c.skipped,
+        "ungated": c.ungated, "errors": c.errors,
+        "regime": regime if regime is not None else prev.get("regime", "unknown"),
+        "open_now": open_now if open_now is not None else prev.get("open_now", 0),
+        # ── added 2026-11: why a trader that is alive may not be trading ──
+        "poll_errors": c.poll_errors,
+        "all_failed_streak": state.get("all_failed", 0),
+        "series_fail_streak": dict(sorted(fails.items())),
+        "cycle_error": None if error is None else f"{type(error).__name__}: {error}"[:300],
+        "failed_cycles": state["failed_cycles"],
+        "took_s": took_s,
+    }
+
+
+def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, ledger: Path,
+                      depth_fn, regime_fn, log: Path | None) -> None:
+    """The work of one cycle. Everything it decides or counts goes into `c` as it happens,
+    so run_cycle can still say what happened when this raises."""
     rules = active_rules(rules_path)
-    rows = _load_jsonl(ledger)
+    c.rules = len(rules)
+    rows = c.rows = _load_jsonl(ledger)
     live = open_positions(rows)
     used = {(r.get("event"), r.get("rule")) for r in rows if r.get("t") == "open"}
     per_rule_open: dict[str, int] = {}
     for (_, rule) in live:
         per_rule_open[rule] = per_rule_open.get(rule, 0) + 1
     depth_fn = _default_depth_fn() if depth_fn is None else depth_fn
-    regime = (regime_fn or _default_regime)()
-    new, skipped, ungated, errors = [], {}, 0, 0
+    regime = c.regime = (regime_fn or _default_regime)()
+    new, skipped = c.new, c.skipped
 
     by_series: dict[str, list] = {}
     for r in rules.values():
         for s_ in series_of(r):
             by_series.setdefault(s_, []).append(r)
+    c.series = len(by_series)
     named = {n: _ts(r["named_at"]) for n, r in rules.items()}
     for series, rs in sorted(by_series.items()):
         try:
             markets = fetch_open(series, get=get)
         except Exception as e:  # noqa: BLE001
-            errors += 1
-            print(f"[warn] {series}: {type(e).__name__}: {str(e)[:80]}")
+            c.errors += 1
+            c.listed[series] = False
+            _say(f"[warn] {series}: {type(e).__name__}: {str(e)[:80]}", log)
             continue
+        c.listed[series] = True
         for m in markets:
             tk = m.get("ticker")
             if not tk:
@@ -424,7 +568,7 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
                     skipped["no_depth"] = skipped.get("no_depth", 0) + 1
                     continue
                 if depth is None:
-                    ungated += 1
+                    c.ungated += 1
                 entry = dict(cand, t="open", ts=_iso(now), ticker=tk, event=ev, series=series,
                              contracts=n, fee=kalshi_fee(cand["price"], n),
                              depth=depth, close_time=m.get("close_time"),
@@ -433,26 +577,64 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
                 used.add(key)
                 per_rule_open[cand["rule"]] = per_rule_open.get(cand["rule"], 0) + 1
         time.sleep(SLEEP_S if get is _get else 0)
+    c.list_done = True
 
-    closes = []
+    closes, first_failed = c.closes, None
     for (tk, rule), pos in list(live.items()) + [((e["ticker"], e["rule"]), e) for e in new]:
         ct = _ts(pos.get("close_time"))
         if ct is not None and ct > now.timestamp():
             continue                                   # not closed yet - don't ask
         try:
             m = fetch_market(tk, get=get)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            c.poll_errors += 1                         # counted: it used to vanish here
+            first_failed = first_failed or f"{tk}: {type(e).__name__}: {str(e)[:80]}"
             continue
         if m.get("result") in ("yes", "no"):
             closes.append(settle(pos, m["result"]))
+    if c.poll_errors:                                  # ONE line a cycle, not one a poll
+        _say(f"[warn] {c.poll_errors} settlement poll(s) failed - first {first_failed}", log)
     _append(ledger, new + closes)
-    summary = {"ts": _iso(now), "rules": len(rules), "series": len(by_series),
-               "opened": len(new), "closed": len(closes), "skipped": skipped,
-               "ungated": ungated, "errors": errors, "regime": regime["regime"],
-               "open_now": len(open_positions(rows + new + closes))}
+    c.appended = True
+
+
+def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
+              ledger: Path = LEDGER, depth_fn=None, regime_fn=None,
+              heartbeat: Path | None = HEARTBEAT, state: dict | None = None,
+              log: Path | None = None) -> dict:
+    """One pass: enter what the rules call for, settle what Kalshi has resolved, append
+    both to the ledger, write the heartbeat, return it.
+
+    state      a dict the caller keeps from one cycle to the next (the `run` loop does):
+               the heartbeat's streaks - consecutive cycles in which a series' list call
+               failed, in which EVERY list call failed, in which the cycle raised - are
+               counted in it. Without one, each call counts from zero.
+    log        also append this cycle's warnings to that file (main() passes LOG; tests
+               and the selftest pass nothing and write nothing).
+
+    The heartbeat is written by EVERY cycle, also one that raises: it then carries the
+    exception text in `cycle_error` and every key it always had, and the cycle re-raises.
+    A cycle that died used to leave the old heartbeat in place - ten minutes later the
+    watchdog could only say "alive but not cycling", and the reason was gone with the
+    console."""
+    t0 = time.time()
+    now = now or _now()
+    state = {} if state is None else state
+    c = SimpleNamespace(new=[], closes=[], skipped={}, ungated=0, errors=0, poll_errors=0,
+                        rules=None, series=None, regime=None, rows=None, listed={},
+                        list_done=False, appended=False)
+    error: Exception | None = None
+    try:
+        _trade_and_settle(c, get, now, rules_path, ledger, depth_fn, regime_fn, log)
+    except Exception as e:  # noqa: BLE001 - reported in the heartbeat, then re-raised
+        error = e
+    summary = _heartbeat_of(c, now, state, error, round(max(0.0, time.time() - t0), 2),
+                            heartbeat)
+    state["last"] = summary
     if heartbeat is not None:
-        heartbeat.parent.mkdir(parents=True, exist_ok=True)
-        heartbeat.write_text(json.dumps(summary), encoding="utf-8")
+        _write_heartbeat(heartbeat, summary, log)
+    if error is not None:
+        raise error
     return summary
 
 
@@ -891,6 +1073,36 @@ def _selftest() -> int:
         # per CONTRACT: E1 won 1.12 on a 10-lot, E2 (yes @.85, fee .09) won 1.41
         assert abs(res["FLB_FAV_KXINX"]["mean"] - (0.112 + 0.141) / 2) < 1e-9
 
+        # the heartbeat says WHY a live trader is not trading: failed calls are counted
+        # with their streak, and a cycle that raises still writes it - every key the
+        # watchdog indexes, plus the exception
+        import contextlib
+        import io
+        hb, st = Path(td) / "hb.json", {}
+
+        def down(url, params=None):
+            raise ConnectionError("exchange unreachable")
+
+        def no_regime():
+            raise RuntimeError("regime unreadable")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            for want in (1, 2):
+                h = run_cycle(down, later, rp, lp, depth_fn=lambda t, sd, p: 50,
+                              regime_fn=lambda: {"regime": "good", "mult": 1.0},
+                              heartbeat=hb, state=st)
+                assert (h["errors"], h["all_failed_streak"], h["cycle_error"]) == (1, want, None)
+            try:
+                run_cycle(down, later, rp, lp, depth_fn=lambda t, sd, p: 50,
+                          regime_fn=no_regime, heartbeat=hb, state=st)
+                raise AssertionError("a failing cycle must still raise")
+            except RuntimeError:
+                pass
+        failed = json.loads(hb.read_text(encoding="utf-8"))
+        assert failed["cycle_error"] == "RuntimeError: regime unreadable"
+        assert failed["failed_cycles"] == 1 and list(failed)[:10] == list(h)[:10]
+        assert (failed["rules"], failed["series"], failed["regime"]) == (1, 1, "good")
+
     # exact p: 100 straight wins on 98c 10-lots is ordinary luck under no edge
     fee10 = kalshi_fee(0.98, 10)
     wins = [{"event": f"E{i}", "won": True, "ask": 0.98, "fee_pc": fee10 / 10,
@@ -919,6 +1131,15 @@ def _lock_dir() -> Path | None:
     if os.environ.get("POLYBOT_LOCK_DIR") or LEDGER.parent == ROOT / "data":
         return None
     return LEDGER.parent / "locks"
+
+
+def _log_path() -> Path:
+    """The log `run` and `cycle` append to: logs/sleeve_paper.log (or SLEEVE_PAPER_LOG) for
+    the real ledger; a file next to the ledger when this trader was pointed somewhere
+    else. Like the lock: only the live trader writes the live log."""
+    if os.environ.get("SLEEVE_PAPER_LOG") or LEDGER.parent == ROOT / "data":
+        return LOG
+    return LEDGER.parent / "sleeve_paper.log"
 
 
 def _only_trader() -> bool:
@@ -1039,24 +1260,32 @@ def main() -> int:
         return cmd_report()
     if cmd in ("cycle", "run") and not _only_trader():
         return 1
+    # the paths are passed at call time (run_cycle's defaults were bound at import)
+    paths = {"rules_path": RULES, "ledger": LEDGER, "heartbeat": HEARTBEAT}
     if cmd == "cycle":
-        print(run_cycle())
+        log = _log_path()
+        try:
+            s = run_cycle(log=log, **paths)
+        except Exception as e:  # noqa: BLE001 - into the log, then the traceback as before
+            _log_line(log, f"[warn] cycle failed: {type(e).__name__}: {e}")
+            raise
+        _log_line(log, cycle_line(s))
+        print(s)
         return 0
     if cmd == "run":
-        print(f"sleeve paper - every {CYCLE_S}s -> {LEDGER}. FORWARD-ONLY, no real orders.")
+        log = _log_path()
+        _say(f"sleeve paper - every {CYCLE_S}s -> {LEDGER}. FORWARD-ONLY, no real orders.",
+             log)
+        state: dict = {}                 # the heartbeat's streaks live here between cycles
         while True:
             t0 = time.time()
             try:
-                s = run_cycle()
-                sk = " ".join(f"{k}={v}" for k, v in s["skipped"].items())
-                ug = f" UNGATED={s['ungated']}" if s["ungated"] else ""
-                print(f"[{s['ts'][:19]}] rules={s['rules']} opened={s['opened']} "
-                      f"closed={s['closed']} open_now={s['open_now']} "
-                      f"regime={s['regime']} {sk}{ug}")
+                _say(cycle_line(run_cycle(state=state, log=log, **paths)), log)
             except KeyboardInterrupt:
                 raise
             except Exception as e:  # noqa: BLE001
-                print(f"[warn] cycle failed: {type(e).__name__}: {e}")
+                _say(f"[warn] cycle failed ({state.get('failed_cycles', 1)} in a row): "
+                     f"{type(e).__name__}: {e}", log)
             time.sleep(max(1.0, CYCLE_S - (time.time() - t0)))
     print(__doc__)
     return 1
