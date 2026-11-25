@@ -94,6 +94,7 @@ CYCLE_S = 120
 SLEEP_S = 0.35
 MAX_SPREAD = 0.15
 MAX_OPEN_PER_RULE = 50
+OVERDUE_H = 24.0           # an open position this long past its market's close is "overdue"
 # covered by scripts/paper_trader.py - never double-trade a sleeve
 EXCLUDED_SERIES = {"KXBTC15M", "KXETH15M"}
 LIFE_BANDS = (("early", 0.00, 0.25), ("mid", 0.25, 0.75),
@@ -483,6 +484,8 @@ def cycle_line(s: dict) -> str:
         parts.append(f"poll_errors={s['poll_errors']}")
     if s.get("market_errors"):
         parts.append(f"market_errors={s['market_errors']}")
+    if (s.get("overdue") or {}).get("n"):
+        parts.append(f"overdue={s['overdue']['n']}")
     if s.get("took_s") is not None:
         parts.append(f"took={s['took_s']:.1f}s")
     return " ".join(parts)
@@ -534,10 +537,11 @@ def _heartbeat_of(c: SimpleNamespace, now: datetime, state: dict, error: Excepti
     prev = _last_heartbeat(state, heartbeat) if error is not None else {}
     new, closes = (c.new, c.closes) if c.appended else ([], [])
     regime = c.regime.get("regime") if isinstance(c.regime, dict) else None
-    open_now = None
+    open_now, overdue = None, prev.get("overdue")
     if c.rows is not None:
         try:
-            open_now = len(open_positions(c.rows + new + closes))
+            still_open_now = open_positions(c.rows + new + closes)
+            open_now, overdue = len(still_open_now), _overdue(still_open_now, now.timestamp())
         except Exception:  # noqa: BLE001 - the cycle already failed; report what we can
             pass
     # consecutive failed list calls, per series and for all of them at once. A cycle that
@@ -556,7 +560,7 @@ def _heartbeat_of(c: SimpleNamespace, now: datetime, state: dict, error: Excepti
     elif c.list_done:
         state["all_failed"] = state.get("all_failed", 0) + 1
     state["failed_cycles"] = state.get("failed_cycles", 0) + 1 if error is not None else 0
-    return {
+    summary = {
         "ts": _iso(now),
         "rules": c.rules if c.rules is not None else prev.get("rules", 0),
         "series": c.series if c.series is not None else prev.get("series", 0),
@@ -574,6 +578,31 @@ def _heartbeat_of(c: SimpleNamespace, now: datetime, state: dict, error: Excepti
         "took_s": took_s,
         "bad_rules": c.bad_rules,
     }
+    # absent = unknown: a cycle that died before it read the ledger, with no earlier
+    # heartbeat to carry the figure over from
+    if overdue is not None:
+        summary["overdue"] = overdue
+    return summary
+
+
+_NO_ANSWER = object()          # a settlement poll that failed this cycle
+
+
+def _overdue(positions: dict, now_ts: float) -> dict:
+    """Open positions more than OVERDUE_H hours past their market's close with no yes/no
+    result yet: how many, the ticker overdue the longest, and for how many hours. A
+    market that never reports yes or no (voided, settled as something else, a ticker the
+    endpoint stops serving) is never closed and keeps one of its rule's MAX_OPEN_PER_RULE
+    slots for good - fifty of them and the rule stops entering. Nothing said so."""
+    late = []
+    for (tk, _), pos in positions.items():
+        ct = _ts(pos.get("close_time"))
+        if ct is not None and now_ts - ct > OVERDUE_H * 3600.0:
+            late.append((now_ts - ct, str(tk)))
+    if not late:
+        return {"n": 0, "oldest": None, "oldest_h": None}
+    age, tk = max(late)
+    return {"n": len(late), "oldest": tk, "oldest_h": round(age / 3600.0, 1)}
 
 
 def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, ledger: Path,
@@ -669,16 +698,23 @@ def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, 
     unhandled = c.market_errors
 
     closes, first_failed = c.closes, None
+    # ticker -> its market, asked ONCE a cycle however many rules hold it (a probe pair
+    # holds every market twice, and used to fetch it twice)
+    answers: dict = {}
     for (tk, rule), pos in list(live.items()) + [((e["ticker"], e["rule"]), e) for e in new]:
         try:
             ct = _ts(pos.get("close_time"))
             if ct is not None and ct > now.timestamp():
                 continue                               # not closed yet - don't ask
-            try:
-                m = fetch_market(tk, get=get)
-            except Exception as e:  # noqa: BLE001
-                c.poll_errors += 1                     # counted: it used to vanish here
-                first_failed = first_failed or f"{tk}: {type(e).__name__}: {str(e)[:80]}"
+            if tk not in answers:
+                try:
+                    answers[tk] = fetch_market(tk, get=get)
+                except Exception as e:  # noqa: BLE001
+                    answers[tk] = _NO_ANSWER
+                    c.poll_errors += 1                 # counted: it used to vanish here
+                    first_failed = first_failed or f"{tk}: {type(e).__name__}: {str(e)[:80]}"
+            m = answers[tk]
+            if m is _NO_ANSWER:
                 continue
             if m.get("result") in ("yes", "no"):
                 closes.append(settle(pos, m["result"]))

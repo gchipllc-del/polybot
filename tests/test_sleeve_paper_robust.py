@@ -857,3 +857,86 @@ def test_the_run_loop_says_what_a_failed_cycle_recorded(paths, monkeypatch, caps
     assert out[1].startswith("[warn] cycle failed (2 in a row): RegistryError:")
     assert out[1].endswith("traded as usual.") and len(out) == 2
     assert [r["rule"] for r in sp._load_jsonl(sp.LEDGER)] == ["GOOD"]
+
+
+# ── positions that do not settle ──────────────────────────────────────────────
+
+def _results(by_ticker, calls=None):
+    """Nothing listed; a settlement poll answers `by_ticker[ticker]` ('' = no result
+    yet, an Exception = the poll fails) and is recorded in `calls`."""
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            return {"markets": []}
+        tk = url.rsplit("/", 1)[-1]
+        if calls is not None:
+            calls.append(tk)
+        answer = by_ticker.get(tk, "")
+        if isinstance(answer, Exception):
+            raise answer
+        return {"market": {"ticker": tk, "result": answer}}
+    return get
+
+
+def test_positions_long_past_their_close_show_in_the_heartbeat(tmp_path):
+    """A market that never reports yes or no (voided, settled as 'scalar', a ticker the
+    endpoint stops serving) was polled 720 times a day for good, kept one of its rule's 50
+    slots, and no field of the heartbeat or the report said so."""
+    rp, lp, hb = tmp_path / "rules.jsonl", tmp_path / "ledger.jsonl", tmp_path / "hb.json"
+    favorites(rp)
+    no_close_time = {k: v for k, v in held("S-E5-A").items() if k != "close_time"}
+    sp._append(lp, [held("S-E1-A", closed_h=-30.5), held("S-E2-A", closed_h=-49),
+                    held("S-E3-A", closed_h=-23.9), held("S-E4-A", closed_h=+3),
+                    no_close_time])
+    answers = {"S-E2-A": "scalar", "S-E1-A": ""}
+    s = cycle(_results(answers), rp, lp, heartbeat=hb)
+    assert s["overdue"] == {"n": 2, "oldest": "S-E2-A", "oldest_h": 49.0}
+    assert s["open_now"] == 5 and " overdue=2 " in sp.cycle_line(s)
+    assert json.loads(hb.read_text(encoding="utf-8"))["overdue"] == s["overdue"]
+    answers["S-E2-A"] = "no"                                 # the oldest finally settles
+    s = cycle(_results(answers), rp, lp, heartbeat=hb, at=NOW + timedelta(minutes=6))
+    assert s["closed"] == 1 and s["overdue"] == {"n": 1, "oldest": "S-E1-A", "oldest_h": 30.6}
+    # S-E3-A crosses the 24 h line a little later; a position with no close time never does
+    s = cycle(_results(answers), rp, lp, heartbeat=hb, at=NOW + timedelta(minutes=12))
+    assert s["overdue"] == {"n": 2, "oldest": "S-E1-A", "oldest_h": 30.7}
+
+    def boom():
+        raise RuntimeError("regime file unreadable")
+    with pytest.raises(RuntimeError):                        # a failed cycle that got as far
+        sp.run_cycle(_results(answers), NOW + timedelta(minutes=14), rp, lp,   # as the ledger
+                     depth_fn=lambda t, s, p: 50, regime_fn=boom, heartbeat=hb)
+    assert json.loads(hb.read_text(encoding="utf-8"))["overdue"]["n"] == 2
+    with pytest.raises(OSError):                             # one that did not: carried over
+        cycle(_results(answers), tmp_path, lp, heartbeat=hb, at=NOW + timedelta(minutes=16))
+    assert json.loads(hb.read_text(encoding="utf-8"))["overdue"] == s["overdue"]
+    with pytest.raises(OSError):                             # nothing to carry: unknown
+        cycle(_results(answers), tmp_path, lp, heartbeat=tmp_path / "new" / "hb.json")
+    assert "overdue" not in json.loads((tmp_path / "new" / "hb.json").read_text("utf-8"))
+    # everything settled: the figure goes back to zero and off the cycle line
+    answers.update({"S-E1-A": "no", "S-E3-A": "yes", "S-E5-A": "no"})
+    s = cycle(_results(answers), rp, lp, at=NOW + timedelta(minutes=18))
+    assert s["overdue"] == {"n": 0, "oldest": None, "oldest_h": None}
+    assert "overdue" not in sp.cycle_line(s) and s["open_now"] == 1
+
+
+def test_a_market_held_by_two_rules_is_polled_once_a_cycle(tmp_path):
+    """A probe pair (favorite and longshot) holds every market twice, and the same ticker
+    was fetched once per (ticker, rule): twice a cycle for as long as it took to settle."""
+    rp, lp = tmp_path / "rules.jsonl", tmp_path / "ledger.jsonl"
+    sp.register(sp.probe_rules(["KXINX"]), rp, NOW - timedelta(days=1))
+    listed = [mk("KXINX-E1-A", "KXINX-E1", 88, 86), mk("KXINX-E2-A", "KXINX-E2", 85, 83)]
+    s = cycle(lambda url, params=None: {"markets": listed}, rp, lp)
+    assert s["opened"] == 4                                  # two markets, two rules each
+    later, calls = NOW + timedelta(hours=11), []
+    s = cycle(_results({"KXINX-E1-A": ConnectionError("refused")}, calls), rp, lp, at=later)
+    assert calls == ["KXINX-E1-A", "KXINX-E2-A"]             # was: each ticker twice
+    assert (s["poll_errors"], s["closed"]) == (1, 0)         # one failed poll, not two
+    calls.clear()
+    s = cycle(_results({"KXINX-E1-A": "yes", "KXINX-E2-A": "no"}, calls), rp, lp,
+              at=later + timedelta(minutes=2))
+    assert calls == ["KXINX-E1-A", "KXINX-E2-A"] and s["closed"] == 4
+    closes = [(r["ticker"], r["rule"], r["won"]) for r in sp._load_jsonl(lp)
+              if r["t"] == "close"]
+    assert closes == [("KXINX-E1-A", "FLB_FAV_KXINX", True),      # in ledger order, both
+                      ("KXINX-E1-A", "FLB_LONG_KXINX", False),    # rules from one answer
+                      ("KXINX-E2-A", "FLB_FAV_KXINX", False),
+                      ("KXINX-E2-A", "FLB_LONG_KXINX", True)]
