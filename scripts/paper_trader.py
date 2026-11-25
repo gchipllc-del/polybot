@@ -369,7 +369,11 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
         try:
             return raw_get(*a, **k)
         except Exception as e:  # noqa: BLE001 - recorded, then raised unchanged
-            errs.append(_request_error(f"GET {_endpoint(a[0] if a else k.get('url'))}", e))
+            try:
+                where = _endpoint(a[0] if a else k.get("url"))
+                errs.append(_request_error(f"GET {where}", e))
+            except Exception:  # noqa: BLE001 - the count must never replace the error
+                errs.append("request failed")
             raise
 
     if depth_fn is None:
@@ -479,13 +483,14 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
                "overdue": _overdue(still_open, now),
                "took_s": round(time.monotonic() - t_start, 3)}
     if heartbeat is not None:           # after the ledger, and never able to fail a cycle
-        _write_heartbeat(heartbeat, {
-            "ts": _utc_iso(now), "took_s": summary["took_s"],
-            "opened": opened, "closed": len(closes), "open_now": summary["open_now"],
-            "skipped": skipped, "ungated": ungated,
-            "errors": summary["errors"], "last_error": summary["last_error"],
-            "clock_skew_s": summary["clock_skew_s"], "quote_lag_s": quote_lag,
-            "overdue": summary["overdue"]})
+        hb = {"ts": _utc_iso(now), "took_s": summary["took_s"],
+              "opened": opened, "closed": len(closes), "open_now": summary["open_now"],
+              "skipped": skipped, "ungated": ungated,
+              "errors": summary["errors"], "last_error": summary["last_error"],
+              "clock_skew_s": summary["clock_skew_s"], "quote_lag_s": quote_lag}
+        if summary["overdue"] is not None:   # readers take a missing key as "unknown";
+            hb["overdue"] = summary["overdue"]   # a null block would only trip them up
+        _write_heartbeat(heartbeat, hb)
     return summary
 
 

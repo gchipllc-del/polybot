@@ -507,3 +507,42 @@ def test_the_loop_line_names_overdue_positions(tmp_path, monkeypatch, lock_dir, 
 
 
 _real_cycle = pt.run_cycle
+
+
+def test_an_overdue_count_that_cannot_be_worked_out_is_a_missing_key_not_a_null(
+        tmp_path, monkeypatch):
+    """Readers treat a missing key as unknown. A null block would only trip them up, and
+    a status figure must never be able to fail a cycle whose rows are already written."""
+    def broken(live, now):
+        raise RuntimeError("cannot tell")
+    monkeypatch.setattr(pt, "overdue_positions", broken)
+    p, hb = tmp_path / "paper.jsonl", tmp_path / "hb.json"
+    c = cycle(p, 0.55, heartbeat=hb)
+    assert c["opened"] == 2 and len(opens(p)) == 2 and c["overdue"] is None
+    got = heartbeat_of(hb)
+    assert "overdue" not in got and got["opened"] == 2
+
+
+def test_counting_a_failed_request_never_replaces_its_error(tmp_path, monkeypatch):
+    """The settle sweep's own handler must still see the request's exception even if the
+    bookkeeping around it breaks."""
+    def broken(what, e):
+        raise RuntimeError("bookkeeping broke")
+    monkeypatch.setattr(pt, "_request_error", broken)
+    seen = []
+
+    def failing_sweep(series, get):
+        try:
+            get("https://x.invalid/trade-api/v2/markets", {"series_ticker": series})
+        except Exception as e:  # noqa: BLE001
+            seen.append(type(e).__name__)
+            raise
+    monkeypatch.setattr(s0, "fetch_settled", failing_sweep)
+
+    def sweep_down(url, params=None):
+        if "x.invalid" in url:
+            raise ConnectionError("down")
+        return exchange(0.55)(url, params)
+    c = cycle(tmp_path / "paper.jsonl", 0.55, get=sweep_down)
+    assert seen == ["ConnectionError", "ConnectionError"]
+    assert c["opened"] == 2 and c["errors"] == 2 and c["last_error"] == "request failed"
