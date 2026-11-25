@@ -659,6 +659,21 @@ def trades_of(rows: list[dict], rules: dict[str, dict]) -> dict[str, list[dict]]
     return out
 
 
+def still_open(rows: list[dict], rules: dict[str, dict]) -> dict[str, list[dict]]:
+    """rule -> its positions opened AFTER its named_at and not settled yet: the bets that
+    will join the rule's record. (Rows are read with .get - a junk row is no position.)"""
+    opens = {(r.get("ticker"), r.get("rule")): r for r in rows
+             if r.get("t") == "open" and r.get("ticker") and r.get("rule")}
+    for r in rows:
+        if r.get("t") == "close":
+            opens.pop((r.get("ticker"), r.get("rule")), None)
+    out: dict[str, list[dict]] = {name: [] for name in rules}
+    for (_, name), o in opens.items():
+        if name in rules and (_ts(o.get("ts")) or 0) >= (_ts(rules[name].get("named_at")) or 0):
+            out[name].append(o)
+    return out
+
+
 def retired_stats(rows: list[dict], path: Path = RULES) -> list[dict]:
     """forward_stats of every RETIRED rule's record after its named_at. Never shown, but
     kept in the false-discovery family: retiring is decided after seeing results, and
@@ -682,6 +697,7 @@ def evaluate(rows: list[dict], rules: dict[str, dict], extra_stats=()) -> list[d
     extra_stats, the forward_stats of every other member of the forward family (retired
     and crypto rules: family_extra). Only `rules` are classified and returned."""
     by_rule = trades_of(rows, rules)
+    waiting = still_open(rows, rules)
     names = sorted(rules)
     stats = [forward_stats(by_rule[nm]) for nm in names]
     keep = survivors(stats + list(extra_stats))     # rules come first: index i is names[i]
@@ -702,7 +718,12 @@ def evaluate(rows: list[dict], rules: dict[str, dict], extra_stats=()) -> list[d
                     "verdict": VERDICT_TEXT[cat].format(n=st["n"], need=MIN_EVENTS_VERDICT),
                     "by_series": {k: (v[0], round(v[1], 2)) for k, v in sorted(per_series.items())},
                     "gated_share": (sum(1 for t in ts if t["depth"] is not None) / len(ts))
-                    if ts else None})
+                    if ts else None,
+                    # booked with NO fill check (the depth lookup failed): of the settled
+                    # trades the verdict counts, and of the bets still waiting to settle
+                    "ungated_settled": sum(1 for t in ts if t["depth"] is None),
+                    "open": len(waiting[name]),
+                    "ungated_open": sum(1 for o in waiting[name] if o.get("depth") is None)})
     return out
 
 
@@ -725,16 +746,20 @@ def cmd_report() -> int:
           f"{hb.get('open_now', 0)} | regime {hb.get('regime', '?')}")
     print()
     print(f"  {'rule':30} {'events':>6} {'WR':>6} {'net$':>9} {'c/ct':>6} "
-          f"{'95% CI (c/ct)':>15} {'p':>6}  verdict")
+          f"{'95% CI (c/ct)':>15} {'p':>6} {'ungated':>7}  verdict")
     for r in sorted(res, key=lambda x: (-x["events"], x["rule"])):
         wr = f"{r['wr']:.1%}" if r["wr"] is not None else "-"
         ci = f"[{100 * r['lo']:+.1f},{100 * r['hi']:+.1f}]" if r["events"] >= 2 else "-"
         pv = f"{r['p']:.3f}" if r["events"] else "-"
+        ug = r["ungated_settled"] + r["ungated_open"]
         print(f"  {r['rule'][:30]:30} {r['events']:>6} {wr:>6} {r['net']:>+9.2f} "
-              f"{100 * r['mean']:>+6.1f} {ci:>15} {pv:>6}  {r['verdict']}")
+              f"{100 * r['mean']:>+6.1f} {ci:>15} {pv:>6} {ug:>7}  {r['verdict']}")
         if len(r["by_series"]) > 1:
             print("      by series (descriptive, not tested): " + "  ".join(
                 f"{k} {n}ev {v:+.2f}" for k, (n, v) in r["by_series"].items()))
+        if ug:
+            print(f"      no fill check: {r['ungated_settled']} of {r['trades']} settled trades "
+                  f"(counted in the verdict), {r['ungated_open']} of {r['open']} still open")
     print()
     dups = duplicate_closes(rows)
     if dups:
@@ -756,6 +781,10 @@ def cmd_report() -> int:
                 + sum(s_["n"] >= MIN_TESTABLE_EVENTS for s_ in extra))
     print("c/ct = cents per contract per event, after fees. p = the EXACT chance of a")
     print("record this good with no edge (a favorite that hasn't lost yet is not proof).")
+    print("ungated = positions booked with NO fill check: the order book could not be read")
+    print("(no credentials, or the lookup failed). They are admitted and counted, never")
+    print("hidden - and sleeve verdicts count them, so a rule whose ungated number is not")
+    print("small is partly judged on fills nobody checked the book for.")
     print("Benjamini-Hochberg runs across ALL forward rules, the command center's family:")
     print("these, the retired rules' records and the crypto rules' fill-checked records -")
     print(f"{testable} rules with {MIN_TESTABLE_EVENTS}+ events now. Adding sleeves never "

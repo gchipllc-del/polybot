@@ -205,3 +205,56 @@ def test_report_says_how_many_duplicate_closes_it_left_out(paths, monkeypatch, c
     assert "3 duplicate close row(s) are NOT counted above (HOURLY_FAV 3)" in out
     line = next(l for l in out.splitlines() if l.strip().startswith("HOURLY_FAV "))
     assert line.split()[1] == "8"                             # 8 events, not 11
+
+
+# ── the fill check, shown where verdicts are read ─────────────────────────────
+
+def test_report_shows_per_rule_how_many_positions_had_no_fill_check(paths, monkeypatch, capsys):
+    """An entry whose order-book lookup fails is admitted 'ungated', and sleeve verdicts
+    count every trade - but `report` printed no ungated figure at all: a ledger with 231
+    of 231 positions booked unchecked read like any other."""
+    import lib.command_center as cc
+    monkeypatch.setattr(cc, "CRYPTO_LEDGER", paths / "crypto.jsonl")
+    for name, series in (("GATED", "KXA"), ("LEAKY", "KXB"), ("IDLE", "KXC")):
+        favorites(sp.RULES, name, [series])
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            s = params["series_ticker"]
+            return {"markets": [] if s == "KXC" else [
+                mk(f"{s}-E{i}-A", f"{s}-E{i}", 98, 97, closes_h=1 + i) for i in range(6)]}
+        return {"market": {"result": "yes"}}
+
+    def depth(tk, side, price):                 # KXB's lookups fail: admitted, unchecked
+        return None if tk.startswith("KXB") else 500.0
+
+    s = sp.run_cycle(get, NOW, sp.RULES, sp.LEDGER, depth_fn=depth, regime_fn=lambda: GOOD,
+                     heartbeat=None)
+    assert (s["opened"], s["ungated"]) == (12, 6)
+    s = sp.run_cycle(get, NOW + timedelta(hours=4, minutes=30), sp.RULES, sp.LEDGER,
+                     depth_fn=depth, regime_fn=lambda: GOOD, heartbeat=None)
+    assert s["closed"] == 8                      # four of each rule's six have settled
+    # an unchecked position from BEFORE the rule was named is not part of its record
+    sp._append(sp.LEDGER, [held("KXA-OLD-A", "GATED", depth=None,
+                                ts=(NOW - timedelta(days=40)).isoformat())])
+    res = {r["rule"]: r for r in sp.evaluate(sp._load_jsonl(sp.LEDGER),
+                                             sp.active_rules(sp.RULES))}
+    figures = {n: (r["ungated_settled"], r["ungated_open"], r["open"]) for n, r in res.items()}
+    assert figures == {"GATED": (0, 0, 2), "LEAKY": (4, 2, 2), "IDLE": (0, 0, 0)}
+    assert res["LEAKY"]["gated_share"] == 0.0 and res["GATED"]["gated_share"] == 1.0
+
+    assert run_main(monkeypatch, "report") == 0
+    lines = capsys.readouterr().out.splitlines()
+    head = next(l for l in lines if l.split()[:2] == ["rule", "events"])
+    assert head.split()[-2:] == ["ungated", "verdict"]
+    cells = {n: next(l for l in lines if l.strip().startswith(n + " ")).split()
+             for n in ("GATED", "LEAKY", "IDLE")}
+    # rule, events, WR, net, c/ct, CI, p, ungated, verdict...
+    assert {n: c[7] for n, c in cells.items()} == {"GATED": "0", "LEAKY": "6", "IDLE": "0"}
+    assert all(" ".join(c[8:]).startswith("collecting") for c in cells.values())
+    detail = [l.strip() for l in lines if "no fill check:" in l]
+    assert detail == ["no fill check: 4 of 4 settled trades (counted in the verdict), "
+                      "2 of 2 still open"]
+    assert lines.index(next(l for l in lines if "no fill check:" in l)) == \
+        lines.index(next(l for l in lines if l.strip().startswith("LEAKY "))) + 1
+    assert any(l.startswith("ungated = positions booked with NO fill check") for l in lines)
