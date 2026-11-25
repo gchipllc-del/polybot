@@ -35,10 +35,24 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
 import time
 from pathlib import Path
 
 DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+# The parsed private key, kept while the key FILE stays the same. One signed request used
+# to read and parse the PEM three times (can_sign, build_headers' can_sign, sign_request):
+# about 40 ms each for RSA-2048 and 270 ms for RSA-4096, against 0.4 ms for the signature
+# itself - 0.1 to 0.8 s of CPU between a quote and the order book it is checked against.
+#   * keyed on (path, modification time, size): a replaced or edited key file is loaded
+#     again on the next call;
+#   * a load that fails is never remembered - it is retried, and raises, every time;
+#   * at most one key is held, and it stays in this process's memory, which adds nothing:
+#     the file is readable by the same user.
+_KEY_CACHE: dict[tuple, object] = {}
+# The dashboards sign from request threads; one signature at a time on the shared key.
+_SIGN_LOCK = threading.Lock()
 
 
 def _resolve_private_key_path() -> Path | None:
@@ -56,20 +70,11 @@ def _resolve_private_key_path() -> Path | None:
     return p
 
 
-def load_private_key():
-    """Load the RSA private key from disk into a ``cryptography`` object.
+def _read_private_key(path: Path):
+    """Read and parse the PEM file - the expensive step the cache exists to skip.
 
-    Returns ``None`` when the path env var isn't set OR the file is
-    missing — auth helpers treat that as "no auth available" and skip
-    signed calls.
-
-    Raises ``ValueError`` if the file exists but isn't a valid PEM key
-    (i.e. the user populated the path but the content is corrupted).
+    Raises ``ValueError`` if the file isn't a valid PEM key.
     """
-    path = _resolve_private_key_path()
-    if path is None:
-        return None
-
     from cryptography.hazmat.primitives import serialization
     try:
         with open(path, "rb") as f:
@@ -80,6 +85,49 @@ def load_private_key():
         raise ValueError(
             f"KALSHI_PRIVATE_KEY_PATH={path} is not a valid PEM RSA key: {e}"
         )
+
+
+def _key_file_identity(path: Path) -> tuple | None:
+    """(path, modification time, size) of the key file as it is now, or ``None`` when
+    it cannot be examined - then nothing is cached and the read below raises whatever
+    it always raised."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (str(path), st.st_mtime_ns, st.st_size)
+
+
+def load_private_key():
+    """Load the RSA private key from disk into a ``cryptography`` object.
+
+    Returns ``None`` when the path env var isn't set OR the file is
+    missing — auth helpers treat that as "no auth available" and skip
+    signed calls. The file's existence is checked on every call, before
+    the cache is looked at.
+
+    Raises ``ValueError`` if the file exists but isn't a valid PEM key
+    (i.e. the user populated the path but the content is corrupted).
+
+    The parsed key is reused for as long as the file's path, modification
+    time and size stay the same (see ``_KEY_CACHE``).
+    """
+    path = _resolve_private_key_path()
+    if path is None:
+        return None
+
+    ident = _key_file_identity(path)
+    if ident is not None:
+        cached = _KEY_CACHE.get(ident)
+        if cached is not None:
+            return cached
+    _KEY_CACHE.clear()               # another file, or a changed one: forget the old key
+    key = _read_private_key(path)    # raises on a bad file - and then nothing is cached
+    # Remember it only if the file was the same before and after the read: a key swapped
+    # in mid-read must not be filed under the old file's identity.
+    if ident is not None and _key_file_identity(path) == ident:
+        _KEY_CACHE[ident] = key
+    return key
 
 
 def sign_request(*, method: str, path: str, timestamp_ms: int) -> bytes:
@@ -107,14 +155,15 @@ def sign_request(*, method: str, path: str, timestamp_ms: int) -> bytes:
         )
 
     msg = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
-    signature = pk.sign(
-        msg,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
+    with _SIGN_LOCK:
+        signature = pk.sign(
+            msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
     return base64.b64encode(signature)
 
 
