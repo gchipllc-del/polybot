@@ -514,3 +514,163 @@ def test_each_rule_shows_what_it_won_and_what_it_lost(tmp_path, monkeypatch):
     assert round(r["money"]["won"] - r["money"]["lost"], 2) == round(r["decision"]["net"], 2)
     assert (p["kpi"]["won"], p["kpi"]["lost"]) == (won, lost)
     assert "`won ${dollars(m.won)}`" in cc._PAGE and "`lost ${dollars(m.lost)}`" in cc._PAGE
+
+
+# ── one panel, one guard: an unreadable input costs its own panel, never the page ──
+
+NOM = {"series": "KXINXU", "band": "mid", "side": "yes", "bucket": "80-90c", "n_out": 142,
+       "mean_out": 0.021, "p_out": 0.004, "mean_out_traded": 0.016, "verdict": "NOMINATED"}
+
+
+def _unreadable(path):
+    """Make `path` fail to open the way a file another program holds does (an OSError).
+    chmod cannot do it for a test that runs as root; a directory in the file's place
+    fails on every system."""
+    if path.exists():
+        path.unlink()
+    path.mkdir()
+
+
+def _nothing_scored_yet(monkeypatch):
+    monkeypatch.setattr(cc, "_GOOD", {"scored": None, "at": None}, raising=False)
+    cc._CACHE.update(t=0.0, payload=None)
+
+
+def _rebuild():
+    cc._CACHE.update(t=0.0, payload=None)
+    return cc.build_payload()
+
+
+def test_an_unreadable_ledger_keeps_the_last_good_rules_and_every_other_panel(tmp_path,
+                                                                               monkeypatch):
+    """A ledger or the registry another program holds open (PermissionError on Windows)
+    used to replace the WHOLE /api/command body with one error line: no rules, no trader
+    chips, no watchdog verdict - the page blank exactly when something is wrong. Now the
+    scored block keeps its last good values, marked with their time, and says why."""
+    sp = _isolate(tmp_path, monkeypatch)
+    _nothing_scored_yet(monkeypatch)
+    _sleeve_rule(sp, "S_FAV90", losses=4)
+    _crypto_ledger(cc.CRYPTO_LEDGER)
+    cc.SCREEN.write_text(json.dumps({"nominated": [NOM]}), encoding="utf-8")
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cc.HEALTH_LOG.write_text(f"{stamp} healthy fails=0 warns=0\n", encoding="utf-8")
+    good = cc.build_payload()
+    assert good["errors"] == [] and good["scored_at"] == good["generated"]
+    assert good["kpi"]["rules"] == 4 and len(good["rules"]) == 4
+    for ledger in (cc.CRYPTO_LEDGER, sp.LEDGER, sp.RULES):
+        saved = ledger.read_bytes()
+        _unreadable(ledger)
+        p = _rebuild()
+        assert "error" not in cc.make_app().test_client().get("/api/command").get_json()
+        assert [e["panel"] for e in p["errors"]] == ["rules"], p["errors"]
+        assert "could not be read" in p["errors"][0]["error"]
+        # the last good block, WHOLE, with its own time - never one ledger scored alone:
+        # every rule is judged in one family, so half of it would give other verdicts
+        assert (p["rules"], p["kpi"], p["equity"]) == (good["rules"], good["kpi"],
+                                                       good["equity"])
+        assert p["scored_at"] == good["generated"] < p["generated"]
+        # and every other panel is still there
+        assert p["health"]["state"] == "healthy" and p["nominations"] == [NOM]
+        crypto = next(t for t in p["traders"] if t["venue"] == "crypto")
+        if ledger is cc.CRYPTO_LEDGER:               # unknown - not "no rows yet"
+            assert crypto["status"] == "missing" and "could not be read" in crypto["note"]
+        else:
+            assert crypto["ts"] is not None
+        ledger.rmdir()
+        ledger.write_bytes(saved)
+    back = _rebuild()
+    assert back["errors"] == [] and back["scored_at"] == back["generated"]
+    assert back["kpi"] == good["kpi"]
+
+
+def test_before_any_good_build_an_unreadable_ledger_reads_unknown_never_zero(tmp_path,
+                                                                             monkeypatch):
+    """On a first load there is no last good block. An empty one would print 'Rules that
+    have earned an edge: 0 of 0' - unknown shown as a number. The three scored panels are
+    null, the error is named, and the page has words for it."""
+    _isolate(tmp_path, monkeypatch)
+    _nothing_scored_yet(monkeypatch)
+    _unreadable(cc.CRYPTO_LEDGER)
+    p = cc.build_payload()
+    assert (p["kpi"], p["rules"], p["equity"], p["scored_at"]) == (None, None, None, None)
+    assert [e["panel"] for e in p["errors"]] == ["rules"]
+    assert p["health"]["state"] == "unknown" and p["regime"]["current"]["regime"] == "unknown"
+    assert p["nominations"] == [] and len(p["traders"]) == 2
+    body = cc.make_app().test_client().get("/api/command").get_json()
+    assert "error" not in body and body["kpi"] is None and body["live_money"] == "OFF"
+    # the page: a chip per error, and "Unknown" tiles instead of numbers
+    assert 'id="notices"' in cc._PAGE and "for (const e of DATA.errors || [])" in cc._PAGE
+    assert 'unknownTile("Rules that have earned an edge"' in cc._PAGE
+    assert cc._PAGE.index("if (!k) {") < cc._PAGE.index("String(k.edge)")
+    assert "The rules could not be read, so none is scored" in cc._PAGE
+    assert "if (!DATA.equity) {" in cc._PAGE
+
+
+def test_a_malformed_ledger_row_stops_the_scoring_and_nothing_else(tmp_path, monkeypatch):
+    """A crypto close row whose pnl is not a number: float() raised and the whole payload
+    was that error. The row is NOT skipped - dropping a trade would change a rule's record
+    without a word. The scored block stops, says why, and keeps its last good values."""
+    _isolate(tmp_path, monkeypatch)
+    _nothing_scored_yet(monkeypatch)
+    _crypto_ledger(cc.CRYPTO_LEDGER, rules=1, n=3)
+    good = cc.build_payload()
+    assert good["errors"] == [] and good["rules"][0]["all"]["n"] == 3
+    with cc.CRYPTO_LEDGER.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": "close", "ts": T0.isoformat(), "ticker": "KXBTC15M-X-00",
+                            "rule": "C0", "price": 0.9, "won": True, "pnl": "n/a"}) + "\n")
+    p = _rebuild()
+    assert [e["panel"] for e in p["errors"]] == ["rules"] and "n/a" in p["errors"][0]["error"]
+    assert p["rules"] == good["rules"] and p["scored_at"] == good["generated"]
+    assert len(p["traders"]) == 2 and p["health"]["state"] == "unknown"
+
+
+def test_a_screen_json_that_is_not_the_scanners_costs_only_the_nominations(tmp_path,
+                                                                          monkeypatch):
+    """A top-level list or a null entry in screen.json raised AttributeError out of the
+    nominations panel and took the whole payload with it. Now whatever is not a nomination
+    is skipped, the rest is shown, and a note says the file is damaged - a damaged file
+    must not read as 'nothing nominated' in silence."""
+    _isolate(tmp_path, monkeypatch)
+    _nothing_scored_yet(monkeypatch)
+    cases = [('[{"series": "KXA"}]', [], "not the scanner's output"),
+             ('{"nominated": [null, %s, 7]}' % json.dumps(NOM), [NOM], "2 of 3 entries"),
+             ('{"nominated": {"series": "KXA"}}', [], "not a list"),
+             ('{"nominated": [{"series": "KX', [], "could not be read"),
+             ('{"nominated": [%s]}' % json.dumps(NOM), [NOM], None),
+             ('{"nominated": null}', [], None), ('{"fdr_q": 0.1}', [], None)]
+    for text, shown, note in cases:
+        cc.SCREEN.write_text(text, encoding="utf-8")
+        p = _rebuild()
+        assert p["nominations"] == shown and cc.nominations_panel() == shown, text
+        notes = [e["error"] for e in p["errors"] if e["panel"] == "nominations"]
+        assert len(notes) == (0 if note is None else 1), (text, notes)
+        assert note is None or note in notes[0], (text, notes)
+        # nothing else is touched
+        assert [e for e in p["errors"] if e["panel"] != "nominations"] == []
+        assert p["kpi"]["rules"] == 0 and len(p["traders"]) == 2
+    cc.SCREEN.unlink()                                 # no file: the scanner has not run
+    p = _rebuild()
+    assert p["nominations"] == [] and p["errors"] == []
+
+
+def test_every_other_panel_fails_alone_too(tmp_path, monkeypatch):
+    """Regime, health and the trader chips each sit under their own guard: one raising
+    leaves its 'unknown' shape and its name in errors, and the rest of the payload."""
+    _isolate(tmp_path, monkeypatch)
+    _nothing_scored_yet(monkeypatch)
+    for fn, panel in (("regime_panel", "regime"), ("health_panel", "health"),
+                      ("trader_freshness", "traders")):
+        def broken(*a, _panel=panel, **k):
+            raise RuntimeError(f"{_panel} broke")
+        with monkeypatch.context() as m:
+            m.setattr(cc, fn, broken)
+            p = _rebuild()
+        assert [(e["panel"], e["error"]) for e in p["errors"]] == [
+            (panel, f"could not be read - RuntimeError: {panel} broke")]
+        assert p["kpi"]["rules"] == 0 and p["rules"] == [] and p["scored_at"] == p["generated"]
+        assert p["regime"]["current"]["regime"] == "unknown" and p["health"]["state"] == "unknown"
+        assert isinstance(p["traders"], list) and p["nominations"] == []
+        if panel == "regime":
+            assert p["regime"]["unread"] is True and "regime broke" in p["regime"]["current"]["why"]
+        if panel == "health":
+            assert "health broke" in p["health"]["lines"][0]

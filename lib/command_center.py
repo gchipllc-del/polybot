@@ -71,6 +71,10 @@ def _ts(iso) -> float | None:
         return None
 
 
+def _why(e: BaseException) -> str:
+    return f"{type(e).__name__}: {str(e)[:200]}"
+
+
 def _downsample(points: list, n: int = 40) -> list:
     if len(points) <= n:
         return points
@@ -159,9 +163,10 @@ def _freshness(venue: str, name: str, what: str, t: float | None, limit_min: flo
                 note=None if age < limit_min else late)
 
 
-def trader_freshness(crypto_rows: list[dict], now: float | None = None) -> list[dict]:
+def trader_freshness(crypto_rows: list[dict] | None, now: float | None = None) -> list[dict]:
     """When each paper trader last showed signs of life: the sleeve trader's heartbeat
-    (written every cycle) and the crypto trader's newest ledger row."""
+    (written every cycle) and the crypto trader's newest ledger row. crypto_rows is None
+    when the crypto ledger could not be read - unknown, which is not 'no rows yet'."""
     import sleeve_paper as sp
     now = time.time() if now is None else now
     hb, missing = None, "no heartbeat yet - it has never cycled"
@@ -171,7 +176,7 @@ def trader_freshness(crypto_rows: list[dict], now: float | None = None) -> list[
         except (OSError, ValueError, AttributeError):
             hb = None
         missing = "heartbeat unreadable" if hb is None else missing
-    newest = next((t for t in (_ts(r.get("ts")) for r in reversed(crypto_rows))
+    newest = next((t for t in (_ts(r.get("ts")) for r in reversed(crypto_rows or []))
                    if t is not None), None)          # append-only: the last row is newest
     return [
         _freshness("sleeves", "Sleeve paper trader", "last cycle", hb, SLEEVE_LATE_MIN, now,
@@ -179,7 +184,7 @@ def trader_freshness(crypto_rows: list[dict], now: float | None = None) -> list[
         _freshness("crypto", "Crypto paper trader", "newest ledger row", newest,
                    CRYPTO_QUIET_MIN, now,
                    "quiet - a row is written only when a bet opens or settles",
-                   "no ledger rows yet"),
+                   "ledger could not be read" if crypto_rows is None else "no ledger rows yet"),
     ]
 
 
@@ -376,29 +381,78 @@ def health_panel() -> dict:
                                            for l in fails)))
 
 
-def nominations_panel() -> list[dict]:
+_NOMINATION_KEYS = ("series", "band", "side", "bucket", "n_out", "mean_out", "p_out",
+                    "mean_out_traded", "verdict")
+
+
+def _read_nominations() -> tuple[list[dict], str | None]:
+    """(nominations, note). screen.json is the least important input on the page and is
+    written by a hand-run tool, so it is read for whatever it holds: a file that is not
+    the scanner's shape gives no nominations, an entry that is not an object is skipped,
+    and the note says what was wrong - a damaged file must not read as 'none nominated'
+    without a word. A missing file is no note: the scanner has simply not run."""
     p = SCREEN
     if not p.exists():
-        return []
+        return [], None
     try:
         # errors="replace" + ValueError: one undecodable byte used to raise out of here
         # and replace the WHOLE payload with an error - every panel for the least
         # important input. A damaged file is "no nominations", like a truncated one.
         d = json.loads(p.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, ValueError):
-        return []
-    return [{k: c.get(k) for k in ("series", "band", "side", "bucket", "n_out", "mean_out",
-                                   "p_out", "mean_out_traded", "verdict")}
-            for c in d.get("nominated") or []][:30]
+    except (OSError, ValueError) as e:
+        return [], f"screen.json could not be read - {_why(e)}"
+    if not isinstance(d, dict):
+        return [], (f"screen.json is not the scanner's output (a {type(d).__name__} where "
+                    f"an object belongs) - run the screen again")
+    noms = d.get("nominated")
+    if noms is None:
+        return [], None
+    if not isinstance(noms, list):
+        return [], (f"screen.json is not the scanner's output ('nominated' is a "
+                    f"{type(noms).__name__}, not a list) - run the screen again")
+    rows = [{k: c.get(k) for k in _NOMINATION_KEYS} for c in noms if isinstance(c, dict)]
+    skipped = len(noms) - len(rows)
+    return rows[:30], (f"{skipped} of {len(noms)} entries in screen.json are not "
+                       f"nominations - skipped" if skipped else None)
 
 
-def build_payload() -> dict:
-    now = time.time()
-    if _CACHE["payload"] is not None and now - _CACHE["t"] < 30:
-        return _CACHE["payload"]
+def nominations_panel() -> list[dict]:
+    return _read_nominations()[0]
+
+
+# ── one panel, one guard ──────────────────────────────────────────────────────
+#
+# One unreadable input used to fail the whole payload: a ledger another program held
+# open (a sharing violation on Windows), a screen.json that was not the scanner's shape,
+# or one malformed ledger row replaced every panel with a single error line - the page
+# went blank exactly when something was wrong. Each panel is now built under its own
+# guard, and a panel that failed is named in `errors` (the page shows each as a chip).
+#
+# The scored panels - rules, headline numbers, equity - are ONE block: every rule is
+# judged in one family across both ledgers, so a table scored without one of them would
+# show verdicts the full family does not give. It is built whole or not at all. When it
+# cannot be built the page keeps the LAST GOOD block, marked with its time (scored_at);
+# before any good build the three are null - never zeros, which would read "0 of 0
+# rules have earned an edge", unknown shown as a number.
+
+_GOOD: dict = {"scored": None, "at": None}     # the last scored block that built, and when
+
+
+def _guarded(errors: list, panel: str, build, fallback):
+    """build(), or - when it raises - `fallback` (called with the exception if callable)
+    and an entry in errors. One bad input costs its own panel, never the page."""
+    try:
+        return build()
+    except Exception as e:  # noqa: BLE001
+        errors.append({"panel": panel, "error": f"could not be read - {_why(e)}"})
+        return fallback(e) if callable(fallback) else fallback
+
+
+def _scored(crows: list[dict]) -> dict:
+    """The scored block: the rules, the headline numbers and the equity series."""
     import paper_trader as pt
     import sleeve_paper as sp
-    crows, srows = _load_jsonl(CRYPTO_LEDGER), _load_jsonl(sp.LEDGER)   # each read once
+    srows = _load_jsonl(sp.LEDGER)                      # each ledger is read once a build
     ct = crypto_trades(crows)
     st, srules, retired = sleeve_trades(srows)
     trades = ct + st
@@ -409,9 +463,7 @@ def build_payload() -> dict:
     rules = score_rules(trades, srules, retired, open_now)
     n_crypto = sum(c_open.values())
     n_sleeves = sum(n for (venue, _), n in open_now.items() if venue == "sleeves")
-    payload = {
-        "generated": datetime.now(timezone.utc).isoformat(),
-        "live_money": "OFF",
+    return {
         "kpi": {"rules": len(rules), "edge": sum(r["status"] == "good" for r in rules),
                 "net": round(sum(t["pnl"] for t in trades), 2),
                 **{k: v for k, v in _money(trades).items() if k in ("won", "lost")},
@@ -423,8 +475,57 @@ def build_payload() -> dict:
                 # the rules shown; a retired rule's bets still settle, into its record
                 "open": n_crypto + n_sleeves, "open_crypto": n_crypto,
                 "open_sleeves": n_sleeves, "open_retired": sum(s_open.values()) - n_sleeves},
-        "rules": rules, "traders": trader_freshness(crows, now), "equity": equity_series(trades),
-        "regime": regime_panel(), "health": health_panel(), "nominations": nominations_panel(),
+        "rules": rules, "equity": equity_series(trades)}
+
+
+def _regime_unread(e: BaseException) -> dict:
+    return {"current": {"regime": "unknown", "why": f"the regime could not be read ({_why(e)})"},
+            "cells": [], "unread": True}
+
+
+def _health_unread(e: BaseException) -> dict:
+    return {"state": "unknown", "ts": None, "age_min": None, "fails": 0, "warns": 0,
+            "failing": [], "lines": [f"the watchdog verdict could not be read ({_why(e)})"]}
+
+
+def build_payload() -> dict:
+    now = time.time()
+    if _CACHE["payload"] is not None and now - _CACHE["t"] < 30:
+        return _CACHE["payload"]
+    generated = datetime.now(timezone.utc).isoformat()
+    errors: list[dict] = []
+    read: dict = {}                    # the crypto ledger: the trader chips read it too
+
+    def scored() -> dict:
+        read["crypto"] = _load_jsonl(CRYPTO_LEDGER)
+        return _scored(read["crypto"])
+
+    def nominations() -> list[dict]:
+        rows, note = _read_nominations()
+        if note:
+            errors.append({"panel": "nominations", "error": note})
+        return rows
+
+    block, scored_at = _guarded(errors, "rules", scored, None), generated
+    if block is not None:
+        _GOOD.update(scored=block, at=generated)
+    else:
+        last = dict(_GOOD)             # one read: its block and its time belong together
+        block, scored_at = last["scored"] or dict.fromkeys(("kpi", "rules", "equity")), last["at"]
+    payload = {
+        "generated": generated,
+        "live_money": "OFF",
+        "kpi": block["kpi"], "rules": block["rules"], "equity": block["equity"],
+        # when the three above were scored. Equal to `generated` on a good build; older
+        # = the last good values, kept because this build could not score (see errors);
+        # None = nothing has been scored yet, and the three are null.
+        "scored_at": scored_at,
+        "traders": _guarded(errors, "traders",
+                            lambda: trader_freshness(read.get("crypto"), now), []),
+        "regime": _guarded(errors, "regime", regime_panel, _regime_unread),
+        "health": _guarded(errors, "health", health_panel, _health_unread),
+        "nominations": _guarded(errors, "nominations", nominations, []),
+        "errors": errors,
     }
     _CACHE.update(t=now, payload=payload)
     return payload
@@ -522,6 +623,9 @@ h1 { font-size: 20px; font-weight: 600; margin: 0; }
         border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px;
         background: var(--surface); font-size: 12px; color: var(--ink-2); }
 .chip strong, .health strong { color: var(--ink); font-weight: 600; }
+.chip span { min-width: 0; overflow-wrap: anywhere; }
+.notices { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.notices:empty { display: none; }
 .note a, .note a:visited { color: var(--ink-2); }
 .opencount { color: var(--ink-2); font-weight: 600; }
 .reason { color: var(--ink); font-size: 12px; margin-top: 6px; overflow-wrap: anywhere;
@@ -593,6 +697,7 @@ section { margin-top: 12px; }
     </div>
   </div>
 
+  <div class="notices" id="notices" role="group" aria-label="Panels that could not be read"></div>
   <div class="grid kpis" id="kpis"></div>
   <div class="traders" id="traders" role="group" aria-label="Paper traders, live"></div>
 
@@ -721,21 +826,53 @@ function tile(label, value, note, opts) {
   if (note) c.appendChild(el("div", {class: "note"}, note));
   return c;
 }
+// ── a panel that could not be read says so, in words - never an empty panel in silence ──
+const PANEL = {rules: "Rules, P&L and open bets", traders: "Paper traders", regime: "News regime",
+               health: "System health", nominations: "Scanner nominations"};
+function renderNotices() {
+  const box = document.getElementById("notices"); box.replaceChildren();
+  for (const e of DATA.errors || []) {
+    const chip = el("div", {class: "chip"}), txt = el("span");
+    chip.appendChild(icon("alert", "var(--warning)"));
+    txt.appendChild(el("strong", {}, PANEL[e.panel] || e.panel));
+    let said = " · " + e.error;
+    if (e.panel === "rules")           // the scored block: the last good one, or nothing yet
+      said += DATA.scored_at ? ` · showing the last good values, scored ${DATA.scored_at.slice(11, 19)}Z`
+                             : " · nothing has been scored yet";
+    txt.appendChild(document.createTextNode(said));
+    chip.appendChild(txt);
+    box.appendChild(chip);
+  }
+}
+function unknownTile(label, note, opts) {       // unknown is a word and an icon, never a zero
+  const s = el("span", {class: "status"});
+  s.appendChild(icon("dash", "var(--neutral-cell)"));
+  s.appendChild(document.createTextNode("Unknown"));
+  return tile(label, "", note, {...(opts || {}), node: s});
+}
 function renderKpis() {
   const k = DATA.kpi, box = document.getElementById("kpis");
   box.replaceChildren();
-  box.appendChild(tile("Rules that have earned an edge", String(k.edge),
-    k.edge ? "Survived 100+ events and the family correction - still paper until you decide."
-           : "None yet. That is the honest number, and the reason live money stays off.",
-    {hero: true, of: ` of ${k.rules}`}));
-  box.appendChild(tile("Paper P&L, all rules", usd(k.net),
-    `crypto ${usd(k.net_crypto)} · sleeves ${usd(k.net_sleeves)} · won ${dollars(k.won)}, `
-    + `lost ${dollars(k.lost)}`));
-  box.appendChild(tile("Evidence collected", compact(k.windows + k.events),
-    `${compact(k.windows)} crypto windows · ${compact(k.events)} sleeve events`));
-  box.appendChild(tile("Open bets", String(k.open),
-    `crypto ${k.open_crypto} · sleeves ${k.open_sleeves}`
-    + (k.open_retired ? ` (+${k.open_retired} on retired rules)` : "") + " - not settled yet"));
+  if (!k) {                     // nothing scored yet: "0 of 0" would be unknown shown as a number
+    box.appendChild(unknownTile("Rules that have earned an edge",
+      "The ledgers could not be read, so nothing is scored - see the notice above. "
+      + "Live money stays off.", {hero: true}));
+    for (const label of ["Paper P&L, all rules", "Evidence collected", "Open bets"])
+      box.appendChild(unknownTile(label, "not read yet"));
+  } else {
+    box.appendChild(tile("Rules that have earned an edge", String(k.edge),
+      k.edge ? "Survived 100+ events and the family correction - still paper until you decide."
+             : "None yet. That is the honest number, and the reason live money stays off.",
+      {hero: true, of: ` of ${k.rules}`}));
+    box.appendChild(tile("Paper P&L, all rules", usd(k.net),
+      `crypto ${usd(k.net_crypto)} · sleeves ${usd(k.net_sleeves)} · won ${dollars(k.won)}, `
+      + `lost ${dollars(k.lost)}`));
+    box.appendChild(tile("Evidence collected", compact(k.windows + k.events),
+      `${compact(k.windows)} crypto windows · ${compact(k.events)} sleeve events`));
+    box.appendChild(tile("Open bets", String(k.open),
+      `crypto ${k.open_crypto} · sleeves ${k.open_sleeves}`
+      + (k.open_retired ? ` (+${k.open_retired} on retired rules)` : "") + " - not settled yet"));
+  }
   const rg = DATA.regime.current, meta = REGIME[rg.regime] || REGIME.unknown;
   const st = el("span", {class: "status"});
   st.appendChild(icon(meta.icon, meta.color));
@@ -804,6 +941,11 @@ function niceTicks(lo, hi, n) {
 function renderEquity() {
   const box = document.getElementById("eq-chart"), legend = document.getElementById("eq-legend");
   box.replaceChildren(); legend.replaceChildren();
+  if (!DATA.equity) {
+    box.appendChild(el("div", {class: "empty"}, "Paper P&L could not be read - see the notice at the top of the page."));
+    document.getElementById("eq-table").replaceChildren();
+    return;
+  }
   const series = SERIES.filter(s => VENUE === "all" || VENUE === s.key)
                        .map(s => ({...s, pts: DATA.equity[s.key] || []}))
                        .filter(s => s.pts.length);
@@ -914,6 +1056,12 @@ function ciBar(st, dom) {
 }
 function renderRules() {
   const t = document.getElementById("rules"); t.replaceChildren();
+  if (!DATA.rules) {            // not read: one cell that wraps, no header row to scroll past
+    const tr = el("tr");
+    tr.appendChild(el("td", {class: "empty", style: "white-space:normal"},
+      "The rules could not be read, so none is scored - see the notice at the top of the page."));
+    t.appendChild(tr); return;
+  }
   const rows = DATA.rules.filter(r => VENUE === "all" || r.venue === VENUE);
   const head = el("tr");
   for (const [h, cls] of [["Rule", ""], ["Verdict", ""], ["Events", "num"], ["Win rate", "num"],
@@ -969,7 +1117,8 @@ function renderRegime() {
     sp.appendChild(document.createTextNode(REGIME[k].label)); legend.appendChild(sp);
   }
   const box = document.getElementById("rg-chart"); box.replaceChildren();
-  if (!rg.cells.length) { box.appendChild(el("div", {class: "empty"}, "The news agent has not run yet.")); return; }
+  if (!rg.cells.length) { box.appendChild(el("div", {class: "empty"},
+    rg.unread ? "The news regime could not be read." : "The news agent has not run yet.")); return; }
   const days = [...new Set(rg.cells.map(c => c.d))].sort().slice(-14);
   const gap = 2, L = 44, T = 4, avail = (box.clientWidth || 380) - L;
   const cell = Math.max(6, Math.min(12, Math.floor(avail / 24) - gap));   // fits a phone
@@ -1065,8 +1214,8 @@ function render() {
   live.appendChild(icon("dash", "var(--neutral-cell)"));
   live.appendChild(document.createTextNode(`Live money ${DATA.live_money} - paper only`));
   document.getElementById("gen").textContent = `updated ${DATA.generated.slice(11, 19)}Z · refreshes every minute`;
-  renderKpis(); renderTraders(); renderEquity(); renderRules(); renderRegime(); renderHealth();
-  renderNoms();
+  renderNotices(); renderKpis(); renderTraders(); renderEquity(); renderRules(); renderRegime();
+  renderHealth(); renderNoms();
 }
 async function load() {
   const app = document.getElementById("app");
