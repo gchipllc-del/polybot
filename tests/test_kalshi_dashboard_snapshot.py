@@ -222,6 +222,7 @@ def test_an_unreadable_ledger_is_not_reported_as_paper_off(tmp_path, monkeypatch
     import paper_trader as pt
     ledger = tmp_path / "paper_crypto15.jsonl"
     monkeypatch.setattr(pt, "LEDGER", ledger)
+    monkeypatch.setattr(kd, "_account_payload", lambda: {})       # no balance fetch here
     assert kd._trading_status_payload()["paper"] is False              # no ledger: armed
     ledger.write_text(json.dumps({"t": "open", "ticker": "T", "rule": "H1"}) + "\n[1, 2]\n",
                       encoding="utf-8")
