@@ -400,3 +400,41 @@ def test_backfill_with_no_series_says_so_and_fails(bf, capsys):
     """An empty catalog used to make backfill do nothing, print nothing and return 0."""
     assert ss.cmd_backfill([], 60, get=lambda *a: pytest.fail("no request expected")) == 1
     assert "no series to backfill" in capsys.readouterr().out
+
+
+# ── backfill writes: a market row never stands without its candles ────────────
+
+def test_backfill_writes_each_market_and_its_candles_in_one_flushed_write(bf, tmp_path,
+                                                                          monkeypatch):
+    """A market row is 'fetched' to the resume. Written row by row through an 8 KB
+    buffer, a hard stop (End task, forced restart) left the row on disk without its
+    newest candles - the minutes before the close a last-hour test reads - and no later
+    run repaired it. Each market is now one append (lib.jsonl_io.append_lines)."""
+    import lib.jsonl_io as jio
+    writes: list[list[str]] = []
+
+    def record(path, lines):
+        lines = list(lines)
+        writes.append(lines)
+        return jio.append_lines(path, lines)
+
+    monkeypatch.setattr(ss, "append_lines", record)
+    get, _ = _backfill_api({"KXA": {"KXA-E1": 3}})
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 0
+    assert len(writes) == 3                                       # one per market
+    for w in writes:
+        rows = [json.loads(x) for x in w]
+        assert rows[0]["t"] == "market" and [r["t"] for r in rows[1:]] == ["candle"]
+        assert {r["ticker"] for r in rows} == {rows[0]["ticker"]}
+
+
+def test_backfill_never_glues_a_new_row_onto_a_torn_one(bf, tmp_path):
+    """A file cut inside its last row (power loss, full disk): the resumed run used to
+    glue its first market row onto the torn one, losing that market to every reader and
+    leaving its candles as orphans."""
+    get, _ = _backfill_api({"KXA": {"KXA-E1": 2}})
+    path = tmp_path / "KXA.jsonl"
+    path.write_text('{"t":"market","series":"KXA","ticker":"KXA-E0-T0","res', encoding="utf-8")
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 0
+    sl = ss.load_sleeve_file(path)
+    assert set(sl["KXA"]["markets"]) == {"KXA-E1-T0", "KXA-E1-T1"}

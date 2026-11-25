@@ -356,3 +356,30 @@ def test_close_run_exit_codes():
     capped = dict(hb.new_tally("KXF"), listed=True, todo=15, fetched=15, capped=1,
                   capped_events=1)
     assert hb.close_run([capped], cap=15) == 0            # the cap is the design, not a fault
+
+
+def test_run_writes_each_market_and_its_candles_in_one_write(tmp_path, monkeypatch, slept):
+    """Same contract as sleeve_scan backfill: a market row, which the resume reads as
+    'done', is written together with all its candles or not at all."""
+    import lib.jsonl_io as jio
+    monkeypatch.setattr(hb, "OUT", tmp_path / "bf.jsonl")
+    writes: list[list[str]] = []
+
+    def record(path, lines):
+        lines = list(lines)
+        writes.append(lines)
+        return jio.append_lines(path, lines)
+
+    monkeypatch.setattr(hb, "append_lines", record)
+    get, _ = _run_api({"KXA": ["A-1", "A-2"]})
+    assert hb.cmd_run(["KXA"], 100, get=get) == 0
+    assert [[json.loads(x)["t"] for x in w] for w in writes] == [["market", "candle"]] * 2
+
+
+def test_run_never_glues_a_new_row_onto_a_torn_one(tmp_path, monkeypatch, slept):
+    out = tmp_path / "bf.jsonl"
+    monkeypatch.setattr(hb, "OUT", out)
+    out.write_text('{"t":"market","ticker":"A-0","res', encoding="utf-8")
+    get, _ = _run_api({"KXA": ["A-1"]})
+    assert hb.cmd_run(["KXA"], 100, get=get) == 0
+    assert hb._seen_tickers(out) == {"A-1"}

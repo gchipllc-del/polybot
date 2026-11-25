@@ -45,6 +45,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from lib.jsonl_io import append_lines  # noqa: E402
+
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 SERIES = ["KXBTC15M", "KXETH15M"]
 OUT = Path(os.environ.get("BACKFILL_LOG") or (ROOT / "data" / "history_backfill.jsonl"))
@@ -438,36 +440,36 @@ def cmd_run(series_list: list[str], max_markets: int, get=_get) -> int:
                 and m.get("result") in ("yes", "no")]
         t["listed"], t["todo"] = True, len(todo)
         print(f"{series}: {len(ms)} settled, {len(todo)} to fetch")
-        with open(OUT, "a", encoding="utf-8") as f:
-            for i, m in enumerate(todo):
-                tk = m["ticker"]
-                try:
-                    cs = fetch_candles(series, tk, m.get("open_time"),
-                                       m.get("close_time"), get=get)
-                except Exception as e:  # noqa: BLE001
-                    t["missing"].append(m)
-                    print(f"  [warn] {tk}: {describe_error(e)} - not fetched")
-                    time.sleep(SLEEP_S)            # a failure is paced like a success
-                    if streak.failed(e):
-                        t["missing"].extend(todo[i + 1:])     # never asked for
-                        break
-                    continue
-                streak.ok()
-                f.write(json.dumps({"t": "market", "series": series, "ticker": tk,
-                                    "result": m.get("result"),
-                                    "open_time": m.get("open_time"),
-                                    "close_time": m.get("close_time"),
-                                    "floor_strike": m.get("floor_strike"),
-                                    "volume": m.get("volume")},
-                                   separators=(",", ":")) + "\n")
-                for c in cs:
-                    f.write(json.dumps({"t": "candle", "series": series, "ticker": tk,
-                                        **c}, separators=(",", ":")) + "\n")
-                total_c += len(cs)
-                t["fetched"] += 1
-                if (i + 1) % 25 == 0:
-                    print(f"  {i+1}/{len(todo)} markets, {total_c} candles")
-                time.sleep(SLEEP_S)
+        for i, m in enumerate(todo):
+            tk = m["ticker"]
+            try:
+                cs = fetch_candles(series, tk, m.get("open_time"),
+                                   m.get("close_time"), get=get)
+            except Exception as e:  # noqa: BLE001
+                t["missing"].append(m)
+                print(f"  [warn] {tk}: {describe_error(e)} - not fetched")
+                time.sleep(SLEEP_S)                # a failure is paced like a success
+                if streak.failed(e):
+                    t["missing"].extend(todo[i + 1:])         # never asked for
+                    break
+                continue
+            streak.ok()
+            # the market row and all its candles in ONE write, flushed: a market row
+            # means "fetched" to the resume, so it must never stand without its candles
+            append_lines(OUT, [json.dumps({"t": "market", "series": series, "ticker": tk,
+                                           "result": m.get("result"),
+                                           "open_time": m.get("open_time"),
+                                           "close_time": m.get("close_time"),
+                                           "floor_strike": m.get("floor_strike"),
+                                           "volume": m.get("volume")},
+                                          separators=(",", ":"))]
+                         + [json.dumps({"t": "candle", "series": series, "ticker": tk, **c},
+                                       separators=(",", ":")) for c in cs])
+            total_c += len(cs)
+            t["fetched"] += 1
+            if (i + 1) % 25 == 0:
+                print(f"  {i+1}/{len(todo)} markets, {total_c} candles")
+            time.sleep(SLEEP_S)
     print(f"total new candles: {total_c}")
     return close_run(tallies)
 

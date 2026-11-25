@@ -55,6 +55,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from forecast_replay import MIN_CELL_WINDOWS, mean_ci, norm_cdf, taker_fee  # noqa: E402
 import history_backfill as hb  # noqa: E402
+from lib.jsonl_io import append_lines  # noqa: E402
 
 SLEEVE_DIR = Path(os.environ.get("SLEEVE_DIR") or (ROOT / "data" / "sleeves"))
 CATALOG = SLEEVE_DIR / "catalog.json"
@@ -533,45 +534,45 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
         note = f" ({again} stored with a window under {final_hours:g}h)" if again else ""
         print(f"{series}: {len(evs)} events, {len(todo)} markets to fetch{note} -> {path.name}")
         n = 0
-        with open(path, "a", encoding="utf-8") as f:
-            for i, m in enumerate(todo):
-                o, c = hb._iso_to_ts(m.get("open_time")), hb._iso_to_ts(m.get("close_time"))
-                if o is None or c is None:
-                    t["untimed"] += 1
-                    continue
-                start, every = o, candle_interval(o, c)
-                if final_hours:
-                    start, every = max(o, c - final_hours * 3600.0), 1
-                try:
-                    d = get(f"{hb.KALSHI}/series/{series}/markets/{m['ticker']}/candlesticks",
-                            {"period_interval": every, "start_ts": int(start), "end_ts": int(c)})
-                except Exception as e:  # noqa: BLE001
-                    t["missing"].append(m)
-                    print(f"  [warn] {m['ticker']}: {hb.describe_error(e)} - not fetched")
-                    time.sleep(hb.SLEEP_S)         # a failure is paced like a success
-                    if streak.failed(e):
-                        t["missing"].extend(todo[i + 1:])     # never asked for
-                        break
-                    continue
-                streak.ok()
-                cs = d.get("candlesticks", []) or d.get("candles", []) or []
-                row = {"t": "market", "series": series, "ticker": m["ticker"],
-                       "event_ticker": m.get("event_ticker") or event_of(m),
-                       "category": cats.get(series), "result": m.get("result"),
-                       "open_time": m.get("open_time"), "close_time": m.get("close_time"),
-                       "volume": m.get("volume")}
-                if final_hours:
-                    row["final_hours"] = final_hours      # the window this fetch covers
-                f.write(json.dumps(row, separators=(",", ":")) + "\n")
-                for cd in cs:
-                    f.write(json.dumps({"t": "candle", "series": series,
-                                        "ticker": m["ticker"], **cd},
-                                       separators=(",", ":")) + "\n")
-                n += 1
-                t["fetched"] = n
-                if n % 50 == 0:
-                    print(f"  {n}/{len(todo)}")
-                time.sleep(hb.SLEEP_S)
+        for i, m in enumerate(todo):
+            o, c = hb._iso_to_ts(m.get("open_time")), hb._iso_to_ts(m.get("close_time"))
+            if o is None or c is None:
+                t["untimed"] += 1
+                continue
+            start, every = o, candle_interval(o, c)
+            if final_hours:
+                start, every = max(o, c - final_hours * 3600.0), 1
+            try:
+                d = get(f"{hb.KALSHI}/series/{series}/markets/{m['ticker']}/candlesticks",
+                        {"period_interval": every, "start_ts": int(start), "end_ts": int(c)})
+            except Exception as e:  # noqa: BLE001
+                t["missing"].append(m)
+                print(f"  [warn] {m['ticker']}: {hb.describe_error(e)} - not fetched")
+                time.sleep(hb.SLEEP_S)         # a failure is paced like a success
+                if streak.failed(e):
+                    t["missing"].extend(todo[i + 1:])     # never asked for
+                    break
+                continue
+            streak.ok()
+            cs = d.get("candlesticks", []) or d.get("candles", []) or []
+            row = {"t": "market", "series": series, "ticker": m["ticker"],
+                   "event_ticker": m.get("event_ticker") or event_of(m),
+                   "category": cats.get(series), "result": m.get("result"),
+                   "open_time": m.get("open_time"), "close_time": m.get("close_time"),
+                   "volume": m.get("volume")}
+            if final_hours:
+                row["final_hours"] = final_hours      # the window this fetch covers
+            # the market row and all its candles in ONE write, flushed: a market row
+            # means "fetched" to the resume, so it must never stand without its candles
+            append_lines(path, [json.dumps(row, separators=(",", ":"))]
+                         + [json.dumps({"t": "candle", "series": series,
+                                        "ticker": m["ticker"], **cd}, separators=(",", ":"))
+                            for cd in cs])
+            n += 1
+            t["fetched"] = n
+            if n % 50 == 0:
+                print(f"  {n}/{len(todo)}")
+            time.sleep(hb.SLEEP_S)
     return hb.close_run(
         tallies, event_of=event_of, cap=MAX_MARKETS_PER_EVENT,
         hint=f" Do it soon: only each series' newest {events_per_series} events are looked "
