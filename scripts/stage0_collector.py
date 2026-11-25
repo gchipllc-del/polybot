@@ -32,6 +32,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:          # lib/ must resolve however this file was started
+    sys.path.insert(0, str(ROOT))
+
+from lib.jsonl_io import append_lines  # noqa: E402 - needs ROOT on sys.path
+
 LOG = Path(os.environ.get("STAGE0_LOG") or (ROOT / "data" / "stage0_crypto.jsonl"))
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -196,10 +201,9 @@ def run_cycle(get=_get, now: datetime | None = None, path: Path | None = None,
         except Exception as e:  # noqa: BLE001
             print(f"[warn] settle sweep failed for {series}: {e}")
 
-    if rows:
-        with open(p, "a", encoding="utf-8") as f:
-            for r in rows:
-                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+    # One write per cycle, and never onto a torn line: after a crash mid-append the next
+    # row used to be glued to the fragment and lost with it (lib/jsonl_io.append_lines).
+    append_lines(p, [json.dumps(r, separators=(",", ":")) for r in rows])
     return {"obs": n_obs, "settles": n_settle}
 
 
@@ -222,10 +226,8 @@ def write_snapshot(path: Path | None = None, history: Path | None = None) -> Non
             cells.append({"band": band, "bucket": bucket, "n": c["n"],
                           "gap": round(c["wins"] / c["n"] - c["cost"] / c["n"], 4),
                           "fee": round(c["fee"] / c["n"], 3)})
-    hp.parent.mkdir(parents=True, exist_ok=True)
-    with open(hp, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": _now_iso(), "joined": rep["joined"],
-                            "cells": cells}, separators=(",", ":")) + "\n")
+    append_lines(hp, [json.dumps({"ts": _now_iso(), "joined": rep["joined"],
+                                  "cells": cells}, separators=(",", ":"))])
 
 
 def collect_loop() -> int:

@@ -37,6 +37,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from lib.jsonl_io import append_lines  # noqa: E402 - needs ROOT on sys.path
+
 LEDGER = Path(os.environ.get("PAPER_CRYPTO_LEDGER")
               or (ROOT / "data" / "paper_crypto15.jsonl"))
 
@@ -98,12 +100,13 @@ def _load(path: Path) -> list[dict]:
 
 
 def _append(rows: list[dict], path: Path) -> None:
+    """A cycle's rows in ONE write, and never onto a torn line: if a crash or power cut
+    left the ledger without its final newline, a newline goes first. Without it the next
+    row - the re-entry of the very bet whose row was torn - was glued to the fragment and
+    both were unreadable, so that bet was recorded a cycle later still, or never."""
     if not rows:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, separators=(",", ":")) + "\n")
+    append_lines(path, [json.dumps(r, separators=(",", ":")) for r in rows])
 
 
 def open_positions(rows: list[dict]) -> dict:
