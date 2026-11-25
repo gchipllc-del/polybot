@@ -48,6 +48,9 @@ OUT = Path(os.environ.get("BACKFILL_LOG") or (ROOT / "data" / "history_backfill.
 EXPORT = Path(os.environ.get("BACKFILL_EXPORT")
               or (ROOT / "data" / "stage0_backfill.jsonl"))
 SLEEP_S = 0.35              # polite pacing; these are public endpoints
+LIST_PAGE = 1000            # markets per listing page: the most /markets serves (a
+                            # smaller page from the server still works - the loop
+                            # follows the cursor)
 
 
 def _get(url: str, params: dict | None = None) -> dict:
@@ -68,7 +71,7 @@ def fetch_settled_markets(series: str, get=_get, max_markets: int = 10000) -> li
     """All settled markets for a series, cursor-paginated, oldest data included."""
     out, cursor = [], None
     while len(out) < max_markets:
-        params = {"series_ticker": series, "status": "settled", "limit": 200}
+        params = {"series_ticker": series, "status": "settled", "limit": LIST_PAGE}
         if cursor:
             params["cursor"] = cursor
         data = get(f"{KALSHI}/markets", params)
