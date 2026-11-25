@@ -279,17 +279,19 @@ def _paper_crypto_payload() -> dict:
 
 def _trading_status_payload() -> dict:
     """Unambiguous answer to 'are we trading?' — read from the actual ledgers, not from
-    intent. live=any real order path active; paper=any paper ledger with rows."""
+    intent. live=any real order path active; paper=any paper ledger with rows.
+
+    A ledger that cannot be read RAISES (the panel then shows that error, via the guard in
+    _build_all). It used to be swallowed and counted as zero rows, so a locked ledger read
+    'PAPER OFF ... PAPER ARMED - waiting for a frozen rule to fire' while the Paper book
+    panel beside it showed the read error: unknown reported as zero."""
     import sys as _sys
-    paper_rows = 0
-    try:
-        sdir = str(ROOT / "scripts")
-        if sdir not in _sys.path:
-            _sys.path.insert(0, sdir)
-        import paper_trader as pt
-        paper_rows = len([r for r in pt._load(pt.LEDGER) if r.get("t") == "open"])
-    except Exception:
-        pass
+    sdir = str(ROOT / "scripts")
+    if sdir not in _sys.path:
+        _sys.path.insert(0, sdir)
+    import paper_trader as pt
+    paper_rows = len([r for r in pt._load(pt.LEDGER)
+                      if isinstance(r, dict) and r.get("t") == "open"])
     return {
         "live": False,
         "paper": paper_rows > 0,
@@ -309,9 +311,18 @@ def _trading_status_payload() -> dict:
 # healthcheck's 8 s budget and made every page refresh wait as long. Stale-while-
 # revalidate: a request gets the last snapshot immediately; one older than ALL_TTL_S
 # triggers ONE background rebuild. Only the first request after a start waits.
+#
+# The body also says how the rebuilding itself is going, so a snapshot that has stopped
+# moving cannot hide behind HTTP 200:
+#   age_s               how old the served snapshot is
+#   rebuild_started     ISO time the rebuild now in flight started, or null (none running)
+#   last_rebuild_error  why the latest rebuild could not start or finish, or null
+# (age_s alone cannot tell a watchdog much: a lone request after an idle stretch always
+# gets an old snapshot - and starts the rebuild that replaces it.)
 
 ALL_TTL_S = 30.0
-_ALL: dict = {"payload": None, "t": 0.0, "busy": False}
+_ALL: dict = {"payload": None, "t": 0.0, "busy": False, "thread": None, "started": None,
+              "error": None}
 _ALL_LOCK = threading.Lock()
 
 
@@ -338,13 +349,40 @@ def _build_all() -> dict:
 
 
 def _refresh_all() -> None:
+    error = None
     try:
         payload = _build_all()
         with _ALL_LOCK:
             _ALL.update(payload=payload, t=time.monotonic())
+    except Exception as e:  # noqa: BLE001 - said in the body, not lost on a thread
+        error = f"the snapshot rebuild raised {type(e).__name__}: {str(e)[:200]}"
     finally:
         with _ALL_LOCK:
-            _ALL["busy"] = False
+            _ALL.update(busy=False, error=error)
+
+
+def _rebuilding() -> bool:
+    """Is a rebuild in flight? (Call with _ALL_LOCK held.) The busy flag counts only
+    while its THREAD is alive. The flag alone once froze the page for good: it was set,
+    the thread could not start, and nothing was left to clear it. A timer instead ('a
+    flag older than N minutes is dead') would start a second rebuild on top of a slow
+    live one and double its memory."""
+    t = _ALL.get("thread")
+    return bool(_ALL.get("busy")) and t is not None and t.is_alive()
+
+
+def _start_rebuild() -> None:
+    """Start the one background rebuild. Call with _ALL_LOCK held and none in flight."""
+    t = threading.Thread(target=_refresh_all, name="api-all-refresh", daemon=True)
+    _ALL.update(busy=True, thread=t, started=datetime.now(timezone.utc).isoformat())
+    try:
+        t.start()
+    except Exception as e:  # noqa: BLE001 - "can't start new thread": memory is short
+        # Nothing is running, so nothing would ever clear the flag: clear it here, say
+        # why in the body, and let the next request try again.
+        _ALL.update(busy=False, thread=None, started=None,
+                    error=f"the snapshot rebuild could not start - "
+                          f"{type(e).__name__}: {str(e)[:200]}")
 
 
 def _all_payload(wait_s: float = 6.0) -> dict:
@@ -353,21 +391,24 @@ def _all_payload(wait_s: float = 6.0) -> dict:
     for the first build; if that is still running, it gets a one-panel 'warming' body."""
     with _ALL_LOCK:
         fresh = _ALL["payload"] is not None and time.monotonic() - _ALL["t"] < ALL_TTL_S
-        start = not fresh and not _ALL["busy"]
-        if start:
-            _ALL["busy"] = True
-    if start:
-        threading.Thread(target=_refresh_all, name="api-all-refresh", daemon=True).start()
+        if not fresh and not _rebuilding():
+            _start_rebuild()
     deadline = time.monotonic() + wait_s
-    while _ALL["payload"] is None and time.monotonic() < deadline:
+    while time.monotonic() < deadline:             # only the first build is waited for
+        with _ALL_LOCK:
+            if _ALL["payload"] is not None or not _rebuilding():
+                break
         time.sleep(0.05)
     with _ALL_LOCK:
         payload, t = _ALL["payload"], _ALL["t"]
+        state = {"rebuild_started": _ALL.get("started") if _rebuilding() else None,
+                 "last_rebuild_error": _ALL.get("error")}
     if payload is None:
-        return {"warming": {"error": "first snapshot still building - refresh in a few "
-                                     "seconds"},
-                "ts": datetime.now(timezone.utc).isoformat()}
-    return dict(payload, age_s=round(time.monotonic() - t, 1))
+        why = (f"no snapshot yet - {state['last_rebuild_error']}" if state["last_rebuild_error"]
+               else "first snapshot still building - refresh in a few seconds")
+        return {"warming": {"error": why}, "ts": datetime.now(timezone.utc).isoformat(),
+                **state}
+    return dict(payload, age_s=round(time.monotonic() - t, 1), **state)
 
 
 def make_app():
@@ -455,11 +496,11 @@ h1 { margin: 0 0 6px 0; font-size: 20px; }
 .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
 .grid {
   display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
 }
 .panel {
   background: var(--panel); border: 1px solid var(--border);
-  border-radius: 6px; padding: 12px; overflow-x: auto;
+  border-radius: 6px; padding: 12px; overflow-x: auto; min-width: 0;
 }
 .panel h2 { margin: 0 0 8px 0; font-size: 14px; color: var(--blue); }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -488,6 +529,9 @@ tr:last-child td { border-bottom: none; }
 .nav a { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); text-decoration: none; }
 .nav a:hover { color: var(--text); border-color: var(--blue); }
 .nav a.active { color: var(--blue); border-color: var(--blue); background: rgba(88,166,255,0.12); }
+.sub.stale { color: var(--yellow); font-weight: 600; }
+.wrap, #ts { overflow-wrap: anywhere; }
+.warming .grid, .warming > .panel { opacity: 0.45; }
 </style>
 </head>
 <body>
@@ -625,11 +669,52 @@ function statusClass(s) {
   if (s === 'void') return 'yellow'; return 'muted';
 }
 
+const STALE_S = 180;   // a snapshot older than this is called STALE, in words
+let LOADED = false;    // has this page drawn a snapshot yet?
+function fmtAge(s) {
+  if (typeof s !== 'number' || isNaN(s)) return 'age unknown';
+  return s < 90 ? Math.round(s) + ' s old' : Math.round(s / 60) + ' min old';
+}
+function clock(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? 'an unknown time' : d.toLocaleTimeString();
+}
+// How current is this page? One line, in words - never by colour alone. The snapshot is
+// rebuilt in the background, so its age is printed, and one that has stopped moving says so.
+function showFreshness(data) {
+  const el = document.getElementById('ts');
+  const age = typeof data.age_s === 'number' ? data.age_s : (Date.now() - Date.parse(data.ts)) / 1000;
+  const stale = age > STALE_S;
+  let text = (stale ? '\u26A0 STALE - ' : '') + 'data as of ' + clock(data.ts) + ' (' + fmtAge(age) + ')';
+  if (data.last_rebuild_error) text += ' \u00B7 \u26A0 the last rebuild failed: ' + data.last_rebuild_error;
+  else if (data.rebuild_started) text += ' \u00B7 rebuilding since ' + clock(data.rebuild_started);
+  el.textContent = text;
+  el.classList.toggle('stale', stale || !!data.last_rebuild_error);
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/all');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
-    document.getElementById('ts').textContent = 'last refresh: ' + new Date(data.ts).toLocaleTimeString();
+    if (data.warming) {
+      // The server has no snapshot yet. Say so and leave every panel alone: drawn from
+      // this body they would read "PAPER OFF" and zeros for what is simply not loaded.
+      const el = document.getElementById('ts');
+      el.textContent = 'WARMING UP - ' + (data.last_rebuild_error
+          ? 'no snapshot yet: ' + data.last_rebuild_error
+          : 'the first snapshot is still building'
+            + (data.rebuild_started ? ' (since ' + clock(data.rebuild_started) + ')' : ''))
+        + ' \u00B7 the panels below ' + (LOADED ? 'still show what was loaded before' : 'are not loaded yet')
+        + ' \u00B7 asking again every few seconds';
+      el.classList.add('stale');
+      document.body.classList.add('warming');
+      setTimeout(refresh, 1000);      // the request itself waits for the build, up to 6 s
+      return;
+    }
+    document.body.classList.remove('warming');
+    LOADED = true;
+    showFreshness(data);
 
     // Account
     const acc = data.account || {};
@@ -662,9 +747,14 @@ async function refresh() {
 
     // Trading status — the unambiguous answer to "are we trading?"
     const tr = data.trading || {};
-    document.getElementById('trading').innerHTML = tr.error
-      ? '<div class="red">' + tr.error + '</div>'
-      : '<div class="bigstat"><span class="v ' + (tr.live ? 'red' : 'muted') + '">' +
+    const trEl = document.getElementById('trading');
+    if (tr.error) {          // the ledger could not be read: unknown, which is not "PAPER OFF"
+      const d = document.createElement('div');
+      d.className = 'red wrap';
+      d.textContent = '\u26A0 UNKNOWN - the paper ledger could not be read: ' + tr.error;
+      trEl.replaceChildren(d);
+    } else trEl.innerHTML =
+        '<div class="bigstat"><span class="v ' + (tr.live ? 'red' : 'muted') + '">' +
           (tr.live ? 'LIVE ON' : 'LIVE OFF') + '</span><span class="k">real money</span></div>' +
         '<div class="bigstat"><span class="v ' + (tr.paper ? 'green' : 'muted') + '">' +
           (tr.paper ? tr.paper_rows + ' rows' : 'PAPER OFF') + '</span><span class="k">paper trades</span></div>' +
@@ -854,7 +944,10 @@ async function refresh() {
         ).join('');
 
   } catch (e) {
-    document.getElementById('ts').textContent = 'error: ' + e.message;
+    const el = document.getElementById('ts');
+    el.textContent = '\u26A0 refresh failed (' + e.message + ') - '
+      + (LOADED ? 'the panels show the last data loaded' : 'nothing is loaded yet');
+    el.classList.add('stale');
   }
 }
 refresh();
