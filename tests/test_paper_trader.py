@@ -135,6 +135,12 @@ def live_twin(lock_dir):
     return twin
 
 
+def stop(twin):
+    twin.kill()
+    twin.wait(timeout=10)
+    twin.stdout.close()
+
+
 @pytest.mark.parametrize("cmd", ["cycle", "run"])
 def test_a_second_trader_stands_down_before_it_trades(cmd, lock_dir, monkeypatch, capsys):
     """Two overlapping cycles both read the ledger before either appends, so both book
@@ -148,8 +154,7 @@ def test_a_second_trader_stands_down_before_it_trades(cmd, lock_dir, monkeypatch
     try:
         assert pt.main() == 1
     finally:
-        twin.kill()
-        twin.wait(timeout=10)
+        stop(twin)
     out = capsys.readouterr().out.strip().splitlines()
     assert len(out) == 1 and out[0].startswith("not starting: paper_trader is already "
                                                f"running (pid {twin.pid})")
@@ -192,8 +197,7 @@ def test_the_lock_never_blocks_a_cycle_function_a_report_or_the_selftest(
         monkeypatch.setattr(sys, "argv", ["paper_trader.py", "selftest"])
         assert pt.main() == 0
     finally:
-        twin.kill()
-        twin.wait(timeout=10)
+        stop(twin)
     assert "paper_trader" not in si._HELD
 
 

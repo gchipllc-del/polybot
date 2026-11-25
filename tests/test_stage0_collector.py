@@ -173,6 +173,12 @@ def live_twin(lock_dir):
     return twin
 
 
+def stop(twin):
+    twin.kill()
+    twin.wait(timeout=10)
+    twin.stdout.close()
+
+
 @pytest.mark.parametrize("cmd", ["collect", "once"])
 def test_a_second_collector_stands_down_before_it_collects(cmd, lock_dir, monkeypatch,
                                                            capsys):
@@ -187,8 +193,7 @@ def test_a_second_collector_stands_down_before_it_collects(cmd, lock_dir, monkey
     try:
         assert s0.main() == 1
     finally:
-        twin.kill()
-        twin.wait(timeout=10)
+        stop(twin)
     out = capsys.readouterr().out.strip().splitlines()
     assert len(out) == 1 and out[0].startswith("not starting: stage0_collector is already "
                                                f"running (pid {twin.pid})")
@@ -234,8 +239,7 @@ def test_the_lock_never_blocks_a_cycle_function_or_a_read_only_command(
         monkeypatch.setattr(sys, "argv", ["stage0_collector.py", "selftest"])
         assert s0.main() == 0
     finally:
-        twin.kill()
-        twin.wait(timeout=10)
+        stop(twin)
     assert "stage0_collector" not in si._HELD
 
 
