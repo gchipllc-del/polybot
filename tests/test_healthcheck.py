@@ -63,6 +63,7 @@ class FakeScheduler:
 def results(monkeypatch):
     out = []
     monkeypatch.setattr(hc, "_results", out)
+    monkeypatch.setattr(hc, "_scan_memo", {}, raising=False)
     return out
 
 
@@ -618,13 +619,27 @@ def _iso(t):
     return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
 
 
-def _opens(rule, times, **extra):
-    """Sleeve-ledger open rows for one rule at the given epoch times."""
-    return [dict({"t": "open", "ts": _iso(t), "rule": rule, "ticker": f"{rule}-{i}-T1",
-                  "event": f"{rule}-{i}", "series": "KXTEMPNYCHS", "side": "yes",
+def _opens(rule, times, tag="", **extra):
+    """Sleeve-ledger open rows for one rule at the given epoch times (`tag` keeps the
+    tickers of a second batch apart from the first)."""
+    return [dict({"t": "open", "ts": _iso(t), "rule": rule, "ticker": f"{rule}{tag}-{i}-T1",
+                  "event": f"{rule}{tag}-{i}", "series": "KXTEMPNYCHS", "side": "yes",
                   "price": 0.98, "contracts": 10, "fee": 0.02, "depth": 50.0,
                   "close_time": _iso(t + HOUR)}, **extra)
             for i, t in enumerate(times)]
+
+
+def _settled(opens):
+    """The same positions, each followed by its close row (settled an hour later)."""
+    closes = [{"t": "close", "ts": _iso(_epoch_of(o) + HOUR + 300), "ticker": o["ticker"],
+               "rule": o["rule"], "event": o["event"], "series": o["series"],
+               "side": o["side"], "price": o["price"], "result": "yes", "won": True,
+               "pnl": 0.18} for o in opens]
+    return sorted(opens + closes, key=_epoch_of)
+
+
+def _epoch_of(row):
+    return datetime.fromisoformat(row["ts"]).timestamp()
 
 
 def _every(now, step_h, days=7.0, last_h=0.0):
@@ -731,7 +746,8 @@ def test_a_night_asleep_is_remembered_as_idle_not_as_quiet(results, world):
     does not become the rule's 'longest gap' afterwards."""
     _registry(world, "HOURLY_FAV")
     start = world.now
-    _ledger(world.path("paper_sleeves.jsonl"), _opens("HOURLY_FAV", _every(start, 0.25)))
+    _ledger(world.path("paper_sleeves.jsonl"),
+            _settled(_opens("HOURLY_FAV", _every(start, 0.25))))
     hc._begin_run()
     assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
     world.next_run(8 * 60)                        # asleep for 8 h; the watchdog runs first
@@ -739,8 +755,9 @@ def test_a_night_asleep_is_remembered_as_idle_not_as_quiet(results, world):
     assert hc._state["sleeve_idle"] == [[start, world.now]]
     # trading again for four hours, then three hours with nothing opened
     back = world.now
-    _ledger(world.path("paper_sleeves.jsonl"), _opens("HOURLY_FAV", _every(start, 0.25))
-            + _opens("HOURLY_FAV", [back + k * 0.25 * HOUR for k in range(1, 17)]))
+    _ledger(world.path("paper_sleeves.jsonl"), _settled(
+        _opens("HOURLY_FAV", _every(start, 0.25))
+        + _opens("HOURLY_FAV", [back + k * 0.25 * HOUR for k in range(1, 17)], tag="b")))
     for _ in range(28):                           # 7 h of 15-minute runs
         world.next_run(15)
     said = _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)
@@ -760,8 +777,8 @@ def test_positions_booked_without_a_fill_check_in_the_last_day_are_counted(resul
     now = world.now
     _registry(world, "HOURLY_FAV", "F9799")
     rows = (_opens("HOURLY_FAV", [now - h * HOUR for h in (30, 23, 20, 9, 2)])
-            + _opens("HOURLY_FAV", [now - 25 * HOUR], depth=None)      # yesterday's: not counted
-            + _opens("HOURLY_FAV", [now - 22 * HOUR, now - 3 * HOUR], depth=None)
+            + _opens("HOURLY_FAV", [now - 25 * HOUR], "b", depth=None)   # yesterday's
+            + _opens("HOURLY_FAV", [now - 22 * HOUR, now - 3 * HOUR], "c", depth=None)
             + _opens("F9799", [now - 5 * HOUR], depth=None))
     _ledger(world.path("paper_sleeves.jsonl"), rows)
     said = _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)       # this cycle: ungated=0
@@ -775,8 +792,87 @@ def test_positions_booked_without_a_fill_check_in_the_last_day_are_counted(resul
     assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
 
 
-def _epoch_of(row):
-    return datetime.fromisoformat(row["ts"]).timestamp()
+# ── overdue positions: open long after their market closed ────────────────────
+
+def test_overdue_sleeve_positions_from_the_heartbeat_are_named(results, world):
+    """sleeve-trader#3 (watchdog half): a market that never reports yes or no was polled
+    720 times a day without end, kept one of its rule's 50 slots, and showed nowhere -
+    heartbeat errors=0, watchdog OK. The trader now counts them; this says so."""
+    hb = dict(NEW_SLEEVE_HEARTBEAT,
+              overdue={"n": 2, "oldest": "KXHIGHNY-26NOV20-B52", "oldest_h": 97.5})
+    warn, ok = _sleeves(world, results, hb)
+    assert warn[0] == hc.WARN and ok[0] == hc.OK
+    assert warn[1].startswith("2 open positions more than 24 h past their close with no "
+                              "result (oldest KXHIGHNY-26NOV20-B52, 98 h)"), warn[1]
+    assert [st for st, _ in _sleeves(world, results, NEW_SLEEVE_HEARTBEAT)] == [hc.OK]
+
+
+def test_overdue_sleeve_positions_are_found_in_the_ledger_when_the_trader_cannot_say(
+        results, world):
+    """A trader still on its old code writes no `overdue`. The ledger carries every open
+    position's close_time, so the watchdog can count them itself - once it has seen
+    them at two runs, because right after a wake-up every open position looks late."""
+    now = world.now
+    _registry(world, "F9799")
+    stuck = _opens("F9799", [now - 60 * HOUR], "stuck", close_time=_iso(now - 30 * HOUR))
+    waiting = _opens("F9799", [now - 40 * HOUR], "wait", close_time=_iso(now - 23 * HOUR))
+    running = _opens("F9799", [now - 2 * HOUR], "run", close_time=_iso(now + 20 * HOUR))
+    _ledger(world.path("paper_sleeves.jsonl"),
+            _settled(_opens("F9799", [now - 70 * HOUR])) + stuck + waiting + running)
+    hc._begin_run()
+    assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
+    world.next_run(15)
+    warn, ok = _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)
+    assert warn[0] == hc.WARN and "1 open position more than 24 h past its close" in warn[1]
+    assert "(oldest F9799stuck-0-T1, 30 h)" in warn[1], warn[1]
+    # the trader's own count, once it writes one, is the one that is used
+    assert [st for st, _ in _sleeves(world, results, NEW_SLEEVE_HEARTBEAT)] == [hc.OK]
+
+
+def test_stranded_crypto_positions_are_named_with_or_without_a_heartbeat(results, world):
+    """crypto-trader#1 (watchdog half): after an outage longer than about 50 hours the
+    positions that were open never settle and use up the 8-position cap; the watchdog
+    said '[OK] ledger: 886 opens / 878 closes, no duplicates'. Each open row carries ts
+    and mins_left, so this needs no trader change."""
+    stranded = [row for h in (73, 72, 71)                           # opened, never closed
+                for row in _bet(f"KXBTC15M-26NOV22{75 - h:02d}15-00", h, closed=False)]
+    fresh = _bet("KXBTC15M-26NOV251200-00", 0, closed=False)        # its window is still open
+    _ledger(hc.PAPER_LOG, _bet("KXBTC15M-OLD", 90) + stranded + fresh)
+    world.age("paper_crypto15.jsonl", 1)
+    hc._begin_run()
+    hc.check_crypto_paper()
+    assert [st for st, _ in _said(results, "paper")] == [hc.OK]      # first sighting
+    world.next_run(15)
+    world.age("paper_crypto15.jsonl", 1)
+    hc.check_crypto_paper()
+    (warn,) = [m for st, m in _said(results, "paper") if st == hc.WARN]
+    assert warn.startswith("3 open positions more than 60 min past their window "
+                           "(oldest KXBTC15M-26NOV220215-00, 73.3 h)"), warn
+
+    # with a heartbeat that counts them, the trader's own number is reported at once
+    results.clear()
+    world.write(hc.PAPER_HB, dict(TODAYS_CRYPTO_HEARTBEAT, open_now=8, overdue={
+        "n": 8, "oldest": "KXBTC15M-26NOV220315-15", "oldest_h": 71.9}), age_min=0.5)
+    hc.check_crypto_paper()
+    (warn,) = [m for st, m in _said(results, "paper") if st == hc.WARN]
+    assert warn.startswith("8 open positions more than 60 min past their window "
+                           "(oldest KXBTC15M-26NOV220315-15, 71.9 h)")
+
+
+def test_positions_that_are_late_only_because_the_pc_slept_are_not_reported(results, world):
+    """At the wake-up the ledger's open positions are as late as the night. The trader
+    settles them in its first cycle; the watchdog, which runs at once, must not warn."""
+    _ledger(hc.PAPER_LOG, _bet("KXBTC15M-26NOV251145-00", 0, closed=False))
+    world.age("paper_crypto15.jsonl", 1)
+    hc._begin_run()
+    hc.check_crypto_paper()
+    world.next_run(8 * 60)                        # asleep; that window closed 8 h ago
+    hc.check_crypto_paper()
+    assert [st for st, _ in _said(results, "paper")] == [hc.OK]
+    _ledger(hc.PAPER_LOG, _bet("KXBTC15M-26NOV251145-00", 0))       # settled on waking
+    world.next_run(15)
+    hc.check_crypto_paper()
+    assert [st for st, _ in _said(results, "paper")] == [hc.OK]
 
 
 # ── main(), run after run: what PolybotHealth actually logs ────────────────────

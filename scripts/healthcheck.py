@@ -56,6 +56,10 @@ PAPER_HB_STALE_MIN = 10.0                  # its cycle is 60s, like the collecto
 SLEEVE_HB = "sleeve_paper_heartbeat.json"  # written by sleeve_paper every cycle (2 min)
 SLEEVE_HB_STALE_MIN = 10.0
 SLEEVE_CYCLE_MIN = 2.0
+# A position still open this long after its market closed is overdue: a crypto window's
+# result normally arrives within minutes, a daily-high result within about nine hours.
+PAPER_OVERDUE_MIN = 60.0
+SLEEVE_OVERDUE_H = 24.0
 STREAK_FAIL = 3          # consecutive bad cycles, counted by the trader, before a FAIL
 # The quiet-rule check (see _quiet_rules): a rule with enough recent entries to have a
 # rhythm has opened nothing for longer than that rhythm allows.
@@ -498,6 +502,57 @@ def _paper_trader_story() -> str:
             f"{_paper_counters(s)}")
 
 
+def _overdue_said(hb: dict | None) -> tuple[int, str | None, float | None] | None:
+    """(positions overdue, the oldest one's ticker, its hours past close) as the trader
+    counts them in its own heartbeat - or None when this heartbeat does not say (no
+    file, or a trader still on the code from before it counted them)."""
+    o = hb.get("overdue") if hb else None
+    n = _n(o, "n") if isinstance(o, dict) else None
+    if n is None:
+        return None
+    return int(n), (str(o["oldest"]) if o.get("oldest") else None), _n(o, "oldest_h")
+
+
+def _overdue_in(live, limit_s: float) -> tuple[int, str | None, float | None]:
+    """The same three numbers from the ledger: live = [(ticker, close epoch)]."""
+    now = _now()
+    late = sorted((close, tk) for tk, close in live if now - close > limit_s)
+    if not late:
+        return 0, None, None
+    return len(late), late[0][1], (now - late[0][0]) / 3600.0
+
+
+def _overdue(hb: dict | None, key: str, from_ledger) -> tuple[int, str | None, float | None]:
+    """Overdue positions from the heartbeat when it counts them, else from the ledger -
+    then only once seen at two runs in a row: on the run that follows a wake-up every
+    open position is as late as the night, and the trader settles them a minute later."""
+    said = _overdue_said(hb)
+    if said is not None:
+        _lasting(key, False)
+        return said
+    try:
+        found = from_ledger()
+    except Exception:  # noqa: BLE001 - an unreadable ledger is another check's finding
+        found = (0, None, None)
+    return found if _confirmed(key, found[0] > 0) else (0, None, None)
+
+
+def _warn_crypto_overdue(hb: dict | None) -> None:
+    """Positions the settle step never closes are invisible everywhere else: after a long
+    outage their markets drop off the page the trader settles from, and each one holds a
+    position slot for good - at eight of them the trader books nothing at all."""
+    n, oldest, hours = _overdue(
+        hb, "paper.overdue",
+        lambda: _overdue_in(_scan_crypto_ledger()["live"] if PAPER_LOG.exists() else [],
+                            PAPER_OVERDUE_MIN * 60))
+    if n:
+        which = f" (oldest {oldest}, {hours:.1f} h)" if oldest and hours is not None else ""
+        record(WARN, "paper", f"{n} open position{'' if n == 1 else 's'} more than "
+                              f"{PAPER_OVERDUE_MIN:.0f} min past {'its' if n == 1 else 'their'}"
+                              f" window{which} - not settled, and each holds one of the "
+                              f"trader's position slots")
+
+
 def check_crypto_paper() -> None:
     """The crypto paper trader's heartbeat (data/paper_crypto_heartbeat.json), written
     after each completed cycle once the trader runs the code that has it. Until then
@@ -506,17 +561,20 @@ def check_crypto_paper() -> None:
     cycling" and "cycling but not working", and the cycle's own error count."""
     hb = _data(PAPER_HB)
     if not hb.exists():
+        _warn_crypto_overdue(None)
         record(OK, "paper", "no heartbeat file yet - judged by the ledger alone (the "
                             "trader writes one once it runs the current code)")
         return
     s, age = _read_json(hb), _age_min(hb)
     if s is None or age is None:
+        _warn_crypto_overdue(None)
         record(WARN, "paper", "heartbeat unreadable")
         return
     judged, grace = _since_wake(age)
     if judged > PAPER_HB_STALE_MIN:
         ledger_age = _age_min(PAPER_LOG)
         if ledger_age is not None and ledger_age <= PAPER_HB_STALE_MIN:
+            _warn_crypto_overdue(None)
             record(WARN, "paper", f"heartbeat {age:.0f} min old but the ledger was written "
                                   f"{ledger_age:.0f} min ago - trading, but its heartbeat "
                                   f"is not being written")
@@ -525,6 +583,7 @@ def check_crypto_paper() -> None:
                                   f"is 60s) - alive but not cycling")
         return
     if age > PAPER_HB_STALE_MIN:                  # inside the wake-up grace: old news
+        _warn_crypto_overdue(None)
         record(OK, "paper", f"heartbeat {age:.0f} min old{grace}")
         return
     errors = _n(s, "errors")
@@ -532,6 +591,7 @@ def check_crypto_paper() -> None:
         last = f" (last: {str(s['last_error'])[:90]})" if s.get("last_error") else ""
         record(WARN, "paper", f"requests are failing: {errors:.0f} in the last cycle, and "
                               f"already at the previous check{last}")
+    _warn_crypto_overdue(s)
     skew = _n(s, "clock_skew_s")
     record(OK, "paper", f"cycling (heartbeat {age:.1f} min ago): {_paper_counters(s)}"
                         + (f", clock {skew:+.1f}s vs Kalshi" if skew is not None else ""))
@@ -577,6 +637,50 @@ def _defect_counts(whats: list[str]) -> str:
     return ", ".join(f"{c} {k}{'' if c == 1 else 's'}" for k, c in n.items())
 
 
+_scan_memo: dict = {}
+
+
+def _scan_crypto_ledger() -> dict:
+    """ONE pass over the crypto paper ledger for the two checks that need it ([ledger]
+    and [paper]); the second caller gets the first one's result while the file is
+    unchanged. Only counts and the still-open positions are kept, not the rows."""
+    st = PAPER_LOG.stat()
+    key = (str(PAPER_LOG), st.st_size, st.st_mtime_ns)
+    if _scan_memo.get("key") != key:
+        import diagnostics as dg
+        rows = dg._load(PAPER_LOG)
+        start = dg._recent_start(rows)
+        opened: dict[tuple, dict] = {}
+        closed: set = set()
+        opens = closes = 0
+        defects: list[tuple[int, str]] = []      # (row index, what) - B1's own kinds
+        for i, r in enumerate(rows):
+            k = (r.get("ticker"), r.get("rule"))
+            if r.get("t") == "open":
+                opens += 1
+                if k in opened:
+                    defects.append((i, f"duplicate open {k[0]}/{k[1]}"))
+                opened[k] = r
+            elif r.get("t") == "close":
+                closes += 1
+                if k not in opened:
+                    defects.append((i, f"orphan close {k[0]}/{k[1]}"))
+                elif k in closed:
+                    defects.append((i, f"duplicate close {k[0]}/{k[1]}"))
+                closed.add(k)
+        live = []                                # (ticker, when its window closed)
+        for k, r in opened.items():
+            t, mins = _epoch(r.get("ts")), _n(r, "mins_left")
+            if k not in closed and t is not None and mins is not None:
+                live.append((str(k[0]), t + mins * 60.0))
+        _scan_memo.clear()
+        _scan_memo.update(key=key, out={
+            "opens": opens, "closes": closes, "window_h": dg.RECENT_HOURS, "live": live,
+            "recent": [what for i, what in defects if i >= start],
+            "old": [what for i, what in defects if i < start]})
+    return _scan_memo["out"]
+
+
 def check_ledger_integrity() -> None:
     """Bug 7: the same (market, rule) entered twice would silently double-count P&L.
 
@@ -590,33 +694,13 @@ def check_ledger_integrity() -> None:
     if not PAPER_LOG.exists():
         return
     try:
-        import diagnostics as dg
-        rows = dg._load(PAPER_LOG)
-        start = dg._recent_start(rows)
+        scan = _scan_crypto_ledger()
     except Exception as e:  # noqa: BLE001
         record(FAIL, "ledger", f"unreadable: {type(e).__name__}")
         return
-    opened, closed = set(), set()
-    opens = closes = 0
-    defects: list[tuple[int, str]] = []          # (row index, what) - B1's own kinds
-    for i, r in enumerate(rows):
-        key = (r.get("ticker"), r.get("rule"))
-        if r.get("t") == "open":
-            opens += 1
-            if key in opened:
-                defects.append((i, f"duplicate open {key[0]}/{key[1]}"))
-            opened.add(key)
-        elif r.get("t") == "close":
-            closes += 1
-            if key not in opened:
-                defects.append((i, f"orphan close {key[0]}/{key[1]}"))
-            elif key in closed:
-                defects.append((i, f"duplicate close {key[0]}/{key[1]}"))
-            closed.add(key)
-    recent = [what for i, what in defects if i >= start]
-    old = [what for i, what in defects if i < start]
-    counts = f"{opens} opens / {closes} closes"
-    window = f"{dg.RECENT_HOURS:.0f} h"
+    recent, old = scan["recent"], scan["old"]
+    counts = f"{scan['opens']} opens / {scan['closes']} closes"
+    window = f"{scan['window_h']:.0f} h"
     if recent:
         record(FAIL, "ledger", f"{_defect_counts(recent)} in the ledger's last {window} - "
                                f"first: {recent[0]} (two traders on one ledger?); {counts}")
@@ -624,7 +708,7 @@ def check_ledger_integrity() -> None:
         record(WARN, "ledger", f"{_defect_counts(old)} older than {window} still in the "
                                f"scored record (first: {old[0]}) - a duplicated close "
                                f"counts that trade twice; {counts}")
-    if not defects:
+    if not recent and not old:
         record(OK, "ledger", f"{counts}, no duplicates")
 
 
@@ -781,7 +865,7 @@ def check_sleeve_paper() -> None:
         record(WARN, "sleeves", "no sleeve rules yet - run: py scripts\\sleeve_scan.py "
                                 "discover, then py scripts\\sleeve_paper.py register-probes")
         return
-    for warning in _sleeve_cycle_warnings(s) + _sleeve_ledger_warnings():
+    for warning in _sleeve_cycle_warnings(s) + _sleeve_ledger_warnings(s):
         record(WARN, "sleeves", warning)
     ug = f", {s['ungated']} ungated" if s.get("ungated") else ""
     record(OK, "sleeves", f"{rules} rules on {s.get('series', '?')} sleeves, "
@@ -855,7 +939,17 @@ def _quiet_rules(rows: list[dict], rules, now: float,
     return out
 
 
-def _sleeve_ledger_warnings() -> list[str]:
+def _sleeve_live(rows: list[dict]) -> list[tuple[str, float]]:
+    """[(ticker, close epoch)] of the sleeve positions opened and not yet closed."""
+    opened = {(r.get("ticker"), r.get("rule")): r for r in rows if r.get("t") == "open"}
+    for r in rows:
+        if r.get("t") == "close":
+            opened.pop((r.get("ticker"), r.get("rule")), None)
+    return [(str(k[0]), close) for k, r in opened.items()
+            if (close := _epoch(r.get("close_time"))) is not None]
+
+
+def _sleeve_ledger_warnings(hb: dict) -> list[str]:
     """What only the sleeve LEDGER shows - no heartbeat field can."""
     try:
         import sleeve_paper as sp
@@ -870,6 +964,17 @@ def _sleeve_ledger_warnings() -> list[str]:
                    f"the last {QUIET_WINDOW_DAYS:.0f} days was {gap:.1f} h (alarm past "
                    f"{limit:.1f} h). The trader is cycling, so look at what it is offered: "
                    f"the series' listings, the price band, the fill gate, the position cap")
+    # A market that never reports yes or no (voided, settled as a scalar, a ticker the
+    # endpoint stops serving) leaves its position open for good: polled every cycle,
+    # holding one of its rule's cap slots, errors=0 throughout.
+    n, oldest, hours = _overdue(hb, "sleeves.overdue",
+                                lambda: _overdue_in(_sleeve_live(rows), SLEEVE_OVERDUE_H * 3600))
+    if n:
+        which = f" (oldest {oldest}, {hours:.0f} h)" if oldest and hours is not None else ""
+        out.append(f"{n} open position{'' if n == 1 else 's'} more than "
+                   f"{SLEEVE_OVERDUE_H:.0f} h past {'its' if n == 1 else 'their'} close with "
+                   f"no result{which} - still polled every cycle, and each holds a slot of "
+                   f"its rule's position cap")
     # The fill gate admits a candidate whose order-book lookup FAILED, and counts it
     # "ungated" - in that one cycle's heartbeat. Sleeve verdicts use every trade, so each
     # of these is a quote nobody may have been able to fill, inside a rule's record.
