@@ -46,7 +46,9 @@ HOW IT RUNS - `run` loops every 120 s (the PolybotSleeves task), `cycle` is one 
 Both hold a single-instance lock - one trader per ledger - and append what they print to
 logs/sleeve_paper.log. Every cycle writes data/sleeve_paper_heartbeat.json, ALSO a cycle
 that raises (`cycle_error` then holds the exception), with the failed list calls and
-settlement polls counted and their streaks: alive must never read as trading.
+settlement polls counted and their streaks: alive must never read as trading. One
+malformed market, ledger row or registry row costs only itself; a position more than
+24 h past its close with no result is counted (`overdue`) and asked about hourly.
 
   py scripts/sleeve_paper.py register-probes [--top 20 | --series A,B]   # the FLB probe pair
   py scripts/sleeve_paper.py register-nominations         # after sleeve_scan screen
@@ -498,7 +500,7 @@ def _write_heartbeat(path: Path, summary: dict, log: Path | None = None) -> None
     reader never finds half a file. Where the swap is refused - Windows, while a reader
     has the file open - write it in place as before. A heartbeat that cannot be written
     is a warning, never a failed cycle: the rows are already in the ledger."""
-    data = json.dumps(summary)
+    data = json.dumps(summary, default=str)
     tmp = path.with_name(path.stem + ".tmp" + path.suffix)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1102,11 +1104,20 @@ def cmd_report() -> int:
         return 0
     extra = family_extra(rows, RULES)
     res = evaluate(rows, rules, extra)
-    hb = json.loads(HEARTBEAT.read_text(encoding="utf-8")) if HEARTBEAT.exists() else {}
+    hb = _last_heartbeat({}, HEARTBEAT)                 # {} when missing or unreadable
     print(f"{len(rules)} active rules on "
           f"{len({x for r in rules.values() for x in series_of(r)})} "
           f"sleeves | last cycle {str(hb.get('ts', 'never'))[:19]} | open now "
           f"{hb.get('open_now', 0)} | regime {hb.get('regime', '?')}")
+    if hb.get("cycle_error"):
+        print(f"THE LAST CYCLE FAILED ({hb.get('failed_cycles', '?')} in a row): "
+              f"{hb['cycle_error']}")
+    late = hb.get("overdue") or {}
+    if late.get("n"):
+        print(f"{late['n']} open position(s) more than {OVERDUE_H:g} h past their market's "
+              f"close with no yes/no result (the oldest:")
+        print(f"{late.get('oldest')}, {late.get('oldest_h')} h). Each holds one of its rule's "
+              f"{MAX_OPEN_PER_RULE} slots until Kalshi reports a result.")
     print()
     print(f"  {'rule':30} {'events':>6} {'WR':>6} {'net$':>9} {'c/ct':>6} "
           f"{'95% CI (c/ct)':>15} {'p':>6} {'ungated':>7}  verdict")

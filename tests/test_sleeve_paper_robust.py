@@ -1042,3 +1042,31 @@ def test_an_overdue_market_is_asked_about_when_any_holder_cannot_wait(tmp_path):
     answers["X-E1-A"] = "no"
     s = cycle(_results(answers, calls), rp, lp, state=state, at=NOW + timedelta(minutes=10))
     assert s["closed"] == 2 and calls == ["X-E1-A"] * 6      # one answer, both rules
+
+
+def test_report_shows_a_failing_cycle_and_overdue_positions(paths, monkeypatch, capsys):
+    import lib.command_center as cc
+    monkeypatch.setattr(cc, "CRYPTO_LEDGER", paths / "crypto.jsonl")
+    favorites(sp.RULES)
+    sp._append(sp.LEDGER, [held("S-E1-A", closed_h=-30.5), held("S-E2-A", closed_h=-49)])
+    cycle(_results({}), sp.RULES, sp.LEDGER, heartbeat=sp.HEARTBEAT)
+    assert run_main(monkeypatch, "report") == 0
+    out = capsys.readouterr().out
+    assert "2 open position(s) more than 24 h past their market's close" in out
+    assert "S-E2-A, 49.0 h). Each holds one of its rule's 50 slots" in out
+    assert "THE LAST CYCLE FAILED" not in out
+
+    def boom():
+        raise RuntimeError("regime file unreadable")
+    with pytest.raises(RuntimeError):
+        sp.run_cycle(_results({}), NOW, sp.RULES, sp.LEDGER, depth_fn=lambda t, s, p: 50,
+                     regime_fn=boom, heartbeat=sp.HEARTBEAT)
+    assert run_main(monkeypatch, "report") == 0
+    assert ("THE LAST CYCLE FAILED (1 in a row): RuntimeError: regime file unreadable"
+            in capsys.readouterr().out)
+    cycle(_results({"S-E1-A": "no", "S-E2-A": "no"}), sp.RULES, sp.LEDGER,
+          heartbeat=sp.HEARTBEAT)
+    sp.HEARTBEAT.write_text("{half a heartb", encoding="utf-8")     # unreadable: no crash
+    assert run_main(monkeypatch, "report") == 0
+    out = capsys.readouterr().out
+    assert "last cycle never" in out and "past their market's close" not in out
