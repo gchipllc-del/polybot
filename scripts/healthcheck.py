@@ -53,6 +53,9 @@ PAPER_QUIET_WARN_MIN = 20.0
 PAPER_QUIET_FAIL_MIN = 60.0
 PAPER_HB = "paper_crypto_heartbeat.json"   # written by paper_trader after each cycle
 PAPER_HB_STALE_MIN = 10.0                  # its cycle is 60s, like the collector's
+SLEEVE_HB = "sleeve_paper_heartbeat.json"  # written by sleeve_paper every cycle (2 min)
+SLEEVE_HB_STALE_MIN = 10.0
+STREAK_FAIL = 3          # consecutive bad cycles, counted by the trader, before a FAIL
 LOG_BLOAT_MB = 200.0
 
 OK, WARN, FAIL = "OK  ", "WARN", "FAIL"
@@ -197,6 +200,14 @@ def _lasting(key: str, bad: bool) -> float | None:
         seen[key] = _now()
         return 0.0
     return max(0.0, (_now() - first) / 60.0)
+
+
+def _forget(prefix: str) -> None:
+    """Drop every sighting under a prefix: a run that could not look has not seen it."""
+    seen = _state.get("since")
+    if isinstance(seen, dict):
+        for key in [k for k in seen if k.startswith(prefix)]:
+            del seen[key]
 
 
 def _confirmed(key: str, bad: bool) -> bool:
@@ -652,28 +663,102 @@ def check_news_calendar() -> None:
 
 def check_sleeve_paper() -> None:
     """The multi-sleeve paper trader writes a heartbeat every cycle (2 min). Alive but
-    with no rules is a setup step, not a fault - say exactly what to run."""
-    hb = ROOT / "data" / "sleeve_paper_heartbeat.json"
+    with no rules is a setup step, not a fault - say exactly what to run.
+
+    A fresh heartbeat only proves the loop turns. The trader once went six hours with
+    every Kalshi request failing while this line read 'OK ... (cycle 0 min ago)', so
+    the heartbeat's own account of the cycle is judged too: a cycle that raised, list
+    calls failing for every series, one series failing for cycles on end, settlement
+    polls failing, a rule stuck at its open-position cap. Fields a trader running older
+    code does not write yet are simply unknown. FAILs need a streak - the watchdog reads
+    one cycle in seven, and one bad cycle is not an outage."""
+    hb = _data(SLEEVE_HB)
     if not hb.exists():
+        _forget("sleeves.")
         record(WARN, "sleeves", "sleeve paper trader has never cycled - rerun "
                                 "install_autostart.ps1 (adds PolybotSleeves)")
         return
-    age = _age_min(hb)
-    try:
-        s = json.loads(hb.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    age, s = _age_min(hb), _read_json(hb)
+    if s is None or age is None:
+        _forget("sleeves.")
         record(WARN, "sleeves", "heartbeat unreadable")
         return
-    if age is not None and age > 10:
+    if age > SLEEVE_HB_STALE_MIN:
+        _forget("sleeves.")
         record(FAIL, "sleeves", f"sleeve paper heartbeat {age:.0f} min old (cycle is 2 min)"
                                 f" - alive but not cycling")
-    elif not s.get("rules"):
+        return
+    if s.get("cycle_error"):
+        # The trader now writes its heartbeat even when the cycle raised (it used to go
+        # stale and read "alive but not cycling" with the cause lost on a hidden console).
+        _forget("sleeves.")
+        n = _n(s, "failed_cycles")
+        why = str(s["cycle_error"])[:140]
+        if n is not None and n < STREAK_FAIL:
+            record(WARN, "sleeves", f"the last sleeve cycle failed ({n:.0f} in a row): {why}")
+        else:
+            row = f"{n:.0f} cycles in a row" if n is not None else "the last cycle"
+            record(FAIL, "sleeves", f"the sleeve trader's cycle is FAILING ({row}): {why} - "
+                                    f"nothing is entered or settled while this lasts")
+        return
+    rules, series, errors = s.get("rules"), _n(s, "series"), _n(s, "errors")
+    streak = _n(s, "all_failed_streak")
+    all_now = bool(errors and series and errors >= series)
+    # a trader that does not count the streak itself: two watchdog runs in a row instead
+    all_seen_twice = _confirmed("sleeves.all_failed", streak is None and all_now)
+    if (streak is not None and streak >= STREAK_FAIL) or all_seen_twice:
+        how = (f"for {streak:.0f} cycles in a row" if streak is not None
+               else "in the last cycle, and already at the previous check")
+        record(FAIL, "sleeves", f"EVERY series list call failed {how} - nothing can be "
+                                f"entered ({s.get('open_now', '?')} open); is Kalshi "
+                                f"reachable from this PC?")
+        return
+    if not rules:
         record(WARN, "sleeves", "no sleeve rules yet - run: py scripts\\sleeve_scan.py "
                                 "discover, then py scripts\\sleeve_paper.py register-probes")
-    else:
-        ug = f", {s['ungated']} ungated" if s.get("ungated") else ""
-        record(OK, "sleeves", f"{s['rules']} rules on {s['series']} sleeves, "
-                              f"{s.get('open_now', 0)} open{ug} (cycle {age:.0f} min ago)")
+        return
+    for warning in _sleeve_cycle_warnings(s):
+        record(WARN, "sleeves", warning)
+    ug = f", {s['ungated']} ungated" if s.get("ungated") else ""
+    record(OK, "sleeves", f"{rules} rules on {s.get('series', '?')} sleeves, "
+                          f"{s.get('open_now', 0)} open{ug} (cycle {age:.0f} min ago)")
+
+
+def _sleeve_cycle_warnings(s: dict) -> list[str]:
+    """What the last sleeve cycle says went wrong short of a failure. Per-cycle counters
+    (failed polls, skipped markets, failed list calls) must be seen on two runs in a
+    row; a streak the trader counted itself, and a full cap, are states already."""
+    out = []
+    errors, series = _n(s, "errors"), s.get("series", "?")
+    streaks = s.get("series_fail_streak")
+    stuck = sorted((k for k, v in streaks.items()
+                    if isinstance(v, (int, float)) and v >= STREAK_FAIL),
+                   key=lambda k: (-streaks[k], k)) if isinstance(streaks, dict) else []
+    errors_seen_twice = _confirmed("sleeves.errors", bool(errors))
+    if stuck:
+        shown = ", ".join(f"{k} x{streaks[k]:.0f}" for k in stuck[:4])
+        more = f" (+{len(stuck) - 4} more)" if len(stuck) > 4 else ""
+        out.append(f"list calls keep failing for {len(stuck)} of {series} series - cycles "
+                   f"in a row: {shown}{more}; their events are not being entered")
+    elif errors_seen_twice:
+        out.append(f"list calls are failing: {errors:.0f} of {series} series in the last "
+                   f"cycle, and already at the previous check")
+    polls = _n(s, "poll_errors")
+    if _confirmed("sleeves.poll_errors", bool(polls)):
+        out.append(f"settlement polls are failing: {polls:.0f} in the last cycle, and "
+                   f"already at the previous check - closed positions are not being settled")
+    skipped_markets = _n(s, "market_errors")
+    if _confirmed("sleeves.market_errors", bool(skipped_markets)):
+        out.append(f"{skipped_markets:.0f} market(s) or position(s) were skipped in the last "
+                   f"cycle because handling them raised, and already at the previous check")
+    skipped = s.get("skipped")
+    cap = _n(skipped, "open_cap") if isinstance(skipped, dict) else None
+    if cap:
+        out.append(f"a rule is at its open-position cap: {cap:.0f} entr"
+                   f"{'y' if cap == 1 else 'ies'} refused in the last cycle "
+                   f"({s.get('open_now', '?')} open) - results are not arriving, or "
+                   f"positions are stranded")
+    return out
 
 
 def check_selftests() -> None:
@@ -712,27 +797,38 @@ def check_disk() -> None:
         record(OK, "disk", "log sizes fine")
 
 
+def _safely(check, *args) -> None:
+    """One check that raises must not end the run: a heartbeat missing a key it used to
+    carry once killed the whole watchdog with a KeyError, and a watchdog that dies logs
+    nothing - which reads as 'no news'. The failure is recorded and the rest still run."""
+    try:
+        check(*args)
+    except Exception as e:  # noqa: BLE001
+        record(FAIL, "watchdog", f"{check.__name__} raised {type(e).__name__}: "
+                                 f"{str(e)[:100]} - that check did not finish")
+
+
 def main() -> int:
     repair = "--repair" in sys.argv
     quiet = "--quiet" in sys.argv
 
     _begin_run()
-    check_deps()
-    check_env_auth()
-    check_tasks(repair)
-    check_ports()
-    check_api()
-    check_data_flow()
-    check_crypto_paper()
-    check_depth_coverage()
-    check_ledger_integrity()
-    check_model_integrity()
-    check_news_regime()
-    check_news_calendar()
-    check_sleeve_paper()
-    check_disk()
+    _safely(check_deps)
+    _safely(check_env_auth)
+    _safely(check_tasks, repair)
+    _safely(check_ports)
+    _safely(check_api)
+    _safely(check_data_flow)
+    _safely(check_crypto_paper)
+    _safely(check_depth_coverage)
+    _safely(check_ledger_integrity)
+    _safely(check_model_integrity)
+    _safely(check_news_regime)
+    _safely(check_news_calendar)
+    _safely(check_sleeve_paper)
+    _safely(check_disk)
     if "--fast" not in sys.argv:
-        check_selftests()
+        _safely(check_selftests)
     _end_run()
 
     fails = [r for r in _results if r[0] == FAIL]

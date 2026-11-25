@@ -479,11 +479,137 @@ def test_failing_requests_warn_only_when_seen_on_two_runs(results, world):
     assert [st for st, _ in _said(results, "paper")] == [hc.OK]
 
 
-# ── main(), run after run: what PolybotHealth actually logs ────────────────────
+# ── [sleeves]: a fresh heartbeat is not a working trader ──────────────────────
 
 TODAYS_SLEEVE_HEARTBEAT = {          # exactly what sleeve_paper wrote before the audit
     "ts": "2026-11-25T11:58:00+00:00", "rules": 2, "series": 11, "opened": 0, "closed": 0,
     "skipped": {}, "ungated": 0, "errors": 0, "regime": "good", "open_now": 15}
+NEW_SLEEVE_HEARTBEAT = dict(         # the shared contract's new keys, a healthy cycle
+    TODAYS_SLEEVE_HEARTBEAT, poll_errors=0, market_errors=0, all_failed_streak=0,
+    series_fail_streak={}, cycle_error=None, failed_cycles=0,
+    overdue={"n": 0, "oldest": None, "oldest_h": None}, took_s=4.2)
+
+
+def _sleeves(world, results, heartbeat, age_min=1.0):
+    """What [sleeves] says about this heartbeat: [(status, message)]."""
+    world.write(hc.SLEEVE_HB, heartbeat, age_min=age_min)
+    results.clear()
+    hc.check_sleeve_paper()
+    return _said(results, "sleeves")
+
+
+def test_todays_heartbeat_still_reads_exactly_as_before(results, world):
+    """Version skew: PolybotSleeves keeps its old code after a pull until restarted. Its
+    heartbeat has none of the new keys, and that is unknown - never a fault."""
+    assert _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT) == [
+        (hc.OK, "2 rules on 11 sleeves, 15 open (cycle 1 min ago)")]
+    assert _sleeves(world, results, NEW_SLEEVE_HEARTBEAT) == [
+        (hc.OK, "2 rules on 11 sleeves, 15 open (cycle 1 min ago)")]
+    assert _sleeves(world, results, dict(TODAYS_SLEEVE_HEARTBEAT, ungated=3)) == [
+        (hc.OK, "2 rules on 11 sleeves, 15 open, 3 ungated (cycle 1 min ago)")]
+    ((status, msg),) = _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT, age_min=120)
+    assert status == hc.FAIL and "120 min old" in msg and "not cycling" in msg
+    ((status, msg),) = _sleeves(world, results, dict(TODAYS_SLEEVE_HEARTBEAT, rules=0))
+    assert status == hc.WARN and "register-probes" in msg
+
+
+def test_every_request_failing_is_a_failure_once_it_is_a_streak(results, world):
+    """sleeve-trader#1, case 1: every Kalshi call raised for six hours, the heartbeat
+    said errors=11 for 11 series, and the watchdog answered '[OK] sleeves: 2 rules on 11
+    sleeves, 18 open (cycle 0 min ago)' on 24 of 24 runs. A streak counted by the trader
+    is a FAIL; one bad cycle is not."""
+    dead = dict(NEW_SLEEVE_HEARTBEAT, errors=11)
+    assert [st for st, _ in _sleeves(world, results, dict(dead, all_failed_streak=2))] != [hc.FAIL]
+    ((status, msg),) = _sleeves(world, results, dict(dead, all_failed_streak=3))
+    assert status == hc.FAIL and "EVERY series list call failed for 3 cycles in a row" in msg
+    ((status, msg),) = _sleeves(world, results, dict(dead, all_failed_streak=180))
+    assert status == hc.FAIL and "180 cycles" in msg and "15 open" in msg
+
+
+def test_a_trader_that_counts_no_streak_is_judged_on_two_runs_in_a_row(results, world):
+    """The same outage with the trader still on its old code: errors == series is all
+    the heartbeat says. One such cycle is not a verdict (the fix risk); the same thing
+    at the next watchdog run is."""
+    dead = dict(TODAYS_SLEEVE_HEARTBEAT, errors=11)
+    hc._begin_run()
+    assert [st for st, _ in _sleeves(world, results, dead)] == [hc.OK]
+    world.next_run(15)
+    ((status, msg),) = _sleeves(world, results, dead)
+    assert status == hc.FAIL and "already at the previous check" in msg, msg
+    world.next_run(15)                            # recovered: the count starts again
+    assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
+    world.next_run(15)
+    assert [st for st, _ in _sleeves(world, results, dead)] == [hc.OK]
+
+
+def test_a_cycle_that_raised_is_reported_with_its_cause(results, world):
+    """sleeve-trader#1, case 5: a cycle that raises used to leave the heartbeat stale -
+    'alive but not cycling', ten minutes late and with the cause lost on a hidden
+    console. The trader now writes the heartbeat anyway; this reads it."""
+    failed = dict(NEW_SLEEVE_HEARTBEAT, cycle_error="AttributeError: 'NoneType' object "
+                                                    "has no attribute 'get'")
+    ((status, msg),) = _sleeves(world, results, dict(failed, failed_cycles=3))
+    assert status == hc.FAIL and "3 cycles in a row" in msg and "AttributeError" in msg
+    ((status, msg),) = _sleeves(world, results, dict(failed, failed_cycles=1))
+    assert status == hc.WARN and "1 in a row" in msg and "AttributeError" in msg
+    failed.pop("failed_cycles")                   # no streak told: the error is all we know
+    assert _sleeves(world, results, failed)[0][0] == hc.FAIL
+
+
+def test_a_failed_cycle_heartbeat_of_any_shape_neither_crashes_nor_misleads(results, world):
+    """The verifier's fix risk: fed a failed-cycle heartbeat without `series`, the check
+    raised KeyError and the whole watchdog run died; without `rules` it advised
+    'register-probes' - wrong, and that command registers rules."""
+    for shape in ({"ts": "2026-11-25T11:58:00+00:00", "cycle_error": "KeyError: 'band'",
+                   "failed_cycles": 30},
+                  {"ts": "2026-11-25T11:58:00+00:00", "rules": 2,
+                   "cycle_error": "KeyError: 'band'", "failed_cycles": 30}):
+        ((status, msg),) = _sleeves(world, results, shape)
+        assert status == hc.FAIL and "KeyError: 'band'" in msg and "register" not in msg
+    # and a heartbeat that merely lacks `series` still reads
+    ((status, msg),) = _sleeves(world, results, {"ts": "x", "rules": 2, "open_now": 4})
+    assert status == hc.OK and msg == "2 rules on ? sleeves, 4 open (cycle 1 min ago)"
+
+
+def test_one_series_failing_for_cycles_on_end_is_a_warning(results, world):
+    """sleeve-trader#1, case 2: a replaced series ticker. The rest trade, so nothing
+    else shows it."""
+    hb = dict(NEW_SLEEVE_HEARTBEAT, errors=2,
+              series_fail_streak={"KXTEMPNYCHS": 41, "KXHIGHCHI": 2, "KXTEMPMIAH": 3})
+    warn, ok = _sleeves(world, results, hb)
+    assert warn[0] == hc.WARN and ok[0] == hc.OK
+    assert "2 of 11 series" in warn[1] and "KXTEMPNYCHS x41, KXTEMPMIAH x3" in warn[1]
+    assert "KXHIGHCHI" not in warn[1]             # two cycles is not a streak yet
+
+
+def test_per_cycle_counters_warn_only_when_seen_on_two_runs(results, world):
+    """Failed settlement polls and skipped markets are per-cycle counts: 'a single
+    failed poll in the one cycle the watchdog happens to read will flap'."""
+    hb = dict(NEW_SLEEVE_HEARTBEAT, poll_errors=4, market_errors=1, errors=1)
+    hc._begin_run()
+    assert [st for st, _ in _sleeves(world, results, hb)] == [hc.OK]
+    world.next_run(15)
+    said = _sleeves(world, results, hb)
+    warns = [m for st, m in said if st == hc.WARN]
+    assert len(warns) == 3 and said[-1][0] == hc.OK
+    assert any("settlement polls are failing: 4" in m for m in warns)
+    assert any("1 market(s) or position(s) were skipped" in m for m in warns)
+    assert any("list calls are failing: 1 of 11 series" in m for m in warns)
+
+
+def test_a_rule_at_its_open_position_cap_is_a_warning(results, world):
+    """sleeve-trader#1, case 4: results stopped arriving, the rule reached its cap of 50
+    and skipped every event from then on - '[OK] ... 64 open' on 64 of 64 runs."""
+    hb = dict(TODAYS_SLEEVE_HEARTBEAT, skipped={"open_cap": 16, "no_depth": 3}, open_now=64)
+    warn, ok = _sleeves(world, results, hb)
+    assert warn[0] == hc.WARN and "open-position cap" in warn[1] and "16 entries" in warn[1]
+    assert ok == (hc.OK, "2 rules on 11 sleeves, 64 open (cycle 1 min ago)")
+    # the fill gate refusing candidates is the gate working, not a fault
+    assert [st for st, _ in _sleeves(world, results, dict(
+        TODAYS_SLEEVE_HEARTBEAT, skipped={"no_depth": 44}))] == [hc.OK]
+
+
+# ── main(), run after run: what PolybotHealth actually logs ────────────────────
 
 FRESH = {"stage0_crypto.jsonl": 0.5, "stage0_history.jsonl": 30.0,
          "paper_crypto15.jsonl": 1.0, "sleeve_paper_heartbeat.json": 1.0}
@@ -549,3 +675,15 @@ def test_the_scheduled_run_goes_red_when_the_paper_trader_stops_booking(host):
     assert "UNHEALTHY fails=1" in last[head]
     assert any("[FAIL] data: paper ledger SILENT 91 min" in line for line in last[head:])
     assert (host.world.root / "logs" / hc.STATE_NAME).exists()
+
+
+def test_one_check_raising_does_not_take_the_run_down(host, monkeypatch):
+    """A watchdog that dies logs nothing, and nothing reads as 'no news'."""
+    def boom():
+        raise KeyError("series")
+    monkeypatch.setattr(hc, "check_sleeve_paper", boom)
+    rc, bad = host.run()
+    assert rc == 1
+    assert (hc.FAIL, "watchdog") in [(st, sec) for st, sec, _ in bad]
+    assert "boom raised KeyError" in host.log() and "UNHEALTHY" in host.log()
+    assert any(sec == "disk" for _, sec, _ in host.results)        # later checks still ran
