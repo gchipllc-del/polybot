@@ -184,8 +184,8 @@ def test_the_only_trader_takes_the_lock_and_a_real_second_process_exits_nonzero(
 
 def test_the_lock_never_blocks_a_cycle_function_a_report_or_the_selftest(
         lock_dir, tmp_path, monkeypatch, capsys):
-    """Tests, the selftest the watchdog runs every 15 minutes and the read-only report
-    must all work beside the live trader: the lock lives in main() for run/cycle only."""
+    """Tests, the selftest (which a full healthcheck runs) and the read-only report must
+    all work beside the live trader: the lock lives in main() for run/cycle only."""
     twin = live_twin(lock_dir)
     try:
         assert cycle(tmp_path / "p.jsonl", 0.55)["opened"] == 2      # run_cycle itself
@@ -340,9 +340,9 @@ def test_the_heartbeat_is_swapped_in_whole_never_written_in_place(tmp_path, monk
 
 def test_only_the_real_trader_writes_the_live_heartbeat(tmp_path, monkeypatch, lock_dir,
                                                         capsys):
-    """A bare run_cycle (tests, the selftest the watchdog runs every 15 minutes, a
-    research script) must never overwrite the live status file; `cycle` and the run loop
-    must always write it."""
+    """A bare run_cycle (tests, the selftest a full healthcheck runs, a research script)
+    must never overwrite the live status file; `cycle` and the run loop must always
+    write it."""
     hb = tmp_path / "live_heartbeat.json"
     monkeypatch.setattr(pt, "HEARTBEAT", hb)
     monkeypatch.setattr(pt, "LEDGER", tmp_path / "live.jsonl")
