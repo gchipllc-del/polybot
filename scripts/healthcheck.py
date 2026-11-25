@@ -1230,8 +1230,11 @@ def check_sleeve_paper() -> None:
         record(WARN, "sleeves", "no sleeve rules yet - run: py scripts\\sleeve_scan.py "
                                 "discover, then py scripts\\sleeve_paper.py register-probes")
         return
-    for warning in _sleeve_cycle_warnings(s) + _sleeve_ledger_warnings(s):
+    ledger_warnings, ledger_notes = _sleeve_ledger_warnings(s)
+    for warning in _sleeve_cycle_warnings(s) + ledger_warnings:
         record(WARN, "sleeves", warning)
+    for note in ledger_notes:
+        record(OK, "sleeves", note)
     ug = f", {s['ungated']} ungated" if s.get("ungated") else ""
     record(OK, "sleeves", f"{rules} rules on {s.get('series', '?')} sleeves, "
                           f"{s.get('open_now', 0)} open{ug} (cycle {age:.0f} min ago)")
@@ -1314,19 +1317,33 @@ def _sleeve_live(rows: list[dict]) -> list[tuple[str, float]]:
             if (close := _epoch(r.get("close_time"))) is not None]
 
 
-def _sleeve_ledger_warnings(hb: dict) -> list[str]:
-    """What only the sleeve LEDGER shows - no heartbeat field can."""
+def _sleeve_ledger_warnings(hb: dict) -> tuple[list[str], list[str]]:
+    """(warnings, notes): what only the sleeve LEDGER shows - no heartbeat field can."""
     try:
         import sleeve_paper as sp
         rules = sp.active_rules(_data("sleeve_rules.jsonl"))     # the registry's own reader
         rows = _jsonl_rows(_data("paper_sleeves.jsonl"))
         return _sleeve_ledger_findings(rows, rules, hb)
     except Exception as e:  # noqa: BLE001 - said, never swallowed, never fatal
-        return [f"sleeve ledger not checked: {type(e).__name__}: {str(e)[:80]}"]
+        return [f"sleeve ledger not checked: {type(e).__name__}: {str(e)[:80]}"], []
 
 
-def _sleeve_ledger_findings(rows: list[dict], rules, hb: dict) -> list[str]:
-    out = []
+def _unchecked(opens: list[dict]) -> tuple[int, str]:
+    """(how many of these positions were booked with depth null, 'RULE n of m, ...')."""
+    total: dict[str, int] = {}
+    bare: dict[str, int] = {}
+    for r in opens:
+        rule = str(r.get("rule"))
+        total[rule] = total.get(rule, 0) + 1
+        if r.get("depth") is None:
+            bare[rule] = bare.get(rule, 0) + 1
+    per_rule = ", ".join(f"{k} {v} of {total[k]}"
+                         for k, v in sorted(bare.items(), key=lambda kv: (-kv[1], kv[0])))
+    return sum(bare.values()), per_rule
+
+
+def _sleeve_ledger_findings(rows: list[dict], rules, hb: dict) -> tuple[list[str], list[str]]:
+    out, notes = [], []
     for name, quiet, limit, gap in _quiet_rules(rows, rules, _now(),
                                                 _state.get("sleeve_idle") or ()):
         out.append(f"{name} has opened no position for {quiet:.1f} h - its longest gap in "
@@ -1346,23 +1363,22 @@ def _sleeve_ledger_findings(rows: list[dict], rules, hb: dict) -> list[str]:
                    f"its rule's position cap")
     # The fill gate admits a candidate whose order-book lookup FAILED, and counts it
     # "ungated" - in that one cycle's heartbeat. Sleeve verdicts use every trade, so each
-    # of these is a quote nobody may have been able to fill, inside a rule's record.
+    # of these is a quote nobody may have been able to fill, inside a rule's record. The
+    # last 24 hours are a warning; the whole ledger is told as history.
     now = _now()
-    last_day = [r for r in rows if r.get("t") == "open"
-                and now - 86400 <= (_epoch(r.get("ts")) or 0.0) <= now]
-    unchecked: dict[str, int] = {}
-    for r in last_day:
-        if r.get("depth") is None:
-            unchecked[str(r.get("rule"))] = unchecked.get(str(r.get("rule")), 0) + 1
-    if unchecked:
-        per_rule = ", ".join(f"{k} {v}" for k, v in sorted(unchecked.items(),
-                                                        key=lambda kv: (-kv[1], kv[0])))
-        ever = [r for r in rows if r.get("t") == "open"]
-        out.append(f"{sum(unchecked.values())} of the {len(last_day)} positions opened in "
-                   f"the last 24 h were booked without a fill check (depth null: {per_rule})"
-                   f" - their order-book lookup failed or was not made, see [auth]; in the "
-                   f"whole ledger: {sum(r.get('depth') is None for r in ever)} of {len(ever)}")
-    return out
+    ever = [r for r in rows if r.get("t") == "open"]
+    last_day = [r for r in ever if now - 86400 <= (_epoch(r.get("ts")) or 0.0) <= now]
+    n_ever, ever_by_rule = _unchecked(ever)
+    n_day, day_by_rule = _unchecked(last_day)
+    if n_day:
+        out.append(f"{n_day} of the {len(last_day)} positions opened in the last 24 h were "
+                   f"booked without a fill check (depth null: {day_by_rule}) - their "
+                   f"order-book lookup failed or was not made, see [auth]; in the whole "
+                   f"ledger: {n_ever} of {len(ever)} ({ever_by_rule})")
+    elif n_ever:
+        notes.append(f"fill check: {n_ever} of {len(ever)} positions in the whole ledger "
+                     f"were booked without one ({ever_by_rule}), none in the last 24 h")
+    return out, notes
 
 
 def _sleeve_cycle_warnings(s: dict) -> list[str]:

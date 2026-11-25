@@ -817,10 +817,19 @@ def test_positions_booked_without_a_fill_check_in_the_last_day_are_counted(resul
     assert [st for st, _ in said] == [hc.WARN, hc.OK]
     assert said[0][1].startswith("3 of the 7 positions opened in the last 24 h were "
                                  "booked without a fill check (depth null: "
-                                 "HOURLY_FAV 2, F9799 1)"), said[0][1]
+                                 "HOURLY_FAV 2 of 6, F9799 1 of 1)"), said[0][1]
+    assert said[0][1].endswith("in the whole ledger: 4 of 9 (HOURLY_FAV 3 of 8, "
+                               "F9799 1 of 1)")
 
+    # none in the last day: no warning - but the record still carries the old one, and
+    # the full (not --quiet) output says so
     _ledger(world.path("paper_sleeves.jsonl"),
             [r for r in rows if r["depth"] is not None or _epoch_of(r) < now - DAY])
+    assert _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT) == [
+        (hc.OK, "fill check: 1 of 6 positions in the whole ledger were booked without "
+                "one (HOURLY_FAV 1 of 6), none in the last 24 h"),
+        (hc.OK, "2 rules on 11 sleeves, 15 open (cycle 1 min ago)")]
+    _ledger(world.path("paper_sleeves.jsonl"), [r for r in rows if r["depth"] is not None])
     assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
 
 
