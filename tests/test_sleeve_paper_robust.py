@@ -565,3 +565,295 @@ def test_a_heartbeat_that_cannot_be_swapped_or_written(tmp_path, monkeypatch, ca
     s = cycle(_exchange(), rp, lp, heartbeat=blocker / "hb.json", at=NOW + timedelta(hours=11))
     assert s["closed"] == 0 and s["poll_errors"] == 1        # the cycle ran to its end
     assert "[warn] heartbeat not written:" in capsys.readouterr().out
+
+
+# ── one malformed thing costs that one thing ──────────────────────────────────
+
+def _three_cities(tmp_path, extra_rows=()):
+    """One rule over three series, a 98c favorite listed in each, two bets already held."""
+    rp, lp = tmp_path / "rules.jsonl", tmp_path / "ledger.jsonl"
+    favorites(rp, series=["SA", "SB", "SC"])
+    sp._append(lp, [held("SA-E0-A"), held("SB-E0-A")] + list(extra_rows))
+    return rp, lp
+
+
+def _listing(junk=None, payloads=None):
+    """A 98c favorite in each series (plus `junk` entries in SC's list - the LAST series
+    asked, after SA's and SB's entries are decided); settlement answers from `payloads`."""
+    payloads = {} if payloads is None else payloads
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            s = params["series_ticker"]
+            ms = [mk(f"{s}-E9-A", f"{s}-E9", 3, 2)]
+            return {"markets": (list(junk) + ms) if (junk and s == "SC") else ms}
+        return payloads.get(url.rsplit("/", 1)[-1], {"market": {"result": "no"}})
+    return get
+
+
+def test_a_malformed_market_costs_that_market_only(tmp_path, capsys):
+    """One null entry in ONE series' market list raised AttributeError after the other
+    series' entries had passed the fill gate; nothing was written, and every cycle
+    repeated it for as long as the entry was listed."""
+    for junk in ([None], ["text"], [7], [["x"]], [None, "text", 7, ["x"]]):
+        d = tmp_path / str(len(list(tmp_path.iterdir())))
+        d.mkdir()
+        rp, lp = _three_cities(d)
+        s = cycle(_listing(junk=junk), rp, lp)
+        assert (s["opened"], s["closed"], s["market_errors"]) == (3, 2, len(junk)), junk
+        assert s["cycle_error"] is None and s["errors"] == 0
+        rows = sp._load_jsonl(lp)[2:]
+        assert [(r["t"], r["ticker"]) for r in rows] == [
+            ("open", "SA-E9-A"), ("open", "SB-E9-A"), ("open", "SC-E9-A"),
+            ("close", "SA-E0-A"), ("close", "SB-E0-A")]
+    out = capsys.readouterr().out
+    assert "[warn] 4 market(s) or position(s) skipped - first a SC market: AttributeError" in out
+    assert " market_errors=4 " in sp.cycle_line(s)
+    # the same cycle with clean input writes the same rows: a guard changes nothing valid
+    clean_rp, clean_lp = _three_cities(tmp_path / "clean")
+    c = cycle(_listing(), clean_rp, clean_lp)
+    assert (c["opened"], c["closed"], c["market_errors"]) == (3, 2, 0)
+    def sans_clock(path):                 # a close row is stamped with the wall clock
+        return [{k: v for k, v in r.items() if (k, r["t"]) != ("ts", "close")}
+                for r in sp._load_jsonl(path)]
+    assert sans_clock(clean_lp) == sans_clock(lp)
+    assert "market_errors" not in sp.cycle_line(c)
+
+
+def test_a_settlement_answer_that_is_not_an_object_skips_that_position(tmp_path):
+    for payload in ({"market": "gone"}, {"market": ["x"]}):
+        d = tmp_path / str(len(list(tmp_path.iterdir())))
+        d.mkdir()
+        rp, lp = _three_cities(d)
+        s = cycle(_listing(payloads={"SA-E0-A": payload}), rp, lp)
+        assert (s["opened"], s["closed"], s["market_errors"], s["poll_errors"]) == (3, 1, 1, 0)
+        assert {k[0] for k in sp.open_positions(sp._load_jsonl(lp))} == {
+            "SA-E0-A", "SA-E9-A", "SB-E9-A", "SC-E9-A"}      # SA-E0-A waits, SB-E0-A settled
+    # shapes that were already handled stay handled, and count as nothing
+    for payload in ({"market": None}, {"market": {"result": 7}}, {"market": {}}):
+        d = tmp_path / str(len(list(tmp_path.iterdir())))
+        d.mkdir()
+        rp, lp = _three_cities(d)
+        s = cycle(_listing(payloads={"SA-E0-A": payload}), rp, lp)
+        assert (s["opened"], s["closed"], s["market_errors"], s["poll_errors"]) == (3, 1, 0, 0)
+
+
+def test_ledger_rows_without_a_ticker_or_a_rule_are_no_positions(tmp_path):
+    """A row that is valid JSON but lacks ticker or rule raised KeyError at the top of
+    every cycle: no trading and no settling until someone removed it by hand."""
+    junk = [{"t": "open", "ts": NOW.isoformat()}, {"t": "close", "ticker": "X"},
+            {"t": "close", "rule": "R"}, {"t": "open", "ticker": ["x"], "rule": "R"},
+            {"t": "open", "ticker": "T", "rule": "R", "event": ["e"]},
+            {"t": "open", "ticker": "", "rule": "R"}, {"t": "open", "ticker": "T2", "rule": None}]
+    rp, lp = _three_cities(tmp_path, extra_rows=junk)
+    rows = sp._load_jsonl(lp)
+    assert set(sp.open_positions(rows)) == {("SA-E0-A", "R"), ("SB-E0-A", "R"), ("T", "R")}
+    s = cycle(_listing(), rp, lp)
+    assert (s["opened"], s["closed"], s["cycle_error"]) == (3, 2, None)
+    # ("T", "R") IS a position - it has a ticker and a rule - but nothing to settle it
+    # with (no side, no price): it stays open and is COUNTED every cycle, never hidden
+    assert s["market_errors"] == 1 and s["open_now"] == 4
+    again = cycle(_listing(), rp, lp, at=NOW + timedelta(minutes=2))
+    assert (again["opened"], again["closed"], again["market_errors"]) == (0, 0, 1)
+    # a close row that comes BEFORE its open still closes it (two passes, as before)
+    o = held("S-E5-A")
+    assert sp.open_positions([sp.settle(o, "no"), o]) == {}
+
+
+GOOD_ROW = {"band": "any", "side": "favorite", "lo": 0.97, "hi": 0.995, "contracts": 10}
+
+
+def test_rule_problem_is_exactly_what_a_cycle_would_raise_on():
+    named = {"named_at": NOW.isoformat()}
+    ok = dict(GOOD_ROW, name="R", series=["S"], **named)
+    for usable in (ok, dict(ok, series="S"), dict(ok, series=None), dict(ok, min_h=6, max_h=12.0),
+                   {k: v for k, v in ok.items() if k != "contracts"}, dict(ok, lo=0, hi=1),
+                   dict(ok, named_at="not a date"), dict(ok, band="unheard-of"),
+                   dict(ok, side="sideways")):
+        assert sp.rule_problem(usable) is None, usable
+        sp.candidates(mk("A", "E", 98, 96), NOW.timestamp(), [usable])     # never raises
+    for field in ("band", "side", "lo", "hi", "named_at"):
+        row = {k: v for k, v in ok.items() if k != field}
+        assert sp.rule_problem(row) == f"lacks {field}"
+    assert sp.rule_problem({"name": "R"}) == "lacks band, side, lo, hi, named_at"
+    for field, value in (("lo", "0.97"), ("hi", None), ("min_h", None), ("max_h", None),
+                         ("max_h", "12"), ("side", ["yes"]), ("series", [["S"]])):
+        assert sp.rule_problem(dict(ok, **{field: value})) == f"has an unusable {field}"
+    assert sp.rule_problem(dict(ok, lo=None, max_h=None)) == "has an unusable lo, max_h"
+
+
+def test_a_registry_row_that_cannot_be_traded_stops_only_that_rule(tmp_path, capsys):
+    """A registry row without band or named_at, or with max_h null, raised KeyError or
+    TypeError in every cycle - for ALL rules. Now the other rules trade and settle, the
+    rows are written, and the cycle still ends in an error that names the rule: a rule
+    silently left out would stop its forward test while everything else looked normal."""
+    rp, lp, hb = tmp_path / "rules.jsonl", tmp_path / "ledger.jsonl", tmp_path / "hb.json"
+    favorites(rp, "GOOD", ["SA", "SB"])
+    named = (NOW - timedelta(days=30)).isoformat()
+    no_band = {k: v for k, v in GOOD_ROW.items() if k != "band"}
+    sp._append(rp, [dict(no_band, t="rule", name="NOBAND", series=["SA"], named_at=named),
+                    dict(GOOD_ROW, t="rule", name="NONAME_AT", series=["SC"]),
+                    dict(GOOD_ROW, t="rule", name="NULLMAX", series=["SA"], named_at=named,
+                         max_h=None)])
+    assert set(sp.unusable_rules(sp.active_rules(rp))) == {"NOBAND", "NONAME_AT", "NULLMAX"}
+    sp._append(lp, [held("SA-E0-A", "GOOD"), held("SC-E0-A", "NOBAND")])
+    state: dict = {}
+    with pytest.raises(sp.RegistryError) as err:
+        cycle(_listing(), rp, lp, heartbeat=hb, state=state)
+    msg = str(err.value)
+    assert msg.startswith("3 rule(s) NOT TRADED - registry row unusable: NOBAND lacks band; "
+                          "NONAME_AT lacks named_at; NULLMAX has an unusable max_h.")
+    assert msg.endswith("The other 1 rule(s) traded as usual.")
+    rows = sp._load_jsonl(lp)[2:]
+    # GOOD entered SA and SB (never SC, which only the unusable rules list) and settled;
+    # the unusable rule's OLD position settled too - its bet was made, it is owed its result
+    assert [(r["t"], r["ticker"], r["rule"]) for r in rows] == [
+        ("open", "SA-E9-A", "GOOD"), ("open", "SB-E9-A", "GOOD"),
+        ("close", "SA-E0-A", "GOOD"), ("close", "SC-E0-A", "NOBAND")]
+    s = json.loads(hb.read_text(encoding="utf-8"))
+    assert (s["rules"], s["series"], s["opened"], s["closed"], s["errors"]) == (4, 2, 2, 2, 0)
+    assert s["cycle_error"].startswith("RegistryError: 3 rule(s) NOT TRADED")
+    assert s["failed_cycles"] == 1 and s["open_now"] == 2
+    assert s["bad_rules"] == {"NOBAND": "lacks band", "NONAME_AT": "lacks named_at",
+                              "NULLMAX": "has an unusable max_h"}
+    with pytest.raises(sp.RegistryError):                    # and again, every cycle
+        cycle(_listing(), rp, lp, heartbeat=hb, state=state, at=NOW + timedelta(minutes=2))
+    assert json.loads(hb.read_text(encoding="utf-8"))["failed_cycles"] == 2
+    assert len(sp._load_jsonl(lp)) == 6                      # nothing entered twice
+    # the remedy: retire the unusable rows - the registry is append-only
+    sp._append(rp, [{"t": "retire", "name": n} for n in ("NOBAND", "NONAME_AT", "NULLMAX")])
+    s = cycle(_listing(), rp, lp, heartbeat=hb, state=state, at=NOW + timedelta(minutes=4))
+    assert (s["cycle_error"], s["failed_cycles"], s["bad_rules"], s["rules"]) == (None, 0, {}, 1)
+
+
+def test_rules_and_report_name_an_unusable_registry_row(paths, monkeypatch, capsys):
+    import lib.command_center as cc
+    monkeypatch.setattr(cc, "CRYPTO_LEDGER", paths / "crypto.jsonl")
+    favorites(sp.RULES, "GOOD", ["SA"])
+    sp._append(sp.RULES, [dict(GOOD_ROW, t="rule", name="NULLMAX", series=["SB"], max_h=None,
+                               named_at=NOW.isoformat()),
+                          {"t": "rule", "name": "BARE", "named_at": 5}])
+    assert run_main(monkeypatch, "rules") == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == ("3 active, 0 retired - 2 active rule(s) NOT TRADED "
+                                   "(registry row unusable)")
+    assert "BARE" in out and "NOT TRADED: its registry row lacks band, side, lo, hi." in out
+    assert "NOT TRADED: its registry row has an unusable max_h." in out
+    assert any(l.split()[:2] == ["GOOD", "favorite"] for l in out.splitlines())
+    assert run_main(monkeypatch, "report") == 0
+    out = capsys.readouterr().out
+    assert "NOT TRADED: NULLMAX - its registry row has an unusable max_h" in out
+    assert "NOT TRADED: BARE - its registry row lacks band, side, lo, hi" in out
+    sp._append(sp.RULES, [{"t": "retire", "name": "NULLMAX"}, {"t": "retire", "name": "BARE"}])
+    assert run_main(monkeypatch, "report") == 0
+    assert "NOT TRADED" not in capsys.readouterr().out
+
+
+class _SleepFails:
+    """`time` inside sleeve_paper: the pause after the Nth series' markets raises - a
+    failure outside every per-item guard, in the middle of a cycle."""
+
+    def __init__(self, after):
+        self.after, self.calls = after, 0
+
+    def time(self):
+        return 0.0
+
+    def sleep(self, seconds):
+        self.calls += 1
+        if self.calls == self.after:
+            raise RuntimeError("something nobody guarded against")
+
+
+def test_rows_already_decided_are_recorded_when_the_cycle_then_fails(tmp_path, monkeypatch):
+    """Rows were appended once, at the very end: a cycle that raised after four entries
+    had passed the fill gate wrote none of them, and repeated the order-book lookups on
+    the next cycle for as long as the cause lasted."""
+    rp, lp = _three_cities(tmp_path)
+    hb = tmp_path / "hb.json"
+    monkeypatch.setattr(sp, "time", _SleepFails(after=2))    # dies after SA and SB, before SC
+    with pytest.raises(RuntimeError, match="nobody guarded"):
+        cycle(_listing(), rp, lp, heartbeat=hb)
+    monkeypatch.undo()
+    assert [(r["t"], r["ticker"]) for r in sp._load_jsonl(lp)[2:]] == [
+        ("open", "SA-E9-A"), ("open", "SB-E9-A")]            # decided before it died
+    s = json.loads(hb.read_text(encoding="utf-8"))
+    assert (s["opened"], s["closed"], s["open_now"]) == (2, 0, 4)
+    assert s["cycle_error"] == "RuntimeError: something nobody guarded against"
+    # the next cycle starts from the ledger: SC is entered, nothing is entered twice
+    s = cycle(_listing(), rp, lp, at=NOW + timedelta(minutes=2))
+    assert (s["opened"], s["closed"]) == (1, 2)
+    opens = [r["ticker"] for r in sp._load_jsonl(lp) if r["t"] == "open"]
+    assert sorted(opens) == ["SA-E0-A", "SA-E9-A", "SB-E0-A", "SB-E9-A", "SC-E9-A"]
+
+
+def test_an_append_that_fails_is_never_retried(tmp_path, monkeypatch):
+    """Appending the decided rows before re-raising must not become appending them
+    twice: when the append itself fails, part of it may already be in the file."""
+    rp, lp = _three_cities(tmp_path)
+    hb = tmp_path / "hb.json"
+    real, calls = sp._append, []
+
+    def disk_full(path, rows):
+        calls.append(len(rows))
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sp, "_append", disk_full)
+    with pytest.raises(OSError, match="No space left"):
+        cycle(_listing(), rp, lp, heartbeat=hb)
+    assert calls == [5]                                      # one attempt, 3 opens + 2 closes
+    s = json.loads(hb.read_text(encoding="utf-8"))
+    assert (s["opened"], s["closed"], s["open_now"]) == (0, 0, 2)     # nothing is claimed
+    assert s["cycle_error"].startswith("OSError: [Errno 28]")
+    # a cycle that failed AND could not append reports the failure that came first
+    monkeypatch.setattr(sp, "time", _SleepFails(after=1))
+    with pytest.raises(RuntimeError, match="nobody guarded"):
+        cycle(_listing(), rp, lp, heartbeat=hb)
+    assert calls == [5, 1]
+    monkeypatch.undo()
+    assert sp._append is real and len(sp._load_jsonl(lp)) == 2
+    s = cycle(_listing(), rp, lp, at=NOW + timedelta(minutes=2))      # the disk has room again
+    assert (s["opened"], s["closed"]) == (3, 2) and len(sp._load_jsonl(lp)) == 7
+
+
+def test_a_trader_that_can_read_no_market_at_all_still_fails_loudly(tmp_path, capsys):
+    """The per-market guard is for the odd malformed entry. If NOT ONE listed market can
+    be handled (a changed payload, a bug), a counter in a fresh heartbeat would hide a
+    trader that has stopped trading: that stays a failed cycle - after the positions
+    already held have been settled and recorded."""
+    rp, lp = _three_cities(tmp_path)
+    hb = tmp_path / "hb.json"
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            return {"markets": ["not", "markets"]}
+        return {"market": {"result": "no"}}
+
+    with pytest.raises(RuntimeError) as err:
+        cycle(get, rp, lp, heartbeat=hb)
+    assert str(err.value).startswith("none of the 6 market(s) listed this cycle could be "
+                                     "handled - first a SA market: AttributeError")
+    s = json.loads(hb.read_text(encoding="utf-8"))
+    assert (s["opened"], s["closed"], s["market_errors"], s["failed_cycles"]) == (0, 2, 6, 1)
+    assert s["cycle_error"].startswith("RuntimeError: none of the 6 market(s)")
+    assert [r["t"] for r in sp._load_jsonl(lp)[2:]] == ["close", "close"]
+    # one readable market among the junk and it is the odd entry again, not a failed cycle
+    s = cycle(_listing(junk=["junk"]), rp, lp, at=NOW + timedelta(minutes=2))
+    assert (s["opened"], s["market_errors"], s["cycle_error"]) == (3, 1, None)
+    # an empty listing (or a market with no ticker) is nothing to handle, not a failure
+    s = cycle(lambda url, params=None: {"markets": [{}]}, rp, lp, at=NOW + timedelta(minutes=4))
+    assert (s["market_errors"], s["cycle_error"]) == (0, None)
+
+
+def test_the_run_loop_says_what_a_failed_cycle_recorded(paths, monkeypatch, capsys):
+    favorites(sp.RULES, "GOOD", ["SA"])
+    sp._append(sp.RULES, [dict(GOOD_ROW, t="rule", name="NULLMAX", series=["SB"], max_h=None,
+                               named_at=NOW.isoformat())])
+    run_loop(monkeypatch, 2, _listing())
+    out = [l for l in capsys.readouterr().out.splitlines() if l.startswith("[warn] cycle")]
+    assert out[0].startswith("[warn] cycle failed (1 in a row): RegistryError: 1 rule(s) NOT "
+                             "TRADED - registry row unusable: NULLMAX has an unusable max_h.")
+    assert out[0].endswith("[recorded first: opened=1 closed=0]")
+    assert out[1].startswith("[warn] cycle failed (2 in a row): RegistryError:")
+    assert out[1].endswith("traded as usual.") and len(out) == 2
+    assert [r["rule"] for r in sp._load_jsonl(sp.LEDGER)] == ["GOOD"]

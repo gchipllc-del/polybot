@@ -218,6 +218,46 @@ def registered_rules(path: Path = RULES) -> dict[str, dict]:
     return rules
 
 
+class RegistryError(ValueError):
+    """Active rules whose registry row cannot be traded. Raised at the END of a cycle:
+    every other rule has traded and settled, and the rows are in the ledger."""
+
+
+def rule_problem(r: dict) -> str | None:
+    """Why this registry row cannot be traded - None for a usable one. These are exactly
+    the rows candidates() and run_cycle raise on: band, side, lo, hi or named_at missing,
+    or a lo / hi / min_h / max_h that is not a number. (register-rule writes none of
+    these; it takes a hand edit or another writer.)"""
+    missing = [k for k in ("band", "side", "lo", "hi", "named_at") if k not in r]
+    if missing:
+        return "lacks " + ", ".join(missing)
+    bad = []
+    for key, default in (("lo", 0.0), ("hi", 0.0), ("min_h", 0.0), ("max_h", 1e9)):
+        try:
+            r.get(key, default) <= 0.5          # noqa: B015 - what candidates() compares
+        except TypeError:
+            bad.append(key)
+    try:
+        hash(r["side"])
+    except TypeError:
+        bad.append("side")
+    try:
+        series_of(r)
+    except TypeError:
+        bad.append("series")
+    return ("has an unusable " + ", ".join(bad)) if bad else None
+
+
+def unusable_rules(rules: dict[str, dict]) -> dict[str, str]:
+    """name -> why, for every rule whose registry row cannot be traded."""
+    out = {}
+    for name, r in sorted(rules.items()):
+        why = rule_problem(r)
+        if why is not None:
+            out[name] = why
+    return out
+
+
 def series_of(rule: dict) -> list[str]:
     """The series a rule trades: one (older rules store a string) or many (a list). Either
     way it is ONE hypothesis and ONE test."""
@@ -327,11 +367,31 @@ def settle(pos: dict, result: str) -> dict:
             "price": pos["price"], "result": result, "won": won, "pnl": round(pnl, 4)}
 
 
+def _key(*parts) -> tuple | None:
+    """The parts as a dict key - None when one is missing or cannot be a key. A ledger
+    row is whatever JSON was on the line: a row without a ticker or a rule is no
+    position, and one malformed row must not stop every cycle with a KeyError."""
+    if not all(parts):
+        return None
+    try:
+        hash(parts)
+    except TypeError:
+        return None
+    return parts
+
+
 def open_positions(rows: list[dict]) -> dict[tuple, dict]:
-    opened = {(r["ticker"], r["rule"]): r for r in rows if r.get("t") == "open"}
+    """(ticker, rule) -> the open row of every bet not settled yet. Rows that lack a
+    ticker or a rule are skipped."""
+    opened: dict[tuple, dict] = {}
     for r in rows:
-        if r.get("t") == "close":
-            opened.pop((r["ticker"], r["rule"]), None)
+        key = _key(r.get("ticker"), r.get("rule")) if r.get("t") == "open" else None
+        if key is not None:
+            opened[key] = r
+    for r in rows:
+        key = _key(r.get("ticker"), r.get("rule")) if r.get("t") == "close" else None
+        if key is not None:
+            opened.pop(key, None)
     return opened
 
 
@@ -421,6 +481,8 @@ def cycle_line(s: dict) -> str:
         parts.append(f"all_failed_streak={s['all_failed_streak']}")
     if s.get("poll_errors"):
         parts.append(f"poll_errors={s['poll_errors']}")
+    if s.get("market_errors"):
+        parts.append(f"market_errors={s['market_errors']}")
     if s.get("took_s") is not None:
         parts.append(f"took={s['took_s']:.1f}s")
     return " ".join(parts)
@@ -504,23 +566,35 @@ def _heartbeat_of(c: SimpleNamespace, now: datetime, state: dict, error: Excepti
         "open_now": open_now if open_now is not None else prev.get("open_now", 0),
         # ── added 2026-11: why a trader that is alive may not be trading ──
         "poll_errors": c.poll_errors,
+        "market_errors": c.market_errors,
         "all_failed_streak": state.get("all_failed", 0),
         "series_fail_streak": dict(sorted(fails.items())),
         "cycle_error": None if error is None else f"{type(error).__name__}: {error}"[:300],
         "failed_cycles": state["failed_cycles"],
         "took_s": took_s,
+        "bad_rules": c.bad_rules,
     }
 
 
 def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, ledger: Path,
                       depth_fn, regime_fn, log: Path | None) -> None:
-    """The work of one cycle. Everything it decides or counts goes into `c` as it happens,
-    so run_cycle can still say what happened when this raises."""
-    rules = active_rules(rules_path)
-    c.rules = len(rules)
+    """The work of one cycle, up to (not including) the ledger append. Everything it
+    decides or counts goes into `c` as it happens, so run_cycle can record the decided
+    rows and say what happened even when this raises.
+
+    One malformed thing costs that one thing: a market or a position whose handling
+    raises is skipped and counted (market_errors), a registry row that cannot be traded
+    is left out and named (bad_rules - and the cycle raises RegistryError at its END, so
+    it is never a silent skip). Before, any of these aborted the whole cycle, every
+    cycle, and threw away the entries it had already decided."""
+    active = active_rules(rules_path)
+    c.rules = len(active)
+    c.bad_rules = unusable_rules(active)
+    rules = {n: r for n, r in active.items() if n not in c.bad_rules}
     rows = c.rows = _load_jsonl(ledger)
     live = open_positions(rows)
-    used = {(r.get("event"), r.get("rule")) for r in rows if r.get("t") == "open"}
+    used = {k for k in (_key(r.get("event"), r.get("rule")) for r in rows
+                        if r.get("t") == "open") if k is not None}
     per_rule_open: dict[str, int] = {}
     for (_, rule) in live:
         per_rule_open[rule] = per_rule_open.get(rule, 0) + 1
@@ -528,12 +602,18 @@ def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, 
     regime = c.regime = (regime_fn or _default_regime)()
     new, skipped = c.new, c.skipped
 
+    def skip(what: str, e: Exception) -> None:
+        c.market_errors += 1
+        if c.first_skipped is None:
+            c.first_skipped = f"{what}: {type(e).__name__}: {str(e)[:80]}"
+
     by_series: dict[str, list] = {}
     for r in rules.values():
         for s_ in series_of(r):
             by_series.setdefault(s_, []).append(r)
     c.series = len(by_series)
     named = {n: _ts(r["named_at"]) for n, r in rules.items()}
+    handled = 0                                       # markets looked at without a raise
     for series, rs in sorted(by_series.items()):
         try:
             markets = fetch_open(series, get=get)
@@ -544,58 +624,82 @@ def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, 
             continue
         c.listed[series] = True
         for m in markets:
-            tk = m.get("ticker")
-            if not tk:
-                continue
-            ev = event_of(m)
-            for cand in candidates(m, now.timestamp(), rs):
-                key = (ev, cand["rule"])
-                if key in used:
-                    continue                          # one bet per event per rule
-                if now.timestamp() < (named.get(cand["rule"]) or 0):
+            try:
+                tk = m.get("ticker")
+                if not tk:
+                    handled += 1
                     continue
-                if per_rule_open.get(cand["rule"], 0) >= MAX_OPEN_PER_RULE:
-                    skipped["open_cap"] = skipped.get("open_cap", 0) + 1
-                    continue
-                n = contracts_of(rules[cand["rule"]])
-                # liftable_depth counts resting size up to one tick PAST the price (a
-                # tolerance for quote-vs-book skew). Harmless for a 1-lot - a live quote
-                # always has 1 at the ask - but a sized order booked at the ask must find
-                # all n AT the ask: probe one tick inside it. 1-lots keep the old probe.
-                probe = cand["price"] if n == CONTRACTS else round(cand["price"] - 0.01, 4)
-                depth = depth_fn(tk, cand["side"], probe) if depth_fn else None
-                if depth is not None and depth < n:
-                    skipped["no_depth"] = skipped.get("no_depth", 0) + 1
-                    continue
-                if depth is None:
-                    c.ungated += 1
-                entry = dict(cand, t="open", ts=_iso(now), ticker=tk, event=ev, series=series,
-                             contracts=n, fee=kalshi_fee(cand["price"], n),
-                             depth=depth, close_time=m.get("close_time"),
-                             regime=regime["regime"], regime_mult=regime["mult"], v=VERSION)
-                new.append(entry)
-                used.add(key)
-                per_rule_open[cand["rule"]] = per_rule_open.get(cand["rule"], 0) + 1
+                ev = event_of(m)
+                for cand in candidates(m, now.timestamp(), rs):
+                    key = (ev, cand["rule"])
+                    if key in used:
+                        continue                      # one bet per event per rule
+                    if now.timestamp() < (named.get(cand["rule"]) or 0):
+                        continue
+                    if per_rule_open.get(cand["rule"], 0) >= MAX_OPEN_PER_RULE:
+                        skipped["open_cap"] = skipped.get("open_cap", 0) + 1
+                        continue
+                    n = contracts_of(rules[cand["rule"]])
+                    # liftable_depth counts resting size up to one tick PAST the price (a
+                    # tolerance for quote-vs-book skew). Harmless for a 1-lot - a live
+                    # quote always has 1 at the ask - but a sized order booked at the ask
+                    # must find all n AT the ask: probe one tick inside it. 1-lots keep
+                    # the old probe.
+                    probe = (cand["price"] if n == CONTRACTS
+                             else round(cand["price"] - 0.01, 4))
+                    depth = depth_fn(tk, cand["side"], probe) if depth_fn else None
+                    if depth is not None and depth < n:
+                        skipped["no_depth"] = skipped.get("no_depth", 0) + 1
+                        continue
+                    entry = dict(cand, t="open", ts=_iso(now), ticker=tk, event=ev,
+                                 series=series, contracts=n,
+                                 fee=kalshi_fee(cand["price"], n), depth=depth,
+                                 close_time=m.get("close_time"), regime=regime["regime"],
+                                 regime_mult=regime["mult"], v=VERSION)
+                    new.append(entry)
+                    used.add(key)
+                    per_rule_open[cand["rule"]] = per_rule_open.get(cand["rule"], 0) + 1
+                    if depth is None:
+                        c.ungated += 1                # admitted without a fill check
+                handled += 1
+            except Exception as e:  # noqa: BLE001 - this market only; the rest still trade
+                skip(f"a {series} market", e)
         time.sleep(SLEEP_S if get is _get else 0)
     c.list_done = True
+    unhandled = c.market_errors
 
     closes, first_failed = c.closes, None
     for (tk, rule), pos in list(live.items()) + [((e["ticker"], e["rule"]), e) for e in new]:
-        ct = _ts(pos.get("close_time"))
-        if ct is not None and ct > now.timestamp():
-            continue                                   # not closed yet - don't ask
         try:
-            m = fetch_market(tk, get=get)
-        except Exception as e:  # noqa: BLE001
-            c.poll_errors += 1                         # counted: it used to vanish here
-            first_failed = first_failed or f"{tk}: {type(e).__name__}: {str(e)[:80]}"
-            continue
-        if m.get("result") in ("yes", "no"):
-            closes.append(settle(pos, m["result"]))
+            ct = _ts(pos.get("close_time"))
+            if ct is not None and ct > now.timestamp():
+                continue                               # not closed yet - don't ask
+            try:
+                m = fetch_market(tk, get=get)
+            except Exception as e:  # noqa: BLE001
+                c.poll_errors += 1                     # counted: it used to vanish here
+                first_failed = first_failed or f"{tk}: {type(e).__name__}: {str(e)[:80]}"
+                continue
+            if m.get("result") in ("yes", "no"):
+                closes.append(settle(pos, m["result"]))
+        except Exception as e:  # noqa: BLE001 - this position only; the rest still settle
+            skip(f"position {tk}/{rule}", e)
     if c.poll_errors:                                  # ONE line a cycle, not one a poll
         _say(f"[warn] {c.poll_errors} settlement poll(s) failed - first {first_failed}", log)
-    _append(ledger, new + closes)
-    c.appended = True
+    if c.market_errors:
+        _say(f"[warn] {c.market_errors} market(s) or position(s) skipped - first "
+             f"{c.first_skipped}", log)
+    if unhandled and not handled:
+        # a guard per market must not turn "the trader can no longer read ANY market"
+        # (a changed payload, a bug) into a counter: that stays a failed cycle
+        raise RuntimeError(f"none of the {unhandled} market(s) listed this cycle could be "
+                           f"handled - first {c.first_skipped}")
+    if c.bad_rules:
+        raise RegistryError(
+            f"{len(c.bad_rules)} rule(s) NOT TRADED - registry row unusable: "
+            + "; ".join(f"{n} {why}" for n, why in c.bad_rules.items())
+            + f". Retire and re-register under a new name. The other {len(rules)} rule(s) "
+              f"traded as usual.")
 
 
 def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
@@ -616,11 +720,18 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
     exception text in `cycle_error` and every key it always had, and the cycle re-raises.
     A cycle that died used to leave the old heartbeat in place - ten minutes later the
     watchdog could only say "alive but not cycling", and the reason was gone with the
-    console."""
+    console.
+
+    The rows a cycle has decided are appended even when it then raises: an entry that
+    passed the fill gate is a bet the rule made, whatever went wrong afterwards. The
+    append is tried ONCE - if it is the append that fails, nothing is retried (a second
+    try after a partial write would duplicate rows) and the next cycle starts from
+    whatever reached the file."""
     t0 = time.time()
     now = now or _now()
     state = {} if state is None else state
     c = SimpleNamespace(new=[], closes=[], skipped={}, ungated=0, errors=0, poll_errors=0,
+                        market_errors=0, first_skipped=None, bad_rules={},
                         rules=None, series=None, regime=None, rows=None, listed={},
                         list_done=False, appended=False)
     error: Exception | None = None
@@ -628,6 +739,11 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
         _trade_and_settle(c, get, now, rules_path, ledger, depth_fn, regime_fn, log)
     except Exception as e:  # noqa: BLE001 - reported in the heartbeat, then re-raised
         error = e
+    try:
+        _append(ledger, c.new + c.closes)
+        c.appended = True
+    except Exception as e:  # noqa: BLE001
+        error = error or e
     summary = _heartbeat_of(c, now, state, error, round(max(0.0, time.time() - t0), 2),
                             heartbeat)
     state["last"] = summary
@@ -943,6 +1059,11 @@ def cmd_report() -> int:
             print(f"      no fill check: {r['ungated_settled']} of {r['trades']} settled trades "
                   f"(counted in the verdict), {r['ungated_open']} of {r['open']} still open")
     print()
+    for name, why in unusable_rules(rules).items():
+        print(f"NOT TRADED: {name} - its registry row {why}, so the trader leaves it out")
+        print("(and says so every cycle). Retire it and register the corrected rule under a")
+        print("new name; a registered rule is never edited.")
+        print()
     dups = duplicate_closes(rows)
     if dups:
         print(f"LEDGER: {sum(dups.values())} duplicate close row(s) are NOT counted above ("
@@ -980,12 +1101,18 @@ def cmd_report() -> int:
 def cmd_rules() -> int:
     rules = active_rules(RULES)
     retired = all_registered(RULES) - set(rules)
-    print(f"{len(rules)} active, {len(retired)} retired")
+    bad = unusable_rules(rules)
+    print(f"{len(rules)} active, {len(retired)} retired"
+          + (f" - {len(bad)} active rule(s) NOT TRADED (registry row unusable)" if bad else ""))
     for n, r in sorted(rules.items()):
+        if n in bad:
+            print(f"  {n:30} NOT TRADED: its registry row {bad[n]}. Retire it and register "
+                  f"the corrected rule under a new name.")
+            continue
         win = (f" {r['min_h']:g}-{r['max_h']:g}h" if r.get("max_h", 1e9) < 1e9 or
                r.get("min_h", 0.0) > 0 else "")
         print(f"  {n:30} {r['side']:8} {r['lo']:.2f}-{r['hi']:.3g} {r['band']:5}{win} "
-              f"x{contracts_of(r)} on {series_label(r)}  named {r['named_at'][:16]}"
+              f"x{contracts_of(r)} on {series_label(r)}  named {str(r['named_at'])[:16]}"
               f"  [{r.get('source')}]")
     return 0
 
@@ -1102,6 +1229,28 @@ def _selftest() -> int:
         assert failed["cycle_error"] == "RuntimeError: regime unreadable"
         assert failed["failed_cycles"] == 1 and list(failed)[:10] == list(h)[:10]
         assert (failed["rules"], failed["series"], failed["regime"]) == (1, 1, "good")
+
+        # one malformed thing costs that one thing: a null market entry, a ledger row
+        # with no ticker, a registry row with no band - the valid rule still trades, its
+        # rows are written, and the cycle still ends in an error naming the unusable rule
+        rp2, lp2, st2 = Path(td) / "rules2.jsonl", Path(td) / "ledger2.jsonl", {}
+        register(probe_rules(["KXINX"])[:1], rp2, now - timedelta(days=1))
+        _append(rp2, [{"t": "rule", "name": "NOBAND", "series": "KXINX", "side": "yes",
+                       "lo": 0.1, "hi": 0.2, "named_at": _iso(now - timedelta(days=1))}])
+        _append(lp2, [{"t": "open", "ts": _iso(now)}])
+        markets.insert(0, None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                run_cycle(fake_get, now, rp2, lp2, depth_fn=lambda t, sd, p: 50,
+                          regime_fn=lambda: {"regime": "good", "mult": 1.0},
+                          heartbeat=None, state=st2)
+                raise AssertionError("an unusable registry row must end the cycle in an error")
+            except RegistryError as e:
+                assert "NOBAND lacks band" in str(e), e
+        assert [r["event"] for r in _load_jsonl(lp2) if r.get("t") == "open" and
+                r.get("rule") == "FLB_FAV_KXINX"] == ["KXINX-E1", "KXINX-E2"]
+        assert st2["last"]["market_errors"] == 1 and st2["last"]["opened"] == 2
+        assert st2["last"]["bad_rules"] == {"NOBAND": "lacks band"}
 
     # exact p: 100 straight wins on 98c 10-lots is ordinary luck under no edge
     fee10 = kalshi_fee(0.98, 10)
@@ -1284,8 +1433,11 @@ def main() -> int:
             except KeyboardInterrupt:
                 raise
             except Exception as e:  # noqa: BLE001
+                last = state.get("last") or {}       # what it recorded before it failed
+                did = (f" [recorded first: opened={last['opened']} closed={last['closed']}]"
+                       if last.get("opened") or last.get("closed") else "")
                 _say(f"[warn] cycle failed ({state.get('failed_cycles', 1)} in a row): "
-                     f"{type(e).__name__}: {e}", log)
+                     f"{type(e).__name__}: {e}{did}", log)
             time.sleep(max(1.0, CYCLE_S - (time.time() - t0)))
     print(__doc__)
     return 1
