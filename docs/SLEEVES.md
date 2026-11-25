@@ -82,6 +82,29 @@ that same family. Retirement is decided after seeing results, so a retired rule 
 longer shown but its record stays in the correction: retiring rules can never raise
 another rule's verdict.
 
+### While it runs: alive is not the same as trading (2026-11-25)
+
+`sleeve_paper.py run` (the PolybotSleeves task) and `cycle` hold a single-instance lock:
+one trader per ledger, and a second copy stands down. What they print is also appended to
+`logs\sleeve_paper.log`. Every cycle writes `data\sleeve_paper_heartbeat.json`, also a
+cycle that fails, and next to its old counts it says why a live trader may not be trading:
+
+| heartbeat key | meaning |
+|---|---|
+| `errors`, `series_fail_streak`, `all_failed_streak` | failed list calls this cycle; cycles in a row each series failed; cycles in a row EVERY series failed |
+| `poll_errors`, `market_errors` | failed settlement polls; markets or positions skipped because handling them raised |
+| `cycle_error`, `failed_cycles` | the exception of a cycle that raised (what it had decided is still recorded), and how many in a row |
+| `overdue` | open positions more than 24 h past their close with no yes/no result: `n`, `oldest`, `oldest_h` |
+| `took_s` | the cycle's wall time |
+
+None of this changes what a rule trades. Settlement asks about each market once a cycle,
+and about a position more than 24 h overdue once an hour (every cycle again while its
+rule uses half of its 50 slots, so a late close never costs an entry). A registry row
+that cannot be traded no longer stops every rule: the others trade, and each cycle ends
+in an error naming that row until it is retired. `report` shows, per rule, how many
+positions were booked with no fill check (`ungated`) and how many duplicate close rows
+it left out of the scores.
+
 ## Testing an outside method (e.g. a friend's 97-99c favorites)
 
 ```
