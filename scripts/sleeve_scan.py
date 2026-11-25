@@ -430,13 +430,26 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
     the settled price - the backtest would buy the answer. Each market row records its
     final_hours, and a resume re-fetches a market whose stored window is SHORTER than the
     one asked for (a ticker already on file is not enough): a first touch inside the
-    missing hours would otherwise be invisible, and the test would see survivors."""
+    missing hours would otherwise be invisible, and the test would see survivors.
+
+    Nothing is skipped quietly. The fetcher waits out a refusal (hb._get); a market it
+    still gives up on is warned about with its HTTP status, counted, and paced like any
+    other request - one strike missing from an event can turn that event's first touch
+    from a loss into a win. hb.GIVE_UP_AFTER of them in a row stop the run (Kalshi or the
+    network is down); a series whose listing fails is skipped, not fatal. The run closes
+    with one line per series - markets not fetched, and markets the per-event cap left
+    out - and returns 1 unless every market it set out to fetch is on file."""
     out_dir = SLEEVE_DIR / "final" if final_hours else SLEEVE_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     cats = {}
     if CATALOG.exists():
         cats = {r["series"]: r.get("category") for r in json.loads(CATALOG.read_text(encoding="utf-8"))}
-    for series in series_list:
+    tallies = [hb.new_tally(series) for series in series_list]
+    streak = hb.Streak()
+    for t in tallies:
+        if streak.stopped:
+            break                                  # the rest stay "not started"
+        series = t["series"]
         path = out_dir / f"{series}.jsonl"
         stored: dict[str, float] = {}
         if final_hours:
@@ -444,8 +457,17 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
             done = {tk for tk, h in stored.items() if h >= final_hours}
         else:
             done = hb._seen_tickers(path)
-        ms = hb.fetch_settled_markets(series, get=get,
-                                      max_markets=events_per_series * MAX_MARKETS_PER_EVENT * 2)
+        try:
+            ms = hb.fetch_settled_markets(
+                series, get=get, max_markets=events_per_series * MAX_MARKETS_PER_EVENT * 2)
+        except Exception as e:  # noqa: BLE001
+            t["error"] = hb.describe_error(e)
+            print(f"{series}: [warn] could not list its settled markets "
+                  f"({t['error']}) - series skipped")
+            time.sleep(hb.SLEEP_S)
+            streak.failed(e)
+            continue
+        streak.ok()
         by_ev: dict[str, list] = {}
         for m in ms:
             if m.get("result") in ("yes", "no") and m.get("ticker"):
@@ -454,14 +476,19 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
                      reverse=True)[:events_per_series]
         todo = [m for _, group in evs for m in group[:MAX_MARKETS_PER_EVENT]
                 if m["ticker"] not in done]
+        over = [len(group) - MAX_MARKETS_PER_EVENT for _, group in evs
+                if len(group) > MAX_MARKETS_PER_EVENT]
+        t["listed"], t["todo"] = True, len(todo)
+        t["capped"], t["capped_events"] = sum(over), len(over)
         again = sum(m["ticker"] in stored for m in todo)
         note = f" ({again} stored with a window under {final_hours:g}h)" if again else ""
         print(f"{series}: {len(evs)} events, {len(todo)} markets to fetch{note} -> {path.name}")
         n = 0
         with open(path, "a", encoding="utf-8") as f:
-            for m in todo:
+            for i, m in enumerate(todo):
                 o, c = hb._iso_to_ts(m.get("open_time")), hb._iso_to_ts(m.get("close_time"))
                 if o is None or c is None:
+                    t["untimed"] += 1
                     continue
                 start, every = o, candle_interval(o, c)
                 if final_hours:
@@ -470,8 +497,14 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
                     d = get(f"{hb.KALSHI}/series/{series}/markets/{m['ticker']}/candlesticks",
                             {"period_interval": every, "start_ts": int(start), "end_ts": int(c)})
                 except Exception as e:  # noqa: BLE001
-                    print(f"  [warn] {m['ticker']}: {type(e).__name__}")
+                    t["missing"].append(m)
+                    print(f"  [warn] {m['ticker']}: {hb.describe_error(e)} - not fetched")
+                    time.sleep(hb.SLEEP_S)         # a failure is paced like a success
+                    if streak.failed(e):
+                        t["missing"].extend(todo[i + 1:])     # never asked for
+                        break
                     continue
+                streak.ok()
                 cs = d.get("candlesticks", []) or d.get("candles", []) or []
                 row = {"t": "market", "series": series, "ticker": m["ticker"],
                        "event_ticker": m.get("event_ticker") or event_of(m),
@@ -486,10 +519,14 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
                                         "ticker": m["ticker"], **cd},
                                        separators=(",", ":")) + "\n")
                 n += 1
+                t["fetched"] = n
                 if n % 50 == 0:
                     print(f"  {n}/{len(todo)}")
                 time.sleep(hb.SLEEP_S)
-    return 0
+    return hb.close_run(
+        tallies, event_of=event_of, cap=MAX_MARKETS_PER_EVENT,
+        hint=f" Do it soon: only each series' newest {events_per_series} events are looked "
+             f"at, so a market skipped today moves out of reach as new events settle.")
 
 
 # ── report ────────────────────────────────────────────────────────────────────

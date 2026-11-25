@@ -58,6 +58,7 @@ RETRY_TRIES = 8             # attempts per request before the caller sees the fa
 RETRY_BASE_S = 1.0          # waits between them: 1, 2, 4, 8, 16, 30, 30 s - 91 s in all
 RETRY_CAP_S = 30.0
 RETRY_AFTER_CAP_S = 60.0    # a server's Retry-After is honoured up to this, never longer
+GIVE_UP_AFTER = 3           # requests given up on IN A ROW before a backfill run stops
 
 
 # ── the fetcher: one request, waited out when the failure is the passing kind ──
@@ -196,6 +197,84 @@ def _get(url: str, params: dict | None = None, *, tries: int | None = None,
     raise RuntimeError("unreachable")              # the loop returns or raises
 
 
+# ── what a backfill run owes its reader: pacing, a count, a stop, a closing line ──
+
+class Streak:
+    """Requests in a row that were given up on after waiting (is_transient failures).
+    One is a market for the next run to fetch. GIVE_UP_AFTER of them back to back is
+    Kalshi or the network being down, and the run stops there: at a minute and a half of
+    patience per request, pressing on would hold a 12,000-market run for days. An answer
+    that is final (a 404) is not an outage and breaks the streak, as any success does."""
+
+    def __init__(self, limit: int | None = None):
+        self.n = 0
+        self.limit = GIVE_UP_AFTER if limit is None else limit
+        self.stopped = False
+
+    def ok(self) -> None:
+        self.n = 0
+
+    def failed(self, e: BaseException) -> bool:
+        """Count one failed request. True from the moment the run must stop."""
+        self.n = self.n + 1 if is_transient(e) else 0
+        if self.n >= self.limit and not self.stopped:
+            self.stopped = True
+            print(f"  [stop] {self.n} requests in a row were given up on - Kalshi or the "
+                  f"network is not answering. Stopping the run here.", flush=True)
+        return self.stopped
+
+
+def new_tally(series: str) -> dict:
+    """What a backfill run did for one series; close_run prints one line from each.
+    listed: its settled markets were listed. error: why they were not. todo: markets the
+    run set out to fetch. missing: those it did not fetch (market dicts). capped /
+    capped_events: markets left out on purpose by a per-event cap. untimed: markets
+    with no open or close time, which no run can fetch."""
+    return {"series": series, "listed": False, "error": None, "todo": 0, "fetched": 0,
+            "missing": [], "capped": 0, "capped_events": 0, "untimed": 0}
+
+
+def close_run(tallies: list[dict], event_of=None, cap: int | None = None,
+              hint: str = "") -> int:
+    """The closing lines of a backfill run: one per series, then the verdict. Returns the
+    exit code - 0 only when every market the run set out to fetch is on file. A market
+    given up on, a series that could not be listed and a run that stopped early all
+    return 1, so a chained command does not carry on as if the history were whole.
+    Markets left out by the per-event cap are counted here but are not a failure."""
+    print("SUMMARY")
+    short = whole = 0
+    for t in tallies:
+        if t["error"]:
+            whole += 1
+            line = f"NOT fetched - its markets could not be listed ({t['error']})"
+        elif not t["listed"]:
+            whole += 1
+            line = "NOT started - the run stopped before it"
+        else:
+            short += len(t["missing"])
+            bits = [f"{t['fetched']} fetched" if t["todo"]
+                    else "nothing to fetch (already on file)"]
+            if t["missing"]:
+                where = (f" in {len({event_of(m) for m in t['missing']})} event(s)"
+                         if event_of else "")
+                bits.append(f"{len(t['missing'])} NOT fetched{where}")
+            if t["untimed"]:
+                bits.append(f"{t['untimed']} with no open/close time (cannot be fetched)")
+            if t["capped"]:
+                bits.append(f"{t['capped']} left out by the {cap}-per-event cap "
+                            f"in {t['capped_events']} event(s)")
+            line = ", ".join(bits)
+        print(f"  {t['series']:22} {line}")
+    if not (short or whole):
+        print("COMPLETE: every market this run set out to fetch is on file.")
+        return 0
+    what = " and ".join(x for x in (f"{short} market(s)" if short else "",
+                                    f"{whole} whole series" if whole else "") if x)
+    print(f"NOT COMPLETE: {what} not fetched. Re-run the same command - it resumes and "
+          f"fetches only what is missing.{hint}")
+    return 1
+
+
 def _iso_to_ts(iso: str) -> int | None:
     try:
         return int(datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp())
@@ -330,14 +409,34 @@ def cmd_probe(get=_get) -> int:
 
 
 def cmd_run(series_list: list[str], max_markets: int, get=_get) -> int:
+    """Backfill every settled market of each series (resumable). A request the fetcher
+    gives up on leaves that market for the next run: it is warned about with its HTTP
+    status, counted, and paced like any other. GIVE_UP_AFTER of them in a row stop the
+    run; a series whose listing fails is skipped, not fatal. Returns 1 unless every
+    market it set out to fetch is on file (close_run)."""
     OUT.parent.mkdir(parents=True, exist_ok=True)
     seen = _seen_tickers(OUT)
     print(f"backfill -> {OUT} (resumable; {len(seen)} tickers already stored)")
     total_c = 0
-    for series in series_list:
-        ms = fetch_settled_markets(series, get=get, max_markets=max_markets)
+    tallies = [new_tally(series) for series in series_list]
+    streak = Streak()
+    for t in tallies:
+        if streak.stopped:
+            break                                  # the rest stay "not started"
+        series = t["series"]
+        try:
+            ms = fetch_settled_markets(series, get=get, max_markets=max_markets)
+        except Exception as e:  # noqa: BLE001
+            t["error"] = describe_error(e)
+            print(f"{series}: [warn] could not list its settled markets "
+                  f"({t['error']}) - series skipped")
+            time.sleep(SLEEP_S)
+            streak.failed(e)
+            continue
+        streak.ok()
         todo = [m for m in ms if m.get("ticker") and m["ticker"] not in seen
                 and m.get("result") in ("yes", "no")]
+        t["listed"], t["todo"] = True, len(todo)
         print(f"{series}: {len(ms)} settled, {len(todo)} to fetch")
         with open(OUT, "a", encoding="utf-8") as f:
             for i, m in enumerate(todo):
@@ -346,8 +445,14 @@ def cmd_run(series_list: list[str], max_markets: int, get=_get) -> int:
                     cs = fetch_candles(series, tk, m.get("open_time"),
                                        m.get("close_time"), get=get)
                 except Exception as e:  # noqa: BLE001
-                    print(f"  [warn] {tk}: {e}")
+                    t["missing"].append(m)
+                    print(f"  [warn] {tk}: {describe_error(e)} - not fetched")
+                    time.sleep(SLEEP_S)            # a failure is paced like a success
+                    if streak.failed(e):
+                        t["missing"].extend(todo[i + 1:])     # never asked for
+                        break
                     continue
+                streak.ok()
                 f.write(json.dumps({"t": "market", "series": series, "ticker": tk,
                                     "result": m.get("result"),
                                     "open_time": m.get("open_time"),
@@ -359,11 +464,12 @@ def cmd_run(series_list: list[str], max_markets: int, get=_get) -> int:
                     f.write(json.dumps({"t": "candle", "series": series, "ticker": tk,
                                         **c}, separators=(",", ":")) + "\n")
                 total_c += len(cs)
+                t["fetched"] += 1
                 if (i + 1) % 25 == 0:
                     print(f"  {i+1}/{len(todo)} markets, {total_c} candles")
                 time.sleep(SLEEP_S)
-    print(f"done. total new candles: {total_c}")
-    return 0
+    print(f"total new candles: {total_c}")
+    return close_run(tallies)
 
 
 def cmd_export() -> int:

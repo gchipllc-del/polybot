@@ -3,6 +3,7 @@
 Nothing here touches the network or sleeps for real: fetchers are injected and
 time.sleep is replaced by a recorder.
 """
+import json
 import sys
 import time
 from pathlib import Path
@@ -248,3 +249,110 @@ def test_the_commands_default_fetcher_is_the_patient_one():
     for fn in (hb.fetch_settled_markets, hb.fetch_candles, hb.cmd_probe, hb.cmd_run,
                ss.cmd_probe, ss.cmd_discover, ss.cmd_backfill):
         assert inspect.signature(fn).parameters["get"].default is hb._get, fn.__name__
+
+
+# ── the backfill loop: cmd_run ────────────────────────────────────────────────
+
+def _refused(status=429):
+    import requests
+    return requests.HTTPError(f"{status} Error", response=Resp(status, reason="Too Many Requests"
+                                                               if status == 429 else ""))
+
+
+def _run_api(series_markets: dict, fail: dict | None = None):
+    """get() for cmd_run: /markets lists `series_markets[series]` (a list of tickers);
+    candles come back as one candle each. `fail` maps a series (listing) or a ticker
+    (candles) to the exception raised for it. Every request is logged in order."""
+    fail = fail or {}
+    log: list[str] = []
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            s = params["series_ticker"]
+            log.append(f"list {s}")
+            if s in fail:
+                raise fail[s]
+            return {"markets": [{"ticker": tk, "result": "yes",
+                                 "open_time": "2026-11-16T10:00:00Z",
+                                 "close_time": "2026-11-16T10:15:00Z"}
+                                for tk in series_markets[s]], "cursor": None}
+        tk = url.split("/")[-2]
+        log.append(tk)
+        if tk in fail:
+            raise fail[tk]
+        return {"candlesticks": [{"end_period_ts": 1, "price": 50}]}
+
+    return get, log
+
+
+def test_run_counts_paces_and_reports_a_market_it_could_not_fetch(tmp_path, monkeypatch,
+                                                                  slept, capsys):
+    """A given-up request used to print '[warn] <ticker>: <url>', skip the pause and end
+    in 'done.' with exit 0. Now it names the status, is paced like any request, is
+    counted per series, and the run returns 1 so a re-run is asked for."""
+    monkeypatch.setattr(hb, "OUT", tmp_path / "bf.jsonl")
+    get, log = _run_api({"KXA": ["A-1", "A-2", "A-3"]}, fail={"A-2": _refused(429)})
+    assert hb.cmd_run(["KXA"], 100, get=get) == 1
+    out = capsys.readouterr().out
+    assert "[warn] A-2: HTTP 429 Too Many Requests - not fetched" in out
+    assert len(slept) == 3                    # one pause per candle request, failed or not
+    assert "KXA" in out and "2 fetched, 1 NOT fetched" in out and "NOT COMPLETE" in out
+    stored = {json.loads(x)["ticker"] for x in (tmp_path / "bf.jsonl").read_text().splitlines()}
+    assert stored == {"A-1", "A-3"}
+    log.clear()                               # the re-run fetches only what is missing
+    get2, log2 = _run_api({"KXA": ["A-1", "A-2", "A-3"]})
+    assert hb.cmd_run(["KXA"], 100, get=get2) == 0
+    assert log2 == ["list KXA", "A-2"] and "COMPLETE" in capsys.readouterr().out
+
+
+def test_run_survives_a_failed_listing_and_goes_on_to_the_next_series(tmp_path, monkeypatch,
+                                                                       slept, capsys):
+    """One refused listing call used to end a multi-series run in a traceback."""
+    monkeypatch.setattr(hb, "OUT", tmp_path / "bf.jsonl")
+    get, log = _run_api({"KXA": ["A-1"], "KXB": ["B-1"], "KXC": ["C-1"]},
+                        fail={"KXB": _refused(503)})
+    assert hb.cmd_run(["KXA", "KXB", "KXC"], 100, get=get) == 1
+    assert log == ["list KXA", "A-1", "list KXB", "list KXC", "C-1"]
+    out = capsys.readouterr().out
+    assert "KXB: [warn] could not list its settled markets (HTTP 503) - series skipped" in out
+    assert "NOT fetched - its markets could not be listed (HTTP 503)" in out
+    assert "1 whole series not fetched" in out
+
+
+def test_run_stops_after_a_few_given_up_requests_in_a_row(tmp_path, monkeypatch, slept,
+                                                          capsys):
+    """With a minute and a half of patience per request, pressing on through an outage
+    would hold the run for days. GIVE_UP_AFTER in a row stop it; the rest are reported."""
+    monkeypatch.setattr(hb, "OUT", tmp_path / "bf.jsonl")
+    tks = [f"A-{j}" for j in range(10)]
+    down = {tk: _refused(503) for tk in tks[2:]}
+    get, log = _run_api({"KXA": tks, "KXB": ["B-1"]}, fail=down)
+    assert hb.cmd_run(["KXA", "KXB"], 100, get=get) == 1
+    assert log == ["list KXA"] + tks[:2 + hb.GIVE_UP_AFTER]          # nothing after the stop
+    out = capsys.readouterr().out
+    assert "[stop] 3 requests in a row were given up on" in out
+    assert "2 fetched, 8 NOT fetched" in out
+    assert "NOT started - the run stopped before it" in out
+
+
+def test_a_final_answer_breaks_the_streak_and_does_not_stop_the_run(tmp_path, monkeypatch,
+                                                                     slept, capsys):
+    """A 404 is a market that is gone, not an outage: counted, but the run goes on."""
+    monkeypatch.setattr(hb, "OUT", tmp_path / "bf.jsonl")
+    tks = [f"A-{j}" for j in range(6)]
+    get, log = _run_api({"KXA": tks}, fail={tk: _refused(404) for tk in tks[:5]})
+    assert hb.cmd_run(["KXA"], 100, get=get) == 1
+    assert log == ["list KXA"] + tks and "[stop]" not in capsys.readouterr().out
+
+
+def test_close_run_exit_codes():
+    clean = dict(hb.new_tally("KXA"), listed=True, todo=2, fetched=2)
+    nothing = dict(hb.new_tally("KXB"), listed=True)
+    assert hb.close_run([clean, nothing]) == 0
+    assert hb.close_run([clean, dict(hb.new_tally("KXC"), error="HTTP 429")]) == 1
+    assert hb.close_run([clean, hb.new_tally("KXD")]) == 1               # never started
+    short = dict(hb.new_tally("KXE"), listed=True, todo=2, fetched=1, missing=[{"ticker": "x"}])
+    assert hb.close_run([short]) == 1
+    capped = dict(hb.new_tally("KXF"), listed=True, todo=15, fetched=15, capped=1,
+                  capped_events=1)
+    assert hb.close_run([capped], cap=15) == 0            # the cap is the design, not a fault

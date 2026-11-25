@@ -8,6 +8,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -211,3 +213,105 @@ def test_find_searches_ticker_title_and_category_any_case(tmp_path, monkeypatch,
     assert ss.cmd_find("crypto") == 0 and "1 series match" in capsys.readouterr().out
     monkeypatch.setattr(ss, "CATALOG", tmp_path / "missing.json")
     assert ss.cmd_find("x") == 1
+
+
+# ── backfill: nothing skipped quietly ─────────────────────────────────────────
+
+class _Resp:
+    def __init__(self, status, reason=""):
+        self.status_code, self.reason, self.headers = status, reason, {}
+
+
+def _refused(status=429):
+    import requests
+    return requests.HTTPError(f"{status} Error", response=_Resp(
+        status, "Too Many Requests" if status == 429 else ""))
+
+
+def _backfill_api(series_events: dict, fail: dict | None = None):
+    """get() for cmd_backfill. series_events: series -> {event: n_strikes}. `fail` maps a
+    series (its listing) or a ticker (its candles) to the exception raised for it."""
+    fail = fail or {}
+    log: list[str] = []
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            s = params["series_ticker"]
+            log.append(f"list {s}")
+            if s in fail:
+                raise fail[s]
+            ms = [{"ticker": f"{ev}-T{k}", "event_ticker": ev, "result": "no",
+                   "open_time": "2026-11-16T10:00:00Z",
+                   "close_time": f"2026-11-{17 + i:02d}T00:00:00Z"}
+                  for i, (ev, n) in enumerate(series_events[s].items()) for k in range(n)]
+            return {"markets": ms, "cursor": None}
+        tk = url.split("/")[-2]
+        log.append(tk)
+        if tk in fail:
+            raise fail[tk]
+        return {"candlesticks": [{"end_period_ts": params["start_ts"] + 60,
+                                  "yes_bid": {"close": 40}, "yes_ask": {"close": 45}}]}
+
+    return get, log
+
+
+@pytest.fixture
+def bf(tmp_path, monkeypatch):
+    """sleeve_scan pointed at tmp_path, every pause recorded instead of slept."""
+    import time
+    import history_backfill as hb
+    monkeypatch.setattr(ss, "SLEEVE_DIR", tmp_path)
+    monkeypatch.setattr(ss, "CATALOG", tmp_path / "catalog.json")
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+    return hb, waits
+
+
+def test_backfill_counts_paces_and_reports_a_market_it_could_not_fetch(bf, tmp_path, capsys):
+    """One strike missing from an event can turn its first touch from a loss into a win.
+    It used to print '[warn] <ticker>: HTTPError' (no status), skip the pause, and the
+    run returned 0. Now: status named, paced, counted per series and event, exit 1."""
+    hb, waits = bf
+    get, log = _backfill_api({"KXA": {"KXA-E1": 3, "KXA-E2": 2}}, fail={"KXA-E2-T1": _refused()})
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 1
+    out = capsys.readouterr().out
+    assert "[warn] KXA-E2-T1: HTTP 429 Too Many Requests - not fetched" in out
+    assert len(waits) == 5                    # every candle request paced, failed or not
+    assert "4 fetched, 1 NOT fetched in 1 event(s)" in out and "NOT COMPLETE" in out
+    get2, log2 = _backfill_api({"KXA": {"KXA-E1": 3, "KXA-E2": 2}})
+    assert ss.cmd_backfill(["KXA"], 10, get=get2) == 0    # the re-run fetches the one
+    assert log2 == ["list KXA", "KXA-E2-T1"] and "COMPLETE:" in capsys.readouterr().out
+
+
+def test_backfill_survives_a_failed_listing(bf, capsys):
+    """A 429 on the third series' listing used to end a 13-series run in a traceback."""
+    hb, _ = bf
+    get, log = _backfill_api({"KXA": {"KXA-E1": 1}, "KXB": {"KXB-E1": 1},
+                              "KXC": {"KXC-E1": 1}}, fail={"KXB": _refused()})
+    assert ss.cmd_backfill(["KXA", "KXB", "KXC"], 10, get=get) == 1
+    assert log == ["list KXA", "KXA-E1-T0", "list KXB", "list KXC", "KXC-E1-T0"]
+    out = capsys.readouterr().out
+    assert "could not list its settled markets (HTTP 429 Too Many Requests)" in out
+
+
+def test_backfill_stops_when_kalshi_stops_answering(bf, capsys):
+    hb, _ = bf
+    tks = [f"KXA-E1-T{k}" for k in range(8)]
+    get, log = _backfill_api({"KXA": {"KXA-E1": 8}, "KXB": {"KXB-E1": 1}},
+                             fail={tk: ConnectionResetError("reset") for tk in tks[1:]})
+    assert ss.cmd_backfill(["KXA", "KXB"], 10, get=get) == 1
+    assert log == ["list KXA"] + tks[:1 + hb.GIVE_UP_AFTER]
+    out = capsys.readouterr().out
+    assert "[stop]" in out and "1 fetched, 7 NOT fetched in 1 event(s)" in out
+    assert "NOT started" in out
+
+
+def test_backfill_reports_markets_left_out_by_the_per_event_cap(bf, capsys):
+    """The 15-per-event cap is the frozen screen design and stays; it used to drop the
+    16th strike without a word. Counted now, and not a failure."""
+    hb, _ = bf
+    get, log = _backfill_api({"KXA": {"KXA-E1": 16, "KXA-E2": 22, "KXA-E3": 4}})
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 0
+    assert len(log) == 1 + 15 + 15 + 4
+    out = capsys.readouterr().out
+    assert "8 left out by the 15-per-event cap in 2 event(s)" in out and "COMPLETE:" in out
