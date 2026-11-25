@@ -8,6 +8,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -211,3 +213,228 @@ def test_find_searches_ticker_title_and_category_any_case(tmp_path, monkeypatch,
     assert ss.cmd_find("crypto") == 0 and "1 series match" in capsys.readouterr().out
     monkeypatch.setattr(ss, "CATALOG", tmp_path / "missing.json")
     assert ss.cmd_find("x") == 1
+
+
+# ── backfill: nothing skipped quietly ─────────────────────────────────────────
+
+class _Resp:
+    def __init__(self, status, reason=""):
+        self.status_code, self.reason, self.headers = status, reason, {}
+
+
+def _refused(status=429):
+    import requests
+    return requests.HTTPError(f"{status} Error", response=_Resp(
+        status, "Too Many Requests" if status == 429 else ""))
+
+
+def _backfill_api(series_events: dict, fail: dict | None = None):
+    """get() for cmd_backfill. series_events: series -> {event: n_strikes}. `fail` maps a
+    series (its listing) or a ticker (its candles) to the exception raised for it."""
+    fail = fail or {}
+    log: list[str] = []
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            s = params["series_ticker"]
+            log.append(f"list {s}")
+            if s in fail:
+                raise fail[s]
+            ms = [{"ticker": f"{ev}-T{k}", "event_ticker": ev, "result": "no",
+                   "open_time": "2026-11-16T10:00:00Z",
+                   "close_time": f"2026-11-{17 + i:02d}T00:00:00Z"}
+                  for i, (ev, n) in enumerate(series_events[s].items()) for k in range(n)]
+            return {"markets": ms, "cursor": None}
+        tk = url.split("/")[-2]
+        log.append(tk)
+        if tk in fail:
+            raise fail[tk]
+        return {"candlesticks": [{"end_period_ts": params["start_ts"] + 60,
+                                  "yes_bid": {"close": 40}, "yes_ask": {"close": 45}}]}
+
+    return get, log
+
+
+@pytest.fixture
+def bf(tmp_path, monkeypatch):
+    """sleeve_scan pointed at tmp_path, every pause recorded instead of slept."""
+    import time
+    import history_backfill as hb
+    monkeypatch.setattr(ss, "SLEEVE_DIR", tmp_path)
+    monkeypatch.setattr(ss, "CATALOG", tmp_path / "catalog.json")
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+    return hb, waits
+
+
+def test_backfill_counts_paces_and_reports_a_market_it_could_not_fetch(bf, tmp_path, capsys):
+    """One strike missing from an event can turn its first touch from a loss into a win.
+    It used to print '[warn] <ticker>: HTTPError' (no status), skip the pause, and the
+    run returned 0. Now: status named, paced, counted per series and event, exit 1."""
+    hb, waits = bf
+    get, log = _backfill_api({"KXA": {"KXA-E1": 3, "KXA-E2": 2}}, fail={"KXA-E2-T1": _refused()})
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 1
+    out = capsys.readouterr().out
+    assert "[warn] KXA-E2-T1: HTTP 429 Too Many Requests - not fetched" in out
+    assert len(waits) == 5                    # every candle request paced, failed or not
+    assert "4 fetched, 1 NOT fetched in 1 event(s)" in out and "NOT COMPLETE" in out
+    get2, log2 = _backfill_api({"KXA": {"KXA-E1": 3, "KXA-E2": 2}})
+    assert ss.cmd_backfill(["KXA"], 10, get=get2) == 0    # the re-run fetches the one
+    assert log2 == ["list KXA", "KXA-E2-T1"] and "COMPLETE:" in capsys.readouterr().out
+
+
+def test_backfill_survives_a_failed_listing(bf, capsys):
+    """A 429 on the third series' listing used to end a 13-series run in a traceback."""
+    hb, _ = bf
+    get, log = _backfill_api({"KXA": {"KXA-E1": 1}, "KXB": {"KXB-E1": 1},
+                              "KXC": {"KXC-E1": 1}}, fail={"KXB": _refused()})
+    assert ss.cmd_backfill(["KXA", "KXB", "KXC"], 10, get=get) == 1
+    assert log == ["list KXA", "KXA-E1-T0", "list KXB", "list KXC", "KXC-E1-T0"]
+    out = capsys.readouterr().out
+    assert "could not list its settled markets (HTTP 429 Too Many Requests)" in out
+
+
+def test_backfill_stops_when_kalshi_stops_answering(bf, capsys):
+    hb, _ = bf
+    tks = [f"KXA-E1-T{k}" for k in range(8)]
+    get, log = _backfill_api({"KXA": {"KXA-E1": 8}, "KXB": {"KXB-E1": 1}},
+                             fail={tk: ConnectionResetError("reset") for tk in tks[1:]})
+    assert ss.cmd_backfill(["KXA", "KXB"], 10, get=get) == 1
+    assert log == ["list KXA"] + tks[:1 + hb.GIVE_UP_AFTER]
+    out = capsys.readouterr().out
+    assert "[stop]" in out and "1 fetched, 7 NOT fetched in 1 event(s)" in out
+    assert "NOT started" in out
+
+
+def test_backfill_reports_markets_left_out_by_the_per_event_cap(bf, capsys):
+    """The 15-per-event cap is the frozen screen design and stays; it used to drop the
+    16th strike without a word. Counted now, and not a failure."""
+    hb, _ = bf
+    get, log = _backfill_api({"KXA": {"KXA-E1": 16, "KXA-E2": 22, "KXA-E3": 4}})
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 0
+    assert len(log) == 1 + 15 + 15 + 4
+    out = capsys.readouterr().out
+    assert "8 left out by the 15-per-event cap in 2 event(s)" in out and "COMPLETE:" in out
+
+
+# ── discover: never replace the catalog with a walk that ended on an error ────
+
+def _events_api(n_pages: int, fail_page: int | None = None, per_page: int = 4):
+    """/events?status=settled: n_pages pages; page k (1-based) holds events of series
+    S{k}..; `fail_page` raises a 429 instead."""
+    calls: list[dict] = []
+
+    def get(url, params=None):
+        assert url.endswith("/events"), url
+        calls.append(dict(params))
+        k = int(params.get("cursor") or 1)
+        if k == fail_page:
+            raise _refused(429)
+        evs = [{"series_ticker": f"S{k}-{j}", "category": "C", "title": f"t{k}{j}"}
+               for j in range(per_page)]
+        return {"events": evs, "cursor": str(k + 1) if k < n_pages else ""}
+
+    return get, calls
+
+
+def test_discover_writes_a_whole_walk_through_a_temp_file(bf, tmp_path, capsys):
+    get, _ = _events_api(3)
+    assert ss.cmd_discover(40, get=get) == 0
+    cat = json.loads((tmp_path / "catalog.json").read_text(encoding="utf-8"))
+    assert len(cat) == 12 and [p.name for p in tmp_path.iterdir()] == ["catalog.json"]
+
+
+@pytest.mark.parametrize("fail_page", [1, 3])
+def test_discover_keeps_the_catalog_when_the_walk_ends_on_an_error(bf, tmp_path, capsys,
+                                                                   fail_page):
+    """It used to write the series seen before the error over catalog.json - '[]' when
+    page 1 failed - and return 0; backfill --top N and the rule registrations read it."""
+    get, _ = _events_api(5)
+    assert ss.cmd_discover(40, get=get) == 0
+    before = (tmp_path / "catalog.json").read_bytes()
+    capsys.readouterr()
+    get, calls = _events_api(5, fail_page=fail_page)
+    assert ss.cmd_discover(40, get=get) == 1
+    assert (tmp_path / "catalog.json").read_bytes() == before
+    out = capsys.readouterr().out
+    assert f"[warn] page {fail_page} of 40: HTTP 429 Too Many Requests" in out
+    assert f"discover STOPPED after {fail_page - 1} of 40 page(s)" in out
+    assert "--accept-partial" in out and len(calls) == fail_page
+
+
+def test_discover_with_no_catalog_yet_writes_nothing_on_an_error(bf, tmp_path):
+    get, _ = _events_api(5, fail_page=1)
+    assert ss.cmd_discover(40, get=get) == 1
+    assert not (tmp_path / "catalog.json").exists()
+
+
+def test_discover_accept_partial_keeps_a_short_walk_on_purpose(bf, tmp_path, capsys):
+    """If Kalshi refused deep pages every time, discover could never write a catalog:
+    --accept-partial is the deliberate way through, and says how much was read."""
+    get, _ = _events_api(5, fail_page=3)
+    assert ss.cmd_discover(40, get=get, accept_partial=True) == 0
+    assert len(json.loads((tmp_path / "catalog.json").read_text(encoding="utf-8"))) == 8
+    assert "PARTIAL: 2 of 40 page(s) read" in capsys.readouterr().out
+
+
+def test_discover_leaves_the_catalog_when_windows_refuses_the_swap(bf, tmp_path, capsys,
+                                                                   monkeypatch):
+    """os.replace fails on Windows while another program has catalog.json open."""
+    get, _ = _events_api(2)
+    assert ss.cmd_discover(40, get=get) == 0
+    before = (tmp_path / "catalog.json").read_bytes()
+
+    def refuse(src, dst):
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(ss.os, "replace", refuse)
+    get, _ = _events_api(4)
+    assert ss._replace_catalog([{"series": "X"}], replace=refuse) is False
+    assert ss.cmd_discover(40, get=get) == 1
+    assert (tmp_path / "catalog.json").read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["catalog.json"]      # no temp left
+    assert "previous catalog is unchanged" in capsys.readouterr().out
+
+
+def test_backfill_with_no_series_says_so_and_fails(bf, capsys):
+    """An empty catalog used to make backfill do nothing, print nothing and return 0."""
+    assert ss.cmd_backfill([], 60, get=lambda *a: pytest.fail("no request expected")) == 1
+    assert "no series to backfill" in capsys.readouterr().out
+
+
+# ── backfill writes: a market row never stands without its candles ────────────
+
+def test_backfill_writes_each_market_and_its_candles_in_one_flushed_write(bf, tmp_path,
+                                                                          monkeypatch):
+    """A market row is 'fetched' to the resume. Written row by row through an 8 KB
+    buffer, a hard stop (End task, forced restart) left the row on disk without its
+    newest candles - the minutes before the close a last-hour test reads - and no later
+    run repaired it. Each market is now one append (lib.jsonl_io.append_lines)."""
+    import lib.jsonl_io as jio
+    writes: list[list[str]] = []
+
+    def record(path, lines):
+        lines = list(lines)
+        writes.append(lines)
+        return jio.append_lines(path, lines)
+
+    monkeypatch.setattr(ss, "append_lines", record)
+    get, _ = _backfill_api({"KXA": {"KXA-E1": 3}})
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 0
+    assert len(writes) == 3                                       # one per market
+    for w in writes:
+        rows = [json.loads(x) for x in w]
+        assert rows[0]["t"] == "market" and [r["t"] for r in rows[1:]] == ["candle"]
+        assert {r["ticker"] for r in rows} == {rows[0]["ticker"]}
+
+
+def test_backfill_never_glues_a_new_row_onto_a_torn_one(bf, tmp_path):
+    """A file cut inside its last row (power loss, full disk): the resumed run used to
+    glue its first market row onto the torn one, losing that market to every reader and
+    leaving its candles as orphans."""
+    get, _ = _backfill_api({"KXA": {"KXA-E1": 2}})
+    path = tmp_path / "KXA.jsonl"
+    path.write_text('{"t":"market","series":"KXA","ticker":"KXA-E0-T0","res', encoding="utf-8")
+    assert ss.cmd_backfill(["KXA"], 10, get=get) == 0
+    sl = ss.load_sleeve_file(path)
+    assert set(sl["KXA"]["markets"]) == {"KXA-E1-T0", "KXA-E1-T1"}

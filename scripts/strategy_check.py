@@ -330,6 +330,11 @@ def cmd_favorites(paths: list[Path], lo: float, hi: float, contracts: int,
               "invisible, so the")
         print("test only sees the markets still in range later - survivors. Narrow --max-hours")
         print("to the data, or re-fetch: py scripts/sleeve_scan.py backfill ... --final-hours H")
+    if res["orphans"]:
+        print(f"note: {res['orphans']} candle row(s) have no settled market row before them in "
+              "their file and were not used.")
+        print("A backfill cut off mid-write leaves these; once that market is fetched again "
+              "they are harmless leftovers.")
     trades = trades_from(res, contracts)
     if one_per_event:
         trades = first_per_event(trades)

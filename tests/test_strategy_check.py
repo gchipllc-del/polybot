@@ -231,3 +231,18 @@ def test_data_that_starts_after_the_window_opens_is_flagged(tmp_path, capsys):
     for p in (rec, old):
         res = sc.scan_many([p], 0.97, 0.99, 0.0, 3.0)
         assert set(sc.late_data(res, 3.0).values()) == {1.0}         # 1h of the 3 unseen
+
+
+def test_orphan_candles_are_noted_when_there_are_any(tmp_path, capsys):
+    """Candles with no market row before them (a backfill cut off mid-write) were counted
+    by scan() and never mentioned. A note now says how many - a note, not an error:
+    after the market is re-fetched the leftovers stay counted but do no harm."""
+    p = _quote_file(tmp_path / "m.jsonl", lambda left: (40, 45), n=3)
+    assert sc.cmd_favorites([p], 0.97, 0.99, 10, 0.0, 1e9) == 0
+    assert "candle row(s) have no settled market row" not in capsys.readouterr().out
+    lines = p.read_text(encoding="utf-8").splitlines()
+    cut = [ln for ln in lines if '"market"' not in ln or "D0001" not in ln]   # lose a row
+    p.write_text("\n".join(cut) + "\n", encoding="utf-8")
+    assert sc.cmd_favorites([p], 0.97, 0.99, 10, 0.0, 1e9) == 0
+    out = capsys.readouterr().out
+    assert "note: 120 candle row(s) have no settled market row before them" in out

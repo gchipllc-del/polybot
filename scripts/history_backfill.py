@@ -32,15 +32,20 @@ Per-venue screening: scope BOTH files by env var so venues never mix -
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
+
+from lib.jsonl_io import append_lines  # noqa: E402
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 SERIES = ["KXBTC15M", "KXETH15M"]
@@ -48,13 +53,228 @@ OUT = Path(os.environ.get("BACKFILL_LOG") or (ROOT / "data" / "history_backfill.
 EXPORT = Path(os.environ.get("BACKFILL_EXPORT")
               or (ROOT / "data" / "stage0_backfill.jsonl"))
 SLEEP_S = 0.35              # polite pacing; these are public endpoints
+LIST_PAGE = 1000            # markets per listing page: the most /markets serves (a
+                            # smaller page from the server still works - the loop
+                            # follows the cursor)
+RETRY_TRIES = 8             # attempts per request before the caller sees the failure
+RETRY_BASE_S = 1.0          # waits between them: 1, 2, 4, 8, 16, 30, 30 s - 91 s in all
+RETRY_CAP_S = 30.0
+RETRY_AFTER_CAP_S = 60.0    # a server's Retry-After is honoured up to this, never longer
+GIVE_UP_AFTER = 3           # requests given up on IN A ROW before a backfill run stops
 
 
-def _get(url: str, params: dict | None = None) -> dict:
+# ── the fetcher: one request, waited out when the failure is the passing kind ──
+
+def http_status(e: BaseException) -> int | None:
+    """The HTTP status an error carries, or None (requests.HTTPError keeps it on
+    .response; urllib's HTTPError and injected fakes keep it on the error itself)."""
+    for obj in (getattr(e, "response", None), e):
+        for name in ("status_code", "status", "code"):
+            v = getattr(obj, name, None)
+            if isinstance(v, int) and 100 <= v <= 599:
+                return v
+    return None
+
+
+def is_transient(e: BaseException) -> bool:
+    """True for the failures worth waiting out: HTTP 429, any 5xx, a timeout, a dropped
+    or refused connection. Every other answer is final: a 404 for a market that is gone
+    must not cost a minute and a half of retries."""
+    status = http_status(e)
+    if status is not None:
+        return status == 429 or status >= 500
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return True
+    try:
+        import requests
+    except ImportError:
+        return False
+    return isinstance(e, (requests.ConnectionError, requests.Timeout,
+                          requests.exceptions.ChunkedEncodingError))
+
+
+def describe_error(e: BaseException) -> str:
+    """What a warning line says about a failed request: 'HTTP 429 Too Many Requests', or
+    the error's class and its cause without the connection-pool preamble."""
+    status = http_status(e)
+    if status is not None:
+        reason = " ".join(str(getattr(getattr(e, "response", None), "reason", None)
+                              or "").split())
+        return f"HTTP {status}" + (f" {reason[:40]}" if reason else "")
+    text = " ".join(str(e).split())
+    if "(Caused by " in text:                  # requests wraps urllib3's own wrapper:
+        text = text.rsplit("(Caused by ", 1)[1]            # keep the cause, not the URL
+        text = text[:-1] if text.endswith(")") else text
+    text = re.sub(r"<[^<>]*object at 0x[0-9a-fA-F]+>:\s*|HTTPS?Connection\([^()]*\):\s*",
+                  "", text)
+    return type(e).__name__ + (f": {text[:140]}" if text else "")
+
+
+def parse_retry_after(value, now: float | None = None) -> float | None:
+    """A Retry-After header as seconds from now. It comes as a number ('5') or as an HTTP
+    date ('Wed, 25 Nov 2026 12:00:30 GMT'). None when absent or unreadable; a date
+    already past (or a PC clock running ahead) reads as 0, never negative."""
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    try:
+        secs = float(text)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        try:
+            secs = when.timestamp() - (time.time() if now is None else now)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return max(0.0, secs) if math.isfinite(secs) else None
+
+
+def _header(e: BaseException, name: str):
+    headers = getattr(getattr(e, "response", None), "headers", None)
+    try:
+        for k, v in (headers or {}).items():
+            if str(k).lower() == name.lower():
+                return v
+    except Exception:  # noqa: BLE001 - an odd fake must not turn a retry into a crash
+        pass
+    return None
+
+
+def retry_wait(e: BaseException, attempt: int, now: float | None = None) -> tuple[float, str]:
+    """(seconds to wait after failed attempt number `attempt`, a note for the wait line).
+    The usual step doubles from RETRY_BASE_S up to RETRY_CAP_S. A Retry-After from the
+    server replaces it when it asks for longer, up to RETRY_AFTER_CAP_S - an hour-long
+    Retry-After, or a date read against a PC clock that is off, must not park the run."""
+    step = min(RETRY_CAP_S, RETRY_BASE_S * 2 ** (attempt - 1))
+    asked = parse_retry_after(_header(e, "Retry-After"), now)
+    if asked is None or asked <= step:
+        return step, ""
+    if asked <= RETRY_AFTER_CAP_S:
+        return asked, " as the server asked"
+    return RETRY_AFTER_CAP_S, f" (the server asked for {asked:.0f}s - capped)"
+
+
+def _request(url: str, params: dict):
+    """ONE request, no retry - the seam the tests replace."""
     import requests
-    r = requests.get(url, params=params or {}, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    return requests.get(url, params=params, timeout=20)
+
+
+def _get(url: str, params: dict | None = None, *, tries: int | None = None,
+         request=None, sleep=None, now=None) -> dict:
+    """GET JSON from a public endpoint, waiting out the failures that pass.
+
+    Retried, RETRY_TRIES attempts in all: HTTP 429, any 5xx, a timeout, a dropped or
+    refused connection (is_transient). Between attempts it waits 1, 2, 4, 8, 16, 30, 30 s
+    - about a minute and a half of patience - or what the server's Retry-After asks for
+    (retry_wait). One line is printed per wait, so a command that is waiting never looks
+    hung. Before this, one 429 was one skipped market and the next request left at once.
+
+    NOT retried: every other answer. A 404 for a market that is gone is final.
+
+    When the tries run out the LAST error is raised unchanged: callers print it
+    (describe_error) and decide what to do next (is_transient tells them it was the
+    waiting-out kind). request / sleep / now are test seams; now is a clock function."""
+    tries = RETRY_TRIES if tries is None else max(1, int(tries))
+    request = request or _request
+    for attempt in range(1, tries + 1):
+        try:
+            r = request(url, params or {})
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001 - sorted into retry / raise just below
+            if attempt >= tries or not is_transient(e):
+                raise
+            wait, note = retry_wait(e, attempt, None if now is None else now())
+            shown = f"{wait:.0f}" if wait >= 10 or float(wait).is_integer() else f"{wait:.1f}"
+            print(f"  [wait] {describe_error(e)} - trying again in {shown}s{note} "
+                  f"(try {attempt + 1} of {tries})", flush=True)
+            (sleep or time.sleep)(wait)
+    raise RuntimeError("unreachable")              # the loop returns or raises
+
+
+# ── what a backfill run owes its reader: pacing, a count, a stop, a closing line ──
+
+class Streak:
+    """Requests in a row that were given up on after waiting (is_transient failures).
+    One is a market for the next run to fetch. GIVE_UP_AFTER of them back to back is
+    Kalshi or the network being down, and the run stops there: at a minute and a half of
+    patience per request, pressing on would hold a 12,000-market run for days. An answer
+    that is final (a 404) is not an outage and breaks the streak, as any success does."""
+
+    def __init__(self, limit: int | None = None):
+        self.n = 0
+        self.limit = GIVE_UP_AFTER if limit is None else limit
+        self.stopped = False
+
+    def ok(self) -> None:
+        self.n = 0
+
+    def failed(self, e: BaseException) -> bool:
+        """Count one failed request. True from the moment the run must stop."""
+        self.n = self.n + 1 if is_transient(e) else 0
+        if self.n >= self.limit and not self.stopped:
+            self.stopped = True
+            print(f"  [stop] {self.n} requests in a row were given up on - Kalshi or the "
+                  f"network is not answering. Stopping the run here.", flush=True)
+        return self.stopped
+
+
+def new_tally(series: str) -> dict:
+    """What a backfill run did for one series; close_run prints one line from each.
+    listed: its settled markets were listed. error: why they were not. todo: markets the
+    run set out to fetch. missing: those it did not fetch (market dicts). capped /
+    capped_events: markets left out on purpose by a per-event cap. untimed: markets
+    with no open or close time, which no run can fetch."""
+    return {"series": series, "listed": False, "error": None, "todo": 0, "fetched": 0,
+            "missing": [], "capped": 0, "capped_events": 0, "untimed": 0}
+
+
+def close_run(tallies: list[dict], event_of=None, cap: int | None = None,
+              hint: str = "") -> int:
+    """The closing lines of a backfill run: one per series, then the verdict. Returns the
+    exit code - 0 only when every market the run set out to fetch is on file. A market
+    given up on, a series that could not be listed and a run that stopped early all
+    return 1, so a chained command does not carry on as if the history were whole.
+    Markets left out by the per-event cap are counted here but are not a failure."""
+    print("SUMMARY")
+    short = whole = 0
+    for t in tallies:
+        if t["error"]:
+            whole += 1
+            line = f"NOT fetched - its markets could not be listed ({t['error']})"
+        elif not t["listed"]:
+            whole += 1
+            line = "NOT started - the run stopped before it"
+        else:
+            short += len(t["missing"])
+            bits = [f"{t['fetched']} fetched" if t["todo"]
+                    else "nothing to fetch (already on file)"]
+            if t["missing"]:
+                where = (f" in {len({event_of(m) for m in t['missing']})} event(s)"
+                         if event_of else "")
+                bits.append(f"{len(t['missing'])} NOT fetched{where}")
+            if t["untimed"]:
+                bits.append(f"{t['untimed']} with no open/close time (cannot be fetched)")
+            if t["capped"]:
+                bits.append(f"{t['capped']} left out by the {cap}-per-event cap "
+                            f"in {t['capped_events']} event(s)")
+            line = ", ".join(bits)
+        print(f"  {t['series']:22} {line}")
+    if not (short or whole):
+        print("COMPLETE: every market this run set out to fetch is on file.")
+        return 0
+    what = " and ".join(x for x in (f"{short} market(s)" if short else "",
+                                    f"{whole} whole series" if whole else "") if x)
+    print(f"NOT COMPLETE: {what} not fetched. Re-run the same command - it resumes and "
+          f"fetches only what is missing.{hint}")
+    return 1
 
 
 def _iso_to_ts(iso: str) -> int | None:
@@ -68,7 +288,7 @@ def fetch_settled_markets(series: str, get=_get, max_markets: int = 10000) -> li
     """All settled markets for a series, cursor-paginated, oldest data included."""
     out, cursor = [], None
     while len(out) < max_markets:
-        params = {"series_ticker": series, "status": "settled", "limit": 200}
+        params = {"series_ticker": series, "status": "settled", "limit": LIST_PAGE}
         if cursor:
             params["cursor"] = cursor
         data = get(f"{KALSHI}/markets", params)
@@ -191,40 +411,67 @@ def cmd_probe(get=_get) -> int:
 
 
 def cmd_run(series_list: list[str], max_markets: int, get=_get) -> int:
+    """Backfill every settled market of each series (resumable). A request the fetcher
+    gives up on leaves that market for the next run: it is warned about with its HTTP
+    status, counted, and paced like any other. GIVE_UP_AFTER of them in a row stop the
+    run; a series whose listing fails is skipped, not fatal. Returns 1 unless every
+    market it set out to fetch is on file (close_run)."""
     OUT.parent.mkdir(parents=True, exist_ok=True)
     seen = _seen_tickers(OUT)
     print(f"backfill -> {OUT} (resumable; {len(seen)} tickers already stored)")
     total_c = 0
-    for series in series_list:
-        ms = fetch_settled_markets(series, get=get, max_markets=max_markets)
+    tallies = [new_tally(series) for series in series_list]
+    streak = Streak()
+    for t in tallies:
+        if streak.stopped:
+            break                                  # the rest stay "not started"
+        series = t["series"]
+        try:
+            ms = fetch_settled_markets(series, get=get, max_markets=max_markets)
+        except Exception as e:  # noqa: BLE001
+            t["error"] = describe_error(e)
+            print(f"{series}: [warn] could not list its settled markets "
+                  f"({t['error']}) - series skipped")
+            time.sleep(SLEEP_S)
+            streak.failed(e)
+            continue
+        streak.ok()
         todo = [m for m in ms if m.get("ticker") and m["ticker"] not in seen
                 and m.get("result") in ("yes", "no")]
+        t["listed"], t["todo"] = True, len(todo)
         print(f"{series}: {len(ms)} settled, {len(todo)} to fetch")
-        with open(OUT, "a", encoding="utf-8") as f:
-            for i, m in enumerate(todo):
-                tk = m["ticker"]
-                try:
-                    cs = fetch_candles(series, tk, m.get("open_time"),
-                                       m.get("close_time"), get=get)
-                except Exception as e:  # noqa: BLE001
-                    print(f"  [warn] {tk}: {e}")
-                    continue
-                f.write(json.dumps({"t": "market", "series": series, "ticker": tk,
-                                    "result": m.get("result"),
-                                    "open_time": m.get("open_time"),
-                                    "close_time": m.get("close_time"),
-                                    "floor_strike": m.get("floor_strike"),
-                                    "volume": m.get("volume")},
-                                   separators=(",", ":")) + "\n")
-                for c in cs:
-                    f.write(json.dumps({"t": "candle", "series": series, "ticker": tk,
-                                        **c}, separators=(",", ":")) + "\n")
-                total_c += len(cs)
-                if (i + 1) % 25 == 0:
-                    print(f"  {i+1}/{len(todo)} markets, {total_c} candles")
-                time.sleep(SLEEP_S)
-    print(f"done. total new candles: {total_c}")
-    return 0
+        for i, m in enumerate(todo):
+            tk = m["ticker"]
+            try:
+                cs = fetch_candles(series, tk, m.get("open_time"),
+                                   m.get("close_time"), get=get)
+            except Exception as e:  # noqa: BLE001
+                t["missing"].append(m)
+                print(f"  [warn] {tk}: {describe_error(e)} - not fetched")
+                time.sleep(SLEEP_S)                # a failure is paced like a success
+                if streak.failed(e):
+                    t["missing"].extend(todo[i + 1:])         # never asked for
+                    break
+                continue
+            streak.ok()
+            # the market row and all its candles in ONE write, flushed: a market row
+            # means "fetched" to the resume, so it must never stand without its candles
+            append_lines(OUT, [json.dumps({"t": "market", "series": series, "ticker": tk,
+                                           "result": m.get("result"),
+                                           "open_time": m.get("open_time"),
+                                           "close_time": m.get("close_time"),
+                                           "floor_strike": m.get("floor_strike"),
+                                           "volume": m.get("volume")},
+                                          separators=(",", ":"))]
+                         + [json.dumps({"t": "candle", "series": series, "ticker": tk, **c},
+                                       separators=(",", ":")) for c in cs])
+            total_c += len(cs)
+            t["fetched"] += 1
+            if (i + 1) % 25 == 0:
+                print(f"  {i+1}/{len(todo)} markets, {total_c} candles")
+            time.sleep(SLEEP_S)
+    print(f"total new candles: {total_c}")
+    return close_run(tallies)
 
 
 def cmd_export() -> int:
