@@ -940,3 +940,105 @@ def test_a_market_held_by_two_rules_is_polled_once_a_cycle(tmp_path):
                       ("KXINX-E1-A", "FLB_LONG_KXINX", False),    # rules from one answer
                       ("KXINX-E2-A", "FLB_FAV_KXINX", False),
                       ("KXINX-E2-A", "FLB_LONG_KXINX", True)]
+
+
+def _two_hours(get, rp, lp, state, first=0, cycles=61):
+    """`cycles` cycles two minutes apart, sharing `state` as the run loop does."""
+    out = []
+    for i in range(first, first + cycles):
+        out.append(cycle(get, rp, lp, state=state, at=NOW + timedelta(minutes=2 * i)))
+    return out
+
+
+def test_a_position_a_day_overdue_is_asked_about_once_an_hour(tmp_path):
+    """One market that never reported yes or no cost 720 single-market GETs a day for
+    good. A position more than 24 h past its close is now asked about once an hour; the
+    only effect on the ledger is that the close row of a position already a day late
+    can come up to an hour later."""
+    rp, lp = tmp_path / "rules.jsonl", tmp_path / "ledger.jsonl"
+    favorites(rp)
+    sp._append(lp, [held("S-E1-A", closed_h=-25), held("S-E2-A", closed_h=-23.5),
+                    held("S-E3-A", closed_h=-1)])
+    answers, calls, state = {}, [], {}
+    seen = _two_hours(_results(answers, calls), rp, lp, state)
+    assert calls.count("S-E3-A") == 61                       # an hour late: every cycle
+    assert calls.count("S-E1-A") == 3                        # at 0, 60 and 120 minutes
+    # S-E2-A crosses the 24 h line 30 minutes in: every cycle until then, hourly after
+    assert calls.count("S-E2-A") == 17 + 1
+    assert seen[-1]["overdue"] == {"n": 2, "oldest": "S-E1-A", "oldest_h": 27.0}
+    assert all(s["closed"] == 0 and s["poll_errors"] == 0 for s in seen)
+
+    # the result arrives 2 minutes after a poll: the position closes at the NEXT hourly
+    # poll - 58 minutes later than it used to - with the same result and the same P&L
+    answers["S-E1-A"] = "no"
+    calls.clear()
+    seen = _two_hours(_results(answers, calls), rp, lp, state, first=61, cycles=30)
+    assert [s["closed"] for s in seen] == [0] * 29 + [1] and calls.count("S-E1-A") == 1
+    close = sp._load_jsonl(lp)[-1]
+    assert (close["t"], close["ticker"], close["result"], close["won"]) == (
+        "close", "S-E1-A", "no", True) and abs(close["pnl"] - 0.18) < 1e-9
+    assert seen[-1]["overdue"] == {"n": 1, "oldest": "S-E2-A", "oldest_h": 26.5}
+
+    # a poll that gets no answer is not a look: it is tried again the very next cycle
+    answers["S-E2-A"] = ConnectionError("refused")
+    calls.clear()
+    seen = _two_hours(_results(answers, calls), rp, lp, state, first=91, cycles=40)
+    retried = [i for i, s in enumerate(seen) if s["poll_errors"]]
+    assert retried == list(range(retried[0], 40)) and calls.count("S-E2-A") == len(retried)
+    assert set(state["overdue_asked"]) == {"S-E2-A"}         # a settled ticker is forgotten
+
+    # a one-shot cycle (no state carried) and the first cycle of a new process ask at once
+    calls.clear()
+    for i in (0, 1, 2):
+        cycle(_results({}, calls), rp, lp, at=NOW + timedelta(hours=6, minutes=2 * i))
+    assert calls.count("S-E2-A") == 3
+
+
+def test_a_rule_using_half_its_slots_keeps_the_every_cycle_poll(tmp_path):
+    """Until an overdue position closes it holds one of its rule's 50 slots, so a late
+    close could cost a rule at its cap an entry. The hourly poll therefore applies only
+    while the rule has room to spare; a rule at or near its cap is asked every cycle,
+    exactly as before - here the freed slot is used in the same cycle it always was."""
+    assert sp.OVERDUE_ROOM == sp.MAX_OPEN_PER_RULE // 2 == 25
+    for n_open, polls_in_three_cycles in ((24, 24), (25, 75)):
+        d = tmp_path / str(n_open)
+        d.mkdir()
+        rp, lp = d / "rules.jsonl", d / "ledger.jsonl"
+        favorites(rp)
+        sp._append(lp, [held(f"S-E{i}-A", closed_h=-30) for i in range(n_open)])
+        calls, state = [], {}
+        _two_hours(_results({}, calls), rp, lp, state, cycles=3)
+        assert len(calls) == polls_in_three_cycles, n_open
+
+    # at the cap: 50 positions, all more than a day overdue, and a new event in the band
+    rp, lp = tmp_path / "rules.jsonl", tmp_path / "ledger.jsonl"
+    favorites(rp)
+    sp._append(lp, [held(f"S-E{i}-A", closed_h=-30) for i in range(sp.MAX_OPEN_PER_RULE)])
+    answers, state = {}, {}
+
+    def get(url, params=None):
+        if url.endswith("/markets"):
+            return {"markets": [mk("S-E99-A", "S-E99", 3, 2)]}
+        return _results(answers)(url, params)
+
+    s0 = cycle(get, rp, lp, state=state)
+    assert (s0["opened"], s0["skipped"], s0["closed"]) == (0, {"open_cap": 1}, 0)
+    answers["S-E7-A"] = "no"                                 # one of the fifty reports
+    s1 = cycle(get, rp, lp, state=state, at=NOW + timedelta(minutes=2))
+    assert (s1["opened"], s1["skipped"], s1["closed"]) == (0, {"open_cap": 1}, 1)
+    s2 = cycle(get, rp, lp, state=state, at=NOW + timedelta(minutes=4))
+    assert (s2["opened"], s2["skipped"], s2["closed"]) == (1, {}, 0)    # not an hour later
+
+
+def test_an_overdue_market_is_asked_about_when_any_holder_cannot_wait(tmp_path):
+    rp, lp = tmp_path / "rules.jsonl", tmp_path / "ledger.jsonl"
+    favorites(rp, "ROOMY", ["S"])
+    favorites(rp, "FULL", ["T"])
+    shared = [held("X-E1-A", "ROOMY", closed_h=-30), held("X-E1-A", "FULL", closed_h=-30)]
+    sp._append(lp, shared + [held(f"T-E{i}-A", "FULL", closed_h=+5) for i in range(24)])
+    answers, calls, state = {}, [], {}
+    _two_hours(_results(answers, calls), rp, lp, state, cycles=5)
+    assert calls == ["X-E1-A"] * 5                           # FULL has 25 open: no waiting
+    answers["X-E1-A"] = "no"
+    s = cycle(_results(answers, calls), rp, lp, state=state, at=NOW + timedelta(minutes=10))
+    assert s["closed"] == 2 and calls == ["X-E1-A"] * 6      # one answer, both rules

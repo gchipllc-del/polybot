@@ -95,6 +95,8 @@ SLEEP_S = 0.35
 MAX_SPREAD = 0.15
 MAX_OPEN_PER_RULE = 50
 OVERDUE_H = 24.0           # an open position this long past its market's close is "overdue"
+OVERDUE_POLL_S = 3600      # ... and is asked about once an hour instead of every cycle,
+OVERDUE_ROOM = MAX_OPEN_PER_RULE // 2   # while its rule uses fewer slots than this
 # covered by scripts/paper_trader.py - never double-trade a sleeve
 EXCLUDED_SERIES = {"KXBTC15M", "KXETH15M"}
 LIFE_BANDS = (("early", 0.00, 0.25), ("mid", 0.25, 0.75),
@@ -606,7 +608,7 @@ def _overdue(positions: dict, now_ts: float) -> dict:
 
 
 def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, ledger: Path,
-                      depth_fn, regime_fn, log: Path | None) -> None:
+                      depth_fn, regime_fn, log: Path | None, state: dict) -> None:
     """The work of one cycle, up to (not including) the ledger append. Everything it
     decides or counts goes into `c` as it happens, so run_cycle can record the decided
     rows and say what happened even when this raises.
@@ -698,18 +700,45 @@ def _trade_and_settle(c: SimpleNamespace, get, now: datetime, rules_path: Path, 
     unhandled = c.market_errors
 
     closes, first_failed = c.closes, None
+    positions = list(live.items()) + [((e["ticker"], e["rule"]), e) for e in new]
+    # A position more than OVERDUE_H past its close is asked about once an hour, not every
+    # cycle: a market that never reports yes or no was polled 720 times a day for good.
+    # A late answer only delays the close row - but until then the position also keeps
+    # its cap slot, so this applies ONLY while its rule uses fewer than OVERDUE_ROOM of
+    # its MAX_OPEN_PER_RULE slots: a rule at or near its cap keeps the every-cycle poll,
+    # and the cap could only bind before the next one if that rule made more than
+    # MAX_OPEN_PER_RULE - OVERDUE_ROOM entries in a single cycle. The hour is counted in
+    # `state`: a one-shot `cycle`, or the first cycle after a restart, asks about all.
+    asked = state.setdefault("overdue_asked", {})     # ticker -> when last asked, overdue
+    late, wait = set(), {}                            # tickers overdue / that can wait
+    for (tk, rule), pos in positions:
+        ct = _ts(pos.get("close_time"))
+        if ct is not None and ct > now.timestamp():
+            continue
+        overdue = ct is not None and now.timestamp() - ct > OVERDUE_H * 3600.0
+        if overdue:
+            late.add(tk)
+        wait[tk] = (wait.get(tk, True) and overdue             # every holder must agree
+                    and per_rule_open.get(rule, 0) < OVERDUE_ROOM
+                    and now.timestamp() - asked.get(tk, float("-inf")) < OVERDUE_POLL_S)
+    for tk in [k for k in asked if k not in late]:
+        del asked[tk]                                  # settled, or no longer held
     # ticker -> its market, asked ONCE a cycle however many rules hold it (a probe pair
     # holds every market twice, and used to fetch it twice)
     answers: dict = {}
-    for (tk, rule), pos in list(live.items()) + [((e["ticker"], e["rule"]), e) for e in new]:
+    for (tk, rule), pos in positions:
         try:
             ct = _ts(pos.get("close_time"))
             if ct is not None and ct > now.timestamp():
                 continue                               # not closed yet - don't ask
+            if wait.get(tk):
+                continue                               # overdue, asked within the hour
             if tk not in answers:
                 try:
                     answers[tk] = fetch_market(tk, get=get)
-                except Exception as e:  # noqa: BLE001
+                    if tk in late:
+                        asked[tk] = now.timestamp()    # answered: ask again in an hour
+                except Exception as e:  # noqa: BLE001 - no answer: ask again next cycle
                     answers[tk] = _NO_ANSWER
                     c.poll_errors += 1                 # counted: it used to vanish here
                     first_failed = first_failed or f"{tk}: {type(e).__name__}: {str(e)[:80]}"
@@ -772,7 +801,7 @@ def run_cycle(get=_get, now: datetime | None = None, rules_path: Path = RULES,
                         list_done=False, appended=False)
     error: Exception | None = None
     try:
-        _trade_and_settle(c, get, now, rules_path, ledger, depth_fn, regime_fn, log)
+        _trade_and_settle(c, get, now, rules_path, ledger, depth_fn, regime_fn, log, state)
     except Exception as e:  # noqa: BLE001 - reported in the heartbeat, then re-raised
         error = e
     try:
