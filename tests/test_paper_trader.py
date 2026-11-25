@@ -347,7 +347,11 @@ def test_only_the_real_trader_writes_the_live_heartbeat(tmp_path, monkeypatch, l
     cycle(tmp_path / "other.jsonl", 0.55)
     assert not hb.exists()
 
-    monkeypatch.setattr(s0, "_get", exchange(0.55))
+    # `cycle` and `run` read the REAL clock: give them a market that closes 13 minutes
+    # from now, whenever this test runs, and row stamps from the same clock
+    real_now = pt.datetime.now(timezone.utc)
+    monkeypatch.setattr(pt, "_now_iso", lambda: pt.datetime.now(timezone.utc).isoformat())
+    monkeypatch.setattr(s0, "_get", exchange(0.55, close=real_now + timedelta(minutes=13)))
     monkeypatch.setattr(sys, "argv", ["paper_trader.py", "cycle"])
     assert pt.main() == 0 and heartbeat_of(hb)["opened"] == 2
     hb.unlink()
@@ -411,15 +415,17 @@ def test_quote_lag_is_the_time_from_the_clock_reading_to_each_series_quote(tmp_p
     """The clock is read once, before the ledger is loaded and before any request; a
     quote that arrives seconds later is still banded by it. Measured per series."""
     def slow(url, params=None):
-        time.sleep(0.03)
+        time.sleep(0.04)
         return exchange(0.55)(url, params)
     hb = tmp_path / "hb.json"
     c = cycle(tmp_path / "paper.jsonl", 0.55, get=slow, heartbeat=hb)
     lag = heartbeat_of(hb)["quote_lag_s"]
     assert lag == c["quote_lag_s"] and sorted(lag) == ["KXBTC15M", "KXETH15M"]
+    # lower bounds only, each with 20 ms of slack: the Windows monotonic clock ticks
+    # every 15.6 ms
     assert lag["KXBTC15M"] >= 0.06                    # the event list, then its markets
-    assert lag["KXETH15M"] >= lag["KXBTC15M"] + 0.09  # + BTC's spot and ETH's two calls
-    assert heartbeat_of(hb)["took_s"] >= lag["KXETH15M"] + 0.09   # + ETH spot, 2 sweeps
+    assert lag["KXETH15M"] >= lag["KXBTC15M"] + 0.10  # + BTC's spot and ETH's two calls
+    assert heartbeat_of(hb)["took_s"] >= lag["KXETH15M"] + 0.10   # + ETH spot, 2 sweeps
 
 
 def test_a_series_whose_quotes_never_arrived_has_no_lag_rather_than_a_zero(tmp_path):
