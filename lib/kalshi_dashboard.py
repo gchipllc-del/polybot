@@ -144,25 +144,115 @@ def _paper_payload() -> dict:
     }
 
 
-def _account_payload() -> dict:
-    """Kalshi balance + auth status. Public-facing; returns clean dict
-    even when auth isn't configured.
-    """
-    from lib.kalshi_auth import can_sign, signed_get, status as auth_status
+# ── the Kalshi balance: one cached value per process, fetched in the background ──
+#
+# The balance used to be fetched inline: on EVERY request of the weather page (which
+# polls every 20 s) and inside every crypto snapshot rebuild, between the file panels -
+# six private-key loads and one signed call each time, about 5,800 calls a day with both
+# tabs open for an account that only paper-trades. A Kalshi that accepted the connection
+# and never answered held each request, and each rebuild, for 15 s.
+#
+# Now a request only READS the cache. When the cached value is older than BALANCE_TTL_S
+# it also asks for a refresh - on its own thread, never waited for - so the signed call
+# is never inside a page request and never between _build_all's file panels. When a
+# fetch fails the last balance that came back is kept, with its age and the reason, and
+# the next try comes after BALANCE_RETRY_S.
+
+BALANCE_TTL_S = 300.0        # a paper account's balance does not move by the minute
+BALANCE_RETRY_S = 60.0       # after a fetch that failed
+BALANCE_TIMEOUT_S = 4.0      # for the signed call (it was 15 s)
+
+_BAL: dict = {"account": None,   # what the latest attempt returned (auth, balance, error)
+              "failed": False,   # ... and whether that attempt failed
+              "tried": None,     # monotonic time the latest attempt ended
+              "good": None,      # the last balance that came back, with when:
+              "good_t": None,    #   monotonic time, for its age
+              "good_at": None,   #   ISO time, for the page
+              "busy": False, "thread": None}
+_BAL_LOCK = threading.Lock()
+
+
+def _fetch_account() -> tuple[dict, bool]:
+    """(account, failed). The signed call itself - the only place a dashboard talks to
+    Kalshi. Runs on the balance thread only."""
+    from lib.kalshi_auth import signed_get, status as auth_status
 
     base = {"auth": auth_status(), "balance_dollars": None, "error": None}
-    if not can_sign():
+    if not base["auth"].get("can_sign"):
         base["error"] = "auth not configured (run kalshi-auth-status)"
-        return base
+        return base, False                 # an answer, not a failure: no need to hurry back
     try:
-        data = signed_get("/portfolio/balance")
+        data = signed_get("/portfolio/balance", timeout=BALANCE_TIMEOUT_S)
         # Kalshi returns cents; convert
-        cents = data.get("balance", 0)
-        base["balance_dollars"] = round(cents / 100.0, 2)
+        base["balance_dollars"] = round(data.get("balance", 0) / 100.0, 2)
         base["portfolio_value"] = data.get("portfolio_value")
-    except Exception as e:
+        return base, False
+    except Exception as e:  # noqa: BLE001
         base["error"] = str(e)[:200]
-    return base
+        return base, True
+
+
+def _refresh_balance() -> None:
+    account, failed = None, True
+    try:
+        account, failed = _fetch_account()
+    except Exception as e:  # noqa: BLE001 - said in the panel, not lost on a thread
+        account = {"auth": None, "balance_dollars": None,
+                   "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        now = time.monotonic()
+        with _BAL_LOCK:
+            _BAL.update(account=account, failed=failed, tried=now, busy=False)
+            if account and account.get("balance_dollars") is not None:
+                _BAL.update(good={k: account.get(k) for k in ("balance_dollars", "portfolio_value")},
+                            good_t=now, good_at=datetime.now(timezone.utc).isoformat())
+
+
+def _balance_fetching() -> bool:
+    """Is a fetch in flight? By its thread, like the snapshot (call with _BAL_LOCK held)."""
+    t = _BAL.get("thread")
+    return bool(_BAL.get("busy")) and t is not None and t.is_alive()
+
+
+def account_snapshot() -> dict:
+    """The Kalshi balance and auth status, FROM THE CACHE - this never calls Kalshi and
+    never waits. A value older than its TTL (or none yet) starts ONE background fetch.
+
+      balance_dollars  the last balance that came back, or None
+      fetched_at/age_s when that balance was fetched (ISO) and how old it is
+      error            why the latest attempt gave no balance, or None
+      pending          True until the first attempt has ended
+      auth             kalshi_auth.status() as of the latest attempt"""
+    with _BAL_LOCK:
+        now = time.monotonic()
+        tried = _BAL.get("tried")
+        due = tried is None or now - tried >= (BALANCE_RETRY_S if _BAL.get("failed")
+                                                else BALANCE_TTL_S)
+        if due and not _balance_fetching():
+            t = threading.Thread(target=_refresh_balance, name="kalshi-balance", daemon=True)
+            _BAL.update(busy=True, thread=t)
+            try:
+                t.start()
+            except Exception as e:  # noqa: BLE001 - "can't start new thread"
+                _BAL.update(busy=False, thread=None, failed=True, tried=now,
+                            account=dict(_BAL.get("account") or {"auth": None},
+                                         balance_dollars=None,
+                                         error=f"the balance fetch could not start - "
+                                               f"{type(e).__name__}: {str(e)[:200]}"))
+        account, good = _BAL.get("account"), _BAL.get("good")
+        good_t, good_at = _BAL.get("good_t"), _BAL.get("good_at")
+    out = {"auth": None, "balance_dollars": None, "error": None, "fetched_at": None,
+           "age_s": None, "pending": account is None}
+    if account is not None:
+        out.update(auth=account.get("auth"), error=account.get("error"))
+    if good is not None:                   # kept across a later failure, with its age
+        out.update(good, fetched_at=good_at, age_s=round(now - good_t, 1))
+    return out
+
+
+def _account_payload() -> dict:
+    """The Account panel: the cached balance (see account_snapshot)."""
+    return account_snapshot()
 
 
 def _cron_health_payload() -> dict:
@@ -209,7 +299,10 @@ def _stage0_payload() -> dict:
         import stage0_collector as s0
         rows = []
         if s0.LOG.exists():
-            for line in s0.LOG.read_text(encoding="utf-8").splitlines():
+            # errors="replace": one undecodable byte (a disk fault, a foreign writer) must
+            # cost its own line - which then fails json.loads like any torn line - not the
+            # whole panel for good: the log is append-only, so the byte never goes away
+            for line in s0.LOG.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
@@ -276,17 +369,19 @@ def _paper_crypto_payload() -> dict:
 
 def _trading_status_payload() -> dict:
     """Unambiguous answer to 'are we trading?' — read from the actual ledgers, not from
-    intent. live=any real order path active; paper=any paper ledger with rows."""
+    intent. live=any real order path active; paper=any paper ledger with rows.
+
+    A ledger that cannot be read RAISES (the panel then shows that error, via the guard in
+    _build_all). It used to be swallowed and counted as zero rows, so a locked ledger read
+    'PAPER OFF ... PAPER ARMED - waiting for a frozen rule to fire' while the Paper book
+    panel beside it showed the read error: unknown reported as zero."""
     import sys as _sys
-    paper_rows = 0
-    try:
-        sdir = str(ROOT / "scripts")
-        if sdir not in _sys.path:
-            _sys.path.insert(0, sdir)
-        import paper_trader as pt
-        paper_rows = len([r for r in pt._load(pt.LEDGER) if r.get("t") == "open"])
-    except Exception:
-        pass
+    sdir = str(ROOT / "scripts")
+    if sdir not in _sys.path:
+        _sys.path.insert(0, sdir)
+    import paper_trader as pt
+    paper_rows = len([r for r in pt._load(pt.LEDGER)
+                      if isinstance(r, dict) and r.get("t") == "open"])
     return {
         "live": False,
         "paper": paper_rows > 0,
@@ -306,9 +401,18 @@ def _trading_status_payload() -> dict:
 # healthcheck's 8 s budget and made every page refresh wait as long. Stale-while-
 # revalidate: a request gets the last snapshot immediately; one older than ALL_TTL_S
 # triggers ONE background rebuild. Only the first request after a start waits.
+#
+# The body also says how the rebuilding itself is going, so a snapshot that has stopped
+# moving cannot hide behind HTTP 200:
+#   age_s               how old the served snapshot is
+#   rebuild_started     ISO time the rebuild now in flight started, or null (none running)
+#   last_rebuild_error  why the latest rebuild could not start or finish, or null
+# (age_s alone cannot tell a watchdog much: a lone request after an idle stretch always
+# gets an old snapshot - and starts the rebuild that replaces it.)
 
 ALL_TTL_S = 30.0
-_ALL: dict = {"payload": None, "t": 0.0, "busy": False}
+_ALL: dict = {"payload": None, "t": 0.0, "busy": False, "thread": None, "started": None,
+              "error": None}
 _ALL_LOCK = threading.Lock()
 
 
@@ -324,24 +428,53 @@ def _build_all() -> dict:
     return {
         "live": safe(_live_markets_payload),
         "paper": safe(_paper_payload),
-        "account": safe(_account_payload),
         "cron": safe(_cron_health_payload),
         "stage0": safe(_stage0_payload),
         "shadow": safe(_shadow_payload),
         "trading": safe(_trading_status_payload),
         "paper_crypto": safe(_paper_crypto_payload),
+        # last, after the file panels: a cache read (the balance is fetched on its own
+        # thread), so the fetch started at boot is in by the time the first snapshot ends
+        "account": safe(_account_payload),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def _refresh_all() -> None:
+    error = None
     try:
         payload = _build_all()
         with _ALL_LOCK:
             _ALL.update(payload=payload, t=time.monotonic())
+    except Exception as e:  # noqa: BLE001 - said in the body, not lost on a thread
+        error = f"the snapshot rebuild raised {type(e).__name__}: {str(e)[:200]}"
     finally:
         with _ALL_LOCK:
-            _ALL["busy"] = False
+            _ALL.update(busy=False, error=error)
+
+
+def _rebuilding() -> bool:
+    """Is a rebuild in flight? (Call with _ALL_LOCK held.) The busy flag counts only
+    while its THREAD is alive. The flag alone once froze the page for good: it was set,
+    the thread could not start, and nothing was left to clear it. A timer instead ('a
+    flag older than N minutes is dead') would start a second rebuild on top of a slow
+    live one and double its memory."""
+    t = _ALL.get("thread")
+    return bool(_ALL.get("busy")) and t is not None and t.is_alive()
+
+
+def _start_rebuild() -> None:
+    """Start the one background rebuild. Call with _ALL_LOCK held and none in flight."""
+    t = threading.Thread(target=_refresh_all, name="api-all-refresh", daemon=True)
+    _ALL.update(busy=True, thread=t, started=datetime.now(timezone.utc).isoformat())
+    try:
+        t.start()
+    except Exception as e:  # noqa: BLE001 - "can't start new thread": memory is short
+        # Nothing is running, so nothing would ever clear the flag: clear it here, say
+        # why in the body, and let the next request try again.
+        _ALL.update(busy=False, thread=None, started=None,
+                    error=f"the snapshot rebuild could not start - "
+                          f"{type(e).__name__}: {str(e)[:200]}")
 
 
 def _all_payload(wait_s: float = 6.0) -> dict:
@@ -350,21 +483,24 @@ def _all_payload(wait_s: float = 6.0) -> dict:
     for the first build; if that is still running, it gets a one-panel 'warming' body."""
     with _ALL_LOCK:
         fresh = _ALL["payload"] is not None and time.monotonic() - _ALL["t"] < ALL_TTL_S
-        start = not fresh and not _ALL["busy"]
-        if start:
-            _ALL["busy"] = True
-    if start:
-        threading.Thread(target=_refresh_all, name="api-all-refresh", daemon=True).start()
+        if not fresh and not _rebuilding():
+            _start_rebuild()
     deadline = time.monotonic() + wait_s
-    while _ALL["payload"] is None and time.monotonic() < deadline:
+    while time.monotonic() < deadline:             # only the first build is waited for
+        with _ALL_LOCK:
+            if _ALL["payload"] is not None or not _rebuilding():
+                break
         time.sleep(0.05)
     with _ALL_LOCK:
         payload, t = _ALL["payload"], _ALL["t"]
+        state = {"rebuild_started": _ALL.get("started") if _rebuilding() else None,
+                 "last_rebuild_error": _ALL.get("error")}
     if payload is None:
-        return {"warming": {"error": "first snapshot still building - refresh in a few "
-                                     "seconds"},
-                "ts": datetime.now(timezone.utc).isoformat()}
-    return dict(payload, age_s=round(time.monotonic() - t, 1))
+        why = (f"no snapshot yet - {state['last_rebuild_error']}" if state["last_rebuild_error"]
+               else "first snapshot still building - refresh in a few seconds")
+        return {"warming": {"error": why}, "ts": datetime.now(timezone.utc).isoformat(),
+                **state}
+    return dict(payload, age_s=round(time.monotonic() - t, 1), **state)
 
 
 def make_app():
@@ -419,6 +555,7 @@ def run_dashboard(port: int = 5153):
     s.close()
 
     app = make_app()
+    account_snapshot()              # start the first balance fetch (never waited for)
     _all_payload(wait_s=0)          # start the first snapshot while the server boots
     print(f"Kalshi dashboard → http://localhost:{port}")
     app.run(host=os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
@@ -452,11 +589,11 @@ h1 { margin: 0 0 6px 0; font-size: 20px; }
 .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
 .grid {
   display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
 }
 .panel {
   background: var(--panel); border: 1px solid var(--border);
-  border-radius: 6px; padding: 12px; overflow-x: auto;
+  border-radius: 6px; padding: 12px; overflow-x: auto; min-width: 0;
 }
 .panel h2 { margin: 0 0 8px 0; font-size: 14px; color: var(--blue); }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -485,6 +622,10 @@ tr:last-child td { border-bottom: none; }
 .nav a { font-size: 12px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); text-decoration: none; }
 .nav a:hover { color: var(--text); border-color: var(--blue); }
 .nav a.active { color: var(--blue); border-color: var(--blue); background: rgba(88,166,255,0.12); }
+.sub.stale { color: var(--yellow); font-weight: 600; }
+.wrap, #ts { overflow-wrap: anywhere; }
+.note { font-size: 12px; margin-top: 4px; }
+.warming .grid, .warming > .panel { opacity: 0.45; }
 </style>
 </head>
 <body>
@@ -622,20 +763,81 @@ function statusClass(s) {
   if (s === 'void') return 'yellow'; return 'muted';
 }
 
+const STALE_S = 180;   // a snapshot older than this is called STALE, in words
+let LOADED = false;    // has this page drawn a snapshot yet?
+function fmtAge(s) {
+  if (typeof s !== 'number' || isNaN(s)) return 'age unknown';
+  return s < 90 ? Math.round(s) + ' s old' : Math.round(s / 60) + ' min old';
+}
+function clock(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? 'an unknown time' : d.toLocaleTimeString();
+}
+// How current is this page? One line, in words - never by colour alone. The snapshot is
+// rebuilt in the background, so its age is printed, and one that has stopped moving says so.
+function showFreshness(data) {
+  const el = document.getElementById('ts');
+  const age = typeof data.age_s === 'number' ? data.age_s : (Date.now() - Date.parse(data.ts)) / 1000;
+  const stale = age > STALE_S;
+  let text = (stale ? '\u26A0 STALE - ' : '') + 'data as of ' + clock(data.ts) + ' (' + fmtAge(age) + ')';
+  if (data.last_rebuild_error) text += ' \u00B7 \u26A0 the last rebuild failed: ' + data.last_rebuild_error;
+  else if (data.rebuild_started) text += ' \u00B7 rebuilding since ' + clock(data.rebuild_started);
+  el.textContent = text;
+  el.classList.toggle('stale', stale || !!data.last_rebuild_error);
+}
+
+// The balance is fetched in the background every few minutes, so it is shown with the
+// time it was fetched; when a fetch fails the last balance stays, and the reason is said.
+function renderAccount(acc) {
+  const box = document.getElementById('account');
+  const line = (cls, text) => {
+    const d = document.createElement('div'); d.className = cls; d.textContent = text; return d;
+  };
+  box.replaceChildren();
+  const bal = acc.balance_dollars;
+  if (typeof bal === 'number') {
+    const stat = line('bigstat', ''), v = document.createElement('span'), k = document.createElement('span');
+    v.className = 'v'; v.textContent = '$' + bal.toFixed(2);
+    k.className = 'k';
+    k.textContent = 'balance' + (acc.fetched_at
+      ? ' \u00B7 as of ' + clock(acc.fetched_at) + ' (' + fmtAge((Date.now() - Date.parse(acc.fetched_at)) / 1000) + ')' : '');
+    stat.append(v, k);
+    box.appendChild(stat);
+    if (acc.error) box.appendChild(line('yellow wrap note',
+      '\u26A0 the last fetch failed, so this is the last balance that came back: ' + acc.error));
+  } else if (acc.pending) {
+    box.appendChild(line('muted', 'fetching the balance\u2026'));
+  } else {
+    box.appendChild(line('red wrap', acc.error || 'no balance'));
+  }
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/all');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
-    document.getElementById('ts').textContent = 'last refresh: ' + new Date(data.ts).toLocaleTimeString();
+    if (data.warming) {
+      // The server has no snapshot yet. Say so and leave every panel alone: drawn from
+      // this body they would read "PAPER OFF" and zeros for what is simply not loaded.
+      const el = document.getElementById('ts');
+      el.textContent = 'WARMING UP - ' + (data.last_rebuild_error
+          ? 'no snapshot yet: ' + data.last_rebuild_error
+          : 'the first snapshot is still building'
+            + (data.rebuild_started ? ' (since ' + clock(data.rebuild_started) + ')' : ''))
+        + ' \u00B7 the panels below ' + (LOADED ? 'still show what was loaded before' : 'are not loaded yet')
+        + ' \u00B7 asking again every few seconds';
+      el.classList.add('stale');
+      document.body.classList.add('warming');
+      setTimeout(refresh, 1000);      // the request itself waits for the build, up to 6 s
+      return;
+    }
+    document.body.classList.remove('warming');
+    LOADED = true;
+    showFreshness(data);
 
     // Account
-    const acc = data.account || {};
-    const bal = acc.balance_dollars;
-    const accHtml = bal !== null && bal !== undefined
-      ? '<div class="bigstat"><span class="v">$' + bal.toFixed(2) + '</span><span class="k">balance</span></div>' +
-        (acc.error ? '<div class="red tiny">' + acc.error + '</div>' : '')
-      : '<div class="red">' + (acc.error || 'no balance') + '</div>';
-    document.getElementById('account').innerHTML = accHtml;
+    renderAccount(data.account || {});
 
     // Cron health
     const c = data.cron || {};
@@ -659,9 +861,14 @@ async function refresh() {
 
     // Trading status — the unambiguous answer to "are we trading?"
     const tr = data.trading || {};
-    document.getElementById('trading').innerHTML = tr.error
-      ? '<div class="red">' + tr.error + '</div>'
-      : '<div class="bigstat"><span class="v ' + (tr.live ? 'red' : 'muted') + '">' +
+    const trEl = document.getElementById('trading');
+    if (tr.error) {          // the ledger could not be read: unknown, which is not "PAPER OFF"
+      const d = document.createElement('div');
+      d.className = 'red wrap';
+      d.textContent = '\u26A0 UNKNOWN - the paper ledger could not be read: ' + tr.error;
+      trEl.replaceChildren(d);
+    } else trEl.innerHTML =
+        '<div class="bigstat"><span class="v ' + (tr.live ? 'red' : 'muted') + '">' +
           (tr.live ? 'LIVE ON' : 'LIVE OFF') + '</span><span class="k">real money</span></div>' +
         '<div class="bigstat"><span class="v ' + (tr.paper ? 'green' : 'muted') + '">' +
           (tr.paper ? tr.paper_rows + ' rows' : 'PAPER OFF') + '</span><span class="k">paper trades</span></div>' +
@@ -851,7 +1058,10 @@ async function refresh() {
         ).join('');
 
   } catch (e) {
-    document.getElementById('ts').textContent = 'error: ' + e.message;
+    const el = document.getElementById('ts');
+    el.textContent = '\u26A0 refresh failed (' + e.message + ') - '
+      + (LOADED ? 'the panels show the last data loaded' : 'nothing is loaded yet');
+    el.classList.add('stale');
   }
 }
 refresh();

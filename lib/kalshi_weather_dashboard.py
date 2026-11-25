@@ -120,17 +120,11 @@ def _paper_payload() -> dict:
 
 
 def _account_payload() -> dict:
-    from lib.kalshi_auth import can_sign, signed_get, status as auth_status
-    base = {"auth": auth_status(), "balance_dollars": None, "error": None}
-    if not can_sign():
-        base["error"] = "auth not configured"
-        return base
-    try:
-        data = signed_get("/portfolio/balance")
-        base["balance_dollars"] = round(data.get("balance", 0) / 100.0, 2)
-    except Exception as e:
-        base["error"] = str(e)[:200]
-    return base
+    """The cached balance (lib.kalshi_dashboard.account_snapshot). This page polls every
+    20 s and used to make a signed Kalshi call inside EVERY request; a Kalshi that never
+    answered held each poll for 15 s. A request now only reads the cache."""
+    from lib.kalshi_dashboard import account_snapshot
+    return account_snapshot()
 
 
 def _cron_health_payload() -> dict:
@@ -185,6 +179,7 @@ def run_dashboard(port: int = 5154):
         raise RuntimeError(f"Port {port} is already in use ({e}). Try --port=5055.")
     s.close()
     app = make_app()
+    _account_payload()              # start the first balance fetch (never waited for)
     print(f"Kalshi weather dashboard → http://localhost:{port}")
     app.run(host=os.environ.get("POLYBOT_DASH_HOST", "127.0.0.1"), port=port, debug=False, use_reloader=False)
 
@@ -198,8 +193,9 @@ _TEMPLATE = """<!doctype html>
 *{box-sizing:border-box;}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 background:var(--bg);color:var(--text);padding:16px;}
 h1{margin:0 0 6px 0;font-size:20px;}.sub{color:var(--muted);font-size:12px;margin-bottom:16px;}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px;overflow-x:auto;}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(380px,100%),1fr));}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px;overflow-x:auto;min-width:0;}
+.wrap{overflow-wrap:anywhere;}.note{font-size:12px;margin-top:4px;}
 .panel h2{margin:0 0 8px 0;font-size:14px;color:var(--blue);}
 table{width:100%;border-collapse:collapse;font-size:12px;}
 th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--border);white-space:nowrap;}
@@ -257,13 +253,26 @@ function pnlClass(v){return v>0?'green':v<0?'red':'muted';}
 function statusClass(s){if(s==='won')return 'green';if(s==='lost')return 'red';if(s==='void')return 'yellow';return 'muted';}
 function bucketStr(f,c){if(f!==null&&f!==undefined&&c!==null&&c!==undefined)return f+'–'+c+'°';
 if(f!==null&&f!==undefined)return '≥'+f+'°';if(c!==null&&c!==undefined)return '≤'+c+'°';return '—';}
+function fmtAge(s){if(typeof s!=='number'||isNaN(s))return 'age unknown';return s<90?Math.round(s)+' s old':Math.round(s/60)+' min old';}
+function clock(iso){const d=new Date(iso);return isNaN(d)?'an unknown time':d.toLocaleTimeString();}
+// The balance is fetched in the background every few minutes, so it is shown with the time
+// it was fetched; when a fetch fails the last balance stays, and the reason is said.
+function renderAccount(acc){
+const box=document.getElementById('account');
+const line=(cls,text)=>{const d=document.createElement('div');d.className=cls;d.textContent=text;return d;};
+box.replaceChildren();const bal=acc.balance_dollars;
+if(typeof bal==='number'){
+ const stat=line('bigstat',''),v=document.createElement('span'),k=document.createElement('span');
+ v.className='v';v.textContent='$'+bal.toFixed(2);k.className='k';
+ k.textContent='balance'+(acc.fetched_at?' \u00B7 as of '+clock(acc.fetched_at)+' ('+fmtAge((Date.now()-Date.parse(acc.fetched_at))/1000)+')':'');
+ stat.append(v,k);box.appendChild(stat);
+ if(acc.error)box.appendChild(line('yellow wrap note','\u26A0 the last fetch failed, so this is the last balance that came back: '+acc.error));
+}else if(acc.pending){box.appendChild(line('muted','fetching the balance\u2026'));
+}else{box.appendChild(line('red wrap',acc.error||'no balance'));}}
 async function refresh(){try{
 const r=await fetch('/api/all');const data=await r.json();
 document.getElementById('ts').textContent='last refresh: '+new Date(data.ts).toLocaleTimeString();
-const acc=data.account||{};const bal=acc.balance_dollars;
-document.getElementById('account').innerHTML=(bal!==null&&bal!==undefined)
- ?'<div class="bigstat"><span class="v">$'+bal.toFixed(2)+'</span><span class="k">balance</span></div>'+(acc.error?'<div class="red tiny">'+acc.error+'</div>':'')
- :'<div class="red">'+(acc.error||'no balance')+'</div>';
+renderAccount(data.account||{});
 const c=data.cron||{};const age=c.age_minutes;const ac=age==null?'muted':age<7?'green':age<15?'yellow':'red';
 document.getElementById('cron').innerHTML=c.log_exists
  ?'<div class="bigstat"><span class="v '+ac+'">'+fmt(age,1)+'m</span><span class="k">since last cycle</span></div>'+
