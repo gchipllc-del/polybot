@@ -17,12 +17,22 @@ Notes for a fresh machine: the pages come up immediately, but panels are empty u
 the paper bots have produced data files, and portfolio panels need .env Kalshi keys
 (copy .env from the old machine for full function). 127.0.0.1 only works in a browser
 on THIS computer — that is expected, not a bug.
+
+One copy at a time: a second copy started while one is alive prints "not starting" and
+exits 1 (on Windows its startup sweep would stop the first copy's dashboards and leave
+two supervisors fighting over the ports). To run it by hand, stop the scheduled one
+first: Stop-ScheduledTask PolybotDashboards.
+
+A dashboard that EXITS is restarted with backoff. One that hangs with its port still
+open can be restarted too - set POLYBOT_DASH_PROBE=1 (see PROBE_* below); it is off by
+default.
 """
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -104,7 +114,7 @@ def _http_probe(host: str, port: int, timeout: float = 3.0):
     a known reason 127.0.0.1 pages 'do not work' in a browser."""
     import urllib.request
     import urllib.error
-    url = f"http://{host}:{port}/"
+    url = f"http://{f'[{host}]' if ':' in host else host}:{port}/"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(url, timeout=timeout) as r:
@@ -230,6 +240,8 @@ def doctor() -> int:
         print("      or run in the foreground to watch it live:")
         print("        py scripts\\run_dashboards.py" if is_win
               else "        python3 scripts/run_dashboards.py")
+        print("      (one copy at a time: if that says 'not starting', the scheduled copy")
+        print("       is alive - run Stop-ScheduledTask PolybotDashboards first)")
     print("=" * 68)
     return 0
 
@@ -370,6 +382,116 @@ def _sweep_stale(run=subprocess.run, windows: bool | None = None) -> int:
     return len(stale)
 
 
+# ── one supervisor at a time ──────────────────────────────────────────────────
+#
+# A second copy (started by hand while the scheduled task runs) used to go straight to
+# the startup sweep, which cannot tell a LIVE supervisor's dashboards from leftovers: on
+# Windows it stopped all of them and took the ports, and the first supervisor then
+# relaunched its three dashboards into "port already in use" for as long as both ran -
+# and after the second copy was closed the pages stayed down until the next retry (up
+# to 5 minutes). Off Windows the newcomer lost instead, and retried for ever.
+
+def _stand_down() -> str | None:
+    """Take the supervisor's single-instance lock for the life of this process. None =
+    go ahead (we hold it, or locking is unavailable here and we run without it - a lock
+    problem must never keep the pages down); otherwise the one line to print. The OS
+    frees the lock when its holder dies, so after a killed supervisor the next one
+    starts, and the sweep below still clears what that one left behind."""
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from lib.single_instance import AlreadyRunning, hold
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] single-instance lock unavailable ({type(e).__name__}) - "
+              f"running without it", file=sys.stderr)
+        return None
+    try:
+        hold("run_dashboards")
+    except AlreadyRunning as e:
+        return (f"not starting: {e}. The dashboards are served by that copy. To run them "
+                f"here instead, stop it first (Stop-ScheduledTask PolybotDashboards, or "
+                f"close its window), then start this again.")
+    return None
+
+
+# ── a dashboard that hangs ────────────────────────────────────────────────────
+#
+# A hung dashboard keeps its port open, so nothing that only looks at the port (this
+# supervisor's exit watch, the watchdog's port check) sees it. The probe asks each page
+# for "/" once a minute; one that misses PROBE_MISSES in a row is stopped, and the loop
+# below restarts it like one that exited.
+#
+# OFF unless POLYBOT_DASH_PROBE=1. While the crypto dashboard rebuilds its snapshot its
+# page shell has been measured at 0.5 s today and 3.3 s at five times today's data, so
+# the timeout is generous and three misses a minute apart are needed - but until that
+# rebuild is made cheap a busy dashboard and a hung one are too close to tell apart by
+# default: a wrong kill sends the page back through "warming".
+
+PROBE_EVERY_S = 60.0
+PROBE_TIMEOUT_S = 20.0
+PROBE_MISSES = 3
+PROBE_GRACE_S = 120.0            # after a (re)start: imports, bind, first snapshot
+
+
+def _probe_enabled() -> bool:
+    return os.environ.get("POLYBOT_DASH_PROBE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _answers(host: str, port: int, timeout: float | None = None) -> bool:
+    """Did the page answer at all? Any HTTP status counts: a page that answers 500 is
+    broken, not hung, and a restart would not mend it."""
+    host = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}.get(host, host)
+    timeout = PROBE_TIMEOUT_S if timeout is None else timeout
+    return _http_probe(host, port, timeout)[0] is not None
+
+
+def _probe_loop(procs: dict, answers=_answers, sleep=time.sleep, clock=time.time,
+                rounds: int | None = None) -> None:
+    """The prober (its own thread, so a slow answer never delays noticing an exit): it
+    only COUNTS consecutive misses in st["misses"]; _supervise_once does the stopping."""
+    n = 0
+    while rounds is None or n < rounds:
+        n += 1
+        for st in list(procs.values()):
+            p = st["p"]
+            if p is None or p.poll() is not None or clock() - st["started"] < PROBE_GRACE_S:
+                st["misses"] = 0                  # not running, or still starting up
+                continue
+            ok = answers(DASH_HOST, st["port"])
+            if st["p"] is p:                      # not restarted while we waited
+                st["misses"] = 0 if ok else st.get("misses", 0) + 1
+        sleep(PROBE_EVERY_S)
+
+
+def _supervise_once(procs: dict, spawn, now: float, say=print) -> None:
+    """One pass over the dashboards. Each is supervised ON ITS OWN: a dead one is
+    restarted with backoff (15s, 30s, ... capped at 5 min) while the others keep serving,
+    and one the prober has given up on is stopped, to be restarted the same way."""
+    for name, st in procs.items():
+        p = st["p"]
+        if p is not None and p.poll() is None and st.get("misses", 0) >= PROBE_MISSES:
+            say(f"\n{name} dashboard has not answered {PROBE_MISSES} probes in a row "
+                f"({PROBE_TIMEOUT_S:.0f}s each, {PROBE_EVERY_S:.0f}s apart) with its port open — "
+                f"stopping it; it restarts like one that exited.")
+            st["misses"] = 0
+            try:
+                p.kill()                          # it is not answering: no polite stop
+                p.wait(timeout=10)
+            except Exception:  # noqa: BLE001 - still alive: asked again next pass
+                pass
+        if p is not None and p.poll() is not None:
+            st["fails"] += 1
+            delay = min(300, 15 * 2 ** (st["fails"] - 1))
+            say(f"\n{name} dashboard exited (code {p.returncode}) — retrying in "
+                f"{delay}s; the others keep running. See logs/dash_{name}.log")
+            st["p"], st["retry_at"] = None, now + delay
+        elif p is None and now >= st["retry_at"]:
+            st["p"], st["started"], st["misses"] = spawn(name, st["cmd"], st["port"]), now, 0
+            say(f"{name} dashboard restarted (attempt {st['fails'] + 1})")
+        elif p is not None and st["fails"] and now - st["started"] > 600:
+            st["fails"] = 0                       # stable for 10 min: reset backoff
+
+
 def main() -> int:
     if "--check" in sys.argv:
         return check()
@@ -377,6 +499,10 @@ def main() -> int:
         return doctor()
     ensure_deps()
     load_env()
+    refusal = _stand_down()          # BEFORE the sweep: it would stop a live copy's pages
+    if refusal:
+        print(refusal)
+        return 1
     (ROOT / "logs").mkdir(exist_ok=True)
 
     # Windows: child stdout redirected to a file defaults to cp1252, so the dashboards'
@@ -401,29 +527,21 @@ def main() -> int:
     procs = {}
     for name, cmd, port in DASHBOARDS:
         procs[name] = {"cmd": cmd, "port": port, "p": spawn(name, cmd, port),
-                       "fails": 0, "retry_at": 0.0, "started": time.time()}
+                       "fails": 0, "retry_at": 0.0, "started": time.time(), "misses": 0}
         print(f"  {name:8} -> http://{DASH_HOST}:{port}   (log: logs/dash_{name}.log)")
 
     print(f"\n{len(procs)} dashboards running — open the links above in a browser ON THIS"
           " computer.")
+    if _probe_enabled():
+        threading.Thread(target=_probe_loop, args=(procs,), name="dash-probe",
+                         daemon=True).start()
+        print(f"liveness probe ON: a page that does not answer {PROBE_MISSES} probes in a "
+              f"row ({PROBE_TIMEOUT_S:.0f}s each, {PROBE_EVERY_S:.0f}s apart) is restarted.")
     print("press ctrl-c here to stop them all.")
     try:
         while True:
             time.sleep(2)
-            now = time.time()
-            for name, st in procs.items():
-                p = st["p"]
-                if p is not None and p.poll() is not None:
-                    st["fails"] += 1
-                    delay = min(300, 15 * 2 ** (st["fails"] - 1))
-                    print(f"\n{name} dashboard exited (code {p.returncode}) — retrying in "
-                          f"{delay}s; the others keep running. See logs/dash_{name}.log")
-                    st["p"], st["retry_at"] = None, now + delay
-                elif p is None and now >= st["retry_at"]:
-                    st["p"], st["started"] = spawn(name, st["cmd"], st["port"]), now
-                    print(f"{name} dashboard restarted (attempt {st['fails'] + 1})")
-                elif p is not None and st["fails"] and now - st["started"] > 600:
-                    st["fails"] = 0                       # stable for 10 min: reset backoff
+            _supervise_once(procs, spawn, time.time())
     except KeyboardInterrupt:
         print("\nstopping ...")
         for st in procs.values():
