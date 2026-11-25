@@ -46,6 +46,13 @@ HISTORY_LOG = ROOT / "data" / "stage0_history.jsonl"
 # A collector cycle is 60s; anything past 10 minutes means it is not actually working
 # even if the process exists. This threshold is the whole point of the file.
 STAGE0_STALE_MIN = 10.0
+# The crypto paper trader appends a row whenever a bet opens or settles - about one every
+# two minutes on the host. 20 quiet minutes is the command center's own bar (a whole
+# 15-minute window with neither, plus settlement lag); an hour is thirty usual gaps.
+PAPER_QUIET_WARN_MIN = 20.0
+PAPER_QUIET_FAIL_MIN = 60.0
+PAPER_HB = "paper_crypto_heartbeat.json"   # written by paper_trader after each cycle
+PAPER_HB_STALE_MIN = 10.0                  # its cycle is 60s, like the collector's
 LOG_BLOAT_MB = 200.0
 
 OK, WARN, FAIL = "OK  ", "WARN", "FAIL"
@@ -56,13 +63,148 @@ def record(status: str, section: str, msg: str) -> None:
     _results.append((status, section, msg))
 
 
+def _now() -> float:
+    """The clock, in one place - tests move it."""
+    return time.time()
+
+
+def _data(name: str) -> Path:
+    return ROOT / "data" / name
+
+
 def _age_min(p: Path) -> float | None:
     if not p.exists():
         return None
     try:
-        return (time.time() - p.stat().st_mtime) / 60.0
+        return (_now() - p.stat().st_mtime) / 60.0
     except OSError:
         return None
+
+
+def _read_json(p: Path) -> dict | None:
+    """A JSON object from a file, or None when it is missing, torn or not an object."""
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _n(d: dict, key: str) -> float | None:
+    """A heartbeat number, or None when the key is absent or is not a number. A trader
+    that has not been restarted since a pull still writes the older, shorter heartbeat:
+    a missing key is UNKNOWN, never a fault."""
+    v = d.get(key)
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+# ── what the watchdog remembers between runs ──────────────────────────────────
+#
+# PolybotHealth is a new process every 15 minutes, and some judgements need the run
+# before: "the PC has only just woken up" (after a night asleep every file is as old as
+# the night, and the watchdog runs the moment the PC wakes) and "this was already so at
+# the last run" (one bad cycle caught by chance is not a fault). So it keeps a small JSON
+# file under logs/. The file is advisory, and failing safe is the rule: with no usable
+# file there is NO wake-up grace and nothing counts as seen before - never a watchdog
+# made blind by its own bookkeeping.
+
+STATE_NAME = "healthcheck_state.json"
+CHAIN_GAP_MIN = 40.0     # runs are 15 min apart: a longer silence = the PC was off/asleep
+CONFIRM_MIN = 10.0       # "still so at the next run" = first seen at least this long ago
+
+_state: dict = {}        # this run's copy: main() loads it, checks update it, main() saves
+_state_ok = False        # this run read the file AND could write it back
+
+
+def _state_path() -> Path:
+    return ROOT / "logs" / STATE_NAME
+
+
+def _write_state() -> bool:
+    p = _state_path()
+    try:
+        p.parent.mkdir(exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(_state, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, p)               # never a half-written file for the next run
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _begin_run() -> None:
+    """Load what the previous run left and decide whether this run FOLLOWS it. A gap in
+    the watchdog's own 15-minute chain means the PC was off, asleep or logged off: then
+    `up_since` is this run (the wake-up, as closely as the watchdog can know it) and
+    nothing seen before the gap counts as "the run before". The file is rewritten at
+    once: if that fails, this run trusts none of it."""
+    global _state, _state_ok
+    now = _now()
+    st = _read_json(_state_path()) or {}
+    last = _n(st, "last_run")
+    if not isinstance(st.get("since"), dict):
+        st["since"] = {}
+    if last is None or abs(now - last) > CHAIN_GAP_MIN * 60:
+        st["since"] = {}
+        st["up_since"] = now if last is not None else None
+    st["last_run"] = now
+    _state = st
+    _state_ok = _write_state()
+
+
+def _end_run() -> None:
+    """Save what this run saw. A state file that cannot be kept is said out loud: without
+    it the graces and the cross-run confirmations silently never apply."""
+    global _state_ok
+    if _state_ok:
+        _state_ok = _write_state()
+    if not _state_ok:
+        record(WARN, "watchdog", f"cannot keep logs/{STATE_NAME} between runs - no wake-up "
+                                 f"grace and no 'still so at the next run' until it can "
+                                 f"be written")
+
+
+def _awake_min() -> float | None:
+    """Minutes since the PC is known to have come back - the first run after a gap in
+    the watchdog's own chain. None = not known (no usable state file, or no gap since it
+    was created): then no grace is given."""
+    up = _n(_state, "up_since") if _state_ok else None
+    return None if up is None else max(0.0, (_now() - up) / 60.0)
+
+
+def _since_wake(age_min: float) -> tuple[float, str]:
+    """(the minutes to judge, a note for the message). Nothing can have been written
+    while the PC was off, so after a night asleep a file is as old as the night - and the
+    watchdog runs at once. Its silence is therefore judged from the wake-up, not from the
+    last write. With the wake-up unknown the full age is judged."""
+    awake = _awake_min()
+    if awake is None or awake >= age_min:
+        return age_min, ""
+    return awake, f"; the PC was off or asleep until {awake:.0f} min ago, judged from then"
+
+
+def _lasting(key: str, bad: bool) -> float | None:
+    """How long a condition has been seen at EVERY run, in minutes: None when it is not
+    there now, 0.0 at a first sighting. One run that does not see it starts the count
+    again, and so does a gap in the chain. Without a usable state file every sighting is
+    a first one."""
+    seen = _state.setdefault("since", {})
+    if not bad:
+        seen.pop(key, None)
+        return None
+    first = _n(seen, key)
+    if first is None or not _state_ok:
+        seen[key] = _now()
+        return 0.0
+    return max(0.0, (_now() - first) / 60.0)
+
+
+def _confirmed(key: str, bad: bool) -> bool:
+    """True when `bad` holds now and was already so at a run at least CONFIRM_MIN ago,
+    and at every run since. The watchdog reads one cycle out of many: a counter that is
+    non-zero in the single cycle it happens to see must not flap the log."""
+    lasted = _lasting(key, bad)
+    return lasted is not None and lasted >= CONFIRM_MIN
 
 
 def _rows(p: Path) -> int:
@@ -224,9 +366,7 @@ def check_data_flow() -> None:
         record(OK, "data", f"stage0 fresh ({age:.1f} min, {rows} rows)")
 
     if PAPER_LOG.exists():
-        prows = _rows(PAPER_LOG)
-        page = _age_min(PAPER_LOG)
-        record(OK, "data", f"paper ledger {prows} rows (last write {page:.0f} min ago)")
+        _judge_paper_ledger()
     else:
         record(WARN, "data", "paper ledger empty - no rule has fired yet")
 
@@ -234,6 +374,97 @@ def check_data_flow() -> None:
         record(OK, "data", f"trend history {_rows(HISTORY_LOG)} snapshots")
     else:
         record(WARN, "data", "no trend snapshots yet (written hourly)")
+
+
+def _judge_paper_ledger() -> None:
+    """The crypto ledger's age used to be printed inside an OK line and never judged: a
+    trader dead for three days read 'paper ledger 73603 rows (last write 4320 min ago)'
+    and the run was logged healthy. The ledger is the WORK - a heartbeat only proves
+    cycling, and a trader whose every request fails, or whose slots are all held by
+    positions that will never settle, cycles perfectly and books nothing. So this stays
+    the judge even when a heartbeat exists; the heartbeat only explains it."""
+    prows = _rows(PAPER_LOG)
+    age = _age_min(PAPER_LOG)
+    if age is None:
+        record(WARN, "data", "paper ledger unreadable")
+        return
+    judged, grace = _since_wake(age)
+    if judged <= PAPER_QUIET_WARN_MIN:
+        record(OK, "data", f"paper ledger {prows} rows (last write {age:.0f} min ago{grace})")
+        return
+    silent = judged > PAPER_QUIET_FAIL_MIN
+    record(FAIL if silent else WARN, "data",
+           f"paper ledger {'SILENT' if silent else 'quiet'} {age:.0f} min{grace} (a row is "
+           f"written whenever a bet opens or settles - normally every few minutes) - "
+           f"{_paper_trader_story()}")
+
+
+def _paper_counters(s: dict) -> str:
+    """The last cycle's counters, as far as this heartbeat carries them."""
+    parts = []
+    for key in ("opened", "closed", "open_now", "errors", "ungated"):
+        v = _n(s, key)
+        if v is not None:
+            parts.append(f"{key} {v:.0f}")
+    skipped = s.get("skipped")
+    if isinstance(skipped, dict) and skipped:
+        parts.append("skipped " + " ".join(f"{k}={v}" for k, v in sorted(skipped.items())))
+    if s.get("last_error"):
+        parts.append(f"last error: {str(s['last_error'])[:90]}")
+    return ", ".join(parts) or "its heartbeat carries no counters"
+
+
+def _paper_trader_story() -> str:
+    """Why the crypto ledger is quiet, as far as the trader's heartbeat can say."""
+    hb = _data(PAPER_HB)
+    s, age = _read_json(hb), _age_min(hb)
+    if s is None or age is None:
+        return ("the crypto paper trader is not booking anything (it writes no heartbeat "
+                "yet, so whether it is cycling at all is unknown)")
+    if age > PAPER_HB_STALE_MIN:
+        return (f"and its heartbeat is {age:.0f} min old: the crypto paper trader is not "
+                f"cycling")
+    return (f"the trader IS cycling (heartbeat {age:.0f} min ago) but booking nothing: "
+            f"{_paper_counters(s)}")
+
+
+def check_crypto_paper() -> None:
+    """The crypto paper trader's heartbeat (data/paper_crypto_heartbeat.json), written
+    after each completed cycle once the trader runs the code that has it. Until then
+    there is no file, and that is UNKNOWN, not a fault: the ledger's age in [data] is
+    the judge either way. What the heartbeat adds is the difference between "not
+    cycling" and "cycling but not working", and the cycle's own error count."""
+    hb = _data(PAPER_HB)
+    if not hb.exists():
+        record(OK, "paper", "no heartbeat file yet - judged by the ledger alone (the "
+                            "trader writes one once it runs the current code)")
+        return
+    s, age = _read_json(hb), _age_min(hb)
+    if s is None or age is None:
+        record(WARN, "paper", "heartbeat unreadable")
+        return
+    judged, grace = _since_wake(age)
+    if judged > PAPER_HB_STALE_MIN:
+        ledger_age = _age_min(PAPER_LOG)
+        if ledger_age is not None and ledger_age <= PAPER_HB_STALE_MIN:
+            record(WARN, "paper", f"heartbeat {age:.0f} min old but the ledger was written "
+                                  f"{ledger_age:.0f} min ago - trading, but its heartbeat "
+                                  f"is not being written")
+        else:
+            record(FAIL, "paper", f"crypto paper heartbeat {age:.0f} min old{grace} (cycle "
+                                  f"is 60s) - alive but not cycling")
+        return
+    if age > PAPER_HB_STALE_MIN:                  # inside the wake-up grace: old news
+        record(OK, "paper", f"heartbeat {age:.0f} min old{grace}")
+        return
+    errors = _n(s, "errors")
+    if _confirmed("paper.errors", bool(errors)):
+        last = f" (last: {str(s['last_error'])[:90]})" if s.get("last_error") else ""
+        record(WARN, "paper", f"requests are failing: {errors:.0f} in the last cycle, and "
+                              f"already at the previous check{last}")
+    skew = _n(s, "clock_skew_s")
+    record(OK, "paper", f"cycling (heartbeat {age:.1f} min ago): {_paper_counters(s)}"
+                        + (f", clock {skew:+.1f}s vs Kalshi" if skew is not None else ""))
 
 
 def check_depth_coverage() -> None:
@@ -485,12 +716,14 @@ def main() -> int:
     repair = "--repair" in sys.argv
     quiet = "--quiet" in sys.argv
 
+    _begin_run()
     check_deps()
     check_env_auth()
     check_tasks(repair)
     check_ports()
     check_api()
     check_data_flow()
+    check_crypto_paper()
     check_depth_coverage()
     check_ledger_integrity()
     check_model_integrity()
@@ -500,6 +733,7 @@ def main() -> int:
     check_disk()
     if "--fast" not in sys.argv:
         check_selftests()
+    _end_run()
 
     fails = [r for r in _results if r[0] == FAIL]
     warns = [r for r in _results if r[0] == WARN]

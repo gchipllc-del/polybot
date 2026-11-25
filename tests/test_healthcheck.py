@@ -6,6 +6,7 @@ Task Scheduler is faked through the module's own seams (hc.IS_WIN, hc._ps); noth
 starts PowerShell.
 """
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -78,6 +79,65 @@ def windows(monkeypatch):
 
 def _by_status(results, status):
     return [msg for st, _, msg in results if st == status]
+
+
+def _said(results, section):
+    """[(status, message)] recorded under one section."""
+    return [(st, msg) for st, sec, msg in results if sec == section]
+
+
+class World:
+    """A scratch repo root for the watchdog - its own data/ and logs/ - and a clock the
+    test moves. Files are aged against that clock, never the real one."""
+
+    def __init__(self, root):
+        self.root = root
+        self.now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc).timestamp()
+
+    def path(self, name):
+        return self.root / "data" / name
+
+    def age(self, name, minutes):
+        """Make data/<name> (created empty if absent) `minutes` old on the test clock."""
+        p = self.path(name)
+        if not p.exists():
+            p.write_text("", encoding="utf-8")
+        t = self.now - minutes * 60
+        os.utime(p, (t, t))
+        return p
+
+    def write(self, name, content, age_min=0.0):
+        text = content if isinstance(content, str) else json.dumps(content)
+        self.path(name).write_text(text, encoding="utf-8")
+        return self.age(name, age_min)
+
+    def tick(self, minutes):
+        self.now += minutes * 60
+
+    def next_run(self, minutes=15.0):
+        """Finish this watchdog run and begin the next one `minutes` later, the way two
+        scheduled runs follow each other (main() calls the same two functions)."""
+        hc._end_run()
+        self.tick(minutes)
+        hc._results.clear()
+        hc._begin_run()
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch, results):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "logs").mkdir()
+    monkeypatch.setattr(hc, "ROOT", tmp_path)
+    for attr, name in (("STAGE0_LOG", "stage0_crypto.jsonl"),
+                       ("PAPER_LOG", "paper_crypto15.jsonl"),
+                       ("HISTORY_LOG", "stage0_history.jsonl")):
+        monkeypatch.setattr(hc, attr, tmp_path / "data" / name)
+    monkeypatch.setattr(hc, "_state", {}, raising=False)
+    monkeypatch.setattr(hc, "_state_ok", False, raising=False)
+    w = World(tmp_path)
+    monkeypatch.setattr(hc, "_now", lambda: w.now, raising=False)
+    monkeypatch.setattr(hc.time, "time", lambda: w.now)    # anything not yet on hc._now
+    return w
 
 
 # ── [tasks]: an answer that never came is not four missing tasks ──────────────
@@ -261,3 +321,231 @@ def test_the_calendar_runs_out_on_the_eastern_day_not_the_utc_one(
     assert _calendar_at(tmp_path, monkeypatch, results, late_evening_et) == ([hc.OK], [])
     after_midnight_et = datetime(2026, 12, 5, 6, 0, tzinfo=timezone.utc)
     assert len(_calendar_at(tmp_path, monkeypatch, results, after_midnight_et)[1]) == 1
+
+
+# ── [data] / [paper]: the crypto paper trader is judged by the work it books ──
+
+def _paper_line(results):
+    (line,) = [(st, msg) for st, sec, msg in results if sec == "data" and "paper ledger" in msg]
+    return line
+
+
+def test_a_silent_crypto_ledger_is_judged_not_only_printed(results, world):
+    """news-health#1: the ledger's age was printed inside an OK line and never judged. A
+    paper trader that had written nothing for three days read 'paper ledger 73603 rows
+    (last write 4320 min ago)' and the run was logged healthy, exit 0."""
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=3 * 1440)
+    hc.check_data_flow()
+    status, msg = _paper_line(results)
+    assert status == hc.FAIL and "SILENT 4320 min" in msg, msg
+    assert "no heartbeat" in msg                  # and it says what it cannot know
+
+    for age, want in ((5, hc.OK), (20, hc.OK), (21, hc.WARN), (60, hc.WARN), (61, hc.FAIL)):
+        world.age("paper_crypto15.jsonl", age)
+        results.clear()
+        hc.check_data_flow()
+        assert _paper_line(results)[0] == want, (age, _paper_line(results))
+    assert _paper_line(results)[1].startswith("paper ledger SILENT 61 min")
+
+
+def test_after_a_night_asleep_the_silence_is_judged_from_the_wake_up(results, world):
+    """The fix risk: when the PC wakes, the ledger is as old as the night and the watchdog
+    runs at once. A gap in the watchdog's own 15-minute chain is the wake-up; the
+    ledger's silence counts from there - a grace period, not an amnesty."""
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=1)
+    hc._begin_run()                               # 12:00, all well
+    hc.check_data_flow()
+    assert _paper_line(results)[0] == hc.OK
+    world.next_run(8 * 60)                        # asleep for eight hours, then a run
+    hc.check_data_flow()
+    status, msg = _paper_line(results)
+    assert status == hc.OK and "last write 481 min ago" in msg and "off or asleep" in msg
+    world.next_run(15)                            # 15 min awake, still nothing booked
+    hc.check_data_flow()
+    assert _paper_line(results)[0] == hc.OK
+    world.next_run(15)                            # 30 min awake
+    hc.check_data_flow()
+    assert _paper_line(results)[0] == hc.WARN
+    world.next_run(15)
+    world.next_run(15)
+    world.next_run(15)                            # 75 min awake: the grace is over
+    hc.check_data_flow()
+    status, msg = _paper_line(results)
+    assert status == hc.FAIL and "SILENT 556 min" in msg and "until 75 min ago" in msg, msg
+
+
+def test_without_a_usable_state_file_there_is_no_grace(results, world):
+    """Failing safe: the grace needs proof of a gap. On the very first run, or when the
+    state file cannot be kept, the full age is judged - a watchdog must never be made
+    blind by its own bookkeeping - and an unwritable file is said out loud."""
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=3 * 1440)
+    hc._begin_run()                               # the first run there has ever been
+    hc.check_data_flow()
+    assert _paper_line(results)[0] == hc.FAIL
+    hc._end_run()
+    assert _said(results, "watchdog") == []       # the file was written: nothing to say
+
+    (world.root / "logs" / hc.STATE_NAME).unlink()
+    (world.root / "logs").rmdir()
+    (world.root / "logs").write_text("not a folder", encoding="utf-8")
+    world.tick(8 * 60)                            # a gap - but it cannot be recorded
+    results.clear()
+    hc._begin_run()
+    hc.check_data_flow()
+    assert _paper_line(results)[0] == hc.FAIL
+    hc._end_run()
+    ((status, msg),) = _said(results, "watchdog")
+    assert status == hc.WARN and hc.STATE_NAME in msg
+
+
+TODAYS_CRYPTO_HEARTBEAT = {          # the shared contract's keys, a healthy cycle
+    "ts": "2026-11-25T11:59:00+00:00", "took_s": 2.1, "opened": 1, "closed": 0,
+    "open_now": 3, "skipped": {"window_cap": 2}, "ungated": 0, "errors": 0,
+    "last_error": None, "clock_skew_s": 0.4, "quote_lag_s": {"KXBTC15M": 0.3},
+    "overdue": {"n": 0, "oldest": None, "oldest_h": None}}
+
+
+def test_a_missing_crypto_heartbeat_is_unknown_not_a_fault(results, world):
+    """Shared contract: the trader keeps its old code after a pull until it is
+    restarted, so the file may simply not exist yet."""
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=2)
+    hc.check_crypto_paper()
+    assert [st for st, _ in _said(results, "paper")] == [hc.OK]
+
+    results.clear()                               # ...and one with only some keys
+    world.write(hc.PAPER_HB, {"ts": "2026-11-25T11:59:00+00:00"}, age_min=1)
+    hc.check_crypto_paper()
+    assert [st for st, _ in _said(results, "paper")] == [hc.OK]
+
+
+def test_a_cycling_trader_that_books_nothing_is_still_a_failure(results, world):
+    """The verifier's two stalls: every request failing, and every slot held by a
+    position that will never settle. Both cycles finish normally, so a fresh heartbeat
+    says 'cycling' - the ledger says 'not working', and the ledger is the judge. The
+    heartbeat's counters say why."""
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=75)
+    world.write(hc.PAPER_HB, dict(TODAYS_CRYPTO_HEARTBEAT, opened=0, open_now=8, errors=6,
+                                  skipped={"max_concurrent": 2},
+                                  last_error="ConnectionError: 429"), age_min=0.5)
+    hc.check_data_flow()
+    hc.check_crypto_paper()
+    status, msg = _paper_line(results)
+    assert status == hc.FAIL and "IS cycling" in msg and "booking nothing" in msg, msg
+    assert all(x in msg for x in ("open_now 8", "errors 6", "max_concurrent=2",
+                                  "ConnectionError: 429")), msg
+    assert hc.FAIL not in [st for st, _ in _said(results, "paper")]   # it IS cycling
+
+
+def test_a_stale_crypto_heartbeat_means_not_cycling(results, world):
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=31)
+    world.write(hc.PAPER_HB, TODAYS_CRYPTO_HEARTBEAT, age_min=30)
+    hc.check_crypto_paper()
+    ((status, msg),) = _said(results, "paper")
+    assert status == hc.FAIL and "30 min old" in msg and "not cycling" in msg
+
+    # but a trader that is booking rows is working, whatever its heartbeat file says
+    world.age("paper_crypto15.jsonl", 2)
+    results.clear()
+    hc.check_crypto_paper()
+    ((status, msg),) = _said(results, "paper")
+    assert status == hc.WARN and "heartbeat is not being written" in msg
+
+    results.clear()
+    world.path(hc.PAPER_HB).write_text("{torn", encoding="utf-8")
+    hc.check_crypto_paper()
+    assert _said(results, "paper") == [(hc.WARN, "heartbeat unreadable")]
+
+
+def test_failing_requests_warn_only_when_seen_on_two_runs(results, world):
+    """One failed request in the one cycle in fifteen that the watchdog reads would flap
+    the log. Seen again at the next run, it is a pattern."""
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=1)
+    failing = dict(TODAYS_CRYPTO_HEARTBEAT, errors=2, last_error="ReadTimeout: spot")
+    hc._begin_run()
+    world.write(hc.PAPER_HB, failing, age_min=0.5)
+    hc.check_crypto_paper()
+    assert [st for st, _ in _said(results, "paper")] == [hc.OK]
+    world.next_run(15)
+    world.write(hc.PAPER_HB, failing, age_min=0.5)
+    hc.check_crypto_paper()
+    warn = [m for st, m in _said(results, "paper") if st == hc.WARN]
+    assert len(warn) == 1 and "requests are failing: 2" in warn[0] and "ReadTimeout" in warn[0]
+    world.next_run(15)                            # one clean cycle starts the count again
+    world.write(hc.PAPER_HB, TODAYS_CRYPTO_HEARTBEAT, age_min=0.5)
+    hc.check_crypto_paper()
+    world.next_run(15)
+    world.write(hc.PAPER_HB, failing, age_min=0.5)
+    hc.check_crypto_paper()
+    assert [st for st, _ in _said(results, "paper")] == [hc.OK]
+
+
+# ── main(), run after run: what PolybotHealth actually logs ────────────────────
+
+TODAYS_SLEEVE_HEARTBEAT = {          # exactly what sleeve_paper wrote before the audit
+    "ts": "2026-11-25T11:58:00+00:00", "rules": 2, "series": 11, "opened": 0, "closed": 0,
+    "skipped": {}, "ungated": 0, "errors": 0, "regime": "good", "open_now": 15}
+
+FRESH = {"stage0_crypto.jsonl": 0.5, "stage0_history.jsonl": 30.0,
+         "paper_crypto15.jsonl": 1.0, "sleeve_paper_heartbeat.json": 1.0}
+
+
+class Host:
+    """The scheduled task in miniature: main() with the task's own flags, every 15
+    minutes on the test clock. Files listed in `fresh` are re-aged before each run (a
+    working bot keeps writing); anything a test breaks, it removes from `fresh`."""
+
+    def __init__(self, world, results, monkeypatch):
+        self.world, self.results = world, results
+        self.fresh = dict(FRESH)
+        obs = {"t": "obs", "ts": "2026-11-25T11:59:30+00:00", "series": "KXBTC15M",
+               "ticker": "KXBTC15M-W-1", "yes_ask": 0.5, "no_ask": 0.52,
+               "book": {"yes": [[0.5, 10]]}}
+        world.write("stage0_crypto.jsonl", json.dumps(obs) + "\n")
+        world.write("stage0_history.jsonl", "{}\n")
+        _ledger(world.path("paper_crypto15.jsonl"), _bet("KXBTC15M-A", 1))
+        world.write("sleeve_paper_heartbeat.json", TODAYS_SLEEVE_HEARTBEAT)
+        # not what these tests are about, and they read the real repo's files or ports
+        for name in ("check_ports", "check_api", "check_model_integrity",
+                     "check_news_regime", "check_news_calendar", "check_env_auth"):
+            monkeypatch.setattr(hc, name, lambda: None)
+        monkeypatch.setattr(sys, "argv", ["healthcheck.py", "--repair", "--quiet", "--log",
+                                          "--fast"])
+        self.first = True
+
+    def run(self, minutes=15.0):
+        """One scheduled run -> (exit code, [(status, section, message)] not OK)."""
+        if not self.first:
+            self.world.tick(minutes)
+        self.first = False
+        for name, age in self.fresh.items():
+            self.world.age(name, age)
+        self.results.clear()
+        rc = hc.main()
+        return rc, [r for r in self.results if r[0] != hc.OK]
+
+    def log(self):
+        return (self.world.root / "logs" / "healthcheck.log").read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def host(world, results, monkeypatch, capsys):
+    return Host(world, results, monkeypatch)
+
+
+def test_the_scheduled_run_goes_red_when_the_paper_trader_stops_booking(host):
+    """news-health#1 end to end, the way the task runs it. Before: 'healthy fails=0' on
+    every run while the ledger sat untouched for three days."""
+    rc, bad = host.run()
+    assert rc == 0 and [r for r in bad if r[1] != "tasks"] == [], bad
+    del host.fresh["paper_crypto15.jsonl"]        # from now on nothing is booked
+    seen = []
+    for _ in range(6):                            # 16, 31, 46, 61, 76, 91 min of silence
+        rc, bad = host.run()
+        seen.append((rc, [st for st, sec, msg in bad if "paper ledger" in msg]))
+    assert seen == [(0, []), (0, [hc.WARN]), (0, [hc.WARN]),
+                    (1, [hc.FAIL]), (1, [hc.FAIL]), (1, [hc.FAIL])]
+    last = host.log().splitlines()
+    head = max(i for i, line in enumerate(last) if not line.startswith(" "))
+    assert "UNHEALTHY fails=1" in last[head]
+    assert any("[FAIL] data: paper ledger SILENT 91 min" in line for line in last[head:])
+    assert (host.world.root / "logs" / hc.STATE_NAME).exists()
