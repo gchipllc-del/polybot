@@ -32,10 +32,13 @@ Per-venue screening: scope BOTH files by env var so venues never mix -
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,13 +54,146 @@ SLEEP_S = 0.35              # polite pacing; these are public endpoints
 LIST_PAGE = 1000            # markets per listing page: the most /markets serves (a
                             # smaller page from the server still works - the loop
                             # follows the cursor)
+RETRY_TRIES = 8             # attempts per request before the caller sees the failure
+RETRY_BASE_S = 1.0          # waits between them: 1, 2, 4, 8, 16, 30, 30 s - 91 s in all
+RETRY_CAP_S = 30.0
+RETRY_AFTER_CAP_S = 60.0    # a server's Retry-After is honoured up to this, never longer
 
 
-def _get(url: str, params: dict | None = None) -> dict:
+# ── the fetcher: one request, waited out when the failure is the passing kind ──
+
+def http_status(e: BaseException) -> int | None:
+    """The HTTP status an error carries, or None (requests.HTTPError keeps it on
+    .response; urllib's HTTPError and injected fakes keep it on the error itself)."""
+    for obj in (getattr(e, "response", None), e):
+        for name in ("status_code", "status", "code"):
+            v = getattr(obj, name, None)
+            if isinstance(v, int) and 100 <= v <= 599:
+                return v
+    return None
+
+
+def is_transient(e: BaseException) -> bool:
+    """True for the failures worth waiting out: HTTP 429, any 5xx, a timeout, a dropped
+    or refused connection. Every other answer is final: a 404 for a market that is gone
+    must not cost a minute and a half of retries."""
+    status = http_status(e)
+    if status is not None:
+        return status == 429 or status >= 500
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return True
+    try:
+        import requests
+    except ImportError:
+        return False
+    return isinstance(e, (requests.ConnectionError, requests.Timeout,
+                          requests.exceptions.ChunkedEncodingError))
+
+
+def describe_error(e: BaseException) -> str:
+    """What a warning line says about a failed request: 'HTTP 429 Too Many Requests', or
+    the error's class and its cause without the connection-pool preamble."""
+    status = http_status(e)
+    if status is not None:
+        reason = " ".join(str(getattr(getattr(e, "response", None), "reason", None)
+                              or "").split())
+        return f"HTTP {status}" + (f" {reason[:40]}" if reason else "")
+    text = " ".join(str(e).split())
+    if "(Caused by " in text:                  # requests wraps urllib3's own wrapper:
+        text = text.rsplit("(Caused by ", 1)[1]            # keep the cause, not the URL
+        text = text[:-1] if text.endswith(")") else text
+    text = re.sub(r"<[^<>]*object at 0x[0-9a-fA-F]+>:\s*|HTTPS?Connection\([^()]*\):\s*",
+                  "", text)
+    return type(e).__name__ + (f": {text[:140]}" if text else "")
+
+
+def parse_retry_after(value, now: float | None = None) -> float | None:
+    """A Retry-After header as seconds from now. It comes as a number ('5') or as an HTTP
+    date ('Wed, 25 Nov 2026 12:00:30 GMT'). None when absent or unreadable; a date
+    already past (or a PC clock running ahead) reads as 0, never negative."""
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    try:
+        secs = float(text)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        try:
+            secs = when.timestamp() - (time.time() if now is None else now)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return max(0.0, secs) if math.isfinite(secs) else None
+
+
+def _header(e: BaseException, name: str):
+    headers = getattr(getattr(e, "response", None), "headers", None)
+    try:
+        for k, v in (headers or {}).items():
+            if str(k).lower() == name.lower():
+                return v
+    except Exception:  # noqa: BLE001 - an odd fake must not turn a retry into a crash
+        pass
+    return None
+
+
+def retry_wait(e: BaseException, attempt: int, now: float | None = None) -> tuple[float, str]:
+    """(seconds to wait after failed attempt number `attempt`, a note for the wait line).
+    The usual step doubles from RETRY_BASE_S up to RETRY_CAP_S. A Retry-After from the
+    server replaces it when it asks for longer, up to RETRY_AFTER_CAP_S - an hour-long
+    Retry-After, or a date read against a PC clock that is off, must not park the run."""
+    step = min(RETRY_CAP_S, RETRY_BASE_S * 2 ** (attempt - 1))
+    asked = parse_retry_after(_header(e, "Retry-After"), now)
+    if asked is None or asked <= step:
+        return step, ""
+    if asked <= RETRY_AFTER_CAP_S:
+        return asked, " as the server asked"
+    return RETRY_AFTER_CAP_S, f" (the server asked for {asked:.0f}s - capped)"
+
+
+def _request(url: str, params: dict):
+    """ONE request, no retry - the seam the tests replace."""
     import requests
-    r = requests.get(url, params=params or {}, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    return requests.get(url, params=params, timeout=20)
+
+
+def _get(url: str, params: dict | None = None, *, tries: int | None = None,
+         request=None, sleep=None, now=None) -> dict:
+    """GET JSON from a public endpoint, waiting out the failures that pass.
+
+    Retried, RETRY_TRIES attempts in all: HTTP 429, any 5xx, a timeout, a dropped or
+    refused connection (is_transient). Between attempts it waits 1, 2, 4, 8, 16, 30, 30 s
+    - about a minute and a half of patience - or what the server's Retry-After asks for
+    (retry_wait). One line is printed per wait, so a command that is waiting never looks
+    hung. Before this, one 429 was one skipped market and the next request left at once.
+
+    NOT retried: every other answer. A 404 for a market that is gone is final.
+
+    When the tries run out the LAST error is raised unchanged: callers print it
+    (describe_error) and decide what to do next (is_transient tells them it was the
+    waiting-out kind). request / sleep / now are test seams; now is a clock function."""
+    tries = RETRY_TRIES if tries is None else max(1, int(tries))
+    request = request or _request
+    for attempt in range(1, tries + 1):
+        try:
+            r = request(url, params or {})
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001 - sorted into retry / raise just below
+            if attempt >= tries or not is_transient(e):
+                raise
+            wait, note = retry_wait(e, attempt, None if now is None else now())
+            shown = f"{wait:.0f}" if wait >= 10 or float(wait).is_integer() else f"{wait:.1f}"
+            print(f"  [wait] {describe_error(e)} - trying again in {shown}s{note} "
+                  f"(try {attempt + 1} of {tries})", flush=True)
+            (sleep or time.sleep)(wait)
+    raise RuntimeError("unreachable")              # the loop returns or raises
 
 
 def _iso_to_ts(iso: str) -> int | None:
