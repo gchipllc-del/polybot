@@ -141,15 +141,20 @@ def _mins_left(close_iso: str, now: datetime) -> float | None:
 
 
 def _seen_settles(path: Path) -> set:
+    """Tickers whose settlement is already in the log. This is the first thing every
+    cycle does, so it must survive a damaged file: undecodable bytes are replaced (the
+    line then fails json.loads and is skipped like a torn one) and a line that is JSON
+    but not a row is skipped too. One stray byte from a disk fault or another writer
+    used to raise here on every cycle and stop collection until a hand repair."""
     if not path.exists():
         return set()
     seen = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if d.get("t") == "settle":
+        if isinstance(d, dict) and d.get("t") == "settle":
             seen.add(d.get("ticker"))
     return seen
 
@@ -214,7 +219,7 @@ def write_snapshot(path: Path | None = None, history: Path | None = None) -> Non
     lp = path or LOG
     rows = []
     if lp.exists():
-        for line in lp.read_text(encoding="utf-8").splitlines():
+        for line in lp.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
@@ -365,7 +370,7 @@ def print_trend(history: Path | None = None, min_n: int = 20) -> None:
         print("collect loop (after this update; restart the collector task once).")
         return
     snaps = []
-    for line in hp.read_text(encoding="utf-8").splitlines():
+    for line in hp.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             snaps.append(json.loads(line))
         except json.JSONDecodeError:
@@ -501,7 +506,7 @@ def main() -> int:
     if cmd == "report":
         rows = []
         if LOG.exists():
-            for line in LOG.read_text(encoding="utf-8").splitlines():
+            for line in LOG.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:

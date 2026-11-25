@@ -81,3 +81,55 @@ def test_a_torn_history_tail_does_not_swallow_the_next_snapshot(tmp_path):
     snaps = readable(hp)
     assert [s["joined"] for s in snaps] == [0, 1]      # the new snapshot is its own line
     assert hp.read_bytes().endswith(b"\n")
+
+
+# ── one damaged line must not stop collection, the snapshot or the reports ───
+
+BTC = "KXBTC15M-26NOV251215-15"
+STRAY = b"\xff\xfe stray bytes from another writer \xe9\n"   # a byte-order mark, a cp1252 e-acute
+
+
+def test_one_undecodable_byte_does_not_stop_collection(tmp_path):
+    """_seen_settles is the first thing a cycle does and it decoded strictly: with one
+    stray byte anywhere in the log EVERY cycle raised before its first request and
+    appended nothing, while the task stayed 'Running' - until a hand repair."""
+    p = tmp_path / "s0.jsonl"
+    assert collect(p, 0.55, 0) == {"obs": 2, "settles": 0}
+    with open(p, "ab") as f:
+        f.write(STRAY)
+    size = p.stat().st_size
+    assert collect(p, 0.58, 1, [(BTC, "yes")]) == {"obs": 2, "settles": 1}
+    assert p.stat().st_size > size                     # the cycle wrote its rows
+    # ... and the settle logged AFTER the damaged line is still known: no duplicate
+    assert collect(p, 0.58, 2, [(BTC, "yes")]) == {"obs": 2, "settles": 0}
+    rows = readable(p)
+    assert sum(r["t"] == "obs" for r in rows) == 6
+    assert [r["ticker"] for r in rows if r["t"] == "settle"] == [BTC]
+
+
+def test_a_damaged_log_still_snapshots_and_reports(tmp_path, monkeypatch, capsys):
+    p, hp = tmp_path / "s0.jsonl", tmp_path / "hist.jsonl"
+    collect(p, 0.55, 0)
+    with open(p, "ab") as f:
+        f.write(STRAY)
+    collect(p, 0.58, 1, [(BTC, "yes")])
+    s0.write_snapshot(path=p, history=hp)              # the hourly read of the whole log
+    assert [s["joined"] for s in readable(hp)] == [1]
+    monkeypatch.setattr(s0, "LOG", p)
+    monkeypatch.setattr(sys, "argv", ["stage0_collector.py", "report"])
+    assert s0.main() == 0
+    assert "joined market-band observations: 1" in capsys.readouterr().out
+    with open(hp, "ab") as f:                          # the trend history, damaged the same way
+        f.write(STRAY)
+    s0.print_trend(history=hp)
+    assert "stage0 trend - 1 snapshots" in capsys.readouterr().out
+
+
+def test_a_line_that_is_json_but_not_a_row_does_not_stop_collection(tmp_path):
+    """Same symptom, other trigger: a hand edit or another writer leaves a line that
+    parses but is not an object. The per-cycle read must skip it, not raise on it."""
+    p = tmp_path / "s0.jsonl"
+    collect(p, 0.55, 0, [(BTC, "yes")])
+    with open(p, "ab") as f:
+        f.write(b'null\n123\n"text"\n[1,2]\n\n')
+    assert collect(p, 0.58, 1, [(BTC, "yes")]) == {"obs": 2, "settles": 0}
