@@ -171,6 +171,8 @@ def _isolate(tmp_path, monkeypatch):
                             (sp, "LEDGER", "ledger.jsonl"), (sp, "HEARTBEAT", "hb.json"),
                             (nr, "REGIME_LOG", "regime.jsonl")):
         monkeypatch.setattr(mod, name, tmp_path / file)
+    # the crypto trader's heartbeat too: never the live one in data/
+    monkeypatch.setattr(cc, "CRYPTO_HEARTBEAT", tmp_path / "crypto_hb.json", raising=False)
     return sp
 
 
@@ -674,3 +676,109 @@ def test_every_other_panel_fails_alone_too(tmp_path, monkeypatch):
             assert p["regime"]["unread"] is True and "regime broke" in p["regime"]["current"]["why"]
         if panel == "health":
             assert "health broke" in p["health"]["lines"][0]
+
+
+# ── the heartbeats say whether a trader is WORKING, not only that it is alive ──
+
+OLD_KEYS = {"rules": 2, "series": 11, "opened": 0, "closed": 0, "skipped": {}, "ungated": 0,
+            "errors": 0, "regime": "good", "open_now": 7}
+
+
+def _stamp(minutes_ago):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def _chips(crypto_rows=()):
+    return {t["venue"]: t for t in cc.trader_freshness(list(crypto_rows))}
+
+
+def test_a_sleeve_trader_that_is_alive_but_failing_reads_failing(tmp_path, monkeypatch):
+    """A heartbeat a minute old only proves the process is alive. A trader whose cycle
+    raises, or whose every market-list call fails cycle after cycle, wrote a fresh
+    heartbeat each time and the chip said all was well. It now reads 'failing', in words.
+    A heartbeat from before these keys existed is unknown on them - never a fault."""
+    sp = _isolate(tmp_path, monkeypatch)
+
+    def sleeve(minutes_ago=1, **more):
+        sp.HEARTBEAT.write_text(json.dumps(dict(OLD_KEYS, ts=_stamp(minutes_ago), **more)),
+                                encoding="utf-8")
+        return _chips()["sleeves"]
+
+    t = sleeve()                                           # the old ten keys only
+    assert (t["status"], t["note"]) == ("good", None)
+    t = sleeve(all_failed_streak=0, cycle_error=None, failed_cycles=0, poll_errors=0,
+               market_errors=0, series_fail_streak={}, took_s=4.2,
+               overdue={"n": 0, "oldest": None, "oldest_h": None})
+    assert (t["status"], t["note"]) == ("good", None)      # every new key, nothing wrong
+    t = sleeve(cycle_error="RuntimeError: regime unreadable", failed_cycles=4)
+    assert t["status"] == "failing" and 0.5 < t["age_min"] < 2
+    assert t["note"] == ("failing - its last cycle raised RuntimeError: regime unreadable "
+                         "(4 cycles in a row)")
+    t = sleeve(errors=11, all_failed_streak=3, cycle_error=None)
+    assert t["status"] == "failing"
+    assert t["note"] == "failing - every market list call has failed for 3 cycles in a row"
+    t = sleeve(errors=11, all_failed_streak=2, cycle_error=None)       # two is a blip
+    assert (t["status"], t["note"]) == ("good", None)
+    t = sleeve(cycle_error="RuntimeError: x", failed_cycles=1, all_failed_streak=7)
+    assert t["note"] == ("failing - its last cycle raised RuntimeError: x; every market "
+                         "list call has failed for 7 cycles in a row")
+    for odd in ("many", None, True, 2.5, [3]):             # not a count: unknown
+        assert sleeve(all_failed_streak=odd)["status"] == "good", odd
+    t = sleeve(minutes_ago=14, cycle_error="OSError: disk full", failed_cycles=1)
+    assert t["status"] == "failing"                         # stopped AND its last word
+    assert t["note"] == ("late - it cycles every 2 min · failing - its last cycle raised "
+                         "OSError: disk full")
+    t = sleeve(overdue={"n": 2, "oldest": "KXHIGHNY-26NOV20-B58", "oldest_h": 61.4})
+    assert t["status"] == "warning"
+    assert t["note"] == ("2 open positions overdue - more than a day past their close with "
+                         "no result (oldest KXHIGHNY-26NOV20-B58, 61 h)")
+    for odd in (None, "3", [1], {"n": "x"}, {"oldest": "T"}):          # unknown, no fault
+        assert sleeve(overdue=odd)["status"] == "good", odd
+    # the page: its own icon for failing, and the note printed whatever the status
+    assert 'failing: ["cross", "var(--critical)"]' in cc._PAGE
+    assert '(t.note ? ` · ${t.note}` : "")' in cc._PAGE
+
+
+def test_the_crypto_trader_is_read_from_its_heartbeat_when_it_has_one(tmp_path, monkeypatch):
+    """The crypto trader had no heartbeat, so its newest ledger row stood in - and a row
+    is written only when a bet opens or settles, so a quiet market and a dead trader
+    looked alike. With a heartbeat the chip says when the last CYCLE ran and what it
+    reported; without one (a trader still running the older code) nothing changes."""
+    _isolate(tmp_path, monkeypatch)
+    row = {"t": "open", "ts": _stamp(45), "ticker": "KXBTC15M-26NOV250115-00", "rule": "H1",
+           "price": 0.9, "contracts": 1, "fee": 0.01, "v": 4, "depth": 20}
+
+    def crypto(text=None, **hb):
+        cc.CRYPTO_HEARTBEAT.write_text(json.dumps(hb) if text is None else text,
+                                       encoding="utf-8")
+        return _chips([row])["crypto"]
+
+    t = _chips([row])["crypto"]                             # no heartbeat: as before
+    assert (t["what"], t["status"]) == ("newest ledger row", "warning") and "quiet" in t["note"]
+    t = crypto(ts=_stamp(1), took_s=3.1, opened=0, closed=0, open_now=2, skipped={},
+               ungated=0, errors=0, last_error=None, clock_skew_s=0.4, quote_lag_s={},
+               overdue={"n": 0, "oldest": None, "oldest_h": None})
+    assert (t["what"], t["status"], t["note"]) == ("last cycle", "good", None)
+    assert 0.5 < t["age_min"] < 2 and t["limit_min"] == cc.CRYPTO_LATE_MIN
+    t = crypto(ts=_stamp(1))                                # only a time: still enough
+    assert (t["what"], t["status"], t["note"]) == ("last cycle", "good", None)
+    t = crypto(ts=_stamp(9))
+    assert (t["status"], t["note"]) == ("warning", "late - it cycles every minute")
+    t = crypto(ts=_stamp(1), errors=6, last_error="markets KXBTC15M: ConnectionError: refused")
+    assert t["status"] == "warning" and t["note"] == (
+        "6 requests failed in its last cycle (last: markets KXBTC15M: ConnectionError: refused)")
+    t = crypto(ts=_stamp(1), errors=1, overdue={"n": 8, "oldest": "KXBTC15M-26NOV230115-00",
+                                                "oldest_h": 50.2})
+    assert t["status"] == "warning" and t["note"] == (
+        "1 request failed in its last cycle · 8 open positions overdue - more than an hour "
+        "past their close with no result (oldest KXBTC15M-26NOV230115-00, 50 h)")
+    for unreadable in ("{not json", "[1, 2]", '{"took_s": 3.1}', '{"ts": "yesterday"}'):
+        t = crypto(text=unreadable)                         # unknown: the ledger stands in
+        assert (t["what"], t["status"]) == ("newest ledger row", "warning"), unreadable
+    # a heartbeat also answers for a ledger that cannot be read
+    cc.CRYPTO_HEARTBEAT.write_text(json.dumps({"ts": _stamp(1)}), encoding="utf-8")
+    t = {x["venue"]: x for x in cc.trader_freshness(None)}["crypto"]
+    assert (t["what"], t["status"]) == ("last cycle", "good")
+    cc.CRYPTO_HEARTBEAT.unlink()
+    t = {x["venue"]: x for x in cc.trader_freshness(None)}["crypto"]
+    assert t["status"] == "missing" and "could not be read" in t["note"]

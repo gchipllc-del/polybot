@@ -6,6 +6,7 @@ or changes state:
   data/paper_crypto15.jsonl     crypto 15-min forward paper ledger
   data/paper_sleeves.jsonl      multi-sleeve forward paper ledger (+ data/sleeve_rules.jsonl)
   data/sleeve_paper_heartbeat.json  the sleeve trader's last cycle
+  data/paper_crypto_heartbeat.json  the crypto trader's last cycle (when it writes one)
   data/news_regime.jsonl        the news agent's hourly regime
   data/sleeves/screen.json      sleeve scanner nominations
   logs/healthcheck.log          the watchdog's last verdict
@@ -135,10 +136,20 @@ def _series_count(srules: dict) -> int:
 
 # The sleeve trader stamps a heartbeat every cycle (2 min); the watchdog FAILs it past 10.
 SLEEVE_LATE_MIN = 10.0
-# The crypto trader keeps no heartbeat, so its newest ledger row stands in - and a row is
-# written only when a bet opens or settles. At its concurrency cap a healthy trader goes
-# ~11-15 min from its last entry in a 15-min window to the next settlement, so a 10-min
-# bar would flag it every window. 20 = a whole window with neither, plus settlement lag.
+# A heartbeat a minute old only says the trader is ALIVE. It also says whether the cycle
+# worked: `cycle_error` (the cycle raised) or `all_failed_streak` (cycles in a row in which
+# EVERY market-list call failed). This many of those in a row is failing, not a blip.
+ALL_FAILED_CYCLES = 3
+# The crypto trader writes a heartbeat too (after every completed 60 s cycle) once it
+# runs the code that has one; five missed cycles is late.
+CRYPTO_HEARTBEAT = Path(os.environ.get("PAPER_CRYPTO_HEARTBEAT")
+                        or (DATA / "paper_crypto_heartbeat.json"))
+CRYPTO_LATE_MIN = 5.0
+# Without a heartbeat (a trader started before it existed keeps running old code after a
+# pull until it is restarted) its newest ledger row stands in - and a row is written only
+# when a bet opens or settles. At its concurrency cap a healthy trader goes ~11-15 min
+# from its last entry in a 15-min window to the next settlement, so a 10-min bar would
+# flag it every window. 20 = a whole window with neither, plus settlement lag.
 CRYPTO_QUIET_MIN = 20.0
 
 
@@ -163,29 +174,109 @@ def _freshness(venue: str, name: str, what: str, t: float | None, limit_min: flo
                 note=None if age < limit_min else late)
 
 
-def trader_freshness(crypto_rows: list[dict] | None, now: float | None = None) -> list[dict]:
-    """When each paper trader last showed signs of life: the sleeve trader's heartbeat
-    (written every cycle) and the crypto trader's newest ledger row. crypto_rows is None
-    when the crypto ledger could not be read - unknown, which is not 'no rows yet'."""
+def _heartbeat(path: Path) -> tuple[dict | None, bool]:
+    """(heartbeat, the file exists). None = not there, or not a readable JSON object."""
+    if not path.exists():
+        return None, False
+    try:
+        d = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None, True
+    return (d if isinstance(d, dict) else None), True
+
+
+def _count(d: dict, key: str) -> int:
+    """A heartbeat counter. A key that is missing or is not a count reads 0: a trader
+    that still runs the code from before the key existed is UNKNOWN on it, not at fault."""
+    v = d.get(key)
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _clip(text, n: int) -> str:
+    text = str(text)
+    return text if len(text) <= n else text[:n].rstrip() + "..."
+
+
+def _overdue_note(hb: dict, past: str) -> str | None:
+    """Open positions the trader itself reports as stranded past their close."""
+    od = hb.get("overdue")
+    if not isinstance(od, dict) or not _count(od, "n"):
+        return None
+    note = f"{_plural(od['n'], 'open position')} overdue - {past} with no result"
+    if od.get("oldest"):
+        hours = od.get("oldest_h")
+        note += f" (oldest {_clip(od['oldest'], 40)}" + (
+            f", {hours:.0f} h)" if isinstance(hours, (int, float)) else ")")
+    return note
+
+
+def _with_notes(chip: dict, failing: list[str], watch: list[str]) -> dict:
+    """A chip built from a heartbeat, plus what that heartbeat says about the cycle
+    itself: `failing` (why it is not working) and `watch` (worth a look). Every status
+    is a word in the note as well as an icon on the page."""
+    parts = [chip["note"]] if chip["note"] else []          # "late - ...", when it is
+    if failing:
+        parts.append("failing - " + "; ".join(failing))
+    status = "failing" if failing else ("warning" if parts or watch else "good")
+    return dict(chip, status=status, note=" · ".join(parts + watch) or None)
+
+
+def _sleeve_trader(now: float) -> dict:
     import sleeve_paper as sp
+    hb, exists = _heartbeat(sp.HEARTBEAT)        # read at call time: tests and env move it
+    t = _ts(hb.get("ts")) if hb else None
+    chip = _freshness("sleeves", "Sleeve paper trader", "last cycle", t, SLEEVE_LATE_MIN, now,
+                      "late - it cycles every 2 min",
+                      "heartbeat unreadable" if exists else "no heartbeat yet - it has never cycled")
+    if t is None:
+        return chip
+    failing = []
+    if hb.get("cycle_error"):
+        n = _count(hb, "failed_cycles")
+        failing.append(f"its last cycle raised {_clip(hb['cycle_error'], 160)}"
+                       + (f" ({n} cycles in a row)" if n > 1 else ""))
+    streak = _count(hb, "all_failed_streak")
+    if streak >= ALL_FAILED_CYCLES:
+        failing.append(f"every market list call has failed for {streak} cycles in a row")
+    overdue = _overdue_note(hb, "more than a day past their close")
+    return _with_notes(chip, failing, [overdue] if overdue else [])
+
+
+def _crypto_trader(crypto_rows: list[dict] | None, now: float) -> dict:
+    hb, _ = _heartbeat(CRYPTO_HEARTBEAT)
+    t = _ts(hb.get("ts")) if hb else None
+    if t is None:           # no heartbeat to read: unknown - the ledger stands in, as before
+        newest = next((x for x in (_ts(r.get("ts")) for r in reversed(crypto_rows or []))
+                       if x is not None), None)      # append-only: the last row is newest
+        return _freshness("crypto", "Crypto paper trader", "newest ledger row", newest,
+                          CRYPTO_QUIET_MIN, now,
+                          "quiet - a row is written only when a bet opens or settles",
+                          "ledger could not be read" if crypto_rows is None
+                          else "no ledger rows yet")
+    chip = _freshness("crypto", "Crypto paper trader", "last cycle", t, CRYPTO_LATE_MIN, now,
+                      "late - it cycles every minute", "")
+    watch = []
+    failed = _count(hb, "errors")
+    if failed:
+        watch.append(f"{_plural(failed, 'request')} failed in its last cycle"
+                     + (f" (last: {_clip(hb['last_error'], 120)})" if hb.get("last_error") else ""))
+    overdue = _overdue_note(hb, "more than an hour past their close")
+    return _with_notes(chip, [], watch + ([overdue] if overdue else []))
+
+
+def trader_freshness(crypto_rows: list[dict] | None, now: float | None = None) -> list[dict]:
+    """Is each paper trader working - not merely alive? Both from their heartbeats: when
+    the last cycle ran, and what it says about itself. A sleeve trader whose cycle raises,
+    or whose every market-list call has failed for ALL_FAILED_CYCLES cycles, is 'failing'
+    however fresh its heartbeat. The crypto trader is read from its heartbeat when it has
+    one, else from its newest ledger row. A missing file or key is unknown, never a fault.
+    crypto_rows is None when the crypto ledger could not be read - not 'no rows yet'."""
     now = time.time() if now is None else now
-    hb, missing = None, "no heartbeat yet - it has never cycled"
-    if sp.HEARTBEAT.exists():                   # read at call time: tests and env move it
-        try:
-            hb = _ts(json.loads(sp.HEARTBEAT.read_text(encoding="utf-8")).get("ts"))
-        except (OSError, ValueError, AttributeError):
-            hb = None
-        missing = "heartbeat unreadable" if hb is None else missing
-    newest = next((t for t in (_ts(r.get("ts")) for r in reversed(crypto_rows or []))
-                   if t is not None), None)          # append-only: the last row is newest
-    return [
-        _freshness("sleeves", "Sleeve paper trader", "last cycle", hb, SLEEVE_LATE_MIN, now,
-                   "late - it cycles every 2 min", missing),
-        _freshness("crypto", "Crypto paper trader", "newest ledger row", newest,
-                   CRYPTO_QUIET_MIN, now,
-                   "quiet - a row is written only when a bet opens or settles",
-                   "ledger could not be read" if crypto_rows is None else "no ledger rows yet"),
-    ]
+    return [_sleeve_trader(now), _crypto_trader(crypto_rows, now)]
 
 
 # ── the one scoring family ────────────────────────────────────────────────────
@@ -911,7 +1002,7 @@ function renderKpis() {
 
 // ── is each paper trader still working? (live - not the watchdog's 15-min verdict) ──
 const FRESH = {good: ["check", "var(--good)"], warning: ["alert", "var(--warning)"],
-               missing: ["alert", "var(--warning)"]};
+               missing: ["alert", "var(--warning)"], failing: ["cross", "var(--critical)"]};
 function renderTraders() {
   const box = document.getElementById("traders"); box.replaceChildren();
   for (const t of DATA.traders || []) {
@@ -920,7 +1011,7 @@ function renderTraders() {
     chip.appendChild(icon(kind, color));
     txt.appendChild(el("strong", {}, t.name));
     txt.appendChild(document.createTextNode(" · " + (t.status === "missing" ? t.note
-      : `${t.what} ${ago(t.age_min)}` + (t.status === "warning" ? ` · ${t.note}` : ""))));
+      : `${t.what} ${ago(t.age_min)}` + (t.note ? ` · ${t.note}` : ""))));
     chip.appendChild(txt);
     box.appendChild(chip);
   }
