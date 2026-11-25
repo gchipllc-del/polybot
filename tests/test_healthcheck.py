@@ -67,17 +67,6 @@ def results(monkeypatch):
     return out
 
 
-@pytest.fixture
-def windows(monkeypatch):
-    """check_tasks believes it is on Windows; the test installs its own scheduler."""
-    monkeypatch.setattr(hc, "IS_WIN", True)
-
-    def install(sched):
-        monkeypatch.setattr(hc, "_ps", sched)
-        return sched
-    return install
-
-
 def _by_status(results, status):
     return [msg for st, _, msg in results if st == status]
 
@@ -136,10 +125,22 @@ def world(tmp_path, monkeypatch, results):
     monkeypatch.setattr(hc, "_state", {}, raising=False)
     monkeypatch.setattr(hc, "_state_ok", False, raising=False)
     monkeypatch.setattr(hc, "_state_kept", False, raising=False)
+    monkeypatch.setenv("POLYBOT_LOCK_DIR", str(tmp_path / "data" / "locks"))
     w = World(tmp_path)
     monkeypatch.setattr(hc, "_now", lambda: w.now, raising=False)
-    monkeypatch.setattr(hc.time, "time", lambda: w.now)    # anything not yet on hc._now
     return w
+
+
+@pytest.fixture
+def windows(world, monkeypatch):
+    """check_tasks believes it is on Windows, in a scratch root (no real data file or
+    lock can colour the answer); the test installs its own scheduler."""
+    monkeypatch.setattr(hc, "IS_WIN", True)
+
+    def install(sched):
+        monkeypatch.setattr(hc, "_ps", sched)
+        return sched
+    return install
 
 
 # ── [tasks]: an answer that never came is not four missing tasks ──────────────
@@ -928,7 +929,7 @@ class Host:
         _ledger(world.path("paper_crypto15.jsonl"), _bet("KXBTC15M-A", 1))
         world.write("sleeve_paper_heartbeat.json", TODAYS_SLEEVE_HEARTBEAT)
         # not what these tests are about, and they read the real repo's files or ports
-        for name in ("check_ports", "check_api", "check_model_integrity",
+        for name in ("check_deps", "check_ports", "check_api", "check_model_integrity",
                      "check_news_regime", "check_news_calendar", "check_env_auth"):
             monkeypatch.setattr(hc, name, lambda: None)
         monkeypatch.setattr(sys, "argv", ["healthcheck.py", "--repair", "--quiet", "--log",

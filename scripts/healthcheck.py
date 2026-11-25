@@ -12,6 +12,11 @@ The failures we actually hit, and the check that would have caught each one:
   7. paper ledger could double-enter one market    -> [ledger]    duplicate-key scan
   8. dashboard and CLI disagreed on sample size    -> [selftest]  every module's selftest
 
+And three an audit found before the host did - each logged "healthy" while it lasted:
+  9. paper trader dead, or cycling but booking nothing -> [data]    ledger silence judged
+ 10. sleeve trader cycling while every request failed  -> [sleeves] its heartbeat is read
+ 11. a task Running but stalled; a false "REPAIRED"    -> [tasks]   restart, then verify
+
 LIVENESS over EXISTENCE: a process being alive proves nothing. This checks that data is
 actually accruing - file freshness, row growth, endpoint payloads - because every real
 outage here looked healthy from the outside.
@@ -933,7 +938,7 @@ def check_crypto_paper() -> None:
     judged, grace = _since_wake(age)
     if judged > PAPER_HB_STALE_MIN:
         ledger_age = _age_min(PAPER_LOG)
-        if ledger_age is not None and ledger_age <= PAPER_HB_STALE_MIN:
+        if ledger_age is not None and ledger_age <= PAPER_QUIET_WARN_MIN:
             _warn_crypto_overdue(None)
             record(WARN, "paper", f"heartbeat {age:.0f} min old but the ledger was written "
                                   f"{ledger_age:.0f} min ago - trading, but its heartbeat "
@@ -1315,8 +1320,12 @@ def _sleeve_ledger_warnings(hb: dict) -> list[str]:
         import sleeve_paper as sp
         rules = sp.active_rules(_data("sleeve_rules.jsonl"))     # the registry's own reader
         rows = _jsonl_rows(_data("paper_sleeves.jsonl"))
-    except Exception as e:  # noqa: BLE001
+        return _sleeve_ledger_findings(rows, rules, hb)
+    except Exception as e:  # noqa: BLE001 - said, never swallowed, never fatal
         return [f"sleeve ledger not checked: {type(e).__name__}: {str(e)[:80]}"]
+
+
+def _sleeve_ledger_findings(rows: list[dict], rules, hb: dict) -> list[str]:
     out = []
     for name, quiet, limit, gap in _quiet_rules(rows, rules, _now(),
                                                 _state.get("sleeve_idle") or ()):
