@@ -23,8 +23,9 @@ outage here looked healthy from the outside.
 
 Run after run: the scheduled task is a new process every 15 minutes, so what must be
 known from the run before (was the PC asleep? was this already so? was a restart tried?)
-is kept in logs/healthcheck_state.json. Without it the watchdog judges every file's full
-age and restarts no running task - it is never made blind by its own bookkeeping.
+is kept in logs/healthcheck_state.json by the scheduled (--log) runs. Without it - and
+on a run by hand that follows no scheduled run - the watchdog judges every file's full
+age and restarts no running task: it is never made blind by its own bookkeeping.
 """
 from __future__ import annotations
 
@@ -174,6 +175,7 @@ CONFIRM_MIN = 10.0       # "still so at the next run" = first seen at least this
 
 _state: dict = {}        # this run's copy: main() loads it, checks update it, main() saves
 _state_ok = False        # this run read the file AND could write it back
+_state_kept = False      # this run is one that keeps the file (see _begin_run)
 
 
 def _state_path() -> Path:
@@ -203,26 +205,38 @@ def _write_state() -> bool:
     return False
 
 
-def _begin_run() -> None:
+def _begin_run(scheduled: bool = True) -> None:
     """Load what the previous run left and decide whether this run FOLLOWS it. A gap in
     the watchdog's own 15-minute chain means the PC was off, asleep or logged off: then
     `up_since` is this run (the wake-up, as closely as the watchdog can know it) and
-    nothing seen before the gap counts as "the run before". The file is rewritten at
-    once: if that fails, this run trusts none of it."""
-    global _state, _state_ok
+    nothing seen or tried before the gap counts as "the run before". The file is
+    rewritten at once: if that fails, this run trusts none of it.
+
+    Only the SCHEDULED runs (the task's --log runs) make the chain. A run by hand
+    shortly after one of them reads and updates the rest of the file but does not move
+    the chain; a run by hand with no scheduled run just before it reads and writes
+    nothing. Otherwise someone who runs this once a day would look, every time, like a
+    PC that has just woken up - and the grace would never end."""
+    global _state, _state_ok, _state_kept
     now = _now()
     st = _read_json(_state_path()) or {}
     last = _n(st, "last_run")
+    follows = last is not None and abs(now - last) <= CHAIN_GAP_MIN * 60
+    if not scheduled and not follows:
+        _state, _state_ok, _state_kept = {}, False, False
+        return
     if not isinstance(st.get("since"), dict):
         st["since"] = {}
     _note_idle(st, now, now)             # (only tidies whatever the file held)
-    if last is None or abs(now - last) > CHAIN_GAP_MIN * 60:
+    if not follows:
         st["since"] = {}
+        st["repairs"] = {}               # what dies after a night asleep is a new incident
         st["up_since"] = now if last is not None else None
         if last is not None and last < now:
             _note_idle(st, last, now)    # no watchdog = no PC = no trader either
-    st["last_run"] = now
-    _state = st
+    if scheduled:
+        st["last_run"] = now
+    _state, _state_kept = st, True
     _state_ok = _write_state()
 
 
@@ -252,7 +266,7 @@ def _end_run() -> None:
     global _state_ok
     if _state_ok:
         _state_ok = _write_state()
-    if not _state_ok:
+    if _state_kept and not _state_ok:
         record(WARN, "watchdog", f"cannot keep logs/{STATE_NAME} between runs - no wake-up "
                                  f"grace and no 'still so at the next run' until it can "
                                  f"be written")
@@ -562,8 +576,18 @@ def _running_task(t: str, repair: bool) -> None:
                               f"when nothing is written between two of its runs")
         return
     if not _state_ok:
-        record(WARN, "tasks", f"{stalled} - NOT restarted: without logs/{STATE_NAME} one "
-                              f"slow cycle cannot be told from a stall")
+        record(WARN, "tasks", f"{stalled} - NOT restarted on a single look: one slow cycle "
+                              f"cannot be told from a stall. The scheduled watchdog "
+                              f"restarts it when nothing is written between two of its "
+                              f"runs; by hand: Stop-ScheduledTask {t}; Start-ScheduledTask {t}")
+        return
+    lock = TASK_LOCK.get(t)
+    if lock and _lock_held(lock) is not True:
+        record(WARN, "tasks", f"{stalled} and is NOT restarted automatically: its process "
+                              f"does not hold the single-instance lock (it started before "
+                              f"the lock existed), so a restart could leave two copies on "
+                              f"one ledger. Once, by hand: Stop-ScheduledTask {t}; check "
+                              f"Task Manager for a leftover python.exe; Start-ScheduledTask {t}")
         return
     if lasted < CONFIRM_MIN:
         record(WARN, "tasks", f"{stalled} - it is restarted if nothing has been written by "
@@ -574,14 +598,6 @@ def _running_task(t: str, repair: bool) -> None:
         record(WARN, "tasks", f"{t} was restarted {since:.0f} min ago and is still stalled "
                               f"({what}) - at most one restart an hour, the next in "
                               f"{RESTART_EVERY_MIN - since:.0f} min")
-        return
-    lock = TASK_LOCK.get(t)
-    if lock and _lock_held(lock) is not True:
-        record(WARN, "tasks", f"{stalled} and is NOT restarted automatically: its process "
-                              f"does not hold the single-instance lock (it started before "
-                              f"the lock existed), so a restart could leave two copies on "
-                              f"one ledger. Once, by hand: Stop-ScheduledTask {t}; check "
-                              f"Task Manager for a leftover python.exe; Start-ScheduledTask {t}")
         return
     _ps(f"Stop-ScheduledTask -TaskName {t}")
     for _ in range(5):                   # let Windows end the process and free its lock
@@ -1428,7 +1444,7 @@ def main() -> int:
     repair = "--repair" in sys.argv
     quiet = "--quiet" in sys.argv
 
-    _begin_run()
+    _begin_run(scheduled="--log" in sys.argv)
     _safely(check_deps)
     _safely(check_env_auth)
     _safely(check_tasks, repair)

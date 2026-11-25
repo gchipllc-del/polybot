@@ -135,6 +135,7 @@ def world(tmp_path, monkeypatch, results):
         monkeypatch.setattr(hc, attr, tmp_path / "data" / name)
     monkeypatch.setattr(hc, "_state", {}, raising=False)
     monkeypatch.setattr(hc, "_state_ok", False, raising=False)
+    monkeypatch.setattr(hc, "_state_kept", False, raising=False)
     w = World(tmp_path)
     monkeypatch.setattr(hc, "_now", lambda: w.now, raising=False)
     monkeypatch.setattr(hc.time, "time", lambda: w.now)    # anything not yet on hc._now
@@ -397,6 +398,36 @@ def test_without_a_usable_state_file_there_is_no_grace(results, world):
     hc._end_run()
     ((status, msg),) = _said(results, "watchdog")
     assert status == hc.WARN and hc.STATE_NAME in msg
+
+
+def test_runs_by_hand_never_look_like_a_wake_up(results, world):
+    """The grace hangs on a gap in the SCHEDULED runs. If every run counted, someone
+    who runs the healthcheck by hand once a day would look like a PC that has just woken
+    up, every time, and a dead trader's silence would never be judged."""
+    world.write("paper_crypto15.jsonl", "{}\n", age_min=3 * 1440)
+    for _ in range(3):                            # by hand, a day apart, no scheduled task
+        results.clear()
+        hc._begin_run(scheduled=False)
+        hc.check_data_flow()
+        assert _paper_line(results)[0] == hc.FAIL
+        hc._end_run()
+        assert _said(results, "watchdog") == []   # nothing kept, and nothing to complain of
+        world.tick(1440)
+    assert not (world.root / "logs" / hc.STATE_NAME).exists()
+
+    # a run by hand BETWEEN two scheduled runs judges like them and does not move the chain
+    world.age("paper_crypto15.jsonl", 1)
+    hc._begin_run()
+    world.next_run(8 * 60)                        # asleep; the scheduled run at the wake-up
+    hc._end_run()
+    world.tick(5)
+    results.clear()
+    hc._begin_run(scheduled=False)                # five minutes later, by hand
+    hc.check_data_flow()
+    status, msg = _paper_line(results)
+    assert status == hc.OK and "off or asleep until 5 min ago" in msg
+    hc._end_run()
+    assert hc._read_json(world.root / "logs" / hc.STATE_NAME)["last_run"] == world.now - 300
 
 
 TODAYS_CRYPTO_HEARTBEAT = {          # the shared contract's keys, a healthy cycle
@@ -1067,8 +1098,7 @@ def test_a_bot_without_the_single_instance_lock_is_not_restarted_automatically(
     host.run()
     del host.fresh["sleeve_paper_heartbeat.json"]
     host.world.age("sleeve_paper_heartbeat.json", 120)
-    host.run()
-    for _ in range(5):
+    for _ in range(6):                                     # said at once, and never done
         _, bad = host.run()
         ((status, msg),) = _tasks(bad)
         assert status == hc.WARN and "NOT restarted automatically" in msg
@@ -1156,6 +1186,22 @@ def test_a_task_that_starts_and_dies_again_fails_on_the_second_repair(host, sche
     scheduler.states["PolybotSleeves"] = "Ready"           # a new, separate death
     _, bad = host.run()
     assert _tasks(bad)[0][0] == hc.WARN and "REPAIRED, restarted" in _tasks(bad)[0][1]
+
+
+def test_a_death_after_a_night_asleep_is_a_new_incident(host, scheduler):
+    """'In a row' is about runs that follow each other. A task repaired in the evening
+    and found dead again when the PC wakes eight hours later is started as a first
+    attempt - and fails only if THAT start does not hold either."""
+    scheduler.states["PolybotStage0"] = "Ready"
+    _, bad = host.run()
+    assert "REPAIRED, restarted" in _tasks(bad)[0][1]
+    host.run()
+    scheduler.states["PolybotStage0"] = "Ready"
+    _, bad = host.run(8 * 60)                              # the wake-up run
+    assert _tasks(bad) == [(hc.WARN, "PolybotStage0 was 'Ready' (dead) - REPAIRED, restarted")]
+    scheduler.states["PolybotStage0"] = "Ready"            # ...and it does not hold
+    _, bad = host.run()
+    assert _tasks(bad)[0][0] == hc.FAIL and "attempt 2 in a row" in _tasks(bad)[0][1]
 
 
 def test_a_task_that_is_down_while_its_bot_is_alive_is_not_started(
