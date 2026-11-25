@@ -870,6 +870,24 @@ def _sleeve_ledger_warnings() -> list[str]:
                    f"the last {QUIET_WINDOW_DAYS:.0f} days was {gap:.1f} h (alarm past "
                    f"{limit:.1f} h). The trader is cycling, so look at what it is offered: "
                    f"the series' listings, the price band, the fill gate, the position cap")
+    # The fill gate admits a candidate whose order-book lookup FAILED, and counts it
+    # "ungated" - in that one cycle's heartbeat. Sleeve verdicts use every trade, so each
+    # of these is a quote nobody may have been able to fill, inside a rule's record.
+    now = _now()
+    last_day = [r for r in rows if r.get("t") == "open"
+                and now - 86400 <= (_epoch(r.get("ts")) or 0.0) <= now]
+    unchecked: dict[str, int] = {}
+    for r in last_day:
+        if r.get("depth") is None:
+            unchecked[str(r.get("rule"))] = unchecked.get(str(r.get("rule")), 0) + 1
+    if unchecked:
+        per_rule = ", ".join(f"{k} {v}" for k, v in sorted(unchecked.items(),
+                                                        key=lambda kv: (-kv[1], kv[0])))
+        ever = [r for r in rows if r.get("t") == "open"]
+        out.append(f"{sum(unchecked.values())} of the {len(last_day)} positions opened in "
+                   f"the last 24 h were booked without a fill check (depth null: {per_rule})"
+                   f" - their order-book lookup failed or was not made, see [auth]; in the "
+                   f"whole ledger: {sum(r.get('depth') is None for r in ever)} of {len(ever)}")
     return out
 
 

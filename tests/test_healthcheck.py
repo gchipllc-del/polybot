@@ -749,6 +749,36 @@ def test_a_night_asleep_is_remembered_as_idle_not_as_quiet(results, world):
     assert "was 0.2 h (alarm past 2.0 h)" in said[0][1]              # not 8 h -> 16 h
 
 
+# ── [sleeves]: positions booked without a fill check ──────────────────────────
+
+def test_positions_booked_without_a_fill_check_in_the_last_day_are_counted(results, world):
+    """sleeve-trader#2 (watchdog half): a failed order-book lookup books the candidate
+    with depth null - 'admitted but COUNTED as ungated, never hidden'. But the count
+    lived in one cycle's heartbeat: with the gate off for a whole day (114 ungated
+    entries) the watchdog mentioned it in 2 of 96 runs, both on OK lines that --quiet
+    --log never writes. The ledger remembers every one of them."""
+    now = world.now
+    _registry(world, "HOURLY_FAV", "F9799")
+    rows = (_opens("HOURLY_FAV", [now - h * HOUR for h in (30, 23, 20, 9, 2)])
+            + _opens("HOURLY_FAV", [now - 25 * HOUR], depth=None)      # yesterday's: not counted
+            + _opens("HOURLY_FAV", [now - 22 * HOUR, now - 3 * HOUR], depth=None)
+            + _opens("F9799", [now - 5 * HOUR], depth=None))
+    _ledger(world.path("paper_sleeves.jsonl"), rows)
+    said = _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)       # this cycle: ungated=0
+    assert [st for st, _ in said] == [hc.WARN, hc.OK]
+    assert said[0][1].startswith("3 of the 7 positions opened in the last 24 h were "
+                                 "booked without a fill check (depth null: "
+                                 "HOURLY_FAV 2, F9799 1)"), said[0][1]
+
+    _ledger(world.path("paper_sleeves.jsonl"),
+            [r for r in rows if r["depth"] is not None or _epoch_of(r) < now - DAY])
+    assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
+
+
+def _epoch_of(row):
+    return datetime.fromisoformat(row["ts"]).timestamp()
+
+
 # ── main(), run after run: what PolybotHealth actually logs ────────────────────
 
 FRESH = {"stage0_crypto.jsonl": 0.5, "stage0_history.jsonl": 30.0,
