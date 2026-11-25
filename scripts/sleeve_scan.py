@@ -27,6 +27,7 @@ FOUR GUARDS (each one paid for by an earlier mistake in this project):
 
   py scripts/sleeve_scan.py probe                        # what the API returns (paste me)
   py scripts/sleeve_scan.py discover [--pages 40]        # rank every series with settled events
+                     # [--accept-partial] keeps a walk that ended on an error (else exit 1)
   py scripts/sleeve_scan.py find temperature            # search the catalog: ticker, title, category
   py scripts/sleeve_scan.py backfill [--top 20] [--events 60] [--series A,B]
   py scripts/sleeve_scan.py backfill --series A,B --events 300 --final-hours 2
@@ -343,10 +344,41 @@ def cmd_probe(get=hb._get) -> int:
     return 0
 
 
-def cmd_discover(pages: int = 40, get=hb._get) -> int:
-    """Rank series by settled events seen in the most recent `pages` x 200 events."""
+def _replace_catalog(cat: list[dict], path: Path | None = None, replace=None) -> bool:
+    """Write the catalog through a temporary file beside it and os.replace, so a stopped
+    write can never leave half a catalog. False (old file untouched, temp file removed)
+    when the swap fails - on Windows os.replace refuses while another program has the
+    file open. `replace` is a test seam."""
+    path = CATALOG if path is None else path
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(cat, indent=1), encoding="utf-8")
+        (replace or os.replace)(tmp, path)
+        return True
+    except OSError as e:
+        print(f"could not write {path} ({type(e).__name__}: {e}) - the previous catalog "
+              f"is unchanged. Close any program that has it open and run discover again.")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def cmd_discover(pages: int = 40, get=hb._get, accept_partial: bool = False) -> int:
+    """Rank series by settled events seen in the most recent `pages` x 200 events.
+
+    The catalog chooses the series for `backfill --top N` and for sleeve_paper's
+    registrations, and a registered rule can never be edited. So a walk that ends on an
+    error (after the fetcher's own retries) leaves the existing catalog.json alone, says
+    how many pages were read, and returns 1 - it used to write the series seen before
+    the error over the catalog (an empty list when page 1 failed) and return 0.
+    accept_partial (--accept-partial) is the deliberate way to keep a short walk, e.g.
+    if Kalshi refuses deep pages every time. A walk that finds no series at all never
+    replaces a catalog."""
     seen: dict[str, dict] = {}
     cursor = None
+    read, failed = 0, None
     for i in range(pages):
         params = {"status": "settled", "limit": 200}
         if cursor:
@@ -354,8 +386,10 @@ def cmd_discover(pages: int = 40, get=hb._get) -> int:
         try:
             d = get(f"{hb.KALSHI}/events", params)
         except Exception as e:  # noqa: BLE001
-            print(f"[warn] page {i}: {type(e).__name__}: {str(e)[:80]}")
+            failed = hb.describe_error(e)
+            print(f"[warn] page {i + 1} of {pages}: {failed}")
             break
+        read += 1
         for e in d.get("events", []):
             s = e.get("series_ticker")
             if not s:
@@ -368,9 +402,20 @@ def cmd_discover(pages: int = 40, get=hb._get) -> int:
             break
         time.sleep(hb.SLEEP_S)
     cat = sorted(seen.values(), key=lambda r: -r["events"])
+    n_events = sum(r["events"] for r in cat)
+    if failed and not accept_partial:
+        print(f"discover STOPPED after {read} of {pages} page(s) ({n_events} events, "
+              f"{len(cat)} series) - {CATALOG} left as it was. Run discover again, or "
+              f"pass --accept-partial to keep the {read} page(s) read.")
+        return 1
+    if not cat:
+        print(f"no series with settled events in {read} page(s) - {CATALOG} left as it was")
+        return 1
     SLEEVE_DIR.mkdir(parents=True, exist_ok=True)
-    CATALOG.write_text(json.dumps(cat, indent=1), encoding="utf-8")
-    print(f"{len(cat)} series with settled events -> {CATALOG}")
+    if not _replace_catalog(cat):
+        return 1
+    part = f" - PARTIAL: {read} of {pages} page(s) read (--accept-partial)" if failed else ""
+    print(f"{len(cat)} series with settled events -> {CATALOG}{part}")
     print(f"  {'series':22} {'category':16} {'events':>6}  title")
     for r in cat[:40]:
         print(f"  {r['series']:22} {str(r['category'])[:16]:16} {r['events']:>6}  {r['title'][:44]}")
@@ -439,6 +484,10 @@ def cmd_backfill(series_list: list[str], events_per_series: int, get=hb._get,
     network is down); a series whose listing fails is skipped, not fatal. The run closes
     with one line per series - markets not fetched, and markets the per-event cap left
     out - and returns 1 unless every market it set out to fetch is on file."""
+    if not series_list:
+        print("no series to backfill - the catalog is empty: run `discover` again, or "
+              "pass --series A,B")
+        return 1
     out_dir = SLEEVE_DIR / "final" if final_hours else SLEEVE_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     cats = {}
@@ -696,7 +745,8 @@ def main() -> int:
     if cmd == "probe":
         return cmd_probe()
     if cmd == "discover":
-        return cmd_discover(int(_arg(args, "--pages", 40)))
+        return cmd_discover(int(_arg(args, "--pages", 40)),
+                            accept_partial="--accept-partial" in args)
     if cmd == "find" and len(args) > 1:
         return cmd_find(" ".join(args[1:]))
     if cmd == "backfill":

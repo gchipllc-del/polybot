@@ -315,3 +315,88 @@ def test_backfill_reports_markets_left_out_by_the_per_event_cap(bf, capsys):
     assert len(log) == 1 + 15 + 15 + 4
     out = capsys.readouterr().out
     assert "8 left out by the 15-per-event cap in 2 event(s)" in out and "COMPLETE:" in out
+
+
+# ── discover: never replace the catalog with a walk that ended on an error ────
+
+def _events_api(n_pages: int, fail_page: int | None = None, per_page: int = 4):
+    """/events?status=settled: n_pages pages; page k (1-based) holds events of series
+    S{k}..; `fail_page` raises a 429 instead."""
+    calls: list[dict] = []
+
+    def get(url, params=None):
+        assert url.endswith("/events"), url
+        calls.append(dict(params))
+        k = int(params.get("cursor") or 1)
+        if k == fail_page:
+            raise _refused(429)
+        evs = [{"series_ticker": f"S{k}-{j}", "category": "C", "title": f"t{k}{j}"}
+               for j in range(per_page)]
+        return {"events": evs, "cursor": str(k + 1) if k < n_pages else ""}
+
+    return get, calls
+
+
+def test_discover_writes_a_whole_walk_through_a_temp_file(bf, tmp_path, capsys):
+    get, _ = _events_api(3)
+    assert ss.cmd_discover(40, get=get) == 0
+    cat = json.loads((tmp_path / "catalog.json").read_text(encoding="utf-8"))
+    assert len(cat) == 12 and [p.name for p in tmp_path.iterdir()] == ["catalog.json"]
+
+
+@pytest.mark.parametrize("fail_page", [1, 3])
+def test_discover_keeps_the_catalog_when_the_walk_ends_on_an_error(bf, tmp_path, capsys,
+                                                                   fail_page):
+    """It used to write the series seen before the error over catalog.json - '[]' when
+    page 1 failed - and return 0; backfill --top N and the rule registrations read it."""
+    get, _ = _events_api(5)
+    assert ss.cmd_discover(40, get=get) == 0
+    before = (tmp_path / "catalog.json").read_bytes()
+    capsys.readouterr()
+    get, calls = _events_api(5, fail_page=fail_page)
+    assert ss.cmd_discover(40, get=get) == 1
+    assert (tmp_path / "catalog.json").read_bytes() == before
+    out = capsys.readouterr().out
+    assert f"[warn] page {fail_page} of 40: HTTP 429 Too Many Requests" in out
+    assert f"discover STOPPED after {fail_page - 1} of 40 page(s)" in out
+    assert "--accept-partial" in out and len(calls) == fail_page
+
+
+def test_discover_with_no_catalog_yet_writes_nothing_on_an_error(bf, tmp_path):
+    get, _ = _events_api(5, fail_page=1)
+    assert ss.cmd_discover(40, get=get) == 1
+    assert not (tmp_path / "catalog.json").exists()
+
+
+def test_discover_accept_partial_keeps_a_short_walk_on_purpose(bf, tmp_path, capsys):
+    """If Kalshi refused deep pages every time, discover could never write a catalog:
+    --accept-partial is the deliberate way through, and says how much was read."""
+    get, _ = _events_api(5, fail_page=3)
+    assert ss.cmd_discover(40, get=get, accept_partial=True) == 0
+    assert len(json.loads((tmp_path / "catalog.json").read_text(encoding="utf-8"))) == 8
+    assert "PARTIAL: 2 of 40 page(s) read" in capsys.readouterr().out
+
+
+def test_discover_leaves_the_catalog_when_windows_refuses_the_swap(bf, tmp_path, capsys,
+                                                                   monkeypatch):
+    """os.replace fails on Windows while another program has catalog.json open."""
+    get, _ = _events_api(2)
+    assert ss.cmd_discover(40, get=get) == 0
+    before = (tmp_path / "catalog.json").read_bytes()
+
+    def refuse(src, dst):
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(ss.os, "replace", refuse)
+    get, _ = _events_api(4)
+    assert ss._replace_catalog([{"series": "X"}], replace=refuse) is False
+    assert ss.cmd_discover(40, get=get) == 1
+    assert (tmp_path / "catalog.json").read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["catalog.json"]      # no temp left
+    assert "previous catalog is unchanged" in capsys.readouterr().out
+
+
+def test_backfill_with_no_series_says_so_and_fails(bf, capsys):
+    """An empty catalog used to make backfill do nothing, print nothing and return 0."""
+    assert ss.cmd_backfill([], 60, get=lambda *a: pytest.fail("no request expected")) == 1
+    assert "no series to backfill" in capsys.readouterr().out
