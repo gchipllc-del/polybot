@@ -141,10 +141,10 @@ SLEEVE_LATE_MIN = 10.0
 # EVERY market-list call failed). This many of those in a row is failing, not a blip.
 ALL_FAILED_CYCLES = 3
 # The crypto trader writes a heartbeat too (after every completed 60 s cycle) once it
-# runs the code that has one; five missed cycles is late.
+# runs the code that has one. Late past 10 min - the bar the watchdog uses for it.
 CRYPTO_HEARTBEAT = Path(os.environ.get("PAPER_CRYPTO_HEARTBEAT")
                         or (DATA / "paper_crypto_heartbeat.json"))
-CRYPTO_LATE_MIN = 5.0
+CRYPTO_LATE_MIN = 10.0
 # Without a heartbeat (a trader started before it existed keeps running old code after a
 # pull until it is restarted) its newest ledger row stands in - and a row is written only
 # when a bet opens or settles. At its concurrency cap a healthy trader goes ~11-15 min
@@ -249,16 +249,22 @@ def _sleeve_trader(now: float) -> dict:
 def _crypto_trader(crypto_rows: list[dict] | None, now: float) -> dict:
     hb, _ = _heartbeat(CRYPTO_HEARTBEAT)
     t = _ts(hb.get("ts")) if hb else None
+    newest = next((x for x in (_ts(r.get("ts")) for r in reversed(crypto_rows or []))
+                   if x is not None), None)          # append-only: the last row is newest
+    by_ledger = _freshness("crypto", "Crypto paper trader", "newest ledger row", newest,
+                           CRYPTO_QUIET_MIN, now,
+                           "quiet - a row is written only when a bet opens or settles",
+                           "ledger could not be read" if crypto_rows is None
+                           else "no ledger rows yet")
     if t is None:           # no heartbeat to read: unknown - the ledger stands in, as before
-        newest = next((x for x in (_ts(r.get("ts")) for r in reversed(crypto_rows or []))
-                       if x is not None), None)      # append-only: the last row is newest
-        return _freshness("crypto", "Crypto paper trader", "newest ledger row", newest,
-                          CRYPTO_QUIET_MIN, now,
-                          "quiet - a row is written only when a bet opens or settles",
-                          "ledger could not be read" if crypto_rows is None
-                          else "no ledger rows yet")
+        return by_ledger
     chip = _freshness("crypto", "Crypto paper trader", "last cycle", t, CRYPTO_LATE_MIN, now,
                       "late - it cycles every minute", "")
+    if chip["note"] and newest is not None and newest - t > 60.0:
+        # rows written after its last heartbeat: it is trading, the heartbeat is not being
+        # written (an older trader back in charge, or the file cannot be replaced)
+        return _with_notes(by_ledger, [], [f"its heartbeat is {chip['age_min']:.0f} min old "
+                                           f"and is not being written"])
     watch = []
     failed = _count(hb, "errors")
     if failed:

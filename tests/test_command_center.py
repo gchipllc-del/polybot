@@ -762,8 +762,17 @@ def test_the_crypto_trader_is_read_from_its_heartbeat_when_it_has_one(tmp_path, 
     assert 0.5 < t["age_min"] < 2 and t["limit_min"] == cc.CRYPTO_LATE_MIN
     t = crypto(ts=_stamp(1))                                # only a time: still enough
     assert (t["what"], t["status"], t["note"]) == ("last cycle", "good", None)
-    t = crypto(ts=_stamp(9))
+    t = crypto(ts=_stamp(9))                                # the watchdog's bar is 10
+    assert (t["status"], t["note"]) == ("good", None)
+    t = crypto(ts=_stamp(14))
     assert (t["status"], t["note"]) == ("warning", "late - it cycles every minute")
+    # ...unless rows were written AFTER that heartbeat: it is trading, and it is the
+    # heartbeat that is not being written. The ledger answers, and the chip says why.
+    recent = dict(row, ts=_stamp(2), ticker="KXBTC15M-26NOV250130-00")
+    cc.CRYPTO_HEARTBEAT.write_text(json.dumps({"ts": _stamp(14)}), encoding="utf-8")
+    t = _chips([row, recent])["crypto"]
+    assert (t["what"], t["status"]) == ("newest ledger row", "warning") and 1 < t["age_min"] < 3
+    assert t["note"] == "its heartbeat is 14 min old and is not being written"
     t = crypto(ts=_stamp(1), errors=6, last_error="markets KXBTC15M: ConnectionError: refused")
     assert t["status"] == "warning" and t["note"] == (
         "6 requests failed in its last cycle (last: markets KXBTC15M: ConnectionError: refused)")
