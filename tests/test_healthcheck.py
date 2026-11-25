@@ -203,3 +203,61 @@ def test_a_clean_ledger_reads_as_before(results, tmp_path, monkeypatch):
     _crypto_ledger(tmp_path, monkeypatch, _bet("KXBTC15M-A", 30) + _bet("KXBTC15M-B", 0))
     hc.check_ledger_integrity()
     assert results == [(hc.OK, "ledger", "2 opens / 2 closes, no duplicates")]
+
+
+# ── [news]: the hand-kept calendar runs out ───────────────────────────────────
+
+_CALENDAR = """events:
+  - {date: "2026-12-04", time_et: "08:30", event: "Jobs report (NFP)", impact: high}
+  - {date: "2026-12-09", time_et: "14:00", event: "FOMC rate decision + projections", impact: high}
+  - {date: "2026-12-10", time_et: "08:30", event: "CPI release", impact: high}
+  - {date: "2026-12-15", time_et: "08:30", event: "PPI release", impact: medium}
+  - {date: "2027-01-27", time_et: "14:00", event: "FOMC rate decision", impact: high}
+  - {date: "2027-12-08", time_et: "14:00", event: "FOMC rate decision + projections", impact: high}
+"""
+
+
+def _calendar_at(tmp_path, monkeypatch, results, utc):
+    """What [news] says about the calendar with the clock at `utc`: (statuses, warnings)."""
+    from lib import news_regime as nr
+    p = tmp_path / "news_calendar.yaml"
+    p.write_text(_CALENDAR, encoding="utf-8")
+    monkeypatch.setattr(nr, "CALENDAR_PATH", p)
+    monkeypatch.setattr(nr, "_utcnow", lambda: utc)
+    results.clear()
+    hc.check_news_calendar()
+    return [st for st, _, _ in results], _by_status(results, hc.WARN)
+
+
+def test_the_calendar_check_warns_when_a_release_family_has_run_out(
+        results, tmp_path, monkeypatch):
+    """news-health#5: the shipped calendar lists no jobs report or CPI after 10 December
+    2026. The check said 'calendar readable (12 listed)' and would have said so in 2028:
+    it never compared a date with today, and release days were stamped as ordinary."""
+    def at(y, m, d, h=17):
+        return _calendar_at(tmp_path, monkeypatch, results,
+                            datetime(y, m, d, h, tzinfo=timezone.utc))
+
+    assert at(2026, 11, 25) == ([hc.OK], [])            # every family has a date ahead
+    assert at(2026, 12, 4) == ([hc.OK], [])             # the last jobs report is TODAY
+    statuses, (warn,) = at(2026, 12, 5)
+    assert statuses == [hc.OK, hc.WARN]                 # still readable - and run out
+    which, advice = warn.split(" - ", 1)
+    assert which == "calendar ran out for Jobs (last listed 2026-12-04)", warn
+    assert "news_calendar.yaml" in advice
+    _, (warn,) = at(2027, 1, 15)
+    assert warn.split(" - ", 1)[0] == (
+        "calendar ran out for Jobs (last listed 2026-12-04), CPI (last listed 2026-12-10), "
+        "PPI (last listed 2026-12-15)")                 # FOMC is listed through 2027-12-08
+    _, (warn,) = at(2027, 12, 9)
+    assert "FOMC (last listed 2027-12-08)" in warn.split(" - ", 1)[0]
+
+
+def test_the_calendar_runs_out_on_the_eastern_day_not_the_utc_one(
+        results, tmp_path, monkeypatch):
+    """Calendar dates are US/Eastern days. 03:00 UTC on the 5th is still the evening of
+    the 4th in New York - the jobs-report day itself - so nothing has run out yet."""
+    late_evening_et = datetime(2026, 12, 5, 3, 0, tzinfo=timezone.utc)
+    assert _calendar_at(tmp_path, monkeypatch, results, late_evening_et) == ([hc.OK], [])
+    after_midnight_et = datetime(2026, 12, 5, 6, 0, tzinfo=timezone.utc)
+    assert len(_calendar_at(tmp_path, monkeypatch, results, after_midnight_et)[1]) == 1

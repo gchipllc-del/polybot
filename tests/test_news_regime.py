@@ -601,6 +601,8 @@ def test_healthcheck_warns_on_an_unreadable_calendar(tmp_path, monkeypatch):
     import healthcheck as hc
     seen = []
     monkeypatch.setattr(hc, "record", lambda level, name, msg: seen.append((level, msg)))
+    monkeypatch.setattr(nr, "_utcnow", lambda: NOW)    # the check also warns once a
+    # release family's last listed date has passed: keep 2027-01-13 in the future
     monkeypatch.setattr(nr, "CALENDAR_PATH", _cal_file(
         tmp_path, "events:\n  - {date: '2027-01-13', event: CPI, impact: high\n"))
     hc.check_news_calendar()

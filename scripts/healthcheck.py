@@ -388,10 +388,15 @@ def check_news_calendar() -> None:
     """config/news_calendar.yaml is the one news input kept by hand, and an entry the
     agent cannot read makes its day look unlisted (FOMC day at full size). So a YAML
     error or an unreadable entry is a WARN here - read from the file now, not from
-    the last hourly regime row."""
+    the last hourly regime row.
+
+    It also RUNS OUT. A release family (the first word of the event name: Jobs, CPI, PPI,
+    FOMC) with no date left from today on means every later release day of that kind is
+    stamped like an ordinary one - and 'readable' said nothing about it, in any year."""
     try:
         from lib import news_regime as nr
         events, problems = nr.read_calendar(nr.CALENDAR_PATH)
+        today = nr.et_date(nr._utcnow())           # calendar dates are US/Eastern days
     except Exception as e:  # noqa: BLE001
         record(WARN, "news", f"calendar check raised {type(e).__name__}")
         return
@@ -401,6 +406,17 @@ def check_news_calendar() -> None:
                              f"{nr.CALENDAR_PATH.name}")
     else:
         record(OK, "news", f"calendar readable ({len(events)} listed)")
+    last: dict[str, str] = {}
+    for e in events:
+        family = e["event"].split()[0]
+        last[family] = max(last.get(family, ""), e["date"])
+    ran_out = [f"{family} (last listed {d})"
+               for family, d in sorted(last.items(), key=lambda kv: (kv[1], kv[0])) if d < today]
+    if ran_out:
+        record(WARN, "news", f"calendar ran out for {', '.join(ran_out)} - add the next dates "
+                             f"to {nr.CALENDAR_PATH.name} (BLS release schedule for jobs / "
+                             f"CPI / PPI, the Fed's calendar for FOMC); until then those "
+                             f"days are stamped like ordinary ones")
 
 
 def check_sleeve_paper() -> None:
