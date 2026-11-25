@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 IS_WIN = sys.platform.startswith("win")
 TASKS = ["PolybotDashboards", "PolybotStage0", "PolybotPaper", "PolybotSleeves"]
+QUERY_DONE = "polybot-task-query-done"   # echoed after the task list: PowerShell answered
 PORTS = [("crypto dashboard", 5153), ("weather dashboard", 5154), ("command center", 5155)]
 STAGE0_LOG = ROOT / "data" / "stage0_crypto.jsonl"
 PAPER_LOG = ROOT / "data" / "paper_crypto15.jsonl"
@@ -129,20 +130,42 @@ def check_env_auth() -> None:
         record(FAIL, "auth", f"auth check raised {type(e).__name__}: {str(e)[:80]}")
 
 
+def _task_states(names: list[str]) -> tuple[dict[str, str], bool]:
+    """({task: state}, answered). PowerShell prints one name=state line per registered
+    task and then QUERY_DONE. `answered` is whether that last line arrived: _ps returns ''
+    on any failure (its timeout included), and an empty answer is also exactly what four
+    unregistered tasks look like - only the marker tells the two apart."""
+    out = _ps("Get-ScheduledTask " + ",".join(names) +
+              " -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName + '=' + $_.State }"
+              f"; '{QUERY_DONE}'")
+    states, answered = {}, False
+    for line in out.splitlines():
+        line = line.strip()
+        if line == QUERY_DONE:
+            answered = True
+        elif "=" in line:
+            k, v = line.split("=", 1)
+            states[k.strip()] = v.strip()
+    return states, answered
+
+
 def check_tasks(repair: bool) -> None:
     if not IS_WIN:
         record(WARN, "tasks", "not Windows - skipping scheduled-task check")
         return
-    out = _ps("Get-ScheduledTask " + ",".join(TASKS) +
-              " -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName + '=' + $_.State }")
-    states = {}
-    for line in out.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            states[k.strip()] = v.strip()
+    states, answered = _task_states(TASKS)
+    if not answered and not states:
+        # No answer is not "four tasks missing": that sent the owner to re-run the
+        # installer while everything was running. Nothing is known, so nothing is repaired.
+        record(WARN, "tasks", "could not query Task Scheduler (PowerShell gave no answer) - "
+                              "task states unknown this run, nothing checked or repaired")
+        return
+    unknown = []
     for t in TASKS:
         st = states.get(t)
-        if st is None:
+        if st is None and not answered:
+            unknown.append(t)
+        elif st is None:
             record(FAIL, "tasks", f"{t} NOT REGISTERED - run install_autostart.ps1")
         elif st.lower() == "running":
             record(OK, "tasks", f"{t} running")
@@ -153,6 +176,9 @@ def check_tasks(repair: bool) -> None:
             else:
                 record(FAIL, "tasks", f"{t} is '{st}', not Running "
                                       f"(self-heal fires within 10 min, or --repair now)")
+    if unknown:
+        record(WARN, "tasks", f"Task Scheduler's answer was cut short - state unknown for "
+                              f"{', '.join(unknown)}")
 
 
 def check_ports() -> None:
