@@ -55,7 +55,19 @@ PAPER_HB = "paper_crypto_heartbeat.json"   # written by paper_trader after each 
 PAPER_HB_STALE_MIN = 10.0                  # its cycle is 60s, like the collector's
 SLEEVE_HB = "sleeve_paper_heartbeat.json"  # written by sleeve_paper every cycle (2 min)
 SLEEVE_HB_STALE_MIN = 10.0
+SLEEVE_CYCLE_MIN = 2.0
 STREAK_FAIL = 3          # consecutive bad cycles, counted by the trader, before a FAIL
+# The quiet-rule check (see _quiet_rules): a rule with enough recent entries to have a
+# rhythm has opened nothing for longer than that rhythm allows.
+QUIET_WINDOW_DAYS = 7.0
+QUIET_MIN_ENTRIES = 20       # entries in the window before a rule has a rhythm to judge
+QUIET_MIN_SPAN_H = 48.0      # ...and they must span two days: one night teaches nothing
+QUIET_DAYS_SEEN = 3          # ...on three different days (a weekly burst has no rhythm)
+QUIET_FLOOR_H = 2.0
+QUIET_MULT = 2.0             # alarm past twice the longest gap seen in the window
+QUIET_HOURLY_PER_DAY = 24.0  # a rule making fewer entries a day than this is not hourly:
+QUIET_DAILY_FLOOR_H = 26.0   # its events open once a day, so a day (+2 h) can pass in peace
+IDLE_KEEP_DAYS = 10.0
 LOG_BLOAT_MB = 200.0
 
 OK, WARN, FAIL = "OK  ", "WARN", "FAIL"
@@ -93,12 +105,37 @@ def _read_json(p: Path) -> dict | None:
     return d if isinstance(d, dict) else None
 
 
+def _jsonl_rows(p: Path) -> list[dict]:
+    """Every JSON-object row of a JSONL file; torn or foreign lines are skipped."""
+    rows = []
+    try:
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict):
+                    rows.append(d)
+    except OSError:
+        pass
+    return rows
+
+
 def _n(d: dict, key: str) -> float | None:
     """A heartbeat number, or None when the key is absent or is not a number. A trader
     that has not been restarted since a pull still writes the older, shorter heartbeat:
     a missing key is UNKNOWN, never a fault."""
     v = d.get(key)
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _epoch(iso) -> float | None:
+    """An ISO timestamp as epoch seconds, or None."""
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 # ── what the watchdog remembers between runs ──────────────────────────────────
@@ -150,9 +187,31 @@ def _begin_run() -> None:
     if last is None or abs(now - last) > CHAIN_GAP_MIN * 60:
         st["since"] = {}
         st["up_since"] = now if last is not None else None
+        if last is not None and last < now:
+            _note_idle(st, last, now)    # no watchdog = no PC = no trader either
     st["last_run"] = now
     _state = st
     _state_ok = _write_state()
+
+
+def _note_idle(st: dict, t0: float, t1: float) -> None:
+    """Remember that the sleeve trader was NOT cycling from t0 to t1 (epoch seconds), as
+    far as the watchdog could see: the PC was off (a gap in the watchdog's own chain), or
+    the heartbeat was stale, or the cycle kept failing. Kept merged and sorted, and only
+    for IDLE_KEEP_DAYS - the quiet-rule check subtracts these spans, so an outage does
+    not pass for the rule's own rhythm."""
+    spans = [[float(a), float(b)] for a, b in
+             (x for x in st.get("sleeve_idle") or [] if isinstance(x, list) and len(x) == 2)
+             if isinstance(a, (int, float)) and isinstance(b, (int, float))]
+    if t1 > t0:
+        spans.append([float(t0), float(t1)])
+    merged: list[list[float]] = []
+    for a, b in sorted(spans):
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    st["sleeve_idle"] = [x for x in merged if x[1] >= t1 - IDLE_KEEP_DAYS * 86400]
 
 
 def _end_run() -> None:
@@ -685,6 +744,7 @@ def check_sleeve_paper() -> None:
         return
     if age > SLEEVE_HB_STALE_MIN:
         _forget("sleeves.")
+        _sleeve_idle_for(age)
         record(FAIL, "sleeves", f"sleeve paper heartbeat {age:.0f} min old (cycle is 2 min)"
                                 f" - alive but not cycling")
         return
@@ -693,6 +753,7 @@ def check_sleeve_paper() -> None:
         # stale and read "alive but not cycling" with the cause lost on a hidden console).
         _forget("sleeves.")
         n = _n(s, "failed_cycles")
+        _sleeve_idle_for((n or 1) * SLEEVE_CYCLE_MIN)
         why = str(s["cycle_error"])[:140]
         if n is not None and n < STREAK_FAIL:
             record(WARN, "sleeves", f"the last sleeve cycle failed ({n:.0f} in a row): {why}")
@@ -706,6 +767,9 @@ def check_sleeve_paper() -> None:
     all_now = bool(errors and series and errors >= series)
     # a trader that does not count the streak itself: two watchdog runs in a row instead
     all_seen_twice = _confirmed("sleeves.all_failed", streak is None and all_now)
+    if streak or all_now:                         # cycling, but nothing could be listed
+        _sleeve_idle_for(streak * SLEEVE_CYCLE_MIN if streak else
+                         (_lasting("sleeves.all_failed", True) or 0.0) + SLEEVE_CYCLE_MIN)
     if (streak is not None and streak >= STREAK_FAIL) or all_seen_twice:
         how = (f"for {streak:.0f} cycles in a row" if streak is not None
                else "in the last cycle, and already at the previous check")
@@ -717,11 +781,96 @@ def check_sleeve_paper() -> None:
         record(WARN, "sleeves", "no sleeve rules yet - run: py scripts\\sleeve_scan.py "
                                 "discover, then py scripts\\sleeve_paper.py register-probes")
         return
-    for warning in _sleeve_cycle_warnings(s):
+    for warning in _sleeve_cycle_warnings(s) + _sleeve_ledger_warnings():
         record(WARN, "sleeves", warning)
     ug = f", {s['ungated']} ungated" if s.get("ungated") else ""
     record(OK, "sleeves", f"{rules} rules on {s.get('series', '?')} sleeves, "
                           f"{s.get('open_now', 0)} open{ug} (cycle {age:.0f} min ago)")
+
+
+def _sleeve_idle_for(minutes: float) -> None:
+    """The sleeve trader has not been trading for the last `minutes`."""
+    now = _now()
+    _note_idle(_state, now - minutes * 60.0, now)
+
+
+def _trading_s(t0: float, t1: float, idle) -> float:
+    """Seconds between t0 and t1 not covered by an idle span (idle: merged, sorted)."""
+    total = t1 - t0
+    for a, b in idle:
+        lo, hi = max(a, t0), min(b, t1)
+        if hi > lo:
+            total -= hi - lo
+    return max(0.0, total)
+
+
+def _quiet_rules(rows: list[dict], rules, now: float,
+                 idle=()) -> list[tuple[str, float, float, float]]:
+    """[(rule, hours quiet, alarm limit in hours, longest recent gap in hours)] for every
+    rule that has gone quiet for longer than its own recent rhythm allows.
+
+    The one check that does not depend on the cause. A replaced series ticker, a fill
+    gate refusing every candidate, a price band nothing reaches: each leaves the trader
+    cycling with errors=0 and a clean heartbeat, and the only trace is a rule that has
+    stopped opening positions.
+
+    A rule is judged once it has a rhythm: QUIET_MIN_ENTRIES entries in the last
+    QUIET_WINDOW_DAYS, spanning QUIET_MIN_SPAN_H and QUIET_DAYS_SEEN different days.
+
+        alarm when  quiet > max(floor, QUIET_MULT x its longest gap in the window)
+
+    floor is QUIET_FLOOR_H for a rule that enters at least hourly on average, and
+    QUIET_DAILY_FLOOR_H for one that does not: its events open once a day, and on a day
+    when every entry comes at the open the next one is a full day away.
+
+    Gaps and the quiet time are counted in TRADING time: `idle` spans (the PC off, the
+    trader not cycling) are subtracted, so an overnight outage neither raises the alarm
+    nor passes for the rule's own longest gap for the week after.
+
+    This is a WARN and never a FAIL: it is a statistic about a rule's habits. The first
+    prototype (1.5 x the longest gap, a 2 h floor, nothing else) raised a false alarm in
+    about 1 watchdog run in 80 on simulated healthy weeks and went blind for a week
+    after a 10-hour outage; this version raised none in 16,554 simulated runs and still
+    named a dead hourly rule 1.2-1.3 h after the fault began."""
+    by_rule: dict[str, list[float]] = {name: [] for name in rules}
+    for r in rows:
+        if r.get("t") == "open" and r.get("rule") in by_rule:
+            t = _epoch(r.get("ts"))
+            if t is not None and now - QUIET_WINDOW_DAYS * 86400 <= t <= now:
+                by_rule[r["rule"]].append(t)
+    out = []
+    for name, ts in sorted(by_rule.items()):
+        ts.sort()
+        span = _trading_s(ts[0], now, idle) if ts else 0.0
+        if len(ts) < QUIET_MIN_ENTRIES or span < QUIET_MIN_SPAN_H * 3600 or \
+                len({int(t // 86400) for t in ts}) < QUIET_DAYS_SEEN:
+            continue
+        hourly = len(ts) / (span / 86400.0) >= QUIET_HOURLY_PER_DAY
+        floor = QUIET_FLOOR_H if hourly else QUIET_DAILY_FLOOR_H
+        gap = max(_trading_s(a, b, idle) for a, b in zip(ts, ts[1:]))
+        limit = max(floor * 3600, QUIET_MULT * gap)
+        quiet = _trading_s(ts[-1], now, idle)
+        if quiet > limit:
+            out.append((name, quiet / 3600, limit / 3600, gap / 3600))
+    return out
+
+
+def _sleeve_ledger_warnings() -> list[str]:
+    """What only the sleeve LEDGER shows - no heartbeat field can."""
+    try:
+        import sleeve_paper as sp
+        rules = sp.active_rules(_data("sleeve_rules.jsonl"))     # the registry's own reader
+        rows = _jsonl_rows(_data("paper_sleeves.jsonl"))
+    except Exception as e:  # noqa: BLE001
+        return [f"sleeve ledger not checked: {type(e).__name__}: {str(e)[:80]}"]
+    out = []
+    for name, quiet, limit, gap in _quiet_rules(rows, rules, _now(),
+                                                _state.get("sleeve_idle") or ()):
+        out.append(f"{name} has opened no position for {quiet:.1f} h - its longest gap in "
+                   f"the last {QUIET_WINDOW_DAYS:.0f} days was {gap:.1f} h (alarm past "
+                   f"{limit:.1f} h). The trader is cycling, so look at what it is offered: "
+                   f"the series' listings, the price band, the fill gate, the position cap")
+    return out
 
 
 def _sleeve_cycle_warnings(s: dict) -> list[str]:

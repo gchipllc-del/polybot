@@ -609,6 +609,146 @@ def test_a_rule_at_its_open_position_cap_is_a_warning(results, world):
         TODAYS_SLEEVE_HEARTBEAT, skipped={"no_depth": 44}))] == [hc.OK]
 
 
+# ── [sleeves]: the quiet-rule check - the one that needs no cause ─────────────
+
+HOUR, DAY = 3600.0, 86400.0
+
+
+def _iso(t):
+    return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+
+
+def _opens(rule, times, **extra):
+    """Sleeve-ledger open rows for one rule at the given epoch times."""
+    return [dict({"t": "open", "ts": _iso(t), "rule": rule, "ticker": f"{rule}-{i}-T1",
+                  "event": f"{rule}-{i}", "series": "KXTEMPNYCHS", "side": "yes",
+                  "price": 0.98, "contracts": 10, "fee": 0.02, "depth": 50.0,
+                  "close_time": _iso(t + HOUR)}, **extra)
+            for i, t in enumerate(times)]
+
+
+def _every(now, step_h, days=7.0, last_h=0.0):
+    """Entry times every `step_h` hours over `days`, the last one `last_h` hours ago."""
+    n = int(days * 24 / step_h)
+    return [now - last_h * HOUR - k * step_h * HOUR for k in range(n, -1, -1)]
+
+
+def _quiet_names(rows, now, idle=(), rules=("HOURLY_FAV", "F9799")):
+    return [(name, round(quiet, 1), round(limit, 1))
+            for name, quiet, limit, _ in hc._quiet_rules(rows, rules, now, idle)]
+
+
+def test_a_rule_that_has_gone_quiet_for_longer_than_its_own_rhythm_is_named(world):
+    """sleeve-trader#1 cases 2-4: the hourly series list nothing, or the fill gate
+    refuses everything, or a band nothing reaches - errors=0, a clean heartbeat, and a
+    rule that has simply stopped opening positions. The ledger is the only witness."""
+    now = world.now
+    hourly = _opens("HOURLY_FAV", _every(now, 0.25, last_h=3.0))      # 4 an hour, then silence
+    daily = _opens("F9799", _every(now, 3.5, last_h=5.0))             # ~7 a day
+    assert _quiet_names(hourly + daily, now) == [("HOURLY_FAV", 3.0, 2.0)]
+    # and a rule that is not in the registry (retired) is nobody's alarm
+    assert _quiet_names(hourly, now, rules=("F9799",)) == []
+    # a longer gap seen this week is the rule's own rhythm: the limit is twice it
+    bursty = _opens("HOURLY_FAV", [t for t in _every(now, 0.25, last_h=9.0)
+                                   if not now - 80 * HOUR < t < now - 75 * HOUR])
+    assert _quiet_names(bursty, now) == []                            # 9 h < 2 x 5 h
+    assert _quiet_names(bursty, now + 2 * HOUR) == [("HOURLY_FAV", 11.0, 10.0)]
+
+
+def test_a_once_a_day_rule_gets_a_full_day_before_it_counts_as_quiet(world):
+    """The verifier's false alarms: a daily-high rule whose entries mostly come when the
+    next day's markets open. On a day when ALL of them do, the next entry is 24 h away -
+    and '1.5 x the longest gap this week' (often 5-10 h) cried wolf 28 times in 864
+    healthy runs. A rule making fewer than 24 entries a day is not hourly: 26 h floor."""
+    now = world.now
+    assert _quiet_names(_opens("F9799", _every(now, 3.5, last_h=25.9)), now) == []
+    assert _quiet_names(_opens("F9799", _every(now, 3.5, last_h=26.1)), now) == [
+        ("F9799", 26.1, 26.0)]
+    # every entry at the daily open, seven cities at once: 24 h apart, 48 h to alarm
+    at_open = [now - 23.9 * HOUR - d * DAY for d in range(6, -1, -1) for _ in range(7)]
+    assert _quiet_names(_opens("F9799", at_open), now) == []
+    assert _quiet_names(_opens("F9799", at_open), now + 25 * HOUR) == [
+        ("F9799", 48.9, 48.0)]
+
+
+def test_a_rule_without_a_rhythm_yet_is_not_judged(world):
+    """The verifier's first false alarms: 16 on the first night, when a few hours of
+    entries were the whole history. A rule needs 20 entries AND two days behind it."""
+    now = world.now
+    first_day = _opens("HOURLY_FAV", _every(now, 0.25, days=1.5, last_h=6.0))
+    assert _quiet_names(first_day, now) == []
+    sparse = _opens("F9799", _every(now, 12.0, last_h=60.0))          # 15 entries in 7 days
+    assert _quiet_names(sparse, now) == []
+    two_days = _opens("HOURLY_FAV", _every(now, 0.25, days=2.1, last_h=3.0))
+    assert _quiet_names(two_days, now) == [("HOURLY_FAV", 3.0, 2.0)]
+    # forty entries in one burst a few days ago (a weekly release): no rhythm to break
+    burst = _opens("FLB_FAV", [now - 3 * DAY + k * 60 for k in range(40)])
+    assert _quiet_names(burst, now, rules=("FLB_FAV",)) == []
+
+
+def test_time_the_trader_was_down_is_not_the_rules_rhythm(world):
+    """The verifier's third weakness: a 10-hour host outage became the rule's longest
+    gap and lifted its limit to 15 h for a week - the same six-hour fault two days later
+    went unseen. Idle spans are subtracted from the gaps AND from the quiet time."""
+    now = world.now
+    off0, off1 = now - 2 * DAY - 10 * HOUR, now - 2 * DAY           # the PC was off
+    times = [t for t in _every(now, 0.25, last_h=3.0) if not off0 < t < off1]
+    rows = _opens("HOURLY_FAV", times)
+    assert _quiet_names(rows, now) == []                            # blinded by the outage
+    assert _quiet_names(rows, now, idle=[[off0, off1]]) == [("HOURLY_FAV", 3.0, 2.0)]
+    # and waking up is not "quiet": asleep since the last entry, nothing is overdue
+    asleep = _opens("HOURLY_FAV", _every(now, 0.25, last_h=8.0))
+    assert _quiet_names(asleep, now) == [("HOURLY_FAV", 8.0, 2.0)]
+    assert _quiet_names(asleep, now, idle=[[now - 8 * HOUR, now]]) == []
+
+
+def _registry(world, *names, retired=()):
+    rows = [{"t": "rule", "name": n, "series": ["KXTEMPNYCHS"], "band": "any",
+             "side": "favorite", "lo": 0.97, "hi": 0.995, "contracts": 10,
+             "named_at": "2026-11-01T00:00:00+00:00", "v": 2} for n in names]
+    rows += [{"t": "retire", "name": n, "ts": "2026-11-20T00:00:00+00:00"} for n in retired]
+    _ledger(world.path("sleeve_rules.jsonl"), rows)
+
+
+def test_the_sleeve_check_warns_about_a_quiet_rule_and_stays_healthy(results, world):
+    """Through check_sleeve_paper, from the files the trader writes. A WARN only: the
+    verdict stays 'healthy' - it is a pointer for the owner, not an outage."""
+    now = world.now
+    _registry(world, "HOURLY_FAV", "F9799", "OLD_RULE", retired=("OLD_RULE",))
+    _ledger(world.path("paper_sleeves.jsonl"),
+            _opens("HOURLY_FAV", _every(now, 0.25, last_h=5.2))
+            + _opens("F9799", _every(now, 3.5, last_h=1.0))
+            + _opens("OLD_RULE", _every(now, 0.25, last_h=30.0)))
+    said = _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)
+    assert [st for st, _ in said] == [hc.WARN, hc.OK]
+    assert said[0][1].startswith("HOURLY_FAV has opened no position for 5.2 h")
+    assert "longest gap in the last 7 days was 0.2 h (alarm past 2.0 h)" in said[0][1]
+
+
+def test_a_night_asleep_is_remembered_as_idle_not_as_quiet(results, world):
+    """End to end with the state file: the gap in the watchdog's own chain is recorded
+    as time the trader was not cycling. Nothing is said at the wake-up, and that night
+    does not become the rule's 'longest gap' afterwards."""
+    _registry(world, "HOURLY_FAV")
+    start = world.now
+    _ledger(world.path("paper_sleeves.jsonl"), _opens("HOURLY_FAV", _every(start, 0.25)))
+    hc._begin_run()
+    assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
+    world.next_run(8 * 60)                        # asleep for 8 h; the watchdog runs first
+    assert [st for st, _ in _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)] == [hc.OK]
+    assert hc._state["sleeve_idle"] == [[start, world.now]]
+    # trading again for four hours, then three hours with nothing opened
+    back = world.now
+    _ledger(world.path("paper_sleeves.jsonl"), _opens("HOURLY_FAV", _every(start, 0.25))
+            + _opens("HOURLY_FAV", [back + k * 0.25 * HOUR for k in range(1, 17)]))
+    for _ in range(28):                           # 7 h of 15-minute runs
+        world.next_run(15)
+    said = _sleeves(world, results, TODAYS_SLEEVE_HEARTBEAT)
+    assert [st for st, _ in said] == [hc.WARN, hc.OK], said
+    assert "HOURLY_FAV has opened no position for 3.0 h" in said[0][1]
+    assert "was 0.2 h (alarm past 2.0 h)" in said[0][1]              # not 8 h -> 16 h
+
+
 # ── main(), run after run: what PolybotHealth actually logs ────────────────────
 
 FRESH = {"stage0_crypto.jsonl": 0.5, "stage0_history.jsonl": 30.0,
