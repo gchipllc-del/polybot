@@ -381,8 +381,11 @@ def nominations_panel() -> list[dict]:
     if not p.exists():
         return []
     try:
-        d = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        # errors="replace" + ValueError: one undecodable byte used to raise out of here
+        # and replace the WHOLE payload with an error - every panel for the least
+        # important input. A damaged file is "no nominations", like a truncated one.
+        d = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
         return []
     return [{k: c.get(k) for k in ("series", "band", "side", "bucket", "n_out", "mean_out",
                                    "p_out", "mean_out_traded", "verdict")}

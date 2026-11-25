@@ -124,6 +124,25 @@ def test_payload_on_an_empty_machine_never_crashes(tmp_path, monkeypatch):
     assert p["nominations"] == [] and p["health"]["state"] == "unknown"
 
 
+def test_a_bad_byte_in_screen_json_costs_only_the_nominations(tmp_path, monkeypatch):
+    """screen.json was read strictly: one undecodable byte raised out of the nominations
+    panel and the whole /api/command body became {'error': 'UnicodeDecodeError ...'} -
+    no rules, no traders, no watchdog verdict, for the least important input."""
+    _isolate(tmp_path, monkeypatch)
+    row = {"series": "KXINXU", "band": "mid", "side": "yes", "bucket": "80-90c",
+           "n_out": 142, "mean_out": 0.021, "p_out": 0.004, "mean_out_traded": 0.016,
+           "verdict": "NOMINATED"}
+    text = json.dumps({"nominated": [row]}).encode()
+    for at in (text.index(b"KXINXU") + 2,           # inside a string: the row survives
+               text.index(b"[")):                    # on the structure: no longer JSON
+        cc.SCREEN.write_bytes(text[:at] + b"\xff" + text[at + 1:])
+        cc._CACHE.update(t=0.0, payload=None)
+        body = cc.make_app().test_client().get("/api/command").get_json()
+        assert "error" not in body and body["kpi"]["rules"] == 0, body
+        assert body["health"]["state"] == "unknown" and len(body["traders"]) == 2
+        assert len(body["nominations"]) == (1 if at != text.index(b"[") else 0)
+
+
 def test_routes_serve_page_and_json(tmp_path, monkeypatch):
     monkeypatch.setattr(cc, "CRYPTO_LEDGER", tmp_path / "none.jsonl")
     cc._CACHE.update(t=0.0, payload=None)

@@ -76,3 +76,23 @@ def test_route_serves_the_snapshot(monkeypatch):
     _setup(monkeypatch, calls)
     r = kd.make_app().test_client().get("/api/all")
     assert r.status_code == 200 and set(SECTIONS) <= set(r.get_json())
+
+
+def test_stage0_panel_survives_an_undecodable_byte(tmp_path, monkeypatch):
+    """The collector log is append-only, so one stray byte (a disk fault, a foreign
+    writer) stays for good - and the strict read left the Stage-0 panel in permanent
+    error. The damaged line is skipped like a torn one; the rest still joins."""
+    import json
+
+    import stage0_collector as s0
+    log = tmp_path / "stage0_crypto.jsonl"
+    tk = "KXBTC15M-26NOV250115-00"
+    rows = [{"t": "obs", "ts": "2026-11-25T01:06:00+00:00", "ticker": tk, "mins_left": 9.0,
+             "yes_ask": 0.55, "no_ask": 0.47},
+            {"t": "settle", "ts": "2026-11-25T01:16:00+00:00", "ticker": tk, "result": "yes"}]
+    log.write_bytes(json.dumps(rows[0]).encode() + b"\n\xff\n"
+                    + json.dumps(rows[1]).encode() + b"\n")
+    monkeypatch.setattr(s0, "LOG", log)
+    panel = kd._stage0_payload()
+    assert "error" not in panel, panel
+    assert (panel["joined"], panel["n_settles"]) == (1, 1)

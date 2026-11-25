@@ -209,7 +209,10 @@ def _stage0_payload() -> dict:
         import stage0_collector as s0
         rows = []
         if s0.LOG.exists():
-            for line in s0.LOG.read_text(encoding="utf-8").splitlines():
+            # errors="replace": one undecodable byte (a disk fault, a foreign writer) must
+            # cost its own line - which then fails json.loads like any torn line - not the
+            # whole panel for good: the log is append-only, so the byte never goes away
+            for line in s0.LOG.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
