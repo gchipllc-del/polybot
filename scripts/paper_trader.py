@@ -30,7 +30,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,6 +73,13 @@ MAX_PER_WINDOW = 1
 STRATEGY_VERSION = 4
 CYCLE_S = 60
 START_BANKROLL = 500.0     # paper only, for a readable equity number
+# A 15-minute market has its result within minutes of its close. A position still open
+# an hour past it is not waiting, it is STRANDED: the settle step only sees the newest
+# 200 settled markets per series (about 50 hours), so after a longer outage the result
+# is never offered again, and the position holds one of the MAX_CONCURRENT slots for
+# good. The heartbeat counts them so the watchdog can say so; settling them is a
+# separate, owner-approved change (it alters which later entries are taken).
+OVERDUE_AFTER_H = 1.0
 
 
 def _now_iso() -> str:
@@ -138,6 +145,15 @@ def _clock_skew(s0, since_mono: float) -> float | None:
     older collector module). For the heartbeat only - nothing is ever corrected by it."""
     try:
         return s0.clock_skew_since(since_mono)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _overdue(live: dict, now: datetime) -> dict | None:
+    """overdue_positions for the heartbeat; None (unknown) if it cannot be worked out.
+    A status figure must never be able to fail a cycle whose rows are already written."""
+    try:
+        return overdue_positions(live, now)
     except Exception:  # noqa: BLE001
         return None
 
@@ -217,6 +233,37 @@ def evaluate_market(m: dict, mins_left: float, rules, bands, fee_fn,
             entry["skipped"] = "no_depth"
         out.append(entry)
     return out
+
+
+def _window_close(pos: dict) -> datetime | None:
+    """When this position's market closed, from its own entry row: the entry stamp plus
+    the minutes that were left at that moment. None if the row carries neither."""
+    try:
+        ts = datetime.fromisoformat(str(pos["ts"]).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts + timedelta(minutes=float(pos["mins_left"]))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def overdue_positions(live: dict, now: datetime) -> dict:
+    """Open positions more than OVERDUE_AFTER_H past their window's close, for the
+    heartbeat: how many, and the one waiting longest with its hours past close.
+    READ-ONLY: it settles nothing and frees no slot. A row whose close time cannot be
+    worked out is left out (unknown is not overdue)."""
+    n, oldest, oldest_h = 0, None, None
+    for (ticker, _rule), pos in live.items():
+        close = _window_close(pos)
+        if close is None:
+            continue
+        hours = (now - close).total_seconds() / 3600.0
+        if hours > OVERDUE_AFTER_H:
+            n += 1
+            if oldest_h is None or hours > oldest_h:
+                oldest, oldest_h = ticker, hours
+    return {"n": n, "oldest": oldest,
+            "oldest_h": None if oldest_h is None else round(oldest_h, 2)}
 
 
 def settle_positions(rows: list[dict], results: dict) -> list[dict]:
@@ -423,11 +470,13 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
     closes = settle_positions(rows + new_rows, results)
     new_rows.extend(closes)
     _append(new_rows, p)
+    still_open = open_positions(_load(p))        # the ledger as it now stands on disk
     summary = {"opened": opened, "closed": len(closes), "skipped": skipped,
                "ungated": ungated, "regime": regime["regime"],
-               "open_now": len(open_positions(_load(p))),
+               "open_now": len(still_open),
                "errors": len(errs), "last_error": errs[-1] if errs else None,
                "clock_skew_s": _clock_skew(s0, t_start), "quote_lag_s": quote_lag,
+               "overdue": _overdue(still_open, now),
                "took_s": round(time.monotonic() - t_start, 3)}
     if heartbeat is not None:           # after the ledger, and never able to fail a cycle
         _write_heartbeat(heartbeat, {
@@ -435,7 +484,8 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
             "opened": opened, "closed": len(closes), "open_now": summary["open_now"],
             "skipped": skipped, "ungated": ungated,
             "errors": summary["errors"], "last_error": summary["last_error"],
-            "clock_skew_s": summary["clock_skew_s"], "quote_lag_s": quote_lag})
+            "clock_skew_s": summary["clock_skew_s"], "quote_lag_s": quote_lag,
+            "overdue": summary["overdue"]})
     return summary
 
 
@@ -449,8 +499,9 @@ def run_loop() -> int:
             sk = " ".join(f"{k}={v}" for k, v in c["skipped"].items())
             ug = f" UNGATED={c['ungated']}" if c.get("ungated") else ""
             er = f" ERRORS={c['errors']}" if c.get("errors") else ""
+            od = f" OVERDUE={c['overdue']['n']}" if (c.get("overdue") or {}).get("n") else ""
             print(f"[{_now_iso()}] opened={c['opened']} closed={c['closed']} "
-                  f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}{er}")
+                  f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}{er}{od}")
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001
@@ -617,6 +668,7 @@ def _selftest() -> int:
         assert sorted(hb["quote_lag_s"]) == sorted(s0.SERIES), hb
         assert all(v >= 0 for v in hb["quote_lag_s"].values()), hb
         assert hb["clock_skew_s"] is None, hb
+        assert sorted(hb["overdue"]) == ["n", "oldest", "oldest_h"], hb
         # every entry carries the news-agent regime in force when it opened - a
         # stamp only: the cautious regime did NOT change the size or the count
         opens = [r for r in _load(p) if r.get("t") == "open"]
@@ -631,6 +683,17 @@ def _selftest() -> int:
         pu = Path(td) / "ungated.jsonl"
         cu = run_cycle(get=fake_get, now=now, path=pu, depth_fn=lambda t, s, pr: None)
         assert cu["opened"] == 2 and cu["ungated"] == 2, cu
+
+    # a position still open long after its window closed is STRANDED (its result left
+    # the settled sweep): counted for the heartbeat - detection only, it keeps its slot
+    stranded = {("KXBTC15M-OLD-1", "H1_settlement_lag"):
+                {"t": "open", "ts": (now - timedelta(hours=66)).isoformat(),
+                 "ticker": "KXBTC15M-OLD-1", "rule": "H1_settlement_lag", "mins_left": 0.0},
+                ("KXBTC15M-NEW-1", "H1_settlement_lag"):
+                {"t": "open", "ts": (now - timedelta(minutes=20)).isoformat(),
+                 "ticker": "KXBTC15M-NEW-1", "rule": "H1_settlement_lag", "mins_left": 1.0}}
+    od = overdue_positions(stranded, now)
+    assert od == {"n": 1, "oldest": "KXBTC15M-OLD-1", "oldest_h": 66.0}, od
 
     # every request failing must not look like a quiet market: the cycle completes,
     # writes no row, and its status file says how many requests failed and why

@@ -26,13 +26,19 @@ CLOSE = datetime(2026, 11, 25, 12, 15, tzinfo=timezone.utc)
 GOOD = {"regime": "good", "mult": 1.0}
 
 
+CLOCK = {"now": T0}           # what the trader's wall clock reads; cycle() moves it
+
+
 @pytest.fixture(autouse=True)
 def _hermetic(tmp_path, monkeypatch):
-    """Only the frozen rules, and no fair-value history: nothing here may depend on the
-    overlay file or the collector log of the machine the suite runs on."""
+    """Only the frozen rules, no fair-value history, and a wall clock that agrees with
+    the injected `now`: nothing here may depend on the overlay file, the collector log
+    or the date of the machine the suite runs on."""
     monkeypatch.setattr(pt, "_rules",
                         lambda: (list(sb.RULES), sb.BANDS, sb.kalshi_taker_fee))
     monkeypatch.setattr(s0, "LOG", tmp_path / "no_stage0.jsonl")
+    monkeypatch.setitem(CLOCK, "now", T0)
+    monkeypatch.setattr(pt, "_now_iso", lambda: CLOCK["now"].isoformat())
 
 
 def exchange(yes_ask, close=CLOSE, settled=()):
@@ -60,7 +66,8 @@ def cycle(path, yes_ask, minute=0, **kw):
     kw.setdefault("get", exchange(yes_ask))
     kw.setdefault("depth_fn", lambda t, s, p: 100.0)
     kw.setdefault("regime_fn", lambda: GOOD)
-    return pt.run_cycle(now=T0 + timedelta(minutes=minute), path=path, **kw)
+    CLOCK["now"] = T0 + timedelta(minutes=minute)
+    return pt.run_cycle(now=CLOCK["now"], path=path, **kw)
 
 
 def tear_last_row(path: Path, tail: bytes = b"") -> None:
@@ -207,7 +214,8 @@ def test_a_completed_cycle_leaves_a_heartbeat_with_its_counters(tmp_path):
     lag = got.pop("quote_lag_s")
     assert got == {"ts": T0.isoformat(), "took_s": c["took_s"], "opened": 2, "closed": 0,
                    "open_now": 2, "skipped": {}, "ungated": 0, "errors": 0,
-                   "last_error": None, "clock_skew_s": None}
+                   "last_error": None, "clock_skew_s": None,
+                   "overdue": {"n": 0, "oldest": None, "oldest_h": None}}
     assert sorted(lag) == ["KXBTC15M", "KXETH15M"]
     assert isinstance(got["took_s"], float) and 0 <= got["took_s"] < 5
     assert [f.name for f in hb.parent.iterdir()] == [hb.name]      # no temp file left
@@ -423,3 +431,79 @@ def test_a_series_whose_quotes_never_arrived_has_no_lag_rather_than_a_zero(tmp_p
     cycle(tmp_path / "paper.jsonl", 0.55, get=eth_down, heartbeat=hb)
     got = heartbeat_of(hb)
     assert list(got["quote_lag_s"]) == ["KXBTC15M"] and got["errors"] == 1
+
+
+# ── stranded positions: counted in the heartbeat, nothing else changes ───────
+
+def stranded(i, hours_past_close, rule="CONTROL_midprice"):
+    """An entry row as the trader writes it, whose window closed that long before T0."""
+    close = T0 - timedelta(hours=hours_past_close)
+    return {"t": "open", "ts": (close - timedelta(minutes=12)).isoformat(),
+            "ticker": f"KXBTC15M-OLD{i}-15", "series": "KXBTC15M", "rule": rule,
+            "band": ">10min", "side": "yes", "price": 0.55, "contracts": 1, "fee": 0.02,
+            "mins_left": 12.0, "v": 4}
+
+
+def test_overdue_counts_open_positions_more_than_an_hour_past_their_close():
+    live = {(r["ticker"], r["rule"]): r for r in (
+        stranded(0, 0.5), stranded(1, 1.0), stranded(2, 1.02), stranded(3, 66.0))}
+    assert pt.overdue_positions(live, T0) == {
+        "n": 2, "oldest": "KXBTC15M-OLD3-15", "oldest_h": 66.0}
+    assert pt.overdue_positions({}, T0) == {"n": 0, "oldest": None, "oldest_h": None}
+    # a row whose close time cannot be worked out is unknown, not overdue - and no crash
+    odd = {("A", "R"): {"t": "open", "ticker": "A", "rule": "R"},
+           ("B", "R"): {"t": "open", "ts": "not a time", "mins_left": 3.0},
+           ("C", "R"): {"t": "open", "ts": T0.isoformat(), "mins_left": None},
+           ("D", "R"): dict(stranded(4, 5.0), ts=stranded(4, 5.0)["ts"].replace(
+               "+00:00", "Z"))}                      # a Z stamp is read like +00:00
+    assert pt.overdue_positions(odd, T0) == {"n": 1, "oldest": "D", "oldest_h": 5.0}
+
+
+def test_stranded_positions_show_in_the_heartbeat_and_nothing_else_changes(tmp_path):
+    """After an outage longer than the settled sweep reaches back (200 markets = 50 h)
+    the open positions are never offered a result again. They kept all 8 slots, the
+    trader opened nothing, and no file said so. Now the heartbeat does. DETECTION ONLY:
+    they stay open and still hold their slots exactly as before."""
+    p, hb = tmp_path / "paper.jsonl", tmp_path / "hb.json"
+    rows = [stranded(i, 66.0 + i) for i in range(8)]
+    pt._append(rows, p)
+    before = p.read_bytes()
+    c = cycle(p, 0.55, heartbeat=hb)
+    assert (c["opened"], c["closed"], c["open_now"]) == (0, 0, 8)
+    assert c["skipped"] == {"max_concurrent": 2}     # the cap still counts them
+    assert p.read_bytes() == before                  # not settled, not voided, not touched
+    assert heartbeat_of(hb)["overdue"] == {
+        "n": 8, "oldest": "KXBTC15M-OLD7-15", "oldest_h": 73.0}
+    assert c["overdue"] == heartbeat_of(hb)["overdue"]
+
+
+def test_a_late_position_that_settles_this_cycle_is_not_overdue(tmp_path):
+    """The PC wakes after 30 hours: everything that closed meanwhile is settled by the
+    first cycle, so the first heartbeat must not raise a false alarm."""
+    p, hb = tmp_path / "paper.jsonl", tmp_path / "hb.json"
+    pt._append([stranded(0, 30.0), stranded(1, 30.0)], p)
+    settled = [{"ticker": "KXBTC15M-OLD0-15", "result": "yes"},
+               {"ticker": "KXBTC15M-OLD1-15", "result": "no"}]
+    c = cycle(p, 0.55, get=exchange(0.55, settled=settled), heartbeat=hb)
+    assert c["closed"] == 2 and heartbeat_of(hb)["overdue"]["n"] == 0
+
+
+def test_the_loop_line_names_overdue_positions(tmp_path, monkeypatch, lock_dir, capsys):
+    monkeypatch.setattr(pt, "HEARTBEAT", tmp_path / "hb.json")
+    monkeypatch.setattr(pt, "LEDGER", tmp_path / "live.jsonl")
+    monkeypatch.setattr(pt, "_depth_fetcher", lambda on_error=None: (lambda t, s, p: 100.0))
+    monkeypatch.setattr(pt, "_regime_now", lambda: GOOD)
+    monkeypatch.setattr(pt, "run_cycle", lambda **kw: _real_cycle(now=T0, **kw))
+    monkeypatch.setattr(s0, "_get", exchange(0.55))
+    pt._append([stranded(i, 66.0) for i in range(3)], pt.LEDGER)
+
+    def one_cycle_then_stop(seconds):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(pt.time, "sleep", one_cycle_then_stop)
+    with pytest.raises(KeyboardInterrupt):
+        pt.run_loop()
+    line = [ln for ln in capsys.readouterr().out.splitlines() if "opened=" in ln][-1]
+    assert "opened=2" in line and line.endswith("OVERDUE=3")
+
+
+_real_cycle = pt.run_cycle
