@@ -4,7 +4,10 @@ import json
 import os
 import subprocess
 import sys
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
+from email.utils import formatdate
 from pathlib import Path
 
 import pytest
@@ -201,9 +204,11 @@ def test_a_completed_cycle_leaves_a_heartbeat_with_its_counters(tmp_path):
     p, hb = tmp_path / "paper.jsonl", tmp_path / "status" / "paper_crypto_heartbeat.json"
     c = cycle(p, 0.55, heartbeat=hb)
     got = heartbeat_of(hb)
+    lag = got.pop("quote_lag_s")
     assert got == {"ts": T0.isoformat(), "took_s": c["took_s"], "opened": 2, "closed": 0,
                    "open_now": 2, "skipped": {}, "ungated": 0, "errors": 0,
-                   "last_error": None}
+                   "last_error": None, "clock_skew_s": None}
+    assert sorted(lag) == ["KXBTC15M", "KXETH15M"]
     assert isinstance(got["took_s"], float) and 0 <= got["took_s"] < 5
     assert [f.name for f in hb.parent.iterdir()] == [hb.name]      # no temp file left
     # the next cycle replaces it with its own numbers: one position settles
@@ -349,3 +354,72 @@ def test_only_the_real_trader_writes_the_live_heartbeat(tmp_path, monkeypatch, l
     assert got["errors"] == 4 and got["open_now"] == 2
     line = [ln for ln in capsys.readouterr().out.splitlines() if "opened=" in ln][-1]
     assert line.endswith("ERRORS=4")                 # the loop's own line says so too
+
+
+# ── the clock and the quote lag: measured, never corrected ───────────────────
+
+class Resp:
+    def __init__(self, body, headers):
+        self._body, self.headers = body, headers
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._body
+
+
+def test_the_heartbeat_measures_the_pc_clock_against_kalshi_and_corrects_nothing(
+        tmp_path, monkeypatch):
+    """Every entry's time band comes from the PC clock, read once per cycle, and nothing
+    compared it with anything. Now the heartbeat carries Kalshi's Date header minus the
+    PC clock - and the ledger is byte-identical whatever that header says."""
+    import requests
+    monkeypatch.setattr(s0, "_CLOCK_SAMPLES", deque(maxlen=64))
+    monkeypatch.setattr(pt, "_now_iso", lambda: "2026-11-25T12:00:21+00:00")
+
+    def served_with(headers):
+        def fake_requests_get(url, params=None, timeout=None):
+            return Resp(exchange(0.55)(url, params), headers)
+        return fake_requests_get
+    ledgers, beats = [], []
+    for name, headers in (("an_hour_off", {"Date": formatdate(time.time() + 3600,
+                                                               usegmt=True)}),
+                          ("no_date", {})):
+        monkeypatch.setattr(requests, "get", served_with(headers))
+        p, hb = tmp_path / f"{name}.jsonl", tmp_path / f"{name}_hb.json"
+        c = pt.run_cycle(now=T0, path=p, depth_fn=lambda t, s, pr: 100.0,
+                         regime_fn=lambda: GOOD, heartbeat=hb)      # get: the real _get
+        assert c["opened"] == 2
+        ledgers.append(p.read_bytes())
+        beats.append(heartbeat_of(hb))
+    assert abs(beats[0]["clock_skew_s"] - 3600) < 1.1 # Kalshi an hour ahead of the PC
+    assert beats[1]["clock_skew_s"] is None           # not measurable: unknown, not 0
+    assert ledgers[0] == ledgers[1]                   # same bets, same mins_left, same bands
+    assert [r["mins_left"] for r in pt._load(tmp_path / "an_hour_off.jsonl")] == [14.67] * 2
+
+
+def test_quote_lag_is_the_time_from_the_clock_reading_to_each_series_quote(tmp_path):
+    """The clock is read once, before the ledger is loaded and before any request; a
+    quote that arrives seconds later is still banded by it. Measured per series."""
+    def slow(url, params=None):
+        time.sleep(0.03)
+        return exchange(0.55)(url, params)
+    hb = tmp_path / "hb.json"
+    c = cycle(tmp_path / "paper.jsonl", 0.55, get=slow, heartbeat=hb)
+    lag = heartbeat_of(hb)["quote_lag_s"]
+    assert lag == c["quote_lag_s"] and sorted(lag) == ["KXBTC15M", "KXETH15M"]
+    assert lag["KXBTC15M"] >= 0.06                    # the event list, then its markets
+    assert lag["KXETH15M"] >= lag["KXBTC15M"] + 0.09  # + BTC's spot and ETH's two calls
+    assert heartbeat_of(hb)["took_s"] >= lag["KXETH15M"] + 0.09   # + ETH spot, 2 sweeps
+
+
+def test_a_series_whose_quotes_never_arrived_has_no_lag_rather_than_a_zero(tmp_path):
+    def eth_down(url, params=None):
+        if (params or {}).get("series_ticker") == "KXETH15M" and url.endswith("/events"):
+            raise ConnectionError("reset by peer")
+        return exchange(0.55)(url, params)
+    hb = tmp_path / "hb.json"
+    cycle(tmp_path / "paper.jsonl", 0.55, get=eth_down, heartbeat=hb)
+    got = heartbeat_of(hb)
+    assert list(got["quote_lag_s"]) == ["KXBTC15M"] and got["errors"] == 1

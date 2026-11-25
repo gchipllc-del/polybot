@@ -4,7 +4,10 @@ import json
 import os
 import subprocess
 import sys
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
+from email.utils import formatdate
 from pathlib import Path
 
 import pytest
@@ -233,3 +236,122 @@ def test_the_lock_never_blocks_a_cycle_function_or_a_read_only_command(
         twin.kill()
         twin.wait(timeout=10)
     assert "stage0_collector" not in si._HELD
+
+
+# ── the PC clock against Kalshi's: measured, never used ──────────────────────
+
+class Resp:
+    """What requests.get returns, as far as _get looks at it."""
+
+    def __init__(self, body=None, headers=None, status=200):
+        self._body, self.status = body, status
+        if headers is not None:
+            self.headers = headers
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"{self.status} Server Error")
+
+    def json(self):
+        return self._body
+
+
+@pytest.fixture
+def samples(monkeypatch):
+    fresh = deque(maxlen=64)
+    monkeypatch.setattr(s0, "_CLOCK_SAMPLES", fresh)
+    return fresh
+
+
+PC = 1_800_000_000.0                                  # a PC clock reading, on a whole second
+
+
+def dated(offset_s, **extra):
+    return Resp(headers=dict({"Date": formatdate(PC + offset_s, usegmt=True)}, **extra))
+
+
+def test_clock_skew_is_the_date_header_minus_the_pc_clock(samples):
+    """Nothing compared the PC clock with anything: _get threw the Date header away. A
+    10 s error can put a third of the entries in the wrong time band, unnoticed."""
+    mark = time.monotonic()
+    assert s0.clock_skew_since(mark) is None          # no answer yet: unknown, not zero
+    # Kalshi stamped :10 while the PC, half-way through a 0.2 s request, read :00.1.
+    # The header is in whole seconds, so its centre is :10.5.
+    s0._note_server_clock(s0.KALSHI + "/events", dated(10), PC, PC + 0.2)
+    assert s0.clock_skew_since(mark) == pytest.approx(10.4)
+    assert s0.clock_skew_since(time.monotonic() + 1) is None      # nothing since then
+    samples.clear()
+    s0._note_server_clock(s0.KALSHI + "/events", dated(-7), PC, PC + 0.2)
+    assert s0.clock_skew_since(mark) == pytest.approx(-6.6)       # the PC clock is ahead
+
+
+def test_the_quickest_answer_of_the_cycle_is_the_one_believed(samples):
+    mark = time.monotonic()
+    s0._note_server_clock(s0.KALSHI + "/markets", dated(2), PC, PC + 3.0)     # +-2.0 s
+    s0._note_server_clock(s0.KALSHI + "/markets", dated(0), PC, PC + 0.1)     # +-0.55 s
+    s0._note_server_clock(s0.KALSHI + "/markets", dated(1), PC, PC + 1.0)
+    assert s0.clock_skew_since(mark) == pytest.approx(0.45)
+
+
+def test_what_is_not_a_clean_kalshi_reading_leaves_no_sample_and_never_raises(samples):
+    k = s0.KALSHI + "/markets"
+    s0._note_server_clock("https://api.coinbase.com/v2/prices/BTC-USD/spot", dated(10),
+                          PC, PC + 0.1)               # not Kalshi's clock
+    s0._note_server_clock(k, dated(10), PC, PC + 9.0)  # too slow to say anything about 5 s
+    s0._note_server_clock(k, dated(10, Age="3"), PC, PC + 0.1)    # held by a cache
+    s0._note_server_clock(k, Resp(headers={}), PC, PC + 0.1)      # no Date header
+    s0._note_server_clock(k, Resp(headers={"Date": "yesterday-ish"}), PC, PC + 0.1)
+    s0._note_server_clock(k, Resp(), PC, PC + 0.1)    # a test double with no headers
+    s0._note_server_clock(k, None, PC, PC + 0.1)
+    s0._note_server_clock(k, dated(10), PC + 5, PC)   # the clock stepped back mid-request
+    assert list(samples) == []
+    s0._note_server_clock(k, dated(10, Age="0"), PC, PC + 0.1)    # Age 0 is a fresh answer
+    assert len(samples) == 1
+
+
+def test_get_keeps_the_date_header_and_still_behaves_as_before(samples, monkeypatch):
+    import requests
+    calls = []
+
+    def fake_requests_get(url, params=None, timeout=None):
+        calls.append((url, params, timeout))
+        return answers.pop(0)
+    monkeypatch.setattr(requests, "get", fake_requests_get)
+    mark, url = time.monotonic(), s0.KALSHI + "/markets"
+    ahead = {"Date": formatdate(time.time() + 10, usegmt=True)}
+    answers = [Resp({"markets": [1]}, ahead), Resp({"markets": [2]}),
+               Resp({"markets": []}, ahead, status=503)]
+    assert s0._get(url, {"limit": 200}) == {"markets": [1]}
+    assert calls == [(url, {"limit": 200}, 15)]       # the same request as ever
+    assert abs(s0.clock_skew_since(mark) - 10) < 1.1  # whole-second header: +-0.5 s
+    assert s0._get(url) == {"markets": [2]}           # a double without headers: fine
+    with pytest.raises(RuntimeError):                 # an error answer still raises...
+        s0._get(url)
+    assert len(samples) == 2                          # ...and its Date still counted
+
+
+def test_the_collector_only_measures_the_clock_it_never_corrects_its_rows(samples,
+                                                                          tmp_path,
+                                                                          monkeypatch):
+    """The rows' ts and mins_left come from the PC clock whatever Kalshi's says: using
+    the server time would move observations between the frozen time bands."""
+    import requests
+
+    def served_with(headers):
+        def fake_requests_get(url, params=None, timeout=None):
+            return Resp(exchange(0.55)(url, params), headers)
+        return fake_requests_get
+    logs = []
+    for name, headers in (("an_hour_off", {"Date": formatdate(time.time() + 3600,
+                                                               usegmt=True)}),
+                          ("no_date", {})):
+        monkeypatch.setattr(requests, "get", served_with(headers))
+        p = tmp_path / f"{name}.jsonl"
+        assert s0.run_cycle(now=T0, path=p, fetch_book=lambda t: None) == {
+            "obs": 2, "settles": 0}
+        logs.append(p.read_bytes())
+    assert logs[0] == logs[1]
+    assert [r["mins_left"] for r in readable(tmp_path / "an_hour_off.jsonl")] == [
+        pytest.approx(14 + 40 / 60)] * 2
+    assert abs(s0.clock_skew_since(0.0) - 3600) < 1.1
+    assert len(samples) == 6          # 2 series x 3 Kalshi calls; Coinbase's 2 leave none

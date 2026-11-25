@@ -132,6 +132,16 @@ def _request_error(what: str, e: BaseException) -> str:
     return f"{what}: {type(e).__name__}: {str(e)[:160]}"
 
 
+def _clock_skew(s0, since_mono: float) -> float | None:
+    """Kalshi's clock minus the PC clock (seconds) as this cycle's own Kalshi responses
+    showed it, or None when it could not be measured (an injected network, no answer, an
+    older collector module). For the heartbeat only - nothing is ever corrected by it."""
+    try:
+        return s0.clock_skew_since(since_mono)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _write_heartbeat(path: Path, hb: dict) -> bool:
     """Replace the status file atomically (temp file + os.replace), so a reader never
     sees half of it. A failure is printed and swallowed: the ledger is already written
@@ -301,6 +311,7 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
     p = path or LEDGER
     raw_get = get or s0._get
     now = now or datetime.now(timezone.utc)
+    t_clock = time.monotonic()           # the instant `now` was read; mins_left hangs on it
 
     # Every failed request of this cycle, newest last. Until now each one was a console
     # line (or swallowed outright) and the cycle looked the same as a healthy quiet one.
@@ -332,12 +343,17 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
     # PASS 1: gather every candidate. Nothing is committed here, because choosing the
     # best strike in a window requires seeing all of that window's strikes first.
     candidates = []
+    quote_lag: dict[str, float] = {}     # series -> seconds from the clock to its quotes
     for series in s0.SERIES:
         try:
             markets = s0.fetch_open_markets(series, get=get)
         except Exception as e:  # noqa: BLE001
             print(f"[warn] discovery failed {series}: {e}")
             continue
+        # MEASURED ONLY. `now` was read once, above; these quotes arrived this much
+        # later and are still banded by it. Re-reading the clock here would move
+        # entries between bands, which is not this code's call to make.
+        quote_lag[series] = round(time.monotonic() - t_clock, 3)
         spot = s0.fetch_spot(s0.SPOT_SYMBOL[series], get=get)
         edge_fn = _edge_fetcher(series, s0.LOG)
         for m in markets:
@@ -411,13 +427,15 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
                "ungated": ungated, "regime": regime["regime"],
                "open_now": len(open_positions(_load(p))),
                "errors": len(errs), "last_error": errs[-1] if errs else None,
+               "clock_skew_s": _clock_skew(s0, t_start), "quote_lag_s": quote_lag,
                "took_s": round(time.monotonic() - t_start, 3)}
     if heartbeat is not None:           # after the ledger, and never able to fail a cycle
         _write_heartbeat(heartbeat, {
             "ts": _utc_iso(now), "took_s": summary["took_s"],
             "opened": opened, "closed": len(closes), "open_now": summary["open_now"],
             "skipped": skipped, "ungated": ungated,
-            "errors": summary["errors"], "last_error": summary["last_error"]})
+            "errors": summary["errors"], "last_error": summary["last_error"],
+            "clock_skew_s": summary["clock_skew_s"], "quote_lag_s": quote_lag})
     return summary
 
 
@@ -594,6 +612,11 @@ def _selftest() -> int:
         assert hb["open_now"] == 2 and hb["closed"] == 0 and hb["ungated"] == 0, hb
         assert hb["errors"] == 0 and hb["last_error"] is None, hb
         assert [f.name for f in Path(td).iterdir() if "tmp" in f.name] == []
+        # measured, never corrected: how long after the clock reading each series'
+        # quotes arrived; the clock itself cannot be judged against a fake network
+        assert sorted(hb["quote_lag_s"]) == sorted(s0.SERIES), hb
+        assert all(v >= 0 for v in hb["quote_lag_s"].values()), hb
+        assert hb["clock_skew_s"] is None, hb
         # every entry carries the news-agent regime in force when it opened - a
         # stamp only: the cautious regime did NOT change the size or the count
         opens = [r for r in _load(p) if r.get("t") == "open"]
@@ -624,6 +647,7 @@ def _selftest() -> int:
         assert cd["opened"] == 0 and cd["errors"] == 4 and not pd_.exists(), cd
         hb = json.loads(hbd.read_text(encoding="utf-8"))
         assert hb["errors"] == 4 and "exchange unreachable" in hb["last_error"], hb
+        assert hb["quote_lag_s"] == {} and hb["clock_skew_s"] is None, hb   # unknown
     # PER-WINDOW CAP: 6 strikes in ONE window must collapse to MAX_PER_WINDOW per rule,
     # and the survivor must be the one the volatility model ranked most mispriced.
     def fake_get_many(url, params=None):

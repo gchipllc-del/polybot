@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,11 +58,64 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── the PC clock against Kalshi's: MEASURED, never used to correct anything ──
+# Every row's minutes-to-close, and so the time band a rule fires in, comes from the PC
+# clock. If that clock is off by seconds, entries land a cycle early or late and nothing
+# says so. Each Kalshi response carries a Date header; we keep what it implies about the
+# PC clock so the paper trader can put it in its heartbeat. Correcting mins_left with it
+# would change which band entries land in - that is the owner's decision, not this code's.
+CLOCK_SAMPLE_MAX_RTT_S = 4.0     # a slower answer says too little about a 5 s question
+_CLOCK_SAMPLES: deque = deque(maxlen=64)    # (monotonic at receipt, skew_s, round_trip_s)
+
+
+def _note_server_clock(url, response, sent_wall: float, got_wall: float) -> None:
+    """Record one clock sample from a Kalshi response. Never raises: a measurement must
+    not be able to fail a request (test doubles for requests carry no headers at all).
+
+    skew = server - PC. The Date header is in whole seconds, so the server's reading sits
+    on average half a second after it; the PC's matching reading is taken as the middle
+    of the request. That is good to about +-(0.5 s + half the round trip). Responses a
+    cache held for a while (Age > 0) are skipped: their Date may be the stored one."""
+    try:
+        if not str(url).startswith(KALSHI):
+            return
+        rtt = got_wall - sent_wall
+        if not (0.0 <= rtt <= CLOCK_SAMPLE_MAX_RTT_S):
+            return
+        headers = response.headers
+        try:
+            if float(headers.get("Age") or 0) > 0:
+                return
+        except (TypeError, ValueError):
+            pass
+        from email.utils import parsedate_to_datetime
+        server = parsedate_to_datetime(headers.get("Date"))
+        if server.tzinfo is None:
+            server = server.replace(tzinfo=timezone.utc)
+        skew = (server.timestamp() + 0.5) - (sent_wall + got_wall) / 2.0
+        _CLOCK_SAMPLES.append((time.monotonic(), skew, rtt))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def clock_skew_since(mono: float) -> float | None:
+    """Kalshi's clock minus the PC clock, in seconds, from the quickest Kalshi response
+    received since `mono` (a time.monotonic() reading); None when there was none.
+    Positive = the PC clock is BEHIND Kalshi's. A measurement only."""
+    best = None
+    for at, skew, rtt in list(_CLOCK_SAMPLES):
+        if at >= mono and (best is None or rtt < best[1]):
+            best = (skew, rtt)
+    return None if best is None else round(best[0], 3)
+
+
 # ── network (thin, injectable) ───────────────────────────────────────────────
 
 def _get(url: str, params: dict | None = None) -> dict:
     import requests
+    sent = time.time()
     r = requests.get(url, params=params or {}, timeout=15)
+    _note_server_clock(url, r, sent, time.time())      # reads a header; changes nothing
     r.raise_for_status()
     return r.json()
 
@@ -473,6 +527,17 @@ def _selftest() -> int:
         assert yes_cell and yes_cell["wins"] == 0        # YES @7c lost
         assert no_cell and no_cell["wins"] == no_cell["n"]  # NO @95c won
     assert kalshi_taker_fee(0.07) == 0.01
+
+    # the clock measurement: Kalshi's Date header (whole seconds, so centred half a
+    # second on) minus the PC clock at the middle of the request. Never raises.
+    class _Answer:
+        headers = {"Date": "Thu, 01 Jan 2026 00:00:10 GMT"}
+    pc = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+    mark = time.monotonic()
+    _note_server_clock(KALSHI + "/events", _Answer(), pc, pc + 0.2)
+    assert abs(clock_skew_since(mark) - 10.4) < 1e-6, clock_skew_since(mark)
+    _note_server_clock(KALSHI + "/events", object(), pc, pc)      # no headers: ignored
+    assert clock_skew_since(time.monotonic() + 1) is None
 
     # trajectory classifier: holds -> stable; shrinks toward 0 as n grows -> fading
     assert classify_trajectory([(20, 0.15), (60, 0.14), (120, 0.15)]) == "stable"
