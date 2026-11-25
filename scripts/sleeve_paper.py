@@ -171,12 +171,13 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 
 def _append(path: Path, rows: list[dict]) -> None:
+    """Append rows in ONE write, never onto a torn line: a process killed mid-append
+    leaves the file without its final newline, and the next row glued to that line was
+    lost with it - an entry that then never settled (lib.jsonl_io.append_lines)."""
     if not rows:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, separators=(",", ":"), default=str) + "\n")
+    from lib.jsonl_io import append_lines
+    append_lines(path, [json.dumps(r, separators=(",", ":"), default=str) for r in rows])
 
 
 def active_rules(path: Path = RULES) -> dict[str, dict]:
@@ -609,14 +610,40 @@ def classify(st: dict, survives: bool) -> str:
     return "positive_ns" if st["mean"] > 0 else "negative_ns"
 
 
+def duplicate_closes(rows: list[dict]) -> dict[str, int]:
+    """rule -> close rows beyond the first for one (ticker, rule). Two traders writing one
+    ledger leave them (the single-instance lock in main() now prevents that); the ledger
+    is append-only, so they stay - trades_of scores each bet once and `report` says how
+    many rows that left out."""
+    seen: set[tuple] = set()
+    out: dict[str, int] = {}
+    for r in rows:
+        if r.get("t") != "close":
+            continue
+        key = (r.get("ticker"), r.get("rule"))
+        if key in seen:
+            out[str(key[1])] = out.get(str(key[1]), 0) + 1
+        seen.add(key)
+    return out
+
+
 def trades_of(rows: list[dict], rules: dict[str, dict]) -> dict[str, list[dict]]:
-    """rule -> its closed trades opened AFTER its named_at, in forward_stats' shape."""
+    """rule -> its closed trades opened AFTER its named_at, in forward_stats' shape.
+
+    ONE trade per (ticker, rule): a second close row for the same bet is ignored. One
+    duplicated close used to count that trade twice AND give its event two trades, which
+    moved the whole rule off the exact test onto the approximate one (120 straight wins
+    at 97-99c read p = 0.025 instead of 0.113)."""
     opens = {(r.get("ticker"), r.get("rule")): r for r in rows if r.get("t") == "open"}
     out: dict[str, list[dict]] = {name: [] for name in rules}
+    settled: set[tuple] = set()
     for r in rows:
         name = r.get("rule")
         if r.get("t") != "close" or name not in rules:
             continue
+        if (r.get("ticker"), name) in settled:
+            continue                                  # the same bet, closed twice: one trade
+        settled.add((r.get("ticker"), name))
         o = opens.get((r.get("ticker"), name)) or {}
         if (_ts(o.get("ts")) or 0) < (_ts(rules[name].get("named_at")) or 0):
             continue                                  # only trades after pre-registration
@@ -709,6 +736,13 @@ def cmd_report() -> int:
             print("      by series (descriptive, not tested): " + "  ".join(
                 f"{k} {n}ev {v:+.2f}" for k, (n, v) in r["by_series"].items()))
     print()
+    dups = duplicate_closes(rows)
+    if dups:
+        print(f"LEDGER: {sum(dups.values())} duplicate close row(s) are NOT counted above ("
+              + ", ".join(f"{k} {v}" for k, v in sorted(dups.items())) + "). Two traders once")
+        print("wrote this ledger at the same time; every bet is scored once, on its first close")
+        print("row (`py scripts/diagnostics.py` reports them as structure defects).")
+        print()
     pooled = sorted(n for n, r in rules.items() if len(series_of(r)) > 1)
     if pooled:
         more = f" +{len(pooled) - 3} more" if len(pooled) > 3 else ""
@@ -848,6 +882,34 @@ def _selftest() -> int:
     return 0
 
 
+def _lock_dir() -> Path | None:
+    """Where the single-instance lock lives. The lock guards a LEDGER: the shared lock
+    folder for the real one (None = lib.single_instance's default, or POLYBOT_LOCK_DIR),
+    a folder next to the ledger when this trader was pointed somewhere else - a scratch
+    run or a test must neither wait for the live trader nor take its lock."""
+    if os.environ.get("POLYBOT_LOCK_DIR") or LEDGER.parent == ROOT / "data":
+        return None
+    return LEDGER.parent / "locks"
+
+
+def _only_trader() -> bool:
+    """Take the single-instance lock for the life of this process. False = another
+    sleeve trader is running on this ledger: stand down. run_cycle reads the ledger at
+    the start and appends at the end, so a second process inside that window writes
+    every entry and settlement of the cycle a second time - and the ledger is
+    append-only. Called from main() only, for `run` and `cycle`: tests and the selftest
+    call run_cycle directly and must never be blocked by the live task. If locking
+    itself is broken, hold() says so and the trader runs unlocked (fail open)."""
+    from lib.single_instance import AlreadyRunning, hold
+    try:
+        hold("sleeve_paper", _lock_dir())
+    except AlreadyRunning as e:
+        print(f"not starting: {e}. One sleeve trader per ledger - a second one would "
+              f"write every entry and settlement twice.")
+        return False
+    return True
+
+
 def main() -> int:
     args = sys.argv[1:]
     cmd = args[0] if args else ""
@@ -946,6 +1008,8 @@ def main() -> int:
         return cmd_rules()
     if cmd == "report":
         return cmd_report()
+    if cmd in ("cycle", "run") and not _only_trader():
+        return 1
     if cmd == "cycle":
         print(run_cycle())
         return 0
