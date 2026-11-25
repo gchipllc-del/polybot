@@ -94,7 +94,8 @@ def test_a_torn_history_tail_does_not_swallow_the_next_snapshot(tmp_path):
 # ── one damaged line must not stop collection, the snapshot or the reports ───
 
 BTC = "KXBTC15M-26NOV251215-15"
-STRAY = b"\xff\xfe stray bytes from another writer \xe9\n"   # a byte-order mark, a cp1252 e-acute
+# a UTF-16 byte-order mark and a cp1252 e-acute: what another writer leaves behind
+STRAY = b"\xff\xfe stray bytes from another writer \xe9\n"
 
 
 def test_one_undecodable_byte_does_not_stop_collection(tmp_path):
@@ -127,7 +128,7 @@ def test_a_damaged_log_still_snapshots_and_reports(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(sys, "argv", ["stage0_collector.py", "report"])
     assert s0.main() == 0
     assert "joined market-band observations: 1" in capsys.readouterr().out
-    with open(hp, "ab") as f:                          # the trend history, damaged the same way
+    with open(hp, "ab") as f:                          # the trend history, damaged too
         f.write(STRAY)
     s0.print_trend(history=hp)
     assert "stage0 trend - 1 snapshots" in capsys.readouterr().out
@@ -263,7 +264,7 @@ def samples(monkeypatch):
     return fresh
 
 
-PC = 1_800_000_000.0                                  # a PC clock reading, on a whole second
+PC = 1_800_000_000.0                                  # a PC clock reading, whole second
 
 
 def dated(offset_s, **extra):

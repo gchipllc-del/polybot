@@ -21,6 +21,9 @@ only). Network calls are injectable for the selftest.
   py scripts/stage0_collector.py once             # single cycle (cron/Task Scheduler)
   py scripts/stage0_collector.py report
   py scripts/stage0_collector.py selftest
+
+`collect` and `once` are single-instance: while one is alive a second prints "not
+starting" and exits 1, because two collectors on one log write every row twice.
 """
 from __future__ import annotations
 

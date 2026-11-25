@@ -403,7 +403,7 @@ def test_the_heartbeat_measures_the_pc_clock_against_kalshi_and_corrects_nothing
         beats.append(heartbeat_of(hb))
     assert abs(beats[0]["clock_skew_s"] - 3600) < 1.1 # Kalshi an hour ahead of the PC
     assert beats[1]["clock_skew_s"] is None           # not measurable: unknown, not 0
-    assert ledgers[0] == ledgers[1]                   # same bets, same mins_left, same bands
+    assert ledgers[0] == ledgers[1]                   # same bets, mins_left and bands
     assert [r["mins_left"] for r in pt._load(tmp_path / "an_hour_off.jsonl")] == [14.67] * 2
 
 

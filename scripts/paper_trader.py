@@ -23,6 +23,13 @@ order path stays closed until an out-of-sample rule earns it.
   py scripts/paper_trader.py run        # loop every 60s
   py scripts/paper_trader.py report
   py scripts/paper_trader.py selftest
+
+`run` and `cycle` are single-instance: while one is alive a second prints "not starting"
+and exits 1, because two traders on one ledger enter every market twice. Each completed
+cycle also replaces data/paper_crypto_heartbeat.json - what the cycle did, how many
+requests failed, the PC clock against Kalshi's, and positions stranded past their close -
+which is what the watchdog reads; the ledger alone cannot tell a stalled trader from a
+quiet market.
 """
 from __future__ import annotations
 
@@ -504,7 +511,8 @@ def run_loop() -> int:
             sk = " ".join(f"{k}={v}" for k, v in c["skipped"].items())
             ug = f" UNGATED={c['ungated']}" if c.get("ungated") else ""
             er = f" ERRORS={c['errors']}" if c.get("errors") else ""
-            od = f" OVERDUE={c['overdue']['n']}" if (c.get("overdue") or {}).get("n") else ""
+            n_od = (c.get("overdue") or {}).get("n")
+            od = f" OVERDUE={n_od}" if n_od else ""
             print(f"[{_now_iso()}] opened={c['opened']} closed={c['closed']} "
                   f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}{er}{od}")
         except KeyboardInterrupt:

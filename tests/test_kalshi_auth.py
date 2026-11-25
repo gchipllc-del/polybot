@@ -232,7 +232,8 @@ def test_a_signed_request_parses_the_key_once_not_three_times(real_key, parses,
     monkeypatch.setattr(requests, "get", fake_requests_get)
     monkeypatch.setenv("KALSHI_API_BASE", "https://example.invalid/trade-api/v2")
     for _ in range(5):
-        assert ka.signed_get("/markets/T/orderbook", params={"depth": 5}) == {"orderbook": {}}
+        got = ka.signed_get("/markets/T/orderbook", params={"depth": 5})
+        assert got == {"orderbook": {}}
     assert len(parses) == 1                    # was 15: three per request
     url, headers = sent[-1]
     assert url == "https://example.invalid/trade-api/v2/markets/T/orderbook"
@@ -280,4 +281,5 @@ def test_signatures_are_made_one_at_a_time_and_all_verify(real_key, monkeypatch)
     for t in threads:
         t.join(timeout=60)
     assert held == [True] * 8
-    assert all(verifies(public, out[i], f"{i}GET/trade-api/v2/x".encode()) for i in range(8))
+    assert all(verifies(public, out[i], f"{i}GET/trade-api/v2/x".encode())
+               for i in range(8))
