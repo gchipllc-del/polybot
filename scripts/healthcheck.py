@@ -17,8 +17,14 @@ actually accruing - file freshness, row growth, endpoint payloads - because ever
 outage here looked healthy from the outside.
 
   py scripts/healthcheck.py            # full check, exit 0 = healthy
-  py scripts/healthcheck.py --repair   # also restart anything dead (Windows tasks)
+  py scripts/healthcheck.py --repair   # also start what is dead and restart what is
+                                       # Running but stalled (Windows tasks; see [tasks])
   py scripts/healthcheck.py --quiet    # only print problems (for scheduled runs)
+
+Run after run: the scheduled task is a new process every 15 minutes, so what must be
+known from the run before (was the PC asleep? was this already so? was a restart tried?)
+is kept in logs/healthcheck_state.json. Without it the watchdog judges every file's full
+age and restarts no running task - it is never made blind by its own bookkeeping.
 """
 from __future__ import annotations
 
@@ -37,6 +43,16 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 IS_WIN = sys.platform.startswith("win")
 TASKS = ["PolybotDashboards", "PolybotStage0", "PolybotPaper", "PolybotSleeves"]
+NEWS_TASK = "PolybotNews"                # hourly, runs and exits: 'Ready' is its normal state
+TASK_CMD = {                             # what each task runs (install_autostart.ps1)
+    "PolybotDashboards": "scripts\\run_dashboards.py",
+    "PolybotStage0": "scripts\\stage0_collector.py collect",
+    "PolybotPaper": "scripts\\paper_trader.py run",
+    "PolybotSleeves": "scripts\\sleeve_paper.py run"}
+TASK_LOCK = {                            # the lib.single_instance name each one holds
+    "PolybotDashboards": "run_dashboards", "PolybotStage0": "stage0_collector",
+    "PolybotPaper": "paper_trader", "PolybotSleeves": "sleeve_paper"}
+RESTART_EVERY_MIN = 60.0                 # at most one automatic restart per task per hour
 QUERY_DONE = "polybot-task-query-done"   # echoed after the task list: PowerShell answered
 PORTS = [("crypto dashboard", 5153), ("weather dashboard", 5154), ("command center", 5155)]
 STAGE0_LOG = ROOT / "data" / "stage0_crypto.jsonl"
@@ -165,15 +181,26 @@ def _state_path() -> Path:
 
 
 def _write_state() -> bool:
+    """Write the state file whole or not at all (temp file + replace). One retry: on
+    Windows a virus scanner or an open editor can hold the file for a moment."""
     p = _state_path()
+    tmp = p.with_name(f"healthcheck_state.tmp{os.getpid()}.json")
+    for attempt in (1, 2):
+        try:
+            p.parent.mkdir(exist_ok=True)
+            tmp.write_text(json.dumps(_state, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, p)
+            return True
+        except (TypeError, ValueError):
+            return False
+        except OSError:
+            if attempt == 1:
+                _sleep(0.3)
     try:
-        p.parent.mkdir(exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(_state, separators=(",", ":")), encoding="utf-8")
-        os.replace(tmp, p)               # never a half-written file for the next run
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+        tmp.unlink()
+    except OSError:
+        pass
+    return False
 
 
 def _begin_run() -> None:
@@ -188,6 +215,7 @@ def _begin_run() -> None:
     last = _n(st, "last_run")
     if not isinstance(st.get("since"), dict):
         st["since"] = {}
+    _note_idle(st, now, now)             # (only tidies whatever the file held)
     if last is None or abs(now - last) > CHAIN_GAP_MIN * 60:
         st["since"] = {}
         st["up_since"] = now if last is not None else None
@@ -299,6 +327,11 @@ def _listening(port: int, host: str = "127.0.0.1") -> bool:
         s.close()
 
 
+def _sleep(seconds: float) -> None:
+    """A pause - one seam, so tests do not wait."""
+    time.sleep(seconds)
+
+
 def _ps(cmd: str, timeout: int = 20) -> str:
     if not IS_WIN:
         return ""
@@ -365,17 +398,325 @@ def _task_states(names: list[str]) -> tuple[dict[str, str], bool]:
     return states, answered
 
 
+# ── [tasks]: is each task running, and is --repair allowed to touch it ────────
+#
+# "Running" is Task Scheduler's word for "the launcher process exists". The repair this
+# file was first given - start a task that is NOT Running - could not help with the
+# outage it names in its own messages ("alive but not collecting"): a request that never
+# returns leaves the task Running for ever, and the installer's 10-minute repeat trigger
+# is a no-op while it does (-MultipleInstances IgnoreNew). So a Running task whose bot
+# has stopped working is restarted too - carefully, because a restart can hurt:
+#   * never on one look. After a night asleep every file is as old as the night and the
+#     watchdog runs at once; an exchange pause lasts hours. The evidence must be stale at
+#     two runs with NOTHING written in between, and then at most once an hour per task.
+#   * never without the single-instance lock. Stop-ScheduledTask ends the launcher; a
+#     python.exe that survives it would trade next to the new copy and double-book an
+#     append-only ledger for good. Only a bot that holds lib.single_instance's lock is
+#     restarted: whatever survives the stop keeps the lock and the new copy stands down.
+#   * never claimed. After any start the state is asked for again, attempts are counted
+#     across runs, and the second attempt in a row is a FAIL, not another "REPAIRED".
+
+def _lock_held(name: str, windows: bool | None = None, msvcrt_mod=None) -> bool | None:
+    """Does a live process hold lib.single_instance's lock for this job? True - yes.
+    False - nobody does (the bot started before the lock existed, or its locking failed
+    open). None - cannot tell. The probe takes the lock for an instant when it is free
+    and gives it straight back. (windows / msvcrt_mod are test seams, as in the lib.)"""
+    try:
+        from lib import single_instance as si
+        path = si.lock_dir() / f"{name}.lock"
+        if not path.exists():
+            return False
+        fd = os.open(str(path), os.O_RDWR)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        if not si._lock_fd(fd, windows=windows, msvcrt_mod=msvcrt_mod):
+            return True
+        if (os.name == "nt") if windows is None else windows:
+            if msvcrt_mod is None:
+                import msvcrt as msvcrt_mod      # noqa: PLC0415 - Windows only
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt_mod.locking(fd, msvcrt_mod.LK_UNLCK, 1)
+        return False                             # (elsewhere closing the file unlocks it)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _lock_holder(name: str) -> str:
+    try:
+        from lib import single_instance as si
+        pid = int((si.lock_dir() / f"{name}.pid").read_text(encoding="utf-8").strip())
+        return f"a process (pid {pid})"
+    except Exception:  # noqa: BLE001
+        return "another process"
+
+
+def _evidence(task: str) -> tuple[bool, str, float] | None:
+    """(stale, what, when it last wrote) - a loop bot's own proof that it is working, or
+    None when there is nothing to judge it by. A bot is stale only when NONE of its
+    files is fresh: a trader that books rows is working whatever its heartbeat says."""
+    def age_of(p: Path) -> float:
+        a = _age_min(p)
+        return float("inf") if a is None else a
+
+    def too_old(age: float, limit: float) -> bool:
+        return _since_wake(age)[0] > limit       # silence counts from the wake-up
+    now = _now()
+    if task == "PolybotStage0":
+        age = age_of(STAGE0_LOG)
+        return None if age == float("inf") else (
+            too_old(age, STAGE0_STALE_MIN), f"stage0 log {age:.0f} min old", now - age * 60)
+    if task == "PolybotSleeves":
+        age = age_of(_data(SLEEVE_HB))
+        return None if age == float("inf") else (
+            too_old(age, SLEEVE_HB_STALE_MIN), f"heartbeat {age:.0f} min old", now - age * 60)
+    if task == "PolybotPaper":
+        hb, ledger = age_of(_data(PAPER_HB)), age_of(PAPER_LOG)
+        newest = min(hb, ledger)
+        if newest == float("inf"):
+            return None
+        if hb != float("inf"):                   # it writes a heartbeat: 10 quiet minutes
+            return (too_old(newest, PAPER_HB_STALE_MIN), f"heartbeat {hb:.0f} min old",
+                    now - newest * 60)
+        return (too_old(ledger, PAPER_QUIET_FAIL_MIN),   # no heartbeat yet: the ledger only
+                f"ledger silent {ledger:.0f} min, no heartbeat", now - ledger * 60)
+    return None
+
+
+def _working(task: str) -> bool:
+    """Is this task's bot demonstrably doing its job right now?"""
+    if task == "PolybotDashboards":
+        return all(_listening(port) for _, port in PORTS)
+    ev = _evidence(task)
+    return ev is not None and not ev[0]
+
+
+def _repairs() -> dict:
+    reps = _state.get("repairs")
+    if not isinstance(reps, dict):
+        reps = _state["repairs"] = {}
+    return reps
+
+
+def _since_repair_min(task: str) -> float | None:
+    rec = _repairs().get(task)
+    t = _n(rec, "t") if isinstance(rec, dict) else None
+    return None if t is None or not _state_ok else max(0.0, (_now() - t) / 60.0)
+
+
+def _count_repair(task: str) -> int:
+    """Record a repair attempt and return its number IN A ROW. The row ends only when
+    the task has then stayed healthy for a full hour (_rested) - a bot that starts,
+    crashes a moment later and is 'repaired' again every 15 minutes is not repaired."""
+    rec = _repairs().get(task)
+    n = (int(_n(rec, "n") or 0) if isinstance(rec, dict) and _state_ok else 0) + 1
+    _repairs()[task] = {"t": _now(), "n": n}
+    return n
+
+
+def _rested(task: str) -> None:
+    since = _since_repair_min(task)
+    if since is None or since >= RESTART_EVERY_MIN:
+        _repairs().pop(task, None)
+
+
+def _state_after_start(task: str) -> str | None:
+    """The task's state once a start has had a moment to take - asked up to three
+    times, two seconds apart (Task Scheduler reports 'Queued' for an instant)."""
+    st = None
+    for i in range(3):
+        if i:
+            _sleep(2.0)
+        st = _task_states([task])[0].get(task)
+        if st is not None and st.lower() == "running":
+            break
+    return st
+
+
+def _by_hand(task: str) -> str:
+    return f"run it by hand to see why: py {TASK_CMD[task]}" if task in TASK_CMD else \
+        "start it by hand to see why"
+
+
+def _running_task(t: str, repair: bool) -> None:
+    ev = _evidence(t)
+    key = f"stalled.{t}"
+    if ev is None or not ev[0]:
+        _lasting(key, False)
+        _rested(t)
+        record(OK, "tasks", f"{t} running")
+        return
+    _, what, written = ev
+    first = _n(_state.get("since") or {}, key)
+    if first is not None and written > first:
+        _forget(key)                     # it has written since the first look: slow, not stalled
+    lasted = _lasting(key, True) or 0.0
+    stalled = f"{t} is Running but its bot looks stalled ({what})"
+    if not repair:
+        record(WARN, "tasks", f"{stalled} - the scheduled watchdog (--repair) restarts it "
+                              f"when nothing is written between two of its runs")
+        return
+    if not _state_ok:
+        record(WARN, "tasks", f"{stalled} - NOT restarted: without logs/{STATE_NAME} one "
+                              f"slow cycle cannot be told from a stall")
+        return
+    if lasted < CONFIRM_MIN:
+        record(WARN, "tasks", f"{stalled} - it is restarted if nothing has been written by "
+                              f"the next run")
+        return
+    since = _since_repair_min(t)
+    if since is not None and since < RESTART_EVERY_MIN:
+        record(WARN, "tasks", f"{t} was restarted {since:.0f} min ago and is still stalled "
+                              f"({what}) - at most one restart an hour, the next in "
+                              f"{RESTART_EVERY_MIN - since:.0f} min")
+        return
+    lock = TASK_LOCK.get(t)
+    if lock and _lock_held(lock) is not True:
+        record(WARN, "tasks", f"{stalled} and is NOT restarted automatically: its process "
+                              f"does not hold the single-instance lock (it started before "
+                              f"the lock existed), so a restart could leave two copies on "
+                              f"one ledger. Once, by hand: Stop-ScheduledTask {t}; check "
+                              f"Task Manager for a leftover python.exe; Start-ScheduledTask {t}")
+        return
+    _ps(f"Stop-ScheduledTask -TaskName {t}")
+    for _ in range(5):                   # let Windows end the process and free its lock
+        _sleep(2.0)
+        if not (lock and _lock_held(lock)):
+            break
+    else:
+        # Still held ten seconds after the stop: the old python.exe outlived it. A start
+        # now would only stand down at the lock - say who is in the way instead.
+        n = _count_repair(t)
+        record(FAIL, "tasks", f"{t} was Running but stalled ({what}); it was stopped, but "
+                              f"{_lock_holder(lock)} still holds its single-instance lock - "
+                              f"the old process outlived the stop. End it in Task Manager; "
+                              f"the task is started at the next run (attempt {n})")
+        return
+    _ps(f"Start-ScheduledTask -TaskName {t}")
+    after = _state_after_start(t)
+    n = _count_repair(t)
+    if after is not None and after.lower() == "running":
+        if n == 1:
+            record(WARN, "tasks", f"{t} was Running but stalled ({what}, nothing written "
+                                  f"since the last run) - RESTARTED (stop + start), now "
+                                  f"Running")
+        else:
+            record(FAIL, "tasks", f"{t} is still stalled ({what}) after a restart - "
+                                  f"restarted again (attempt {n} in a row), but restarting "
+                                  f"does not cure it; {_by_hand(t)}")
+    elif after is None and n == 1:
+        record(WARN, "tasks", f"{t} was Running but stalled ({what}) - stop + start sent, "
+                              f"but Task Scheduler did not answer afterwards: not confirmed")
+    else:
+        record(FAIL, "tasks", f"{t} was Running but stalled ({what}); after stop + start it "
+                              f"is '{after or 'unknown'}', not Running - REPAIR FAILED "
+                              f"(attempt {n}); {_by_hand(t)}")
+
+
+def _dead_task(t: str, st: str) -> None:
+    """A task that is not Running, with --repair: start it - and say what happened."""
+    _lasting(f"stalled.{t}", False)
+    lock = TASK_LOCK.get(t)
+    if lock and _lock_held(lock):
+        # The task is down but its bot is alive: started by hand, or a python.exe that
+        # outlived a stop. A start would only stand down at the lock (and, for a bot
+        # from before the lock, would have been a second copy).
+        who = _lock_holder(lock)
+        if _working(t):
+            record(WARN, "tasks", f"{t} is '{st}', but its bot is running outside Task "
+                                  f"Scheduler ({who} holds its lock and is working) - "
+                                  f"nothing to repair; end that process to hand the bot "
+                                  f"back to the task")
+        else:
+            record(FAIL, "tasks", f"{t} is '{st}' and cannot be started: {who} still holds "
+                                  f"its single-instance lock and is not working - end that "
+                                  f"process (Task Manager); the task is started at the "
+                                  f"next run")
+        return
+    since = _since_repair_min(t)
+    _ps(f"Start-ScheduledTask -TaskName {t}")
+    after = _state_after_start(t)
+    n = _count_repair(t)
+    up = after is not None and after.lower() == "running"
+    if up and n == 1:
+        record(WARN, "tasks", f"{t} was '{st}' (dead) - REPAIRED, restarted")
+    elif up:
+        ago = f"{since:.0f} min after the last start" if since is not None else "again"
+        record(FAIL, "tasks", f"{t} was '{st}' (dead) {ago} - started once more (attempt "
+                              f"{n} in a row), but it is not staying up; {_by_hand(t)}")
+    elif n == 1 and _state_ok:
+        record(WARN, "tasks", f"{t} was '{st}' (dead) - start sent, but it is still "
+                              f"'{after or 'unknown'}': NOT repaired (attempt 1), trying "
+                              f"again at the next run")
+    else:
+        record(FAIL, "tasks", f"{t} is '{after or 'unknown'}' and will not start (attempt "
+                              f"{n} in a row) - REPAIR FAILED; {_by_hand(t)}, or re-run "
+                              f"install_autostart.ps1")
+
+
+def _regime_age_h() -> float | None:
+    """Hours since the news agent last wrote a regime row, or None when it never has."""
+    try:
+        from lib import news_regime as nr
+        hist = nr.load_history(nr.REGIME_LOG, max_bytes=200_000)
+        t = _epoch(hist[-1].get("ts")) if hist else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None if t is None else (_now() - t) / 3600.0
+
+
+def _news_task(st: str | None, repair: bool) -> None:
+    """PolybotNews runs once an hour and exits: 'Ready' is its normal state, and it is
+    never started from here. A run that HANGS is different - the task stays Running, the
+    hourly trigger is ignored while it does, and the regime goes stale for good. So:
+    Running with a stale regime at two runs in a row = stop it and start it, at most
+    once an hour. The news agent is a soft dependency (entries are stamped 'unknown'
+    and trading goes on), so this only ever WARNs."""
+    key = f"stalled.{NEWS_TASK}"
+    age = _regime_age_h() if st is not None and st.lower() == "running" else None
+    try:
+        from lib.news_regime import STALE_AFTER_H
+    except Exception:  # noqa: BLE001
+        STALE_AFTER_H = 3.0
+    hung = age is not None and age > STALE_AFTER_H
+    lasted = _lasting(key, hung)
+    if not hung:
+        _rested(NEWS_TASK)
+        return
+    since = _since_repair_min(NEWS_TASK)
+    if not repair or not _state_ok or (lasted or 0.0) < CONFIRM_MIN or \
+            (since is not None and since < RESTART_EVERY_MIN):
+        return                           # [news] already reports the stale regime
+    _ps(f"Stop-ScheduledTask -TaskName {NEWS_TASK}")
+    _sleep(2.0)
+    _ps(f"Start-ScheduledTask -TaskName {NEWS_TASK}")
+    n = _count_repair(NEWS_TASK)
+    again = f" (attempt {n} in a row - it keeps hanging)" if n >= 2 else ""
+    record(WARN, "tasks", f"{NEWS_TASK} has been Running with the regime {age:.1f} h old - "
+                          f"a hung run blocks every later hourly start; stopped and "
+                          f"started it{again}")
+
+
 def check_tasks(repair: bool) -> None:
     if not IS_WIN:
         record(WARN, "tasks", "not Windows - skipping scheduled-task check")
         return
-    states, answered = _task_states(TASKS)
+    states, answered = _task_states(TASKS + [NEWS_TASK])
     if not answered and not states:
         # No answer is not "four tasks missing": that sent the owner to re-run the
         # installer while everything was running. Nothing is known, so nothing is repaired.
-        record(WARN, "tasks", "could not query Task Scheduler (PowerShell gave no answer) - "
-                              "task states unknown this run, nothing checked or repaired")
+        lasted = _lasting("tasks.no_answer", True)
+        again = f" (no answer for {lasted:.0f} min now)" if lasted else ""
+        record(WARN, "tasks", f"could not query Task Scheduler (PowerShell gave no answer)"
+                              f"{again} - task states unknown this run, nothing checked or "
+                              f"repaired")
         return
+    _lasting("tasks.no_answer", False)
     unknown = []
     for t in TASKS:
         st = states.get(t)
@@ -384,17 +725,16 @@ def check_tasks(repair: bool) -> None:
         elif st is None:
             record(FAIL, "tasks", f"{t} NOT REGISTERED - run install_autostart.ps1")
         elif st.lower() == "running":
-            record(OK, "tasks", f"{t} running")
+            _running_task(t, repair)
+        elif repair:
+            _dead_task(t, st)
         else:
-            if repair:
-                _ps(f"Start-ScheduledTask -TaskName {t}")
-                record(WARN, "tasks", f"{t} was '{st}' (dead) - REPAIRED, restarted")
-            else:
-                record(FAIL, "tasks", f"{t} is '{st}', not Running "
-                                      f"(self-heal fires within 10 min, or --repair now)")
+            record(FAIL, "tasks", f"{t} is '{st}', not Running "
+                                  f"(self-heal fires within 10 min, or --repair now)")
     if unknown:
         record(WARN, "tasks", f"Task Scheduler's answer was cut short - state unknown for "
                               f"{', '.join(unknown)}")
+    _news_task(states.get(NEWS_TASK), repair)
 
 
 def check_ports() -> None:
@@ -494,7 +834,9 @@ def _paper_trader_story() -> str:
     s, age = _read_json(hb), _age_min(hb)
     if s is None or age is None:
         return ("the crypto paper trader is not booking anything (it writes no heartbeat "
-                "yet, so whether it is cycling at all is unknown)")
+                "yet, so whether it is cycling at all is unknown)" if not hb.exists() else
+                "the crypto paper trader is not booking anything (and its heartbeat is "
+                "unreadable)")
     if age > PAPER_HB_STALE_MIN:
         return (f"and its heartbeat is {age:.0f} min old: the crypto paper trader is not "
                 f"cycling")
@@ -560,12 +902,14 @@ def check_crypto_paper() -> None:
     the judge either way. What the heartbeat adds is the difference between "not
     cycling" and "cycling but not working", and the cycle's own error count."""
     hb = _data(PAPER_HB)
+    s, age = _read_json(hb), _age_min(hb)
+    if s is None or age is None or age > PAPER_HB_STALE_MIN:
+        _forget("paper.errors")                   # no fresh cycle to read a count from
     if not hb.exists():
         _warn_crypto_overdue(None)
         record(OK, "paper", "no heartbeat file yet - judged by the ledger alone (the "
                             "trader writes one once it runs the current code)")
         return
-    s, age = _read_json(hb), _age_min(hb)
     if s is None or age is None:
         _warn_crypto_overdue(None)
         record(WARN, "paper", "heartbeat unreadable")

@@ -953,3 +953,304 @@ def test_one_check_raising_does_not_take_the_run_down(host, monkeypatch):
     assert (hc.FAIL, "watchdog") in [(st, sec) for st, sec, _ in bad]
     assert "boom raised KeyError" in host.log() and "UNHEALTHY" in host.log()
     assert any(sec == "disk" for _, sec, _ in host.results)        # later checks still ran
+
+
+# ── --repair: a task that is Running but stalled, and a start that does not take ──
+
+@pytest.fixture
+def scheduler(host, windows, monkeypatch):
+    """A Windows host in good order: the four tasks Running, PolybotNews Ready between
+    its hourly runs, every bot holding its single-instance lock, and no real waiting."""
+    sched = windows(FakeScheduler(dict(ALL_RUNNING, PolybotNews="Ready")))
+    task_of = {lock: task for task, lock in getattr(hc, "TASK_LOCK", {}).items()}
+    monkeypatch.setattr(hc, "_sleep", lambda seconds: None, raising=False)
+    monkeypatch.setattr(hc, "_lock_held",          # a bot holds its lock while its task runs
+                        lambda name: sched.states.get(task_of[name]) == "Running",
+                        raising=False)
+    return sched
+
+
+def _tasks(bad):
+    return [(st, msg) for st, sec, msg in bad if sec == "tasks"]
+
+
+def _stop_start(task):
+    return [f"Stop-ScheduledTask -TaskName {task}", f"Start-ScheduledTask -TaskName {task}"]
+
+
+def test_a_running_but_stalled_collector_is_restarted_on_the_second_run(host, scheduler):
+    """news-health#2: collector log three hours stale, PolybotStage0 'Running'. Three
+    runs each logged '[FAIL] data: stage0 log STALE 180 min ... alive but not collecting'
+    and sent no command at all: check_tasks only acted on tasks that were NOT Running,
+    and the 10-minute repeat trigger is a no-op while the task runs."""
+    assert host.run()[0] == 0 and scheduler.sent == []
+    del host.fresh["stage0_crypto.jsonl"]
+    host.world.age("stage0_crypto.jsonl", 165)
+    rc, bad = host.run()                                   # one look is not a verdict
+    assert rc == 1 and scheduler.sent == []
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.WARN and "looks stalled (stage0 log 180 min old)" in msg
+    assert "restarted if nothing has been written by the next run" in msg
+    rc, bad = host.run()                                   # still nothing written
+    assert scheduler.sent == _stop_start("PolybotStage0")
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.WARN and "RESTARTED (stop + start), now Running" in msg
+    assert scheduler.commands[-1].startswith("Get-ScheduledTask PolybotStage0 ")  # re-queried
+    host.fresh["stage0_crypto.jsonl"] = 0.5                # the new collector writes
+    rc, bad = host.run()
+    assert rc == 0 and _tasks(bad) == [] and len(scheduler.sent) == 2
+
+
+def test_a_restart_that_does_not_help_is_not_repeated_for_an_hour_and_then_fails(
+        host, scheduler):
+    """The cap: at most one restart per task per hour (an exchange pause lasts hours and
+    a restart cures none of it). And the second in a row is a FAIL - restarting is not
+    working, a person is needed."""
+    host.run()
+    del host.fresh["stage0_crypto.jsonl"]
+    host.world.age("stage0_crypto.jsonl", 60)
+    host.run()
+    host.run()                                             # restart no. 1
+    assert scheduler.sent == _stop_start("PolybotStage0")
+    for minutes in (15, 30, 45):
+        _, bad = host.run()
+        ((status, msg),) = _tasks(bad)
+        assert status == hc.WARN and f"restarted {minutes} min ago and is still stalled" in msg
+        assert len(scheduler.sent) == 2
+    _, bad = host.run()                                    # an hour on: once more
+    assert scheduler.sent == _stop_start("PolybotStage0") * 2
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.FAIL and "attempt 2 in a row" in msg
+    assert "py scripts\\stage0_collector.py collect" in msg
+
+
+def test_waking_up_does_not_restart_anything(host, scheduler):
+    """The fix risk: right after the PC wakes, every bot's evidence is as old as the
+    night and the watchdog runs at once. Nothing seen before the gap counts, the first
+    run after it is a first look, and by the next one the bots have written."""
+    host.run()
+    for name in ("stage0_crypto.jsonl", "sleeve_paper_heartbeat.json", "paper_crypto15.jsonl"):
+        del host.fresh[name]
+    _, bad = host.run()                                    # a first look, 16 min stale
+    assert len(_tasks(bad)) == 2                           # collector and sleeves noted
+    _, bad = host.run(8 * 60)                              # asleep 8 h, then this run
+    assert scheduler.sent == [] and _tasks(bad) == []      # 8 h old - and just woken
+    host.fresh.update(FRESH)                               # everything resumes...
+    del host.fresh["sleeve_paper_heartbeat.json"]          # ...except the sleeve trader
+    _, bad = host.run()                                    # 15 min awake: a first look
+    assert scheduler.sent == []
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.WARN and msg.startswith("PolybotSleeves is Running but its bot "
+                                                "looks stalled (heartbeat 511 min old)")
+    _, bad = host.run()                                    # 30 min awake: it is restarted
+    assert scheduler.sent == _stop_start("PolybotSleeves")
+
+
+def test_a_slow_bot_that_keeps_writing_is_never_restarted(host, scheduler):
+    """Stale at two looks is not enough when it WROTE in between: that is a slow cycle
+    (a sleeve cycle in which every request times out takes over ten minutes), not a
+    stall, and restarting a working trader drops the cycle in flight."""
+    host.run()
+    host.fresh["sleeve_paper_heartbeat.json"] = 11.0       # always 11 min old when looked at,
+    for _ in range(6):                                     # i.e. written between every two runs
+        rc, bad = host.run()
+        assert any("looks stalled (heartbeat 11 min old)" in m for _, m in _tasks(bad))
+    assert scheduler.sent == []
+
+
+def test_a_bot_without_the_single_instance_lock_is_not_restarted_automatically(
+        host, scheduler, monkeypatch):
+    """The serious risk: if Stop-ScheduledTask ends the launcher but leaves python.exe,
+    the Start adds a second trader on the same ledger. Only a bot that holds the lock
+    is restarted - a survivor then keeps the lock and the new copy stands down."""
+    monkeypatch.setattr(hc, "_lock_held", lambda name: False)      # code from before the lock
+    host.run()
+    del host.fresh["sleeve_paper_heartbeat.json"]
+    host.world.age("sleeve_paper_heartbeat.json", 120)
+    host.run()
+    for _ in range(5):
+        _, bad = host.run()
+        ((status, msg),) = _tasks(bad)
+        assert status == hc.WARN and "NOT restarted automatically" in msg
+        assert "Stop-ScheduledTask PolybotSleeves" in msg and "leftover python.exe" in msg
+    assert scheduler.sent == []
+
+
+def test_a_process_that_outlives_the_stop_blocks_the_restart_and_is_named(
+        host, scheduler, monkeypatch):
+    """The lock at work: python.exe survives Stop-ScheduledTask and still holds the
+    lock. A new copy could only stand down at it, so none is started - no second trader -
+    and the watchdog says which process is in the way, now and at every run after."""
+    monkeypatch.setattr(hc, "_lock_held", lambda name: True)        # the survivor's lock
+    monkeypatch.setattr(hc, "_lock_holder", lambda name: "a process (pid 4321)")
+    host.run()
+    del host.fresh["sleeve_paper_heartbeat.json"]
+    host.world.age("sleeve_paper_heartbeat.json", 60)
+    host.run()
+    _, bad = host.run()
+    assert scheduler.sent == ["Stop-ScheduledTask -TaskName PolybotSleeves"]
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.FAIL and "pid 4321" in msg and "outlived the stop" in msg
+    _, bad = host.run()                                             # the task is Ready now
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.FAIL and "cannot be started: a process (pid 4321) still holds" in msg
+    assert len(scheduler.sent) == 1                                 # and no pointless start
+
+
+def test_without_its_state_file_the_watchdog_restarts_no_running_task(host, scheduler):
+    (host.world.root / "logs").rmdir()
+    (host.world.root / "logs").write_text("not a folder", encoding="utf-8")
+    del host.fresh["stage0_crypto.jsonl"]
+    host.world.age("stage0_crypto.jsonl", 180)
+    for _ in range(4):
+        _, bad = host.run()
+        assert any("NOT restarted" in m for _, m in _tasks(bad))
+    assert scheduler.sent == []
+
+
+def test_a_dead_task_is_started_and_the_start_is_checked(host, scheduler):
+    """The case --repair was written for still works: state Ready, one start, healthy."""
+    scheduler.states["PolybotStage0"] = "Ready"
+    rc, bad = host.run()
+    assert scheduler.sent == ["Start-ScheduledTask -TaskName PolybotStage0"]
+    assert _tasks(bad) == [(hc.WARN, "PolybotStage0 was 'Ready' (dead) - REPAIRED, restarted")]
+    assert scheduler.commands[-1].startswith("Get-ScheduledTask PolybotStage0 ")
+    rc, bad = host.run()
+    assert rc == 0 and _tasks(bad) == [] and len(scheduler.sent) == 1
+
+
+def test_a_start_that_does_not_take_is_never_called_repaired(host, scheduler):
+    """news-health#2, second half: a task that is Ready and will NOT start (disabled,
+    python moved, crash at import) logged 'REPAIRED, restarted' on every run - three
+    runs, three identical lines, exit code 0."""
+    scheduler.states["PolybotPaper"] = "Ready"
+    scheduler.start_works = False
+    rc, bad = host.run()
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.WARN and "NOT repaired (attempt 1)" in msg and "REPAIRED," not in msg
+    for attempt in (2, 3):
+        rc, bad = host.run()
+        ((status, msg),) = _tasks(bad)
+        assert rc == 1 and status == hc.FAIL, (attempt, msg)
+        assert f"will not start (attempt {attempt} in a row) - REPAIR FAILED" in msg
+        assert "py scripts\\paper_trader.py run" in msg
+    assert scheduler.sent == ["Start-ScheduledTask -TaskName PolybotPaper"] * 3
+    assert "UNHEALTHY" in host.log().splitlines()[-2]
+
+
+def test_a_task_that_starts_and_dies_again_fails_on_the_second_repair(host, scheduler):
+    """Asking for the state right after a start can still read Running for a task that
+    crashes at import a moment later. Counting attempts across runs catches it: the
+    second repair in a row is a FAIL, and the row ends only after a healthy hour."""
+    scheduler.states["PolybotSleeves"] = "Ready"
+    _, bad = host.run()
+    assert _tasks(bad)[0] == (hc.WARN, "PolybotSleeves was 'Ready' (dead) - REPAIRED, restarted")
+    scheduler.states["PolybotSleeves"] = "Ready"           # it crashed again
+    rc, bad = host.run()
+    ((status, msg),) = _tasks(bad)
+    assert rc == 1 and status == hc.FAIL and "attempt 2 in a row" in msg
+    assert "15 min after the last start" in msg and "not staying up" in msg
+    for _ in range(5):                                     # 75 healthy minutes
+        rc, bad = host.run()
+        assert rc == 0 and _tasks(bad) == []
+    scheduler.states["PolybotSleeves"] = "Ready"           # a new, separate death
+    _, bad = host.run()
+    assert _tasks(bad)[0][0] == hc.WARN and "REPAIRED, restarted" in _tasks(bad)[0][1]
+
+
+def test_a_task_that_is_down_while_its_bot_is_alive_is_not_started(
+        host, scheduler, monkeypatch):
+    """The bot runs outside the task (started by hand, or a python.exe that outlived a
+    stop) and holds the lock. A start could only stand down at the lock - or, for code
+    from before the lock, would have been a second trader on the ledger."""
+    scheduler.states["PolybotPaper"] = "Ready"
+    monkeypatch.setattr(hc, "_lock_held", lambda name: True)
+    rc, bad = host.run()
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.WARN and "running outside Task Scheduler" in msg and rc == 0
+    del host.fresh["paper_crypto15.jsonl"]                 # ...and now it stops working
+    host.world.age("paper_crypto15.jsonl", 3 * 1440)
+    rc, bad = host.run()
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.FAIL and "still holds its single-instance lock" in msg
+    assert scheduler.sent == []
+
+
+def _regime_log(world, monkeypatch, hours_old):
+    from lib import news_regime as nr
+    p = world.path("news_regime.jsonl")
+    p.write_text(json.dumps({"t": "regime", "ts": _iso(world.now - hours_old * HOUR),
+                             "regime": "good", "mult": 1.0, "reasons": []}) + "\n",
+                 encoding="utf-8")
+    monkeypatch.setattr(nr, "REGIME_LOG", p)
+
+
+def test_a_hung_news_run_is_stopped_and_started_but_a_ready_task_is_left_alone(
+        host, scheduler, monkeypatch):
+    """PolybotNews runs hourly and exits: Ready is normal and is never 'repaired'. A run
+    that hangs stays Running, every later hourly start is ignored, and the regime goes
+    stale for good - that, seen at two runs, is stopped and started."""
+    _regime_log(host.world, monkeypatch, hours_old=5.0)
+    for _ in range(4):                                     # Ready with a stale regime
+        host.run()
+    assert scheduler.sent == []
+    scheduler.states["PolybotNews"] = "Running"            # a run that never returns
+    _, bad = host.run()
+    assert scheduler.sent == [] and _tasks(bad) == []      # first look
+    _, bad = host.run()
+    assert scheduler.sent == _stop_start("PolybotNews")
+    ((status, msg),) = _tasks(bad)
+    assert status == hc.WARN and "regime 6.2 h old" in msg and "stopped and started" in msg
+
+    scheduler.commands.clear()                             # Running with a FRESH regime
+    _regime_log(host.world, monkeypatch, hours_old=0.2)
+    for _ in range(6):
+        host.run()
+    assert scheduler.sent == []
+
+
+def test_an_unanswered_query_says_how_long_it_has_been_unanswered(host, scheduler):
+    scheduler.answers = False
+    _, bad = host.run()
+    assert "could not query Task Scheduler" in _tasks(bad)[0][1]
+    assert "min now" not in _tasks(bad)[0][1]
+    host.run()
+    _, bad = host.run()
+    assert "(no answer for 30 min now)" in _tasks(bad)[0][1] and _tasks(bad)[0][0] == hc.WARN
+
+
+def test_the_lock_probe_tells_a_held_lock_from_a_free_one(tmp_path, monkeypatch):
+    """The probe behind 'only a bot that holds the lock is restarted', against the real
+    lib.single_instance on this OS, then through its Windows branch with a fake msvcrt."""
+    import errno
+    from lib import single_instance as si
+    monkeypatch.setenv("POLYBOT_LOCK_DIR", str(tmp_path))
+    assert hc._lock_held("paper_trader") is False          # no lock file: nobody holds it
+    assert si.hold("paper_trader") is True
+    try:
+        assert hc._lock_held("paper_trader") is True
+        assert hc._lock_holder("paper_trader") == f"a process (pid {os.getpid()})"
+    finally:
+        si.release("paper_trader")
+    assert hc._lock_held("paper_trader") is False
+    assert si.hold("paper_trader") is True                 # and the probe left it free
+    si.release("paper_trader")
+
+    class FakeMsvcrt:
+        LK_NBLCK, LK_UNLCK = 2, 0
+
+        def __init__(self, err=None):
+            self.err, self.calls = err, []
+
+        def locking(self, fd, mode, nbytes):
+            self.calls.append((mode, os.lseek(fd, 0, os.SEEK_CUR)))
+            if self.err is not None:
+                raise OSError(self.err, "locking failed")
+
+    free = FakeMsvcrt()
+    assert hc._lock_held("paper_trader", windows=True, msvcrt_mod=free) is False
+    assert free.calls == [(2, 0), (0, 0)]                  # took byte 0, gave byte 0 back
+    assert hc._lock_held("paper_trader", windows=True,
+                         msvcrt_mod=FakeMsvcrt(errno.EACCES)) is True
+    assert hc._lock_held("paper_trader", windows=True,
+                         msvcrt_mod=FakeMsvcrt(errno.ENOLCK)) is None
