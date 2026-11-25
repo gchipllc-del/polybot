@@ -42,6 +42,13 @@ from lib.single_instance import AlreadyRunning, hold  # noqa: E402
 
 LEDGER = Path(os.environ.get("PAPER_CRYPTO_LEDGER")
               or (ROOT / "data" / "paper_crypto15.jsonl"))
+# What the last COMPLETED cycle did, for the watchdog and the dashboards (written by the
+# run loop and by `cycle`, never by a bare run_cycle). The ledger alone cannot tell them:
+# it changes only when a bet opens or settles, so a trader whose every request fails, or
+# whose slots are all stuck, looks exactly like a quiet market. Readers look in data/;
+# the env override is for an experiment that must not touch the live file.
+HEARTBEAT = Path(os.environ.get("PAPER_CRYPTO_HEARTBEAT")
+                 or (ROOT / "data" / "paper_crypto_heartbeat.json"))
 
 CONTRACTS = 1              # sizing is not the question under test
 MAX_CONCURRENT = 8
@@ -108,6 +115,42 @@ def _append(rows: list[dict], path: Path) -> None:
     if not rows:
         return
     append_lines(path, [json.dumps(r, separators=(",", ":")) for r in rows])
+
+
+def _utc_iso(dt: datetime) -> str:
+    return (dt.astimezone(timezone.utc) if dt.tzinfo else dt).isoformat()
+
+
+def _endpoint(url) -> str:
+    """'/events' or '/v2/prices/BTC-USD/spot' - enough to say which call failed."""
+    path = str(url).split("://", 1)[-1].split("?", 1)[0]
+    path = path[path.find("/"):] if "/" in path else path
+    return path.replace("/trade-api/v2", "", 1)[:80]
+
+
+def _request_error(what: str, e: BaseException) -> str:
+    return f"{what}: {type(e).__name__}: {str(e)[:160]}"
+
+
+def _write_heartbeat(path: Path, hb: dict) -> bool:
+    """Replace the status file atomically (temp file + os.replace), so a reader never
+    sees half of it. A failure is printed and swallowed: the ledger is already written
+    and a status file must never cost a cycle."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")    # stays git-ignored
+        tmp.write_text(json.dumps(hb), encoding="utf-8")
+        for attempt in (1, 2, 3):
+            try:
+                os.replace(tmp, path)
+                return True
+            except PermissionError:      # Windows: a reader has it open at this instant
+                if attempt == 3:
+                    raise
+                time.sleep(0.05)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] heartbeat not written: {type(e).__name__}: {str(e)[:80]}")
+    return False
 
 
 def open_positions(rows: list[dict]) -> dict:
@@ -184,9 +227,12 @@ def settle_positions(rows: list[dict], results: dict) -> list[dict]:
 
 # ── live cycle ───────────────────────────────────────────────────────────────
 
-def _depth_fetcher():
+def _depth_fetcher(on_error=None):
     """Order-book depth lookup, when Kalshi auth is configured. Returns
-    fn(ticker, side, price) -> contracts available at <= price, or None."""
+    fn(ticker, side, price) -> contracts available at <= price, or None.
+    on_error(text), if given, is told about every lookup that raised. The lookup still
+    answers None ("the gate did not run") exactly as before; the caller can now COUNT
+    the failed requests instead of never hearing of them."""
     try:
         from lib.envload import load_env
         load_env()
@@ -200,7 +246,12 @@ def _depth_fetcher():
                 ob = signed_get(f"/markets/{ticker}/orderbook", params={"depth": 5})
                 book = ob.get("orderbook") or ob
                 return sb._depth_at(book, side, price)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                if on_error is not None:
+                    try:
+                        on_error(_request_error(f"orderbook {ticker}", e))
+                    except Exception:  # noqa: BLE001 - counting must never break a lookup
+                        pass
                 return None
         return fn
     except Exception:
@@ -240,14 +291,31 @@ def _regime_now(now=None) -> dict:
 
 
 def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
-              regime_fn=None) -> dict:
+              regime_fn=None, heartbeat: Path | None = None) -> dict:
+    """One pass: open what the rules call for, settle what Kalshi has resolved.
+    heartbeat: where to leave the cycle's status file (the run loop and `cycle` pass
+    HEARTBEAT). None writes none, so tests and the selftest never touch the live one."""
     import stage0_collector as s0
+    t_start = time.monotonic()
     rules, bands, fee_fn = _rules()
     p = path or LEDGER
-    get = get or s0._get
+    raw_get = get or s0._get
     now = now or datetime.now(timezone.utc)
+
+    # Every failed request of this cycle, newest last. Until now each one was a console
+    # line (or swallowed outright) and the cycle looked the same as a healthy quiet one.
+    # COUNTING ONLY: every call below is made, and fails, exactly as before.
+    errs: list[str] = []
+
+    def get(*a, **k):                    # the caller's get, with its failures counted
+        try:
+            return raw_get(*a, **k)
+        except Exception as e:  # noqa: BLE001 - recorded, then raised unchanged
+            errs.append(_request_error(f"GET {_endpoint(a[0] if a else k.get('url'))}", e))
+            raise
+
     if depth_fn is None:
-        depth_fn = _depth_fetcher()
+        depth_fn = _depth_fetcher(on_error=errs.append)
     regime = (regime_fn or _regime_now)()
 
     rows = _load(p)
@@ -339,9 +407,18 @@ def run_cycle(get=None, now=None, path: Path | None = None, depth_fn=None,
     closes = settle_positions(rows + new_rows, results)
     new_rows.extend(closes)
     _append(new_rows, p)
-    return {"opened": opened, "closed": len(closes), "skipped": skipped,
-            "ungated": ungated, "regime": regime["regime"],
-            "open_now": len(open_positions(_load(p)))}
+    summary = {"opened": opened, "closed": len(closes), "skipped": skipped,
+               "ungated": ungated, "regime": regime["regime"],
+               "open_now": len(open_positions(_load(p))),
+               "errors": len(errs), "last_error": errs[-1] if errs else None,
+               "took_s": round(time.monotonic() - t_start, 3)}
+    if heartbeat is not None:           # after the ledger, and never able to fail a cycle
+        _write_heartbeat(heartbeat, {
+            "ts": _utc_iso(now), "took_s": summary["took_s"],
+            "opened": opened, "closed": len(closes), "open_now": summary["open_now"],
+            "skipped": skipped, "ungated": ungated,
+            "errors": summary["errors"], "last_error": summary["last_error"]})
+    return summary
 
 
 def run_loop() -> int:
@@ -350,11 +427,12 @@ def run_loop() -> int:
     while True:
         t0 = time.time()
         try:
-            c = run_cycle()
+            c = run_cycle(heartbeat=HEARTBEAT)
             sk = " ".join(f"{k}={v}" for k, v in c["skipped"].items())
             ug = f" UNGATED={c['ungated']}" if c.get("ungated") else ""
+            er = f" ERRORS={c['errors']}" if c.get("errors") else ""
             print(f"[{_now_iso()}] opened={c['opened']} closed={c['closed']} "
-                  f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}")
+                  f"open_now={c['open_now']} regime={c.get('regime')} {sk}{ug}{er}")
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001
@@ -500,14 +578,22 @@ def _selftest() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "paper.jsonl"
+        hbp = Path(td) / "heartbeat.json"
         c1 = run_cycle(get=fake_get, now=now, path=p, depth_fn=lambda t, s, pr: 100,
-                       regime_fn=lambda: {"regime": "cautious", "mult": 0.5})
+                       regime_fn=lambda: {"regime": "cautious", "mult": 0.5},
+                       heartbeat=hbp)
         # both rules in the <2min band fire (favorite 0.88 + longshot 0.14); the
         # fixture serves the SAME ticker under both series, so in-cycle dedup must
         # collapse it to exactly 2 positions, not 4.
         assert c1["opened"] == 2, c1
         assert c1["open_now"] == 2, c1
         assert c1["ungated"] == 0, c1       # depth known -> the gate actually ran
+        # the cycle left its status file: what it did, and that no request failed
+        hb = json.loads(hbp.read_text(encoding="utf-8"))
+        assert hb["ts"] == now.isoformat() and hb["opened"] == 2, hb
+        assert hb["open_now"] == 2 and hb["closed"] == 0 and hb["ungated"] == 0, hb
+        assert hb["errors"] == 0 and hb["last_error"] is None, hb
+        assert [f.name for f in Path(td).iterdir() if "tmp" in f.name] == []
         # every entry carries the news-agent regime in force when it opened - a
         # stamp only: the cautious regime did NOT change the size or the count
         opens = [r for r in _load(p) if r.get("t") == "open"]
@@ -522,6 +608,22 @@ def _selftest() -> int:
         pu = Path(td) / "ungated.jsonl"
         cu = run_cycle(get=fake_get, now=now, path=pu, depth_fn=lambda t, s, pr: None)
         assert cu["opened"] == 2 and cu["ungated"] == 2, cu
+
+    # every request failing must not look like a quiet market: the cycle completes,
+    # writes no row, and its status file says how many requests failed and why
+    def dead_get(url, params=None):
+        raise ConnectionError("exchange unreachable")
+
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as td:
+        pd_, hbd = Path(td) / "dead.jsonl", Path(td) / "heartbeat.json"
+        with contextlib.redirect_stdout(io.StringIO()):     # the [warn] lines it prints
+            cd = run_cycle(get=dead_get, now=now, path=pd_,
+                           depth_fn=lambda t, s, pr: 100, heartbeat=hbd)
+        assert cd["opened"] == 0 and cd["errors"] == 4 and not pd_.exists(), cd
+        hb = json.loads(hbd.read_text(encoding="utf-8"))
+        assert hb["errors"] == 4 and "exchange unreachable" in hb["last_error"], hb
     # PER-WINDOW CAP: 6 strikes in ONE window must collapse to MAX_PER_WINDOW per rule,
     # and the survivor must be the one the volatility model ranked most mispriced.
     def fake_get_many(url, params=None):
@@ -595,7 +697,7 @@ def main() -> int:
             print(f"not starting: {e}; a second copy would enter every market twice")
             return 1
     if cmd == "cycle":
-        c = run_cycle()
+        c = run_cycle(heartbeat=HEARTBEAT)
         print(f"opened={c['opened']} closed={c['closed']} open_now={c['open_now']} "
               f"skipped={c['skipped']} -> {LEDGER}")
         return 0

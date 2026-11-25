@@ -1,5 +1,6 @@
 """paper_trader - the crypto forward trader's safety net: what a crash, a second copy or a
 stalled cycle may cost, each pinned. No test here changes what a frozen rule trades."""
+import json
 import os
 import subprocess
 import sys
@@ -184,3 +185,167 @@ def test_the_lock_never_blocks_a_cycle_function_a_report_or_the_selftest(
         twin.kill()
         twin.wait(timeout=10)
     assert "paper_trader" not in si._HELD
+
+
+# ── the heartbeat: what the last completed cycle did ─────────────────────────
+
+def dead(url, params=None):
+    raise ConnectionError("Max retries exceeded with url: " + url)
+
+
+def heartbeat_of(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_completed_cycle_leaves_a_heartbeat_with_its_counters(tmp_path):
+    p, hb = tmp_path / "paper.jsonl", tmp_path / "status" / "paper_crypto_heartbeat.json"
+    c = cycle(p, 0.55, heartbeat=hb)
+    got = heartbeat_of(hb)
+    assert got == {"ts": T0.isoformat(), "took_s": c["took_s"], "opened": 2, "closed": 0,
+                   "open_now": 2, "skipped": {}, "ungated": 0, "errors": 0,
+                   "last_error": None}
+    assert isinstance(got["took_s"], float) and 0 <= got["took_s"] < 5
+    assert [f.name for f in hb.parent.iterdir()] == [hb.name]      # no temp file left
+    # the next cycle replaces it with its own numbers: one position settles
+    settled = [{"ticker": "KXBTC15M-26NOV251215-15", "result": "yes"}]
+    cycle(p, 0.55, 1, get=exchange(0.55, settled=settled), heartbeat=hb)
+    got = heartbeat_of(hb)
+    assert (got["ts"], got["opened"], got["closed"], got["open_now"]) == (
+        (T0 + timedelta(minutes=1)).isoformat(), 0, 1, 1)
+
+
+def test_a_trader_whose_every_request_fails_no_longer_looks_like_a_quiet_market(
+        tmp_path, capsys):
+    """The cycle completes, raises nothing and writes no ledger row - on disk it was
+    indistinguishable from a healthy trader with nothing to do, for as long as it lasted."""
+    p, hb = tmp_path / "paper.jsonl", tmp_path / "hb.json"
+    c = cycle(p, 0.55, get=dead, heartbeat=hb)
+    assert (c["opened"], c["closed"], c["open_now"]) == (0, 0, 0) and not p.exists()
+    got = heartbeat_of(hb)
+    assert got["errors"] == 4                        # 2 market lists + 2 settlement sweeps
+    assert got["last_error"].startswith("GET /markets: ConnectionError: Max retries")
+    assert c["errors"] == 4 and c["last_error"] == got["last_error"]
+    assert capsys.readouterr().out.count("[warn]") == 4       # the console lines stay
+
+
+def test_failed_spot_requests_are_counted_and_change_nothing_else(tmp_path):
+    def no_spot(url, params=None):
+        if "coinbase" in url:
+            raise TimeoutError("read timed out")
+        return exchange(0.55)(url, params)
+    p, hb = tmp_path / "paper.jsonl", tmp_path / "hb.json"
+    assert cycle(p, 0.55, get=no_spot, heartbeat=hb)["opened"] == 2
+    got = heartbeat_of(hb)
+    assert got["errors"] == 2 and got["opened"] == 2
+    assert got["last_error"] == "GET /v2/prices/ETH-USD/spot: TimeoutError: read timed out"
+    assert [r["spot"] for r in pt._load(p)] == [None, None]     # as before the counting
+
+
+@pytest.fixture
+def signed_lookups_fail(monkeypatch):
+    """Kalshi auth 'configured', every signed order-book request rejected."""
+    import lib.envload
+    import lib.kalshi_auth as ka
+
+    def rejected(path, **kw):
+        raise PermissionError("401 Client Error: Unauthorized for url: " + path)
+    monkeypatch.setattr(lib.envload, "load_env", lambda *a, **k: False)
+    monkeypatch.setattr(ka, "can_sign", lambda: True)
+    monkeypatch.setattr(ka, "signed_get", rejected)
+
+
+def test_rejected_order_book_requests_are_counted(tmp_path, signed_lookups_fail):
+    """Each failed lookup returned None and the entry went in ungated; the failure
+    itself was swallowed. It is still admitted ungated - and now it is counted."""
+    p, hb = tmp_path / "paper.jsonl", tmp_path / "hb.json"
+    c = pt.run_cycle(get=exchange(0.55), now=T0, path=p, regime_fn=lambda: GOOD,
+                     heartbeat=hb)                   # depth_fn=None: the real fetcher
+    assert (c["opened"], c["ungated"]) == (2, 2)
+    got = heartbeat_of(hb)
+    assert got["errors"] == 2 and got["ungated"] == 2
+    assert got["last_error"].startswith(
+        "orderbook KXETH15M-26NOV251215-15: PermissionError: 401 Client Error")
+
+
+def test_the_depth_lookup_other_traders_share_is_unchanged(signed_lookups_fail):
+    """sleeve_paper calls _depth_fetcher() with no arguments: a failed lookup must still
+    answer None, and a callback that itself breaks must not break the lookup."""
+    assert pt._depth_fetcher()("T", "yes", 0.5) is None
+
+    def broken(text):
+        raise RuntimeError("counter broke")
+    assert pt._depth_fetcher(on_error=broken)("T", "yes", 0.5) is None
+
+
+def test_a_heartbeat_that_cannot_be_written_never_costs_the_cycle(tmp_path, monkeypatch,
+                                                                  capsys):
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    p = tmp_path / "paper.jsonl"
+    assert cycle(p, 0.55, heartbeat=blocker / "hb.json")["opened"] == 2
+    assert len(opens(p)) == 2                        # the ledger was written first
+    assert "[warn] heartbeat not written" in capsys.readouterr().out
+
+    # Windows: os.replace is refused while a reader holds the file open. Retried...
+    hb, real, calls = tmp_path / "hb.json", os.replace, []
+
+    def busy_once(src, dst):
+        calls.append(dst)
+        if len(calls) == 1:
+            raise PermissionError(13, "Access is denied")
+        return real(src, dst)
+    monkeypatch.setattr(pt.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pt.os, "replace", busy_once)
+    assert pt._write_heartbeat(hb, {"ts": "x"}) is True and heartbeat_of(hb) == {"ts": "x"}
+
+    # ... and given up on quietly if it stays refused: the old heartbeat stays whole
+    def busy(src, dst):
+        raise PermissionError(13, "Access is denied")
+    monkeypatch.setattr(pt.os, "replace", busy)
+    assert pt._write_heartbeat(hb, {"ts": "y"}) is False and heartbeat_of(hb) == {"ts": "x"}
+    assert "[warn] heartbeat not written: PermissionError" in capsys.readouterr().out
+
+
+def test_the_heartbeat_is_swapped_in_whole_never_written_in_place(tmp_path, monkeypatch):
+    hb, seen, real = tmp_path / "paper_crypto_heartbeat.json", [], os.replace
+    hb.write_text('{"ts":"old"}', encoding="utf-8")
+
+    def spy(src, dst):
+        seen.append((Path(src).name, json.loads(Path(src).read_text(encoding="utf-8")),
+                     heartbeat_of(hb)))
+        return real(src, dst)
+    monkeypatch.setattr(pt.os, "replace", spy)
+    cycle(tmp_path / "paper.jsonl", 0.55, heartbeat=hb)
+    (tmp_name, new, old), = seen
+    assert old == {"ts": "old"} and new["opened"] == 2      # complete before the swap
+    assert tmp_name == "paper_crypto_heartbeat.tmp.json"    # matches data/*heartbeat*.json
+
+
+def test_only_the_real_trader_writes_the_live_heartbeat(tmp_path, monkeypatch, lock_dir,
+                                                        capsys):
+    """A bare run_cycle (tests, the selftest the watchdog runs every 15 minutes, a
+    research script) must never overwrite the live status file; `cycle` and the run loop
+    must always write it."""
+    hb = tmp_path / "live_heartbeat.json"
+    monkeypatch.setattr(pt, "HEARTBEAT", hb)
+    monkeypatch.setattr(pt, "LEDGER", tmp_path / "live.jsonl")
+    monkeypatch.setattr(pt, "_depth_fetcher", lambda on_error=None: (lambda t, s, p: 100.0))
+    monkeypatch.setattr(pt, "_regime_now", lambda: GOOD)
+    cycle(tmp_path / "other.jsonl", 0.55)
+    assert not hb.exists()
+
+    monkeypatch.setattr(s0, "_get", exchange(0.55))
+    monkeypatch.setattr(sys, "argv", ["paper_trader.py", "cycle"])
+    assert pt.main() == 0 and heartbeat_of(hb)["opened"] == 2
+    hb.unlink()
+
+    def one_cycle_then_stop(seconds):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(pt.time, "sleep", one_cycle_then_stop)
+    monkeypatch.setattr(s0, "_get", dead)
+    with pytest.raises(KeyboardInterrupt):
+        pt.run_loop()
+    got = heartbeat_of(hb)
+    assert got["errors"] == 4 and got["open_now"] == 2
+    line = [ln for ln in capsys.readouterr().out.splitlines() if "opened=" in ln][-1]
+    assert line.endswith("ERRORS=4")                 # the loop's own line says so too
