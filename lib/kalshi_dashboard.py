@@ -196,7 +196,7 @@ def _refresh_balance() -> None:
     account, failed = None, True
     try:
         account, failed = _fetch_account()
-    except Exception as e:  # noqa: BLE001 - a status file must never take a thread down silently
+    except Exception as e:  # noqa: BLE001 - said in the panel, not lost on a thread
         account = {"auth": None, "balance_dollars": None,
                    "error": f"{type(e).__name__}: {str(e)[:200]}"}
     finally:

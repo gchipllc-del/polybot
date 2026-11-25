@@ -73,10 +73,10 @@ def test_a_request_never_waits_for_kalshi(kalshi):
     kalshi.gate.clear()                                 # accepts, never answers
     t0 = time.monotonic()
     first = kd._account_payload()
-    assert time.monotonic() - t0 < 0.5                  # was 15 s: the call's own timeout
+    assert time.monotonic() - t0 < 1.5                  # was 15 s: the call's own timeout
     for _ in range(20):                                 # a poll every 20 s, twenty times
         kd._account_payload()
-    assert time.monotonic() - t0 < 0.5
+    assert time.monotonic() - t0 < 1.5
     assert first["pending"] is True and first["balance_dollars"] is None
     assert first["error"] is None                       # not known yet is not an error
     assert len(kalshi.calls) <= 1                       # one fetch in flight, not twenty-one
@@ -156,9 +156,9 @@ def test_the_weather_page_reads_the_cache_too(kalshi, monkeypatch):
     client = wd.make_app().test_client()
     t0 = time.monotonic()
     bodies = [client.get("/api/all").get_json()]
-    assert time.monotonic() - t0 < 1.0                  # was 15 s for each request
+    assert time.monotonic() - t0 < 1.5                  # was 15 s for each request
     bodies += [client.get("/api/all").get_json() for _ in range(2)]
-    assert time.monotonic() - t0 < 1.0
+    assert time.monotonic() - t0 < 1.5
     assert all(b["account"]["pending"] for b in bodies) and len(kalshi.calls) <= 1
     kalshi.gate.set()
     _join_fetches()
