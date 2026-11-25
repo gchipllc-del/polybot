@@ -267,32 +267,64 @@ def check_depth_coverage() -> None:
         record(OK, "depth", f"{pct:.0f}% of recent observations carry order-book depth")
 
 
+def _defect_counts(whats: list[str]) -> str:
+    """'2 duplicate opens, 1 orphan close' from diagnostics-style defect labels."""
+    n: dict[str, int] = {}
+    for w in whats:
+        kind = " ".join(w.split()[:2])
+        n[kind] = n.get(kind, 0) + 1
+    return ", ".join(f"{c} {k}{'' if c == 1 else 's'}" for k, c in n.items())
+
+
 def check_ledger_integrity() -> None:
-    """Bug 7: the same (market, rule) entered twice would silently double-count P&L."""
+    """Bug 7: the same (market, rule) entered twice would silently double-count P&L.
+
+    RECENT EVIDENCE FAILS, HISTORY INFORMS - diagnostics' rule, and its window: the last
+    24 h of the ledger's own timeline, the one B1 judges. The ledger is append-only, so a
+    duplicate that failed this check on every run kept the watchdog red for good, and a
+    watchdog that is always red cannot report the next outage. A defect from the last
+    day FAILs here (and in [model] B1). An older one is a WARN that still counts it,
+    because the scored record still carries the row - and a duplicated close counts that
+    trade twice."""
     if not PAPER_LOG.exists():
         return
     try:
-        import paper_trader as pt
-        rows = pt._load(PAPER_LOG)
+        import diagnostics as dg
+        rows = dg._load(PAPER_LOG)
+        start = dg._recent_start(rows)
     except Exception as e:  # noqa: BLE001
         record(FAIL, "ledger", f"unreadable: {type(e).__name__}")
         return
-    seen, dupes = set(), 0
-    for r in rows:
-        if r.get("t") != "open":
-            continue
+    opened, closed = set(), set()
+    opens = closes = 0
+    defects: list[tuple[int, str]] = []          # (row index, what) - B1's own kinds
+    for i, r in enumerate(rows):
         key = (r.get("ticker"), r.get("rule"))
-        if key in seen:
-            dupes += 1
-        seen.add(key)
-    closes = sum(1 for r in rows if r.get("t") == "close")
-    opens = sum(1 for r in rows if r.get("t") == "open")
-    if dupes:
-        record(FAIL, "ledger", f"{dupes} DUPLICATE entries (same market+rule twice)")
-    elif closes > opens:
-        record(FAIL, "ledger", f"{closes} closes vs {opens} opens - impossible")
-    else:
-        record(OK, "ledger", f"{opens} opens / {closes} closes, no duplicates")
+        if r.get("t") == "open":
+            opens += 1
+            if key in opened:
+                defects.append((i, f"duplicate open {key[0]}/{key[1]}"))
+            opened.add(key)
+        elif r.get("t") == "close":
+            closes += 1
+            if key not in opened:
+                defects.append((i, f"orphan close {key[0]}/{key[1]}"))
+            elif key in closed:
+                defects.append((i, f"duplicate close {key[0]}/{key[1]}"))
+            closed.add(key)
+    recent = [what for i, what in defects if i >= start]
+    old = [what for i, what in defects if i < start]
+    counts = f"{opens} opens / {closes} closes"
+    window = f"{dg.RECENT_HOURS:.0f} h"
+    if recent:
+        record(FAIL, "ledger", f"{_defect_counts(recent)} in the ledger's last {window} - "
+                               f"first: {recent[0]} (two traders on one ledger?); {counts}")
+    if old:
+        record(WARN, "ledger", f"{_defect_counts(old)} older than {window} still in the "
+                               f"scored record (first: {old[0]}) - a duplicated close "
+                               f"counts that trade twice; {counts}")
+    if not defects:
+        record(OK, "ledger", f"{counts}, no duplicates")
 
 
 def check_model_integrity() -> None:
